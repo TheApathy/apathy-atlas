@@ -810,6 +810,14 @@ impl Dsv41SparseCore {
 }
 
 impl PassHook for Dsv41SparseCore {
+    /// DSpark: `V41Forward::rollback` calls this after a Verify pass. NEGATIVE CONTROL ONLY:
+    /// `ATLAS_DSV41_CONTROL_SKIP_ROLLBACK_RESTORE=1` rolls the length back without restoring the
+    /// ratio-2 compressor carry (the gate must then fail).
+    fn rollback(&self, ops: &Ops, n: usize) -> Result<()> {
+        let restore = std::env::var("ATLAS_DSV41_CONTROL_SKIP_ROLLBACK_RESTORE").as_deref() != Ok("1");
+        self.rollback_inner(ops.gpu, n, restore, ops.stream)
+    }
+
     fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
         ensure!(t <= self.max_chunk, "pass of {t} rows exceeds max_chunk {}", self.max_chunk);
         let mut st = self.st.lock().expect("core state poisoned");
@@ -857,11 +865,6 @@ impl PassHook for Dsv41SparseCore {
         }
         Ok(())
     }
-
-    /// DSpark: delegates to the gated [`Dsv41SparseCore::rollback`] on the forward's stream.
-    fn rollback(&self, ops: &Ops, n: usize) -> Result<()> {
-        Dsv41SparseCore::rollback(self, ops.gpu, n, ops.stream)
-    }
 }
 
 impl AttnCore for Dsv41SparseCore {
@@ -905,7 +908,6 @@ impl PassHook for std::sync::Arc<Dsv41SparseCore> {
     fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
         self.as_ref().begin_pass(kind, start, t)
     }
-
     fn rollback(&self, ops: &Ops, n: usize) -> Result<()> {
         PassHook::rollback(self.as_ref(), ops, n)
     }

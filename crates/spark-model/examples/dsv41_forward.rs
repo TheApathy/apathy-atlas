@@ -221,22 +221,6 @@ fn real_moe(
     Cb3RoutedMoe::new(shared, *kernels, config, arena, routers, 10.0, 1.5, max_t)
 }
 
-/// See its one use in `run_model_path`: a stateless-core rollback for layers 0-1 only.
-struct NoCarryCore<'a>(&'a Dsv41SparseCore);
-impl PassHook for NoCarryCore<'_> {
-    fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
-        self.0.begin_pass(kind, start, t)
-    }
-    fn rollback(&self, _ops: &Ops, _n: usize) -> Result<()> {
-        Ok(())
-    }
-}
-impl AttnCore for NoCarryCore<'_> {
-    fn run(&self, ops: &Ops, a: &CoreArgs) -> Result<()> {
-        self.0.run(ops, a)
-    }
-}
-
 struct NoHook;
 impl PassHook for NoHook {
     fn begin_pass(&self, _: PassKind, _: usize, _: usize) -> Result<()> {
@@ -286,18 +270,9 @@ fn run_model_path(
     let feeder = Feeder { dir: ref_dir.to_path_buf(), counts: RefCell::new(HashMap::new()), gpu };
     let fed_core = FedCore(&feeder);
     let real_core;
-    let no_carry;
     let (core, hook): (&dyn AttnCore, &dyn PassHook) = if attn_real {
         real_core = Dsv41SparseCore::load_prefix(&shared_dyn, store, config, 8192, max_chunk, fwd.freqs_c, n_layers)?;
-        if dspark_on && n_layers <= 2 {
-            // TEST ONLY: layers 0-1 are window-only (no compressor, no indexer), so the core
-            // carries no per-position state and a rollback has nothing to restore. Lets the
-            // DSpark mechanics be gated before the core's own rollback lands.
-            no_carry = NoCarryCore(&real_core);
-            (&no_carry, &no_carry)
-        } else {
-            (&real_core, &real_core)
-        }
+        (&real_core, &real_core)
     } else {
         (&fed_core, &NoHook)
     };
@@ -360,9 +335,11 @@ fn run_model_path(
         // oracle's token (teacher forcing), so every step is conditioned on the oracle's prefix.
         let report = |step: usize, v: &[f32]| {
             let mut idx: Vec<usize> = (0..v.len()).collect();
-            idx.select_nth_unstable_by(5, |&a, &b| v[b].total_cmp(&v[a]));
+            // Ties break to the LOWEST token id, as torch.argmax and the device argmax do: an
+            // exact bf16 tie otherwise picks an arbitrary id and forks the greedy stream.
+            idx.select_nth_unstable_by(5, |&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
             let mut top: Vec<usize> = idx[..5].to_vec();
-            top.sort_by(|&a, &b| v[b].total_cmp(&v[a]));
+            top.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
             let o = want.get(step).copied();
             let (ol, margin) = match o {
                 Some(t) => (v[t as usize], v[top[0]] - v[t as usize]),
@@ -389,6 +366,14 @@ fn run_model_path(
                 let out = ds.step(ops, &fwd, &mut seq, tok, hook, core, moe, &Tap::off(), logits, dspark_force)?;
                 step_ms.push(ts.elapsed().as_secs_f64() * 1e3);
                 acc_hist[out.accepted] += 1;
+                if std::env::var("DSV41_DRIVER_DSPARK_VERBOSE").as_deref() == Ok("1") {
+                    // FNV of verify row 0's logits = the plain-decode logits of the same position:
+                    // compare with the plain arm's "decode logits fnv per step".
+                    ops.gpu.synchronize(ops.stream)?;
+                    ops.gpu.copy_d2h(logits, &mut host)?;
+                    let h = host.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
+                    println!("spec step {steps:2}: pos {} tok {tok} accepted {} emitted {:?} row0 fnv {h:x}", seq.len - out.emitted.len(), out.accepted, out.emitted);
+                }
                 steps += 1;
                 got.extend_from_slice(&out.emitted);
             }
