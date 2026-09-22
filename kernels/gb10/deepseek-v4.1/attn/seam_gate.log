@@ -1,0 +1,51 @@
+# DSV41_LT_REDUCTION_MASK=0 (no split-K) -- requires the typed.rs fix owned by dsv41-integrate
+DeepSeek-V4 YaRN parameters: factor=16.0, beta_fast=32.0, beta_slow=1.0, original_max_pos=65536, mscale=0.0, mscale_all_dim=0.0
+weights: 83 tensors, 0.57 GB
+L02 chunk 0: topk rows differ 0/512 (worst set overlap 1.0000)
+L02 chunk 1: topk rows differ 0/512 (worst set overlap 1.0000)
+L02 r=2: ckv bit-exact 0.9999 (rel 4.28e-5), ik bit-exact 0.9992 (rel 9.19e-5)
+L08 chunk 0: topk rows differ 0/512 (worst set overlap 1.0000)
+L08 chunk 1: topk rows differ 0/512 (worst set overlap 1.0000)
+L08 r=2: ckv bit-exact 0.9998 (rel 3.61e-5), ik bit-exact 0.9983 (rel 1.82e-4)
+L14 chunk 0: topk rows differ 0/512 (worst set overlap 1.0000)
+L14 chunk 1: topk rows differ 0/512 (worst set overlap 1.0000)
+L14 r=2: ckv bit-exact 0.9998 (rel 4.72e-5), ik bit-exact 0.9986 (rel 1.07e-4)
+L20 chunk 0: topk rows differ 0/512 (worst set overlap 1.0000)
+L20 chunk 1: topk rows differ 1/512 (worst set overlap 0.9980)
+L20 r=1: ckv bit-exact 1.0000 (rel 0.00e0), ik bit-exact 0.9999 (rel 2.66e-5)
+L20 chunk 1: candidates differ 0/524288 (ld 1024)
+L20 replay tail: 128 rows; equals my own chunk-1 rows 384..511: true; vs capture: 0 rows differ
+L02 chunk 1 attention (own ckv + own topk) vs fp32 reference: bf16 bit-exact 0.9977, rel 1.002e-4 | CTRL cleared ckv: 0.0013, rel 5.927e-1
+L20 chunk 1 attention (own ckv + own topk) vs fp32 reference: bf16 bit-exact 0.9993, rel 7.171e-5 | CTRL cleared ckv: 0.0021, rel 4.545e-1
+odd splits [0, 511, 1000, 1023, 1024]: L02 ckv bit-exact 0.9999; replay tail 128 rows, spans chunks, == own last 128 rows: true, vs capture 0 rows differ
+L02 chunk invariance (odd vs 2x512 splits): 0/1024 rows differ (worst overlap 1.0000)
+L08 chunk invariance (odd vs 2x512 splits): 0/1024 rows differ (worst overlap 1.0000)
+L14 chunk invariance (odd vs 2x512 splits): 0/1024 rows differ (worst overlap 1.0000)
+L20 chunk invariance (odd vs 2x512 splits): 0/1024 rows differ (worst overlap 1.0000)
+CTRL dropped pending at 511: REFUSED loudly (layer 2: 500 compressed rows visible but only 499 published) -- the row count no longer adds up
+SEAM GATE PASS
+
+# default reduction schemes (split-K allowed) -- the failing arm
+L02 chunk 0: topk rows differ 0/512 (worst set overlap 1.0000)
+L02 chunk 1: topk rows differ 0/512 (worst set overlap 1.0000)
+L02 r=2: ckv bit-exact 0.9999 (rel 4.28e-5), ik bit-exact 0.9992 (rel 9.19e-5)
+L08 chunk 0: topk rows differ 0/512 (worst set overlap 1.0000)
+L08 chunk 1: topk rows differ 0/512 (worst set overlap 1.0000)
+L08 r=2: ckv bit-exact 0.9998 (rel 3.61e-5), ik bit-exact 0.9983 (rel 1.82e-4)
+L14 chunk 0: topk rows differ 0/512 (worst set overlap 1.0000)
+L14 chunk 1: topk rows differ 0/512 (worst set overlap 1.0000)
+L14 r=2: ckv bit-exact 0.9998 (rel 4.72e-5), ik bit-exact 0.9986 (rel 1.07e-4)
+L20 chunk 0: topk rows differ 0/512 (worst set overlap 1.0000)
+L20 chunk 1: topk rows differ 296/512 (worst set overlap 0.9922)
+L20 r=1: ckv bit-exact 0.7070 (rel 2.38e-3), ik bit-exact 0.6007 (rel 2.75e-3)
+L20 chunk 1: candidates differ 0/524288 (ld 1024)
+L20 replay tail: 128 rows; equals my own chunk-1 rows 384..511: true; vs capture: 94 rows differ
+L02 chunk 1 attention (own ckv + own topk) vs fp32 reference: bf16 bit-exact 0.9977, rel 1.002e-4 | CTRL cleared ckv: 0.0013, rel 5.927e-1
+L20 chunk 1 attention (own ckv + own topk) vs fp32 reference: bf16 bit-exact 0.7750, rel 1.681e-3 | CTRL cleared ckv: 0.0021, rel 4.545e-1
+odd splits [0, 511, 1000, 1023, 1024]: L02 ckv bit-exact 0.9999; replay tail 128 rows, spans chunks, == own last 128 rows: true, vs capture 94 rows differ
+L02 chunk invariance (odd vs 2x512 splits): 0/1024 rows differ (worst overlap 1.0000)
+L08 chunk invariance (odd vs 2x512 splits): 0/1024 rows differ (worst overlap 1.0000)
+L14 chunk invariance (odd vs 2x512 splits): 0/1024 rows differ (worst overlap 1.0000)
+L20 chunk invariance (odd vs 2x512 splits): 0/1024 rows differ (worst overlap 1.0000)
+CTRL dropped pending at 511: REFUSED loudly (layer 2: 500 compressed rows visible but only 499 published) -- the row count no longer adds up
+Error: SEAM GATE FAIL (3 checks)

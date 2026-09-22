@@ -343,3 +343,39 @@ dsv41_index_score_probe(const __nv_bfloat16* Q, const __nv_bfloat16* IK, const f
     }
 }
 #endif
+
+// ------------------------------------------------------------------ compressor + index glue
+
+// Ratio-2 gated combine (engine/model.py `_compressed`, r = 2):
+//   latent[g, c] = kv[2g, c] * w0 + kv[2g+1, c] * w1,  (w0, w1) = softmax(sc[2g, c], sc[2g+1, c])
+// fp32 in, bf16 out (`latent.to(bfloat16)` before comp_norm). expf, not __expf: torch's softmax.
+extern "C" __global__ void dsv41_compress_combine2(const float* __restrict__ KV,
+                                                  const float* __restrict__ SC,
+                                                  __nv_bfloat16* __restrict__ OUT,
+                                                  int n_pairs, int d)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)n_pairs * d) return;
+    const long long g = i / d, c = i % d;
+    const float a = SC[(2 * g) * d + c], b = SC[(2 * g + 1) * d + c];
+    const float m = fmaxf(a, b);
+    const float ea = expf(a - m), eb = expf(b - m);
+    const float s = ea + eb;
+    const float lat = KV[(2 * g) * d + c] * (ea / s) + KV[(2 * g + 1) * d + c] * (eb / s);
+    OUT[i] = __float2bfloat16_rn(lat);
+}
+
+// wts = float(bf16 x @ weights_proj^T) * scale   (scale = 128^-0.5 * 32^-0.5)
+extern "C" __global__ void dsv41_index_wts(const __nv_bfloat16* __restrict__ RAW, float* __restrict__ OUT,
+                                          float scale, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) OUT[i] = __bfloat162float(RAW[i]) * scale;
+}
+
+// out[i] = start + i * stride: absolute RoPE positions (tokens: stride 1; compressed rows: r).
+extern "C" __global__ void dsv41_iota_i32(int* __restrict__ OUT, int start, int stride, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) OUT[i] = start + i * stride;
+}

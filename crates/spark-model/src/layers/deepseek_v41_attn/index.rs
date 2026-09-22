@@ -50,6 +50,9 @@ pub struct IndexKernels {
     pub score: KernelHandle,
     pub topk: KernelHandle,
     pub candidates: KernelHandle,
+    pub combine2: KernelHandle,
+    pub wts: KernelHandle,
+    pub iota: KernelHandle,
 }
 
 impl IndexKernels {
@@ -67,6 +70,9 @@ impl IndexKernels {
             score: k("dsv41_index_score")?,
             topk: k("dsv41_index_topk")?,
             candidates: k("dsv41_select_candidates")?,
+            combine2: k("dsv41_compress_combine2")?,
+            wts: k("dsv41_index_wts")?,
+            iota: k("dsv41_iota_i32")?,
         })
     }
 }
@@ -156,6 +162,50 @@ impl IndexOps<'_> {
             .arg_ptr(score).arg_ptr(block_scratch).arg_ptr(cand)
             .arg_i32(n_pad as i32).arg_u64(pos0 as u64).arg_i32(ratio as i32)
             .arg_i32(topk_blocks as i32).arg_i32(block_size as i32)
+            .launch(self.stream)
+    }
+}
+
+impl IndexOps<'_> {
+    fn grid_1d(n: usize) -> Result<u32> {
+        u32::try_from(n.div_ceil(256)).context("1-D grid overflow")
+    }
+
+    /// Ratio-2 gated combine: `kv`, `sc` `[2 * n_pairs, d]` fp32 -> `out` `[n_pairs, d]` bf16.
+    pub fn combine2(&self, kv: DevicePtr, sc: DevicePtr, out: DevicePtr, n_pairs: usize, d: usize) -> Result<()> {
+        if n_pairs == 0 {
+            return Ok(());
+        }
+        KernelLaunch::new(self.gpu, self.k.combine2)
+            .grid([Self::grid_1d(n_pairs * d)?, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(kv).arg_ptr(sc).arg_ptr(out).arg_i32(n_pairs as i32).arg_i32(d as i32)
+            .launch(self.stream)
+    }
+
+    /// `out[i] = float(raw[i]) * scale`, `n` values.
+    pub fn wts(&self, raw: DevicePtr, out: DevicePtr, scale: f32, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        KernelLaunch::new(self.gpu, self.k.wts)
+            .grid([Self::grid_1d(n)?, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(raw).arg_ptr(out).arg_f32(scale).arg_i32(n as i32)
+            .launch(self.stream)
+    }
+
+    /// `out[i] = start + i * stride` as i32: absolute RoPE positions.
+    pub fn iota(&self, out: DevicePtr, start: usize, stride: usize, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let last = start + stride * (n - 1);
+        ensure!(last <= i32::MAX as usize, "position {last} overflows the i32 RoPE index");
+        KernelLaunch::new(self.gpu, self.k.iota)
+            .grid([Self::grid_1d(n)?, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(out).arg_i32(start as i32).arg_i32(stride as i32).arg_i32(n as i32)
             .launch(self.stream)
     }
 }
