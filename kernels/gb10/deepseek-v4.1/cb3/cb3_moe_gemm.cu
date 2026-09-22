@@ -80,13 +80,6 @@ __device__ __forceinline__ uint32_t bf16_bits(float v) {
     return (uint32_t)(*reinterpret_cast<const unsigned short*>(&b));
 }
 
-/// Pick entry `idx` (0..7) of an 8-entry bf16 table held as four packed u32 — predicated
-/// selects, no dynamically indexed register array (which would spill to local memory).
-__device__ __forceinline__ uint32_t pick(uint32_t idx, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3) {
-    const uint32_t w = (idx & 4u) ? ((idx & 2u) ? t3 : t2) : ((idx & 2u) ? t1 : t0);
-    return (idx & 1u) ? (w >> 16) : (w & 0xFFFFu);
-}
-
 /// The packed bytes one thread needs for one (row, 32-weight group): fetched one K step
 /// AHEAD so the global loads are in flight during the MMAs of the current step.
 struct Raw {
@@ -105,35 +98,66 @@ __device__ __forceinline__ Raw fetch_group(const Cb3Planes& p, long long n, int 
     return r;
 }
 
-/// Decode one row's one 32-weight scale group into dst[0..32) (bf16, K order).
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+    return r;
+}
+
+/// Four 3-bit codebook indices -> a prmt selector (one index per nibble, bit 3 clear).
+/// Byte j of L/H belongs to lane j of this word; `shift`/`bit` pick sub-position r.
+__device__ __forceinline__ uint32_t cb3_selector(uint32_t L, uint32_t H, int shift, int bit) {
+    const uint32_t a = (L >> shift) & 0x03030303u;
+    const uint32_t b = (bit >= 2 ? (H >> (bit - 2)) : (H << (2 - bit))) & 0x04040404u;
+    const uint32_t ie = a | b;             // one index (0..7) per byte
+    const uint32_t t = ie | (ie >> 4);     // bytes 0 and 2 now hold two indices each
+    return (t & 0xFFu) | ((t >> 8) & 0xFF00u);
+}
+
+/// Decode one row's 32-weight scale group into 16 packed bf16 pairs (K order).
 ///
-/// The row's codebook times the group scale becomes an 8-entry bf16 table, so each weight
-/// costs an index extraction and a select. Values are exactly those of
-/// `cb3_reconstruct_bf16` (fp4 x 2^(s-127), exact in bf16).
-__device__ __forceinline__ void decode_group(const Raw& r, uint2 cb, int k0, __nv_bfloat16* dst) {
+/// The row codebook times the group scale is an 8-entry bf16 table, split into a low-byte
+/// table and a high-byte table (two u32 each). Each weight index then selects its two bytes
+/// with `prmt` — four weights per selector, no per-weight arithmetic, no dynamic register
+/// indexing. Values are exactly `cb3_reconstruct_bf16`'s (fp4 x 2^(s-127), exact in bf16);
+/// this replaced a per-weight predicated select that cost ~3x the instructions.
+__device__ __forceinline__ void decode32(const Raw& r, uint2 cb, int k0, uint32_t (&out)[16]) {
     const int g = (k0 % 512) / 32;
     const float scale = exp2f((float)r.sc - 127.0f);
-    uint32_t t[4];
+    uint32_t e[8];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t word = (i < 2) ? cb.x : cb.y;
-        const uint32_t c0 = (word >> ((2 * i % 4) * 8)) & 0x0Fu;
-        const uint32_t c1 = (word >> ((2 * i % 4 + 1) * 8)) & 0x0Fu;
-        t[i] = bf16_bits(fp4_value(c0) * scale) | (bf16_bits(fp4_value(c1) * scale) << 16);
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t word = (i < 4) ? cb.x : cb.y;
+        e[i] = bf16_bits(fp4_value((word >> ((i % 4) * 8)) & 0x0Fu) * scale);
     }
+    const uint32_t tlo_x = (e[0] & 0xFFu) | ((e[1] & 0xFFu) << 8) | ((e[2] & 0xFFu) << 16) | ((e[3] & 0xFFu) << 24);
+    const uint32_t tlo_y = (e[4] & 0xFFu) | ((e[5] & 0xFFu) << 8) | ((e[6] & 0xFFu) << 16) | ((e[7] & 0xFFu) << 24);
+    const uint32_t thi_x = (e[0] >> 8) | ((e[1] >> 8) << 8) | ((e[2] >> 8) << 16) | ((e[3] >> 8) << 24);
+    const uint32_t thi_y = (e[4] >> 8) | ((e[5] >> 8) << 8) | ((e[6] >> 8) << 16) | ((e[7] >> 8) << 24);
     const int lo_shift = 4 * (g % 2);
     const int hi_bit = ((g / 2) % 2) * 4 + (g % 2) * 2;
     const uint32_t lo_w[4] = {r.lo.x, r.lo.y, r.lo.z, r.lo.w};
     const uint32_t hi_w[4] = {r.hi.x, r.hi.y, r.hi.z, r.hi.w};
-    uint32_t out[16];
 #pragma unroll
-    for (int lane = 0; lane < 16; ++lane) {
-        const uint32_t l = (lo_w[lane / 4] >> ((lane % 4) * 8)) & 0xFFu;
-        const uint32_t h = (hi_w[lane / 4] >> ((lane % 4) * 8)) & 0xFFu;
-        const uint32_t i0 = ((l >> lo_shift) & 3u) | (((h >> hi_bit) & 1u) << 2);
-        const uint32_t i1 = ((l >> (lo_shift + 2)) & 3u) | (((h >> (hi_bit + 1)) & 1u) << 2);
-        out[lane] = pick(i0, t[0], t[1], t[2], t[3]) | (pick(i1, t[0], t[1], t[2], t[3]) << 16);
+    for (int q = 0; q < 4; ++q) {
+        const uint32_t s0 = cb3_selector(lo_w[q], hi_w[q], lo_shift, hi_bit);          // r = 0
+        const uint32_t s1 = cb3_selector(lo_w[q], hi_w[q], lo_shift + 2, hi_bit + 1);  // r = 1
+        const uint32_t lo0 = prmt(tlo_x, tlo_y, s0), hi0 = prmt(thi_x, thi_y, s0);
+        const uint32_t lo1 = prmt(tlo_x, tlo_y, s1), hi1 = prmt(thi_x, thi_y, s1);
+        // Interleave to bf16(lane j, r=0) | bf16(lane j, r=1) << 16 for j = 0..3.
+        const uint32_t x01 = prmt(lo0, lo1, 0x5140), x23 = prmt(lo0, lo1, 0x7362);
+        const uint32_t y01 = prmt(hi0, hi1, 0x5140), y23 = prmt(hi0, hi1, 0x7362);
+        out[4 * q + 0] = prmt(x01, y01, 0x5140);
+        out[4 * q + 1] = prmt(x01, y01, 0x7362);
+        out[4 * q + 2] = prmt(x23, y23, 0x5140);
+        out[4 * q + 3] = prmt(x23, y23, 0x7362);
     }
+}
+
+/// Decode one row's one 32-weight scale group into dst[0..32) (bf16, K order).
+__device__ __forceinline__ void decode_group(const Raw& r, uint2 cb, int k0, __nv_bfloat16* dst) {
+    uint32_t out[16];
+    decode32(r, cb, k0, out);
     uint4* d = reinterpret_cast<uint4*>(dst);
 #pragma unroll
     for (int q = 0; q < 4; ++q) d[q] = make_uint4(out[4 * q], out[4 * q + 1], out[4 * q + 2], out[4 * q + 3]);
@@ -397,30 +421,9 @@ namespace {
 constexpr int GEMV_ROWS = 4;
 constexpr int GEMV_WARPS = 8;
 
-/// Decode one 32-weight group into 16 packed bf16 pairs (K order), from already-fetched bytes.
+/// GEMV alias of `decode32`: the weights stay in registers.
 __device__ __forceinline__ void decode_group_regs(const Raw& r, uint2 cb, int k0, uint32_t (&out)[16]) {
-    const int g = (k0 % 512) / 32;
-    const float scale = exp2f((float)r.sc - 127.0f);
-    uint32_t t[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t word = (i < 2) ? cb.x : cb.y;
-        const uint32_t c0 = (word >> ((2 * i % 4) * 8)) & 0x0Fu;
-        const uint32_t c1 = (word >> ((2 * i % 4 + 1) * 8)) & 0x0Fu;
-        t[i] = bf16_bits(fp4_value(c0) * scale) | (bf16_bits(fp4_value(c1) * scale) << 16);
-    }
-    const int lo_shift = 4 * (g % 2);
-    const int hi_bit = ((g / 2) % 2) * 4 + (g % 2) * 2;
-    const uint32_t lo_w[4] = {r.lo.x, r.lo.y, r.lo.z, r.lo.w};
-    const uint32_t hi_w[4] = {r.hi.x, r.hi.y, r.hi.z, r.hi.w};
-#pragma unroll
-    for (int lane = 0; lane < 16; ++lane) {
-        const uint32_t l = (lo_w[lane / 4] >> ((lane % 4) * 8)) & 0xFFu;
-        const uint32_t h = (hi_w[lane / 4] >> ((lane % 4) * 8)) & 0xFFu;
-        const uint32_t i0 = ((l >> lo_shift) & 3u) | (((h >> hi_bit) & 1u) << 2);
-        const uint32_t i1 = ((l >> (lo_shift + 2)) & 3u) | (((h >> (hi_bit + 1)) & 1u) << 2);
-        out[lane] = pick(i0, t[0], t[1], t[2], t[3]) | (pick(i1, t[0], t[1], t[2], t[3]) << 16);
-    }
+    decode32(r, cb, k0, out);
 }
 
 __device__ __forceinline__ float bf16_lo(uint32_t v) { return __uint_as_float(v << 16); }
