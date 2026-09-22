@@ -153,3 +153,31 @@ whatever kernel produced the capture, not a spec error — but this is NOT
 confirmed, only argued. **Do not treat 3.03e-3 as a closed question; re-run this
 script (or the Rust port) and compare before assuming either a bug or a clean bit
 match.**
+
+**UPDATE (same day): that guess was checked and RULED OUT, with a measurement, not
+an argument.** `act_qdq_fp8` on the engram rows is a literal no-op on this data —
+`max diff 0.0, frac changed 0.0` between the fake-quantized and raw activation,
+because engram rows are dequantized e2m1 codes (293 distinct values max), and
+e2m1's grid is a strict subset of e4m3's, so nothing rounds. Running WITH and
+WITHOUT the qdq step gives the IDENTICAL rel_l2 (0.0030316982667405418 to 16
+digits) either way.
+
+Stronger check: rather than trust the hand reproduction above, `tools/v41_ref.py`
+was imported directly (`import v41_ref as R` — this is literally what
+`engine/model.py:28` does; v41_ref.py is not a looser reference, it IS
+production's math library) and its own `EngramWeights` + `engram_forward` were run
+unmodified, with `MM_TILE = 16` matching `engine/model.py:65`. Same number:
+rel_l2 0.003031698288396001, matching the hand version to 10 significant figures.
+So the residual is not a transcription bug.
+
+Leading unconfirmed hypothesis: CPU vs GPU GEMM/reduction-order numerics. The
+`mm()` docstring already documents ~1e-4 relative sensitivity to cuBLAS's tile /
+split-K choice, "enough to round a bf16 activation to a different ulp" — and this
+op chains a [512,6144]x[6144,25600] GEMM into a 5120-wide dot-product reduction
+under `sigmoid(copysign(sqrt(|dot|), dot))`, which would amplify a ulp-level GEMM
+difference. This script runs on CPU; the capture ran on GPU. compare.py's own
+auto-control puts a 1% perturbation at rel_l2 0.0061 — 0.00303 is real, structured
+signal well below random-noise magnitude, consistent with a small systematic
+device difference rather than a wrong formula. NOT independently confirmed (would
+need a GPU-side rerun); reported to the lead as the leading hypothesis, not a
+closed question.

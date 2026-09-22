@@ -23,7 +23,23 @@ use spark_runtime::weights::WeightStore;
 use super::attn_block::{self, AttnCore, AttnScratch, HEAD_DIM, RING, V41AttnWeights, WINDOW, compress_ratio};
 use super::fwd::{BlockControl, PassScratch, Tap, V41AttentionBlock, V41BlockWeights, V41Dims, V41RoutedMoe, block};
 use super::ops::{Ops, RopeSpec, RopeTable, bf16_tensor, bytemuck_u32, prof};
-use crate::layers::deepseek_v41_engram::{EngramGather, EngramHashState, engram_dead_heads};
+use crate::layers::deepseek_v41_engram::{
+    EngramGather, EngramHashState, N_HEAD_COLS, engram_dead_heads, engram_dead_heads_with_carry,
+    update_dead_carry,
+};
+
+/// Set to dump `engram_in` (the block's `h` going INTO the engram projection),
+/// `engram_rows_masked` (the post-mask, cast-to-bf16 rows the wkv linear
+/// actually reads) alongside the existing `engram_out` tap, and to log the
+/// masked-head count per chunk from the EXECUTING path (host-side, from the
+/// same buffer that gets uploaded to the device -- not a separate recompute).
+/// Off by default: the extra taps cost a D2H copy nobody wants paying for on
+/// every run.
+pub const ENGRAM_DEBUG_ENV: &str = "ATLAS_DSV41_ENGRAM_DEBUG";
+
+fn engram_debug() -> bool {
+    std::env::var(ENGRAM_DEBUG_ENV).is_ok()
+}
 
 /// `candidate_source_layer`: the last encoder layer.
 pub const ENCODER_LAST: usize = 20;
@@ -71,6 +87,13 @@ pub struct V41Seq {
     pub tail_rows: usize,
     /// Token ids of those tail rows (the replay's MoE routes by them).
     pub tail_ids: Vec<u32>,
+    /// The trailing up-to-`MAX_LOOKBACK` raw ids from the most recently processed
+    /// chunk/token, carried so `engram_dead_heads_with_carry` sees look-back
+    /// across a chunk boundary the way `engine/v41_engine.py:755` does (it hashes
+    /// the WHOLE image-expanded prompt once, then slices per chunk) rather than
+    /// `engine/model.py:747`'s local fallback, which only applies to decode/text
+    /// (dsv41-parity, 2026-09-22).
+    pub dead_carry: Vec<u32>,
 }
 
 impl V41Seq {
@@ -90,6 +113,7 @@ impl V41Seq {
             tail_pre: gpu.alloc(WINDOW * dims.hc * 4)?,
             tail_rows: 0,
             tail_ids: Vec::new(),
+            dead_carry: Vec::new(),
         })
     }
 
@@ -205,8 +229,19 @@ impl V41Forward {
                 let rows: Vec<i64> = (0..t).flat_map(|tok| all[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
                 let g = &self.engram.iter().find(|(el, _)| *el == l).context("no engram gather")?.1;
                 prof(ops, "engram.gather", || g.gather_rows_gpu(&rows, t, s.engram_rows, ops.gpu, ops.stream))?;
+                let debug = engram_debug();
+                if debug {
+                    tap.bf16(ops, "engram_in", l, s.h, &[t, self.dims.hc, self.dims.hidden])?;
+                    tap.f32(ops, "engram_rows_premask", l, s.engram_rows, &[t, N_HEAD_COLS, 256])?;
+                }
                 // `pass` uploaded this chunk's dead-head mask into `s.engram_dead`.
                 prof(ops, "engram.proj", || e.forward(ops, s.h, s.engram_rows, s.engram_dead, t, s, &self.dims))?;
+                if debug {
+                    // The mask+cast the wkv linear actually reads, AFTER dsv41_engram_rows_bf16
+                    // runs -- if this doesn't differ from engram_rows_premask on a chunk the
+                    // executing mask log says has masked cells, the mask isn't reaching the GEMM.
+                    tap.bf16(ops, "engram_rows_masked", l, s.engram_rows_bf16, &[t, N_HEAD_COLS, 256])?;
+                }
                 tap.bf16(ops, "engram_out", l, s.h, &[t, self.dims.hc, self.dims.hidden])?;
             }
             let adapter = AttnAdapter { fwd: self, ring: seq.rings[l], win_lo, core, tap };
@@ -234,9 +269,35 @@ impl V41Forward {
         ensure!(seq.len == start, "sequence holds {} positions, pass starts at {start}", seq.len);
         ensure!(start + t <= self.max_seq, "position {} exceeds max_seq {}", start + t, self.max_seq);
         let hashes = seq.hash.forward(ids, start, None)?;
-        // `engram_dead_heads` is a pure function of THIS forward's ids (model.py:747, no
-        // cross-chunk carry); all-False for text.
-        let dead: Vec<u8> = engram_dead_heads(ids).into_iter().map(u8::from).collect();
+        // PREFILL (`engine/v41_engine.py:755`) hashes the WHOLE image-expanded prompt once and
+        // slices per chunk -- carrying the trailing MAX_LOOKBACK raw ids across chunks is the
+        // exact equivalent (see deepseek_v41_engram::dead_heads's module doc). DECODE does NOT
+        // carry: `m.forward(block, pos, prefill=False)` (v41_engine.py:912, 1037) passes no
+        // dead_heads, so `model.py:746-747`'s fallback computes it fresh from that call's own
+        // (single-token) ids with no history. Corrected 2026-09-22 by dsv41-parity: an earlier
+        // version of this carried on decode too, which is wrong at exactly the position right
+        // after an image-ending prompt's first generated token. Replay never reaches an engram
+        // layer, so it never exercises this branch either way.
+        let dead: Vec<u8> = match kind {
+            PassKind::Decode => engram_dead_heads(ids),
+            _ => engram_dead_heads_with_carry(&seq.dead_carry, ids),
+        }
+        .into_iter()
+        .map(u8::from)
+        .collect();
+        if kind != PassKind::Decode {
+            update_dead_carry(&mut seq.dead_carry, ids);
+        }
+        if engram_debug() {
+            // Straight off the host buffer this chunk is about to upload -- proves the mask
+            // reaches the point of upload, not merely that it was computed somewhere upstream.
+            let masked_cells = dead.iter().filter(|&&d| d != 0).count();
+            let masked_positions = dead.chunks(N_HEAD_COLS).filter(|row| row.iter().any(|&d| d != 0)).count();
+            eprintln!(
+                "ENGRAM_DEBUG pass start={start} t={t}: masked_cells={masked_cells}/{} masked_positions={masked_positions}/{t}",
+                dead.len()
+            );
+        }
         ops.gpu.copy_h2d_async(&dead, self.scratch.engram_dead, ops.stream)?;
         ops.gpu.copy_h2d_async(bytemuck_u32(ids), self.ids_dev, ops.stream)?;
         ops.embed(self.embed, self.ids_dev, self.scratch.x, t, self.dims.hidden)?;
@@ -296,6 +357,11 @@ impl V41Forward {
         if start == 0 {
             seq.tail_rows = 0;
             seq.tail_ids.clear();
+            // Robustness (dsv41-parity): V41Seq is rebuilt per request today
+            // (Dsv41Model::alloc_sequence), so this is currently unreachable with a nonempty
+            // carry -- but if a sequence slot is ever reused, a stale dead_carry from the
+            // PREVIOUS request would otherwise silently leak into this request's first chunk.
+            seq.dead_carry.clear();
         }
         let n = self.blocks.len();
         match mode {

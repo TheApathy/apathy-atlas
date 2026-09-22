@@ -152,6 +152,20 @@ impl V41AttentionBlock for ProjAttention<'_> {
     }
 }
 
+/// Three-arm attribution for the dead-head mask (lead's request): compare each
+/// against the oracle with no magnitude reasoning required -- whichever arm is
+/// closest answers "does the mask matter, and is it applied correctly" directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadArm {
+    /// The mask as ported: `engram_dead_heads(chunk_ids)`.
+    Ported,
+    /// Forced all-False: what a port that silently dropped masking would produce.
+    Off,
+    /// The mask shifted forward one position (the off-by-one this lane's own
+    /// tests already use as a negative control) -- a wrong-but-plausible mask.
+    Shifted,
+}
+
 struct Refuse(&'static str);
 impl V41AttentionBlock for Refuse {
     fn forward(&self, _: &Ops, l: usize, _: DevicePtr, _: DevicePtr, _: usize, _: usize) -> Result<()> {
@@ -373,6 +387,8 @@ fn main() -> Result<()> {
     let mut warm_prefill = false;
     let mut splits: Vec<Vec<usize>> = Vec::new();
     let mut engram_live = false;
+    let mut engram_feed_h = false;
+    let mut dead_arm = DeadArm::Ported;
     let mut head_test = false;
     let mut core_real = false;
     let mut args = std::env::args().skip(1);
@@ -387,6 +403,15 @@ fn main() -> Result<()> {
                     "live" => true,
                     "feed" => false,
                     o => bail!("--engram live|feed, got {o}"),
+                }
+            }
+            "--engram-feed-h" => engram_feed_h = true,
+            "--dead-arm" => {
+                dead_arm = match args.next().context("--dead-arm")?.as_str() {
+                    "ported" => DeadArm::Ported,
+                    "off" => DeadArm::Off,
+                    "shifted" => DeadArm::Shifted,
+                    o => bail!("--dead-arm ported|off|shifted, got {o}"),
                 }
             }
             "--head-test" => head_test = true,
@@ -583,8 +608,34 @@ fn main() -> Result<()> {
         ops.embed(embed, d_ids, s.x, t, dims.hidden)?;
         ops.hc_expand(s.x, s.h, s.pre_mix, t, dims.hidden)?;
         if engram_live {
-            let dead_host: Vec<u8> = engram_dead_heads(chunk_ids).iter().map(|&d| u8::from(d)).collect();
+            let real = engram_dead_heads(chunk_ids);
+            let dead_bools: Vec<bool> = match dead_arm {
+                DeadArm::Ported => real,
+                DeadArm::Off => vec![false; real.len()],
+                DeadArm::Shifted => {
+                    // Same construction as dead_heads.rs's own `shifted_mask_is_a_different_function`
+                    // negative control: OR the mask with itself shifted forward one position.
+                    let cols = 24usize;
+                    let tt = chunk_ids.len();
+                    let mut wrong = real.clone();
+                    for p in (1..tt).rev() {
+                        for c in 0..cols {
+                            wrong[p * cols + c] = real[p * cols + c] || real[(p - 1) * cols + c];
+                        }
+                    }
+                    wrong
+                }
+            };
+            let dead_host: Vec<u8> = dead_bools.iter().map(|&d| u8::from(d)).collect();
+            eprintln!(
+                "DEBUG dead_arm={dead_arm:?} dead_host True count = {} / {}",
+                dead_host.iter().filter(|&&d| d != 0).count(),
+                dead_host.len()
+            );
             gpu.copy_h2d(&dead_host, d_dead)?;
+            let mut readback = vec![0u8; dead_host.len()];
+            gpu.copy_d2h(d_dead, &mut readback)?;
+            eprintln!("DEBUG readback True count = {} / {}", readback.iter().filter(|&&d| d != 0).count(), readback.len());
         }
         for w in &blocks {
             if let Some(e) = &w.engram {
@@ -611,6 +662,14 @@ fn main() -> Result<()> {
                         DevicePtr::NULL
                     }
                 };
+                if engram_feed_h {
+                    // Isolate engram+mask from this driver's own block-glue h reconstruction:
+                    // overwrite s.h with the CAPTURE's own input to this layer's engram_forward
+                    // (the "h" tap of layer-1, i.e. the prior layer's own end-of-block output --
+                    // only valid for the FIRST engram layer, where that predecessor was captured).
+                    ensure!(w.layer >= 1, "--engram-feed-h needs a captured predecessor layer");
+                    feeder.feed_raw("h", w.layer - 1, s.h, t * dims.hc * dims.hidden * 2)?;
+                }
                 e.forward(&ops, s.h, s.engram_rows, dead_ptr, t, &s, &dims)?;
                 tap.bf16(&ops, "engram_out", w.layer, s.h, &[t, dims.hc, dims.hidden])?;
             }
