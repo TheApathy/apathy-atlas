@@ -59,7 +59,11 @@ pub struct V41AttnWeights {
 
 impl V41AttnWeights {
     pub fn load(store: &WeightStore, layer: usize, hidden: usize) -> Result<Self> {
-        let p = format!("layers.{layer}.attn");
+        Self::load_prefixed(store, &format!("layers.{layer}.attn"), layer, hidden)
+    }
+
+    /// Same tensors under another prefix (the DSpark blocks: `mtp.{k}.attn`).
+    pub fn load_prefixed(store: &WeightStore, p: &str, layer: usize, hidden: usize) -> Result<Self> {
         let grp_k = HEAD_DIM * N_HEADS / O_GROUPS;
         Ok(Self {
             layer,
@@ -228,14 +232,36 @@ pub fn attention(
         )
     })?;
     tap.bf16(ops, "attn_o_pre_inverse_rope", l, s.o, &[t, N_HEADS, HEAD_DIM])?;
+    attn_output(ops, w, s, wscratch, rope, t, out, tap)
+}
+
+/// The attention sub-layer AFTER the core: inverse RoPE of `s.o` (positions in `s.pos`), the
+/// grouped `wo_a`, then `wo_b` into `out`. Shared by the main layers and the DSpark draft blocks.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_output(
+    ops: &Ops,
+    w: &V41AttnWeights,
+    s: &AttnScratch,
+    wscratch: DevicePtr,
+    rope: &RopeTable,
+    t: usize,
+    out: DevicePtr,
+    tap: &Tap,
+) -> Result<()> {
+    let l = w.layer;
     ops.rope_tail(s.o, s.pos, rope, t, N_HEADS, HEAD_DIM, true)?;
     tap.bf16(ops, "attn_o_post_inverse_rope", l, s.o, &[t, N_HEADS, HEAD_DIM])?;
 
     // grouped wo_a: o [T, 8, 4096] -> o2 [T, 8, 1024], group g uses wo_a rows g*1024..
     let grp_k = HEAD_DIM * N_HEADS / O_GROUPS;
-    if t == 1 && ops.k.fp8_gemv_m1.is_some() {
+    let decode = super::ops::decode_pass();
+    if t == 1 && decode && ops.k.fp8_gemv_m1.is_some() {
         // One grouped fp8 GEMV: output row n reads activation group n / 1024.
         ops.fp8_gemv_m1(s.o, &w.wo_a, s.o2, O_LORA, grp_k)?;
+        return ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t);
+    }
+    if t <= super::ops::GEMV_MAX_M && decode && ops.k.fp8_gemv_m8.is_some() {
+        ops.fp8_gemv_rows(s.o, N_HEADS * HEAD_DIM, &w.wo_a, s.o2, O_GROUPS * O_LORA, t, O_LORA, grp_k)?;
         return ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t);
     }
     // `v41_ref.wo_a_proj` runs the grouped fp8 kernel (row-invariant, not row-tiled), so the

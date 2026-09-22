@@ -22,6 +22,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
 use super::cb3_arena::{Cb3ExpertArena, Cb3LayerResidency};
+use super::device_allocs::{DeviceAllocs, SharedGpu};
 use super::moe::Cb3Matrix;
 use super::moe_forward::{RouterF32, TOP_K};
 use super::routing::Routing;
@@ -77,7 +78,8 @@ pub struct MoeDecode {
     err: DevicePtr,
     h: DevicePtr,
     down: DevicePtr,
-    allocations: Vec<DevicePtr>,
+    /// Every device buffer above, freed when this drops (engine2's owned-allocation pattern).
+    _allocs: DeviceAllocs,
 }
 
 fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
@@ -86,7 +88,10 @@ fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
 }
 
 impl MoeDecode {
-    pub fn new(gpu: &dyn GpuBackend, arena: &Cb3ExpertArena, routers: &[(usize, RouterF32)]) -> Result<Self> {
+    pub fn new(shared: &SharedGpu, arena: &Cb3ExpertArena, routers: &[(usize, RouterF32)]) -> Result<Self> {
+        let gpu: &dyn GpuBackend = shared.as_ref();
+        // Recorded as they are made, so a failure half-way frees what was already taken.
+        let allocs = std::cell::RefCell::new(DeviceAllocs::owned(shared.clone()));
         let k = |name: &str| {
             gpu.kernel(DECODE_MODULE, name).with_context(|| {
                 format!("{DECODE_MODULE}::{name} is not in the compiled PTX (new .cu: touch crates/atlas-kernels/build.rs)")
@@ -102,11 +107,9 @@ impl MoeDecode {
             down_r8: k("dsv41_cb3_down_decode_r8")?,
             sum: k("dsv41_moe_sum_decode")?,
         };
-        let mut allocations = Vec::new();
-        let mut upload = |bytes: &[u8]| -> Result<DevicePtr> {
-            let p = gpu.alloc(bytes.len().max(256))?;
+        let upload = |bytes: &[u8]| -> Result<DevicePtr> {
+            let p = allocs.borrow_mut().alloc(gpu, bytes.len().max(256))?;
             gpu.copy_h2d(bytes, p)?;
-            allocations.push(p);
             Ok(p)
         };
         let mut tables = Vec::with_capacity(routers.len());
@@ -122,25 +125,15 @@ impl MoeDecode {
                 slot_of: upload(bytes_of(&slots))?,
             });
         }
-        let mut a = |bytes: usize| -> Result<DevicePtr> {
-            let p = gpu.alloc(bytes.max(256))?;
+        let a = |bytes: usize| -> Result<DevicePtr> {
+            let p = allocs.borrow_mut().alloc(gpu, bytes.max(256))?;
             gpu.memset(p, 0, bytes.max(256))?;
-            allocations.push(p);
             Ok(p)
         };
-        Ok(Self {
-            k,
-            tables,
-            ids: a(MAX_DECODE_T * 4)?,
-            logits: a(MAX_DECODE_T * ROUTED_EXPERTS * 4)?,
-            groups: a((1 + MAX_ROWS * GROUP_INTS) * 4)?,
-            row_w: a(MAX_ROWS * 4)?,
-            sel: a(MAX_ROWS * 4)?,
-            err: a(4)?,
-            h: a(MAX_ROWS * INTER * 2)?,
-            down: a(MAX_ROWS * HIDDEN * 4)?,
-            allocations,
-        })
+        let (ids, logits, groups) = (a(MAX_DECODE_T * 4)?, a(MAX_DECODE_T * ROUTED_EXPERTS * 4)?, a((1 + MAX_ROWS * GROUP_INTS) * 4)?);
+        let (row_w, sel, err) = (a(MAX_ROWS * 4)?, a(MAX_ROWS * 4)?, a(4)?);
+        let (h, down) = (a(MAX_ROWS * INTER * 2)?, a(MAX_ROWS * HIDDEN * 4)?);
+        Ok(Self { k, tables, ids, logits, groups, row_w, sel, err, h, down, _allocs: allocs.into_inner() })
     }
 
     fn table(&self, layer: usize) -> Result<&LayerTables> {
@@ -306,12 +299,5 @@ impl MoeDecode {
             .arg_ptr(self.down)
             .arg_ptr(out)
             .launch(stream)
-    }
-
-    pub fn free(self, gpu: &dyn GpuBackend) -> Result<()> {
-        for p in self.allocations {
-            gpu.free(p)?;
-        }
-        Ok(())
     }
 }

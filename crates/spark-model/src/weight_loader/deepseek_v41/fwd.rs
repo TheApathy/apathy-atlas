@@ -68,7 +68,11 @@ pub struct SharedExpert {
 
 impl SharedExpert {
     pub fn load(store: &WeightStore, layer: usize, dims: &V41Dims) -> Result<Self> {
-        let p = format!("layers.{layer}.ffn.shared_experts");
+        Self::load_prefixed(store, &format!("layers.{layer}.ffn.shared_experts"), dims)
+    }
+
+    /// Same tensors under another prefix (the DSpark blocks: `mtp.{k}.ffn.shared_experts`).
+    pub fn load_prefixed(store: &WeightStore, p: &str, dims: &V41Dims) -> Result<Self> {
         Ok(Self {
             w1: Fp8Linear::load(store, &format!("{p}.w1"), dims.moe_inter, dims.hidden)?,
             w2: Fp8Linear::load(store, &format!("{p}.w2"), dims.hidden, dims.moe_inter)?,
@@ -403,6 +407,27 @@ impl Tap {
 /// Rows other than the last are never needed at prefill; computing them would be a
 /// `[T, 129280]` GEMM for nothing.
 #[allow(clippy::too_many_arguments)]
+/// [`final_logits_last_row`] for ALL `t` rows of the pass (DSpark verify): `logits` must hold
+/// `tiled_rows(t)` rows of `[vocab]` bf16; row i is the pass's row i. Each row's arithmetic is the
+/// last-row function's (per-row hc_pre/rmsnorm, one MM_TILE-row head GEMM).
+#[allow(clippy::too_many_arguments)]
+pub fn final_logits_rows(
+    ops: &Ops,
+    dims: &V41Dims,
+    s: &PassScratch,
+    t: usize,
+    norm: DevicePtr,
+    head: DevicePtr,
+    vocab: usize,
+    logits: DevicePtr,
+) -> Result<()> {
+    ensure!(t >= 1 && t <= s.max_t && t <= super::ops::MM_TILE, "final_logits_rows: bad t {t}");
+    let d = dims.hidden;
+    ops.hc_pre(s.h, s.pre_mix, s.x, t, d)?;
+    ops.rmsnorm(s.x, norm, s.x, t, d, dims.norm_eps)?;
+    ops.linear_bf16_tiled(s.x, d, head, logits, vocab, t, vocab, d)
+}
+
 pub fn final_logits_last_row(
     ops: &Ops,
     dims: &V41Dims,

@@ -10,6 +10,10 @@ use crate::ir::ThinkingDirective;
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct ChatCompletionRequest {
+    /// Optional: the DeepSeek-V4.1 Python server ignores `model` and accepts a
+    /// request without it; an absent model is the base model (responses echo
+    /// the served name either way).
+    #[serde(default)]
     pub model: String,
     /// M2 per-request LoRA routing: optional resident adapter NAME for THIS
     /// request (independent of `model`). Unset = installed active adapter;

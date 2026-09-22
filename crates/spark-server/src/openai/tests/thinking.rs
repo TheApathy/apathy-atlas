@@ -218,3 +218,13 @@ fn non_string_non_integer_effort_is_refused() {
         assert!(serde_json::from_value::<ChatCompletionRequest>(b).is_err(), "{bad} accepted");
     }
 }
+
+/// A chat request with no `model` parses (production accepts it and ignores the field).
+#[test]
+fn missing_model_field_parses() {
+    let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+    let req: ChatCompletionRequest = serde_json::from_value(body).expect("no model field");
+    assert_eq!(req.model, "");
+    // CONTROL: a malformed field is still an error
+    assert!(serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({"messages": 5})).is_err());
+}

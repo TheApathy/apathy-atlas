@@ -117,6 +117,16 @@ required-features = ["cuda", "gpu-examples"]
 name = "dsv41_forward"
 required-features = ["cuda", "gpu-examples"]
 
+# Small-M fp8 GEMV: every row of M=2..8 bit-identical to M=1 (speculative verify == decode).
+[[example]]
+name = "dsv41_gemv_rows_gate"
+required-features = ["cuda", "gpu-examples"]
+
+# DSpark FP4 MoE decode kernels vs an f64 host reference on the real mtp experts (+2 controls).
+[[example]]
+name = "dsv41_mtp_moe_gate"
+required-features = ["cuda", "gpu-examples"]
+
 # Served DeepSeek-V4.1: dropping the model must return >= 95% of its memory (TUI swap);
 # `--control leak` forgets it and must FAIL.
 [[example]]

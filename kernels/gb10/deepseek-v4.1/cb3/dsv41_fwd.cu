@@ -339,3 +339,17 @@ extern "C" __global__ void dsv41_mul_bf16_to_f32(const __nv_bfloat16* __restrict
     const unsigned long long i = (unsigned long long)blockIdx.x * DSV41_BLOCK + threadIdx.x;
     if (i < n) out[i] = bf(a[i]) * bf(b[i]);
 }
+
+// ── DSpark seed: engine/model.py `h.float().mean(dim=1)` at L37-39, then `.to(bf16)` ──
+// out[t * ld + off + d] = bf16(((h0 + h1) + h2 + h3) / hc). Grid: (T)  Block: 256.
+extern "C" __global__ void dsv41_hc_mean_bf16(const __nv_bfloat16* __restrict__ h,
+                                              __nv_bfloat16* __restrict__ out, const unsigned D,
+                                              const unsigned ld, const unsigned off) {
+    const unsigned t = blockIdx.x;
+    for (unsigned d = threadIdx.x; d < D; d += DSV41_BLOCK) {
+        float acc = 0.f;
+#pragma unroll
+        for (unsigned i = 0; i < DSV41_HC; ++i) acc += bf(h[((size_t)t * DSV41_HC + i) * D + d]);
+        out[(size_t)t * ld + off + d] = __float2bfloat16(acc / (float)DSV41_HC);
+    }
+}

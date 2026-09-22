@@ -102,6 +102,9 @@ pub enum PassKind {
     Replay,
     /// One generated token through all 40 layers.
     Decode,
+    /// DSpark verify: the accepted token plus the drafts (T <= 8) through all 40 layers. Behaves as
+    /// Decode everywhere (decode-size kernels, no dead-head carry); followed by a rollback.
+    Verify,
     /// Debug: all 40 layers over a whole prompt chunk (no replay).
     FullChunk,
 }
@@ -117,6 +120,12 @@ pub enum PrefillMode {
 /// Per-pass hook for the attention lane, called once before the first layer of a pass.
 pub trait PassHook {
     fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()>;
+    /// DSpark: discard every position >= `n` after a Verify pass (see BRIEF.md, "DSPARK ROLLBACK
+    /// CONTRACT"). The default REFUSES: a core that carries state across positions and does not
+    /// implement this would otherwise silently keep the rejected drafts' state.
+    fn rollback(&self, _ops: &Ops, n: usize) -> Result<()> {
+        anyhow::bail!("this attention core cannot roll back (to {n} positions)")
+    }
 }
 
 /// Per-sequence state this module owns. (ckv / ik / pending belong to the attention lane.)
@@ -195,6 +204,13 @@ pub struct V41Forward {
     /// q*k weight products), freed on drop once [`Self::own_allocations`] hands it a backend.
     /// Until then (the driver) it only records them.
     pub allocs: super::device_allocs::DeviceAllocs,
+    /// DSpark seed (`Model.forward`'s `main_hiddens`): bf16 `[rows, 3 * hidden]`, filled with the
+    /// hc-mean of the INPUT stream of L37, L38, L39 on every pass that runs them (replay,
+    /// decode, verify). `None` unless the drafter is loaded (`enable_dspark_seed`).
+    pub dspark_seed: Option<DevicePtr>,
+    /// The DSpark drafter's weights (store-resident), when loaded. Consumed by dsv41-decode's
+    /// draft/verify path.
+    pub dspark: Option<super::mtp::DsparkWeights>,
 }
 
 pub fn rope_specs() -> (RopeSpec, RopeSpec) {
@@ -252,7 +268,19 @@ impl V41Forward {
             max_chunk,
             max_seq,
             allocs: super::device_allocs::DeviceAllocs::unowned(),
+            dspark_seed: None,
+            dspark: None,
         })
+    }
+
+    /// Allocate the DSpark seed buffer (call before [`Self::own_allocations`] so it is owned too).
+    pub fn enable_dspark_seed(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+        let rows = super::ops::tiled_rows(self.max_chunk.max(WINDOW));
+        let cols = super::mtp::DSPARK_TARGET_LAYERS.len() * self.dims.hidden;
+        let p = gpu.alloc(rows * cols * 2)?;
+        self.allocs.adopt(p);
+        self.dspark_seed = Some(p);
+        Ok(())
     }
 
     /// Take ownership of every allocation made in [`Self::load`] so dropping the forward frees
@@ -267,6 +295,9 @@ impl V41Forward {
             a.adopt(t.sin);
         }
         a.adopt(self.ids_dev);
+        if let Some(p) = self.dspark_seed {
+            a.adopt(p);
+        }
         for b in &self.blocks {
             if let Some(e) = &b.engram {
                 a.adopt(e.weight);
@@ -318,6 +349,12 @@ impl V41Forward {
                 }
                 tap.bf16(ops, "engram_out", l, s.h, &[t, self.dims.hc, self.dims.hidden])?;
             }
+            if let (Some(seed), Some(col)) =
+                (self.dspark_seed, super::mtp::DSPARK_TARGET_LAYERS.iter().position(|&x| x == l))
+            {
+                let d = self.dims.hidden;
+                ops.hc_mean_bf16(s.h, seed, t, d, super::mtp::DSPARK_TARGET_LAYERS.len() * d, col * d)?;
+            }
             let adapter = AttnAdapter { fwd: self, ring: seq.rings[l], win_lo, core, tap };
             block(ops, w, &self.dims, s, t, start, &adapter, moe, tap, BlockControl::None)?;
         }
@@ -353,17 +390,17 @@ impl V41Forward {
         // after an image-ending prompt's first generated token. Replay never reaches an engram
         // layer, so it never exercises this branch either way.
         let mut dead_bools = match kind {
-            PassKind::Decode => engram_dead_heads(ids),
+            PassKind::Decode | PassKind::Verify => engram_dead_heads(ids),
             _ => engram_dead_heads_with_carry(&seq.dead_carry, ids),
         };
-        if kind != PassKind::Decode {
+        if !matches!(kind, PassKind::Decode | PassKind::Verify) {
             // Attribution tool only, real path is a no-op (`DeadArm::Ported`) -- see
             // `apply_dead_arm`'s doc. Applied AFTER the carry, so `--dead-arm shifted`'s shift
             // is relative to what the executing path actually computed, not a re-derivation.
             dead_bools = apply_dead_arm(dead_arm()?, dead_bools, t);
         }
         let dead: Vec<u8> = dead_bools.into_iter().map(u8::from).collect();
-        if kind != PassKind::Decode {
+        if !matches!(kind, PassKind::Decode | PassKind::Verify) {
             update_dead_carry(&mut seq.dead_carry, ids);
         }
         if engram_debug() {
@@ -381,12 +418,14 @@ impl V41Forward {
         ops.embed(self.embed, self.ids_dev, self.scratch.x, t, self.dims.hidden)?;
         // Image spans (prefill only; decode ids are never image ids). A no-op, with no
         // GPU work, unless this request encoded images.
-        if kind != PassKind::Decode
+        if !matches!(kind, PassKind::Decode | PassKind::Verify)
             && let Some(v) = &self.vision
         {
             v.splice(ops.gpu, ops.stream, self.embed, ids, start, self.scratch.x)?;
         }
         ops.hc_expand(self.scratch.x, self.scratch.h, self.scratch.pre_mix, t, self.dims.hidden)?;
+        // Decode-size kernels key on the PASS KIND (never on t): see ops::set_decode_pass.
+        super::ops::set_decode_pass(matches!(kind, PassKind::Decode | PassKind::Verify));
         hook.begin_pass(kind, start, t)?;
         moe.begin_pass(ids)?;
         self.run_layers(ops, seq, layers, t, start, 0, Some(&hashes), core, moe, tap)?;
@@ -486,6 +525,7 @@ impl V41Forward {
             let (hrow, prow) = (self.dims.hc * self.dims.hidden * 2, self.dims.hc * 4);
             ops.gpu.copy_d2d_async(seq.tail_h, self.scratch.h, t * hrow, ops.stream)?;
             ops.gpu.copy_d2d_async(seq.tail_pre, self.scratch.pre_mix, t * prow, ops.stream)?;
+            super::ops::set_decode_pass(false);
             hook.begin_pass(PassKind::Replay, start, t)?;
             ensure!(seq.tail_ids.len() == t, "replay tail holds {} ids for {t} rows", seq.tail_ids.len());
             moe.begin_pass(&seq.tail_ids)?;
@@ -513,6 +553,42 @@ impl V41Forward {
             self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
         }
         self.finish_prefill(ops, seq, mode, hook, core, moe, tap, logits)
+    }
+
+    /// DSpark verify: `ids` (the accepted token + the drafts, <= 8) at positions `seq.len..`, as ONE
+    /// Verify pass through every layer; bf16 logits of EVERY row, `[t, vocab]` (row i predicts
+    /// position seq.len + i + 1). `logits` must hold `tiled_rows(t)` rows. Follow with
+    /// [`Self::rollback`] to the accepted length.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify(
+        &self,
+        ops: &Ops,
+        seq: &mut V41Seq,
+        ids: &[u32],
+        hook: &dyn PassHook,
+        core: &dyn AttnCore,
+        moe: &dyn V41RoutedMoe,
+        tap: &Tap,
+        logits: DevicePtr,
+    ) -> Result<()> {
+        ensure!(!ids.is_empty() && ids.len() <= super::ops::GEMV_MAX_M, "verify block of {} ids", ids.len());
+        let start = seq.len;
+        self.pass(ops, seq, ids, start, 0..self.blocks.len(), PassKind::Verify, hook, core, moe, tap)?;
+        prof(ops, "head", || super::fwd::final_logits_rows(ops, &self.dims, &self.scratch, ids.len(), self.norm, self.head, self.vocab, logits))
+    }
+
+    /// Discard every position >= `n` (after a Verify pass): the attention core's carried state
+    /// (`hook`), the engram n-gram history, and the sequence length. The window rings and the
+    /// compressed caches are append-only and need nothing (BRIEF.md rollback contract).
+    pub fn rollback(&self, ops: &Ops, seq: &mut V41Seq, n: usize, hook: &dyn PassHook) -> Result<()> {
+        ensure!(n <= seq.len, "rollback to {n} positions but the sequence holds {}", seq.len);
+        if n == seq.len {
+            return Ok(());
+        }
+        hook.rollback(ops, n)?;
+        seq.hash.rollback(n)?;
+        seq.len = n;
+        Ok(())
     }
 
     /// One decode step at position `seq.len`; bf16 logits `[vocab]`.

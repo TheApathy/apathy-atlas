@@ -55,13 +55,16 @@ __device__ __forceinline__ void dd_bf16x8(const uint4 v, float* f) {
     }
 }
 
-extern "C" __global__ void __launch_bounds__(32 * DD_WARPS) dsv41_fp8_gemv_m1(
-    const __nv_bfloat16* __restrict__ x,   // activation(s), bf16
-    const uint8_t* __restrict__ w,         // e4m3 [N, K]
-    const uint8_t* __restrict__ scale,     // ue8m0 [ceil(N/32), ceil(K/32)]
-    __nv_bfloat16* __restrict__ out,       // bf16 [N]
-    const unsigned N, const unsigned K,
-    const unsigned n_per_group, const unsigned x_group_stride) {
+// R activation rows share every weight load. Row r's arithmetic is EXACTLY the one-row kernel's
+// (same lane -> chunk mapping, same order, same reduction tree), so a row's result does not depend
+// on how many rows share the call: M = 1..8 are bit-identical per row (chunk-invariant by
+// construction). x rows are `ldx` elements apart, out rows `ldo` apart.
+template <int R>
+__device__ __forceinline__ void dd_gemv(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w,
+                                        const uint8_t* __restrict__ scale, __nv_bfloat16* __restrict__ out,
+                                        const unsigned N, const unsigned K, const unsigned n_per_group,
+                                        const unsigned x_group_stride, const unsigned m, const unsigned ldx,
+                                        const unsigned ldo) {
     const unsigned warp = threadIdx.x >> 5, L = threadIdx.x & 31;
     const unsigned n = blockIdx.x * DD_WARPS + warp;
     if (n >= N) return;
@@ -69,25 +72,56 @@ extern "C" __global__ void __launch_bounds__(32 * DD_WARPS) dsv41_fp8_gemv_m1(
     const uint4* wr = reinterpret_cast<const uint4*>(w + (size_t)n * K);
     const uint8_t* sr = scale + (size_t)(n / 32) * ((K + 31) / 32);
     const unsigned chunks = K / 16;
-    float acc = 0.0f;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
 #pragma unroll 4
     for (unsigned c = L; c < chunks; c += 32) {
         const uint4 wv = __ldg(wr + c);
-        const uint4 xa = __ldg(reinterpret_cast<const uint4*>(xg + 16 * c));
-        const uint4 xb = __ldg(reinterpret_cast<const uint4*>(xg + 16 * c + 8));
         const float s = ldexpf(1.0f, (int)__ldg(sr + (c >> 1)) - 127);
-        float wf[16], xf[16];
+        float wf[16];
         dd_fp8x16(wv, wf);
-        dd_bf16x8(xa, xf);
-        dd_bf16x8(xb, xf + 8);
-        float p = 0.0f;
 #pragma unroll
-        for (int q = 0; q < 16; ++q) p = __fadd_rn(p, __fmul_rn(wf[q], xf[q]));
-        acc = __fadd_rn(acc, __fmul_rn(p, s));
+        for (int r = 0; r < R; ++r) {
+            if ((unsigned)r >= m) break;
+            const __nv_bfloat16* xr = xg + (size_t)r * ldx;
+            const uint4 xa = __ldg(reinterpret_cast<const uint4*>(xr + 16 * c));
+            const uint4 xb = __ldg(reinterpret_cast<const uint4*>(xr + 16 * c + 8));
+            float xf[16];
+            dd_bf16x8(xa, xf);
+            dd_bf16x8(xb, xf + 8);
+            float p = 0.0f;
+#pragma unroll
+            for (int q = 0; q < 16; ++q) p = __fadd_rn(p, __fmul_rn(wf[q], xf[q]));
+            acc[r] = __fadd_rn(acc[r], __fmul_rn(p, s));
+        }
     }
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-    if (L == 0) out[n] = __float2bfloat16(acc);
+    for (int r = 0; r < R; ++r) {
+        if ((unsigned)r >= m) break;
+        float a = acc[r];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (L == 0) out[(size_t)r * ldo + n] = __float2bfloat16(a);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(32 * DD_WARPS) dsv41_fp8_gemv_m1(
+    const __nv_bfloat16* __restrict__ x,   // activation(s), bf16
+    const uint8_t* __restrict__ w,         // e4m3 [N, K]
+    const uint8_t* __restrict__ scale,     // ue8m0 [ceil(N/32), ceil(K/32)]
+    __nv_bfloat16* __restrict__ out,       // bf16 [N]
+    const unsigned N, const unsigned K,
+    const unsigned n_per_group, const unsigned x_group_stride) {
+    dd_gemv<1>(x, w, scale, out, N, K, n_per_group, x_group_stride, 1, 0, 0);
+}
+
+// M = 1..8 rows (speculative verify / draft blocks). Grid and block as the one-row kernel.
+extern "C" __global__ void __launch_bounds__(32 * DD_WARPS) dsv41_fp8_gemv_m8(
+    const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w, const uint8_t* __restrict__ scale,
+    __nv_bfloat16* __restrict__ out, const unsigned N, const unsigned K, const unsigned n_per_group,
+    const unsigned x_group_stride, const unsigned m, const unsigned ldx, const unsigned ldo) {
+    dd_gemv<8>(x, w, scale, out, N, K, n_per_group, x_group_stride, m, ldx, ldo);
 }
 
 // ── hc_mixes at decode: the same arithmetic as dsv41_fwd.cu::dsv41_hc_mixes, spread over blocks ──

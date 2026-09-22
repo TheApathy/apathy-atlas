@@ -213,6 +213,8 @@ fn main() -> Result<()> {
     let router = router_from_checkpoint(layer, hidden, gpu)?;
     let moe = Cb3RoutedMoe::new(shared.clone(), kernels, &config, arena, vec![(layer, router)], limit, route_scale, tokens)?;
     moe.set_pass_tokens(pass_ids);
+    // `--rows` slices model a DECODE pass (the decode-size kernels key on the pass kind, not on T).
+    spark_model::weight_loader::deepseek_v41::ops::set_decode_pass(rows.is_some());
     let decode_path = moe.uses_decode_path(tokens);
     println!("  expert path: {}", if decode_path { "DECODE (GPU routing + CB3 GEMV)" } else { "reconstruct + cuBLASLt" });
     moe.set_control(control);
