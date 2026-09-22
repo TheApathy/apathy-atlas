@@ -24,10 +24,11 @@ PRODUCTION entry (i64 idx, bf16 out)            : 0/4849664 differ from bf16(fp3
 PRODUCTION entry (i64 idx, bf16 out) window-only: 0/4849664 differ from bf16(fp32 kernel) | CTRL other mode: 4809958 differ
 PRODUCTION entry w32 (i32 wpos, i64 idx, bf16) : 0/4849664 differ from bf16(fp32 kernel)
 SPLIT-KV decode entry (S=20 x 32 keys + combine): 733/4849664 bf16 differ from bf16(one-pass) (99.9849% identical), vs fp32 ref rel_l2=1.663e-03 | CTRL last split dropped: 2667024 differ
-T=1 latency (GPU-lock held, nothing else running): one-pass 532.4 us
-    split SLICE=64 (S=10,  80 CTAs) + combine 88.9 us (6.0x)  [split alone 84.4, combine alone 4.3]
-    split SLICE=32 (S=20, 160 CTAs) + combine 88.8 us (6.0x)  [split alone 82.6, combine alone 5.7]
-    split SLICE=16 (S=40, 320 CTAs) + combine 84.4 us (6.3x)  [split alone 75.2, combine alone 6.8]
-    split SLICE= 8 (S=80, 640 CTAs) + combine 92.1 us (5.8x)  [split alone 76.0, combine alone 10.2]
-MMA prefill entry: 4819/4849664 bf16 differ from bf16(one-pass) (99.9006% identical); vs fp32 ref: mma 1.663e-03 (bf16-rounded one-pass 1.663e-03) | CTRL compressed rows dropped: 4809961 differ | T=148: one-pass 8.293 ms, mma 0.663 ms (12.5x)
+T=1 latency (GPU-lock held, nothing else running): one-pass 524.4 us
+    split SLICE=64 (S=10,  80 CTAs) + combine 86.0 us (6.1x)  [split alone 81.9, combine alone 4.1]
+    split SLICE=32 (S=20, 160 CTAs) + combine 88.7 us (5.9x)  [split alone 81.9, combine alone 5.5]
+    split SLICE=16 (S=40, 320 CTAs) + combine 83.8 us (6.3x)  [split alone 74.4, combine alone 6.3]
+    split SLICE= 8 (S=80, 640 CTAs) + combine 91.9 us (5.7x)  [split alone 75.7, combine alone 10.2]
+MMA prefill entry: 4819/4849664 bf16 differ from bf16(one-pass) (99.9006% identical); vs fp32 ref: mma 1.663e-03 (bf16-rounded one-pass 1.663e-03) | CTRL compressed rows dropped: 4809961 differ | T=148: one-pass 8.237 ms, mma 0.481 ms (17.1x)
+MMA32 prefill entry: 4798/4849664 bf16 differ from bf16(one-pass) (99.9011% identical); vs fp32 ref 1.663e-03 | T=148: 0.566 ms (14.6x one-pass, 0.85x mma16)
 PASS one-pass streaming gather (controls separate)

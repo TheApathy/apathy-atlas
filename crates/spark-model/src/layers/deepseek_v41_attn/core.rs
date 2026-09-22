@@ -234,8 +234,9 @@ pub struct Dsv41SparseCore {
     prof: Prof,
     /// `ATLAS_DSV41_ATTN_SPLIT=0` forces the one-pass kernel for decode too (A/B arm only).
     split_on: bool,
-    /// `ATLAS_DSV41_COMP_CUBLAS=1`: the ratio-2 compressor's fp32 projections as the reference
-    /// issues them (cuBLASLt, 16-row tiles) instead of `dsv41_gemm_f32_nt` (A/B arm only).
+    /// `ATLAS_DSV41_COMP_CUBLAS=1`: the ratio-2 compressor's fp32 projections and the indexer's
+    /// weights_proj as the reference issues them (cuBLASLt, 16-row tiles) instead of the
+    /// deterministic `dsv41_gemm_f32_nt` / `dsv41_gemm_bf16_smalln` (A/B arm only).
     comp_cublas_tiled: bool,
 }
 
@@ -563,9 +564,13 @@ impl Dsv41SparseCore {
         self.prof.mark(ops, "index.q_gemm")?;
         iops.iota(s.pos, start, 1, t)?;
         ops.rope_tail(s.qi, s.pos, &self.rope_c, t, INDEX_HEADS, INDEX_HEAD_DIM, false)?;
-        tiled(gpu, s.pad_in, s.pad_out, a.x, s.wraw, t, HIDDEN * 2, INDEX_HEADS * 2, stream, |x, o| {
-            ops.linear_bf16(x, w.weights_proj, o, MM_TILE, INDEX_HEADS, HIDDEN)
-        })?;
+        if self.comp_cublas_tiled {
+            tiled(gpu, s.pad_in, s.pad_out, a.x, s.wraw, t, HIDDEN * 2, INDEX_HEADS * 2, stream, |x, o| {
+                ops.linear_bf16(x, w.weights_proj, o, MM_TILE, INDEX_HEADS, HIDDEN)
+            })?;
+        } else {
+            iops.gemm_bf16_smalln(a.x, w.weights_proj, s.wraw, t, INDEX_HEADS, HIDDEN)?;
+        }
         iops.wts(s.wraw, s.wts, WTS_SCALE, t * INDEX_HEADS)?;
         self.prof.mark(ops, "index.q_rope_wts")?;
 
