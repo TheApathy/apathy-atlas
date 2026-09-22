@@ -27,9 +27,10 @@ use crate::weight_map::{DenseWeight, dense, dense_auto};
 
 use super::cb3_arena::{Cb3ExpertArena, resolve_packed_keep};
 use super::layer::{
-    DeepSeekV41Layer, V41HcAttn, V41HyperConnections, V41Router, V41SharedExpert,
+    DeepSeekV41Layer, V41HcAttn, V41HyperConnections, V41SharedExpert,
 };
 use super::moe::{Cb3Reconstruct, expert_matrices};
+use super::moe_forward::RouterF32;
 use super::seams::{ENGRAM_LAYERS, MissingAttention, MissingEngram, SparseShared};
 
 /// Where the CB3 pack lives, relative to the model directory.
@@ -105,6 +106,8 @@ pub fn load_all_layers(
         );
     }
 
+    let fwd_kernels = super::ops::Dsv41Kernels::load(gpu)?;
+    let stream = gpu.default_stream();
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(n);
     for i in 0..n {
         let lp = format!("layers.{i}");
@@ -113,13 +116,9 @@ pub fn load_all_layers(
         let input_norm = dense_auto(store, &format!("{lp}.attn_norm.weight"), gpu)?;
         let post_attn_norm = dense_auto(store, &format!("{lp}.ffn_norm.weight"), gpu)?;
 
-        // Both router biases. `bias_vl` is the vision-language variant, not a duplicate;
-        // see `V41Router`.
-        let router = V41Router {
-            weight: dense_auto(store, &format!("{lp}.ffn.gate.weight"), gpu)?,
-            bias: dense_auto(store, &format!("{lp}.ffn.gate.bias"), gpu)?,
-            bias_vl: dense_auto(store, &format!("{lp}.ffn.gate.bias_vl"), gpu)?,
-        };
+        // The router stays in the reference's dtypes: weight widened to fp32, both biases F32
+        // (never through `dense_auto`, which narrows F32 to bf16). See `RouterF32`.
+        let router = RouterF32::load(store, i, config.hidden_size, gpu, &fwd_kernels, stream)?;
 
         // The shared expert is FP8 block-quantised IN THE MAIN SHARDS, not CB3. Its
         // `.scale` siblings are loaded alongside because an FP8 weight without its scale
@@ -201,7 +200,7 @@ pub fn load_all_layers(
 ///
 /// The engram tables are ~95 GB each and are never loaded into the `WeightStore`, so the
 /// engram seam takes this path rather than a store. See `seams::Dsv41EngramLoader`.
-fn resolve_model_dir() -> Result<PathBuf> {
+pub fn resolve_model_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var(MODEL_DIR_ENV) {
         return Ok(PathBuf::from(dir));
     }

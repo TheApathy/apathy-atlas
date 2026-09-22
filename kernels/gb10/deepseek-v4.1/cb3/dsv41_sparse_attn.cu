@@ -62,11 +62,11 @@ template <> __device__ __forceinline__ __nv_bfloat16 to_out<__nv_bfloat16>(float
 // IdxT: int32_t for the fixture gate, int64_t (long long) in production -- the indexer
 // emits i64 and the window positions are i64, as in the reference. OutT: float for the
 // gate, bf16 in production (the reference's `_softmax_attn(...).to(bfloat16)`).
-template <bool CTRL_ORDER, bool CTRL_GATHER, typename IdxT, typename OutT>
+template <bool CTRL_ORDER, bool CTRL_GATHER, typename IdxT, typename OutT, typename WposT = IdxT>
 __device__ void sparse_attn_body(
     const __nv_bfloat16* __restrict__ Q,     // [T, NH, D]
     const __nv_bfloat16* __restrict__ RING,  // [RING_N, D]
-    const IdxT*          __restrict__ WPOS,  // [T, NW]  absolute positions, -1 = none
+    const WposT*         __restrict__ WPOS,  // [T, NW]  absolute positions, -1 = none
     const __nv_bfloat16* __restrict__ CKV,   // [n_c, D]
     const IdxT*          __restrict__ CIDX,  // [T, NC]  compressed rows, -1 = none
     const float*         __restrict__ SINK,  // [NH]
@@ -209,6 +209,17 @@ __global__ void __launch_bounds__(NT) sparse_attn(
     int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
 {
     sparse_attn_body<CTRL_ORDER, CTRL_GATHER, int32_t, float>(
+        Q, RING, WPOS, CKV, CIDX, SINK, O, T, NH, D, NW, NC, RING_N, win_lo, scale);
+}
+
+// PRODUCTION entry for the forward's attn_block: i32 window positions (as it builds them),
+// i64 compressed indices (as the indexer emits them).
+extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn_w32(
+    const __nv_bfloat16* Q, const __nv_bfloat16* RING, const int32_t* WPOS,
+    const __nv_bfloat16* CKV, const long long* CIDX, const float* SINK, __nv_bfloat16* O,
+    int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
+{
+    sparse_attn_body<false, false, long long, __nv_bfloat16, int32_t>(
         Q, RING, WPOS, CKV, CIDX, SINK, O, T, NH, D, NW, NC, RING_N, win_lo, scale);
 }
 
@@ -410,6 +421,13 @@ int main() {
                         window_only ? " window-only" : "            ", bad, no, ctrl);
             prod_ok = prod_ok && bad == 0 && ctrl > 0;
         }
+        // The forward's entry: i32 window positions straight from the fixture, i64 cidx.
+        dsv41_sparse_attn_w32<<<grid,NT>>>(d_q,d_ring,d_wpos,d_ckv,d_c64,d_sink,d_ob,T,NH,D,NW,NC,RING_N,0,scale);
+        CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
+        CUDA_OK(cudaMemcpy(ob.data(), d_ob, no*2, cudaMemcpyDeviceToHost));
+        const size_t bad32 = bits_equal(h_ok);
+        std::printf("PRODUCTION entry w32 (i32 wpos, i64 idx, bf16) : %zu/%zu differ from bf16(fp32 kernel)\n", bad32, no);
+        prod_ok = prod_ok && bad32 == 0;
         cudaFree(d_w64); cudaFree(d_c64); cudaFree(d_ob);
     }
     const bool all_ok = ok && prod_ok;

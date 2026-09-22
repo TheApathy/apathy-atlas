@@ -16,6 +16,9 @@ cuda = [
     "spark-runtime/cuda",
     "spark-storage/cuda",
     "spark-comm/cuda",
+    # Served DeepSeek-V4.1 (`model::dsv41`) builds its engram hash state from the
+    # checkpoint's tokenizer.json at alloc_sequence.
+    "engram-tokenizer",
 ]
 metal = [
     "atlas-core/metal",
@@ -114,11 +117,20 @@ required-features = ["cuda", "gpu-examples"]
 name = "dsv41_forward"
 required-features = ["cuda", "gpu-examples"]
 
+[[example]]
+name = "dsv41_attn_seam"
+required-features = ["cuda", "gpu-examples"]
+
 # The first comparison of an actual MoE OUTPUT against the serving engine:
 # feeds the oracle's moe_in through CB3 reconstruct + cuBLASLt and checks
 # moe_routed. `--control` reverses the routing weights and must FAIL.
 [[example]]
 name = "cb3_moe_oracle_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+# Per-phase timing of the routed MoE on one resident layer (scores/route/plan/recon/GEMM).
+[[example]]
+name = "dsv41_moe_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]

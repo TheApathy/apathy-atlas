@@ -79,10 +79,10 @@ impl SharedExpert {
     /// `v41_ref.expert_ffn(y, w1, w2, w3, limit)`: out = w2(bf16(silu(clamp(w1 y)) * clamp(w3 y))).
     pub fn forward(&self, ops: &Ops, y: DevicePtr, out: DevicePtr, t: usize, s: &PassScratch, dims: &V41Dims) -> Result<()> {
         let n = t * dims.moe_inter;
-        ops.linear_fp8(y, &self.w1, s.wscratch, s.gate, t)?;
-        ops.linear_fp8(y, &self.w3, s.wscratch, s.up, t)?;
+        ops.linear_fp8_tiled(y, &self.w1, s.wscratch, s.gate, t)?;
+        ops.linear_fp8_tiled(y, &self.w3, s.wscratch, s.up, t)?;
         ops.swiglu(s.gate, s.up, s.act, n, dims.swiglu_limit)?;
-        ops.linear_fp8(s.act, &self.w2, s.wscratch, out, t)
+        ops.linear_fp8_tiled(s.act, &self.w2, s.wscratch, out, t)
     }
 }
 
@@ -114,7 +114,7 @@ impl EngramProj {
     /// `[t, 24]` or NULL for "no dead heads".
     pub fn forward(&self, ops: &Ops, h: DevicePtr, rows: DevicePtr, dead: DevicePtr, t: usize, s: &PassScratch, dims: &V41Dims) -> Result<()> {
         ops.engram_rows_bf16(rows, dead, s.engram_rows_bf16, t * ENGRAM_ROW_WIDTH)?;
-        ops.linear_fp8(s.engram_rows_bf16, &self.wkv, s.wscratch, s.engram_kv, t)?;
+        ops.linear_fp8_tiled(s.engram_rows_bf16, &self.wkv, s.wscratch, s.engram_kv, t)?;
         ops.engram_gate(h, s.engram_kv, self.weight, t, dims.hc, dims.hidden, dims.norm_eps)
     }
 }
@@ -195,7 +195,8 @@ impl PassScratch {
             Ok(p)
         };
         let (d, hc) = (dims.hidden, dims.hc);
-        let t = max_t;
+        // Every activation buffer holds whole MM_TILE tiles (see ops::tiled_rows).
+        let t = super::ops::tiled_rows(max_t);
         let s = Self {
             max_t,
             h: a(t * hc * d * 2)?,
@@ -236,14 +237,19 @@ impl PassScratch {
 /// Everything from `wq_a` to `wo_b`, including the ring/compressor/indexer state updates.
 pub trait V41AttentionBlock {
     #[allow(clippy::too_many_arguments)]
-    fn forward(&self, layer: usize, x: DevicePtr, out: DevicePtr, t: usize, start: usize, stream: u64) -> Result<()>;
+    fn forward(&self, ops: &Ops, layer: usize, x: DevicePtr, out: DevicePtr, t: usize, start: usize) -> Result<()>;
 }
 
 /// The routed experts of one layer: post-`ffn_norm` y `[T, hidden]` -> routed sum `[T, hidden]`
 /// bf16 (router, residency mask, top-k, CB3 experts, weighted combine). Shared expert NOT
 /// included — that is [`SharedExpert`], here.
 pub trait V41RoutedMoe {
-    fn forward(&self, layer: usize, y: DevicePtr, out: DevicePtr, t: usize, stream: u64) -> Result<()>;
+    /// The token ids of the rows the NEXT pass carries (chunk ids, the replay tail's ids, or
+    /// the decode token), for routing that depends on them (image rows use `gate.bias_vl`).
+    fn begin_pass(&self, _token_ids: &[u32]) -> Result<()> {
+        Ok(())
+    }
+    fn forward(&self, ops: &Ops, layer: usize, y: DevicePtr, out: DevicePtr, t: usize) -> Result<()>;
 }
 
 /// A deliberately WRONG wiring, for negative controls only.
@@ -283,7 +289,7 @@ pub fn block(
     ops.hc_pre(s.h, attn_side_pre, s.x, t, d)?;
     ops.rmsnorm(s.x, w.attn_norm, s.x, t, d, eps)?;
     tap.bf16(ops, "attn_x", l, s.x, &[t, d])?;
-    attn.forward(l, s.x, s.y, t, start, ops.stream)?;
+    attn.forward(ops, l, s.x, s.y, t, start)?;
     tap.bf16(ops, "attn_out", l, s.y, &[t, d])?;
     ops.hc_post(s.y, s.h, s.attn_post, s.attn_comb, s.h, t, d)?;
 
@@ -296,7 +302,7 @@ pub fn block(
     ops.hc_pre(s.h, ffn_side_pre, s.x, t, d)?;
     ops.rmsnorm(s.x, w.ffn_norm, s.x, t, d, eps)?;
     tap.bf16(ops, "moe_in", l, s.x, &[t, d])?;
-    moe.forward(l, s.x, s.routed, t, ops.stream)?;
+    moe.forward(ops, l, s.x, s.routed, t)?;
     w.shared.forward(ops, s.x, s.shared, t, s, dims)?;
     tap.bf16(ops, "moe_routed", l, s.routed, &[t, d])?;
     tap.bf16(ops, "moe_shared", l, s.shared, &[t, d])?;
@@ -368,7 +374,8 @@ impl Tap {
 
 /// `Model.forward`'s tail for the LAST row of the pass: `x = hc_pre(h, pre_mix)`,
 /// `rmsnorm(x, norm)`, `logits = head(x)` — bf16 GEMM with fp32 accumulate and bf16 logits,
-/// exactly `R.head_logits` for a bf16 head. `logits` receives `[vocab]` bf16.
+/// exactly `R.head_logits` for a bf16 head. `logits` must hold `[MM_TILE, vocab]` bf16 (the
+/// GEMM runs as one 16-row tile like `R.mm`); row 0 is the result.
 ///
 /// Rows other than the last are never needed at prefill; computing them would be a
 /// `[T, 129280]` GEMM for nothing.
@@ -389,5 +396,5 @@ pub fn final_logits_last_row(
     let pre_last = s.pre_mix.offset((t - 1) * hc * 4);
     ops.hc_pre(h_last, pre_last, s.x, 1, d)?;
     ops.rmsnorm(s.x, norm, s.x, 1, d, dims.norm_eps)?;
-    ops.linear_bf16(s.x, head, logits, 1, vocab, d)
+    ops.linear_bf16_tiled(s.x, d, head, logits, vocab, 1, vocab, d)
 }
