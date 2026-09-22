@@ -1,0 +1,38 @@
+runH_feed40: 1024 tokens in chunks [(0, 512), (512, 512)]; layers 0..40; feed []; control None
+DeepSeek-V4 YaRN parameters: factor=16.0, beta_fast=32.0, beta_slow=1.0, original_max_pos=65536, mscale=0.0, mscale_all_dim=0.0
+weights: 1261 tensors, 9.99 GB in 12.6s
+dsv41 core profile before EncoderChunk (synchronized per phase): total -0.0 ms
+dsv41 core profile before Replay (synchronized per phase): total 255.4 ms
+  attn.sparse.mma                  90.19 ms     38 calls     2.373 ms/call
+  attn.window_only                  2.70 ms      4 calls     0.674 ms/call
+  compress.combine                  0.07 ms      6 calls     0.011 ms/call
+  compress.gemm_bf16                2.09 ms      2 calls     1.043 ms/call
+  compress.gemm_f32_x2            143.27 ms      6 calls    23.879 ms/call
+  compress.ik_gemm                  1.10 ms      8 calls     0.138 ms/call
+  compress.norm                     0.09 ms      8 calls     0.011 ms/call
+  compress.norm_rope_write          0.16 ms      8 calls     0.020 ms/call
+  compress.x_to_f32                 0.37 ms      6 calls     0.061 ms/call
+  index.candidates                  0.15 ms      2 calls     0.074 ms/call
+  index.dequant_wq_b                0.62 ms      8 calls     0.077 ms/call
+  index.keep_tail                   0.34 ms      2 calls     0.172 ms/call
+  index.q_gemm                      3.32 ms      8 calls     0.414 ms/call
+  index.q_rope_wts                  8.92 ms      8 calls     1.115 ms/call
+  index.score                       1.50 ms      8 calls     0.187 ms/call
+  index.topk                        0.54 ms      8 calls     0.067 ms/call
+prefill 1024 tokens in 1.79s
+PROFILE (cold prefill, every scope synchronized):
+scope (a/b = nested in a)                 ms   calls   %top
+attention                              719.7      61   40.4
+moe.routed                             693.6      61   38.9
+dense/gemm                             323.3     431       
+attention/core                         271.1      61       
+engram.gather                          206.1       4   11.6
+dense/dequant                          168.2     492       
+mhc+norm                                67.9     183    3.8
+moe.shared                              66.1      61    3.7
+engram.proj                             23.9       4    1.3
+head                                     5.9       1    0.3
+TOTAL (top-level scopes)              1783.3
+
+model path (replay): prompt 1024 tokens, argmax 4 (logit 27.25)
+DONE dsv41_forward path=model

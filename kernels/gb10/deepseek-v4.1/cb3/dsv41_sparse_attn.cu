@@ -288,6 +288,191 @@ extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn_combine(
         O[((size_t)t * NH + h) * D + tid + i * NT] = __float2bfloat16_rn(acc[i] / denom);
 }
 
+// ------------------------------------------------------------------ TENSOR-CORE PREFILL
+// dsv41_sparse_attn_mma: the same computation on mma.sync.m16n8k16 (bf16 in, fp32 accumulate).
+// One CTA = one token x 16 heads (MQA: the 16 heads share every gathered K/V row), 4 warps.
+// Per 16-key tile: S = Q K^T with warp w summing dims [128w, 128w+128), partials merged in fixed
+// warp order; online softmax in fp32 (window tiles first, then compressed, as the reference);
+// P = exp(s - m) is split P_hi = bf16(P), P_lo = bf16(P - P_hi) and BOTH are applied
+// (acc += P_hi K + P_lo K), keeping ~16 mantissa bits of P -- the decode_attn.py PV_SPLIT
+// idea -- instead of the 8 a single bf16 P would keep. l is accumulated from fp32 P.
+// Numerics vs the fp32-FMA one-pass kernel: different summation order and ~2^-17 relative P
+// error; the band is pre-registered in the gate.
+static const int MH = 16, MK = 16, MWARPS = 4, MNT = MWARPS * 32, KPAD = 8;
+
+__device__ __forceinline__ void mma_bf16_16816(float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__device__ __forceinline__ uint32_t pack2(__nv_bfloat16 lo, __nv_bfloat16 hi) {
+    return (uint32_t)__bfloat16_as_ushort(lo) | ((uint32_t)__bfloat16_as_ushort(hi) << 16);
+}
+
+extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ RING, const int32_t* __restrict__ WPOS,
+    const __nv_bfloat16* __restrict__ CKV, const long long* __restrict__ CIDX, const float* __restrict__ SINK,
+    __nv_bfloat16* __restrict__ O, int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
+{
+    const int t = blockIdx.x, hg = blockIdx.y;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int g = lane >> 2, q = lane & 3;
+
+    __shared__ __align__(16) __nv_bfloat16 qs[MH][DMAX + KPAD];
+    __shared__ __align__(16) __nv_bfloat16 ks[MK][DMAX + KPAD];
+    __shared__ float spart[MWARPS][MH][MK];
+    __shared__ __align__(16) __nv_bfloat16 ph[MH][MK + KPAD], pl[MH][MK + KPAD];
+    __shared__ float mrow[MH], lrow[MH], arow[MH];
+    __shared__ int vld[MK];
+
+    for (int i = tid; i < MH * DMAX / 8; i += MNT) {
+        const int h = i / (DMAX / 8), c = i % (DMAX / 8);
+        *reinterpret_cast<uint4*>(&qs[h][c * 8]) =
+            reinterpret_cast<const uint4*>(Q + ((size_t)t * NH + hg * MH + h) * D)[c];
+    }
+    if (tid < MH) { mrow[tid] = -INFINITY; lrow[tid] = 0.f; }
+    float acc[16][4];
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.f;
+    __syncthreads();
+
+    for (int seg = 0; seg < 2; ++seg) {
+        const int n = seg == 0 ? NW : NC;
+        if (seg == 1 && CIDX == nullptr) continue;
+        const __nv_bfloat16* src = seg == 0 ? RING : CKV;
+        for (int kb = 0; kb < n; kb += MK) {
+            if (tid < MK) {
+                const int c = kb + tid;
+                int row = -1;
+                if (c < n) {
+                    if (seg == 0) {
+                        const long long p = WPOS[(size_t)t * NW + c];
+                        if (p >= 0 && p >= win_lo) row = (int)(p % RING_N);
+                    } else {
+                        const long long j = CIDX[(size_t)t * NC + c];
+                        if (j >= 0) row = (int)j;
+                    }
+                }
+                vld[tid] = row;
+            }
+            __syncthreads();
+            for (int i = tid; i < MK * DMAX / 8; i += MNT) {
+                const int r = i / (DMAX / 8), c = i % (DMAX / 8);
+                const int row = vld[r];
+                *reinterpret_cast<uint4*>(&ks[r][c * 8]) = row >= 0
+                    ? reinterpret_cast<const uint4*>(src + (size_t)row * D)[c] : make_uint4(0, 0, 0, 0);
+            }
+            __syncthreads();
+
+            // ---- S partial over this warp's 128 dims: 8 k-steps x 2 n-tiles of 8 keys
+            float sp[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+#pragma unroll
+            for (int kk = 0; kk < 8; ++kk) {
+                const int kd = warp * 128 + kk * 16;
+                uint32_t a[4];
+                a[0] = *reinterpret_cast<const uint32_t*>(&qs[g][kd + 2 * q]);
+                a[1] = *reinterpret_cast<const uint32_t*>(&qs[g + 8][kd + 2 * q]);
+                a[2] = *reinterpret_cast<const uint32_t*>(&qs[g][kd + 8 + 2 * q]);
+                a[3] = *reinterpret_cast<const uint32_t*>(&qs[g + 8][kd + 8 + 2 * q]);
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    uint32_t b[2];
+                    b[0] = *reinterpret_cast<const uint32_t*>(&ks[nt * 8 + g][kd + 2 * q]);
+                    b[1] = *reinterpret_cast<const uint32_t*>(&ks[nt * 8 + g][kd + 8 + 2 * q]);
+                    mma_bf16_16816(sp[nt], a, b);
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                spart[warp][g][nt * 8 + 2 * q]         = sp[nt][0];
+                spart[warp][g][nt * 8 + 2 * q + 1]     = sp[nt][1];
+                spart[warp][g + 8][nt * 8 + 2 * q]     = sp[nt][2];
+                spart[warp][g + 8][nt * 8 + 2 * q + 1] = sp[nt][3];
+            }
+            __syncthreads();
+
+            // ---- online softmax: 8 threads per head row, 2 keys each
+            {
+                const int row = tid >> 3, k0 = (tid & 7) * 2;
+                float sv[2], pv[2];
+                float tmax = -INFINITY;
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int k = k0 + j;
+                    float v = spart[0][row][k];
+                    for (int w = 1; w < MWARPS; ++w) v += spart[w][row][k];
+                    const bool ok = vld[k] >= 0 && kb + k < n;
+                    sv[j] = ok ? v * scale : -INFINITY;
+                    tmax = fmaxf(tmax, sv[j]);
+                }
+                for (int off = 1; off < 8; off <<= 1) tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, off));
+                const float m_old = mrow[row];
+                const float m_new = fmaxf(m_old, tmax);
+                const float m_safe = (m_new == -INFINITY) ? 0.f : m_new;
+                const float alpha = __expf(m_old - m_safe);
+                float lsum = 0.f;
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    pv[j] = sv[j] == -INFINITY ? 0.f : __expf(sv[j] - m_safe);
+                    lsum += pv[j];
+                    const __nv_bfloat16 hi = __float2bfloat16_rn(pv[j]);
+                    ph[row][k0 + j] = hi;
+                    pl[row][k0 + j] = __float2bfloat16_rn(pv[j] - __bfloat162float(hi));
+                }
+                for (int off = 1; off < 8; off <<= 1) lsum += __shfl_xor_sync(0xffffffffu, lsum, off);
+                __syncwarp();
+                if ((tid & 7) == 0) {
+                    lrow[row] = lrow[row] * alpha + lsum;
+                    mrow[row] = m_new;
+                    arow[row] = alpha;
+                }
+            }
+            __syncthreads();
+
+            // ---- O = O * alpha + (P_hi + P_lo) K over this warp's 128 dims (16 n-tiles)
+            {
+                const float a0 = arow[g], a1 = arow[g + 8];
+                uint32_t ah[4], al[4];
+                ah[0] = *reinterpret_cast<const uint32_t*>(&ph[g][2 * q]);
+                ah[1] = *reinterpret_cast<const uint32_t*>(&ph[g + 8][2 * q]);
+                ah[2] = *reinterpret_cast<const uint32_t*>(&ph[g][8 + 2 * q]);
+                ah[3] = *reinterpret_cast<const uint32_t*>(&ph[g + 8][8 + 2 * q]);
+                al[0] = *reinterpret_cast<const uint32_t*>(&pl[g][2 * q]);
+                al[1] = *reinterpret_cast<const uint32_t*>(&pl[g + 8][2 * q]);
+                al[2] = *reinterpret_cast<const uint32_t*>(&pl[g][8 + 2 * q]);
+                al[3] = *reinterpret_cast<const uint32_t*>(&pl[g + 8][8 + 2 * q]);
+#pragma unroll
+                for (int nt = 0; nt < 16; ++nt) {
+                    acc[nt][0] *= a0; acc[nt][1] *= a0; acc[nt][2] *= a1; acc[nt][3] *= a1;
+                    const int dim = warp * 128 + nt * 8 + g;
+                    uint32_t b[2];
+                    b[0] = pack2(ks[2 * q][dim], ks[2 * q + 1][dim]);
+                    b[1] = pack2(ks[8 + 2 * q][dim], ks[9 + 2 * q][dim]);
+                    mma_bf16_16816(acc[nt], ah, b);
+                    mma_bf16_16816(acc[nt], al, b);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    const int h0 = hg * MH + g, h1 = h0 + 8;
+    const float m0 = mrow[g] == -INFINITY ? 0.f : mrow[g];
+    const float m1 = mrow[g + 8] == -INFINITY ? 0.f : mrow[g + 8];
+    const float d0 = lrow[g] + __expf(SINK[h0] - m0);
+    const float d1 = lrow[g + 8] + __expf(SINK[h1] - m1);
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt) {
+        const int dim = warp * 128 + nt * 8 + 2 * q;
+        __nv_bfloat16* o0 = O + ((size_t)t * NH + h0) * D + dim;
+        __nv_bfloat16* o1 = O + ((size_t)t * NH + h1) * D + dim;
+        o0[0] = __float2bfloat16_rn(acc[nt][0] / d0); o0[1] = __float2bfloat16_rn(acc[nt][1] / d0);
+        o1[0] = __float2bfloat16_rn(acc[nt][2] / d1); o1[1] = __float2bfloat16_rn(acc[nt][3] / d1);
+    }
+}
+
 // PRODUCTION entry. grid (T, NH / 8), block 256. CIDX may be null (window-only layers 0/1).
 extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn(
     const __nv_bfloat16* Q, const __nv_bfloat16* RING, const long long* WPOS,
@@ -568,6 +753,44 @@ int main() {
                 }
             }
             cudaFree(d_part);
+        }
+        // TENSOR-CORE prefill entry. PRE-REGISTERED (before its first run): vs the fp32
+        // reference rel_l2 <= 1e-5 (the one-pass kernel is 3.5e-7; P_hi+P_lo keeps ~2^-17 of P);
+        // >= 99.0% of bf16 outputs identical to bf16(one-pass fp32). CONTROL: compressed rows
+        // dropped (NC = 0) must differ on most outputs. Timing at the fixture's full T.
+        {
+            dim3 gm(T, NH / MH);
+            auto mma = [&](int nc) {
+                dsv41_sparse_attn_mma<<<gm, MNT>>>(d_q, d_ring, d_wpos, d_ckv, nc ? d_c64 : nullptr, d_sink, d_ob, T, NH, D, NW, NC, RING_N, 0, scale);
+                CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
+                CUDA_OK(cudaMemcpy(ob.data(), d_ob, no*2, cudaMemcpyDeviceToHost));
+            };
+            mma(1);
+            const size_t mbad = bits_equal(h_ok);
+            std::vector<float> of(no);
+            for (size_t i = 0; i < no; ++i) of[i] = __bfloat162float(ob[i]);
+            const Err em = compare(of.data(), h_r32, no);
+            std::vector<float> okb(no);
+            for (size_t i = 0; i < no; ++i) okb[i] = __bfloat162float(__float2bfloat16_rn(h_ok[i]));
+            const Err eo = compare(okb.data(), h_r32, no);
+            mma(0);
+            const size_t cbad = bits_equal(h_ok);
+            cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+            auto time_it = [&](auto&& launch) {
+                for (int i = 0; i < 3; ++i) launch();
+                CUDA_OK(cudaDeviceSynchronize());
+                cudaEventRecord(e0);
+                for (int i = 0; i < 20; ++i) launch();
+                cudaEventRecord(e1); cudaEventSynchronize(e1);
+                float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+                return ms / 20;
+            };
+            const float t_one = time_it([&] { dsv41_sparse_attn_w32<<<dim3(T, NH / HB), NT>>>(d_q, d_ring, d_wpos, d_ckv, d_c64, d_sink, d_ob, T, NH, D, NW, NC, RING_N, 0, scale); });
+            const float t_mma = time_it([&] { dsv41_sparse_attn_mma<<<gm, MNT>>>(d_q, d_ring, d_wpos, d_ckv, d_c64, d_sink, d_ob, T, NH, D, NW, NC, RING_N, 0, scale); });
+            std::printf("MMA prefill entry: %zu/%zu bf16 differ from bf16(one-pass) (%.4f%% identical); vs fp32 ref: mma %.3e (bf16-rounded one-pass %.3e) "
+                        "| CTRL compressed rows dropped: %zu differ | T=%d: one-pass %.3f ms, mma %.3f ms (%.1fx)\n",
+                        mbad, no, 100.0 * (1.0 - (double)mbad / no), em.rel, eo.rel, cbad, T, t_one, t_mma, t_one / t_mma);
+            prod_ok = prod_ok && em.rel <= 1e-5 + eo.rel && (double)mbad / no <= 0.01 && cbad > no / 2;
         }
         cudaFree(d_w64); cudaFree(d_c64); cudaFree(d_ob);
     }

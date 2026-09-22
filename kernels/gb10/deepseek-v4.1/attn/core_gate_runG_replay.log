@@ -1,16 +1,16 @@
 DeepSeek-V4 YaRN parameters: factor=16.0, beta_fast=32.0, beta_slow=1.0, original_max_pos=65536, mscale=0.0, mscale_all_dim=0.0
 run runG_replay; weights: 95 tensors, 0.59 GB
-L02 chunk 0: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9988 rel 7.11e-5
-L02 chunk 1: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9977 rel 1.00e-4
+L02 chunk 0: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9984 rel 8.27e-5
+L02 chunk 1: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9975 rel 1.13e-4
 L02: ckv bit-exact 0.9999 (rel 4.28e-5), ik bit-exact 0.9992 (rel 9.19e-5)
-L08 chunk 0: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9977 rel 1.05e-4
-L08 chunk 1: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9969 rel 1.19e-4
+L08 chunk 0: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9975 rel 1.14e-4
+L08 chunk 1: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9967 rel 1.35e-4
 L08: ckv bit-exact 0.9998 (rel 3.61e-5), ik bit-exact 0.9983 (rel 1.82e-4)
-L14 chunk 0: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9989 rel 6.68e-5
-L14 chunk 1: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9982 rel 9.61e-5
+L14 chunk 0: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9987 rel 7.85e-5
+L14 chunk 1: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9979 rel 1.17e-4
 L14: ckv bit-exact 0.9998 (rel 4.72e-5), ik bit-exact 0.9986 (rel 1.07e-4)
-L20 chunk 0: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9997 rel 5.13e-5
-L20 chunk 1: topk rows differ 1/512 (worst overlap 0.9980) | attention bf16 bit-exact 0.9993 rel 7.17e-5
+L20 chunk 0: topk rows differ 0/512 (worst overlap 1.0000) | attention bf16 bit-exact 0.9991 rel 8.52e-5
+L20 chunk 1: topk rows differ 1/512 (worst overlap 0.9980) | attention bf16 bit-exact 0.9987 rel 1.16e-4
 L20: ckv bit-exact 1.0000 (rel 0.00e0), ik bit-exact 0.9999 (rel 2.66e-5)
 L20 chunk 1: candidates differ 0/524288 (ld 1024)
 L20 replay tail: 128 rows, == own last 128 rows: true
@@ -21,15 +21,15 @@ L14 chunk invariance [0, 511, 1000, 1023, 1024] vs 2x512: topk 0/1024 rows diffe
 L20 chunk invariance [0, 511, 1000, 1023, 1024] vs 2x512: topk 0/1024 rows differ (worst 1.0000), attention bit-identical 1.000000
 odd splits: replay tail 128 rows spanning 3 chunks, == own last 128 rows: true
 CTRL dropped pending at 511: REFUSED loudly (layer 2: 500 compressed rows visible, 499 published)
-REPLAY L21: topk 0/128 rows differ (worst overlap 1.0000); attention bit-exact 0.9997 rel 5.58e-5
+REPLAY L21: topk 0/128 rows differ (worst overlap 1.0000); attention bit-exact 0.9989 rel 1.05e-4
 CTRL replay L21 with win_lo=0: attention bit-exact 0.0207 (must collapse)
 REPLAY L30: NOT COMPARED -- its selection comes from an index layer this capture lacks
 REPLAY L39: NOT COMPARED -- its selection comes from an index layer this capture lacks
-REPLAY worst attention bit-exact over captured layers: 0.9997
-DECODE L02 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 0.999760 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9977 rel 9.21e-5
-DECODE L08 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 0.999849 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9977 rel 8.64e-5
-DECODE L14 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 0.999817 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9981 rel 9.83e-5
-DECODE L20 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 0.999802 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9997 rel 4.77e-5
+REPLAY worst attention bit-exact over captured layers: 0.9989
+DECODE L02 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 0.998938 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9977 rel 9.21e-5
+DECODE L08 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 0.999198 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9977 rel 8.64e-5
+DECODE L14 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 0.999218 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9981 rel 9.83e-5
+DECODE L20 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 0.999046 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9997 rel 4.77e-5
 CTRL DECODE L02 wpos shifted by one: attention bit-identical to the real decode 0.1290 (must collapse)
 CTRL DECODE L08 wpos shifted by one: attention bit-identical to the real decode 0.0774 (must collapse)
 CTRL DECODE L14 wpos shifted by one: attention bit-identical to the real decode 0.0866 (must collapse)

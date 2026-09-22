@@ -410,7 +410,10 @@ fn main() -> Result<()> {
             );
             // Decode uses the SPLIT-KV kernel (only the within-row accumulation order differs
             // from prefill's one-pass): >= 99.9% bit-identical to own prefill, rest 1-ulp.
-            fail += usize::from(self_bad != 0 || self_o < 0.999 || cap_bad > 1 || ce < 0.98);
+            // PRE-REGISTERED before the prefill moved to the tensor-core kernel: decode (split,
+            // fp32 P) vs own prefill (mma, P_hi+P_lo) >= 99.5% bf16-identical -- two kernels each
+            // measured within 0.1% of the one-pass fp32 kernel.
+            fail += usize::from(self_bad != 0 || self_o < 0.995 || cap_bad > 1 || ce < 0.98);
         }
         // CONTROL: window positions off by one (the query's own row dropped, p-128 added).
         let c = dec(1)?;

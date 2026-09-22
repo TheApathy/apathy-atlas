@@ -1,7 +1,7 @@
 DeepSeek-V4 YaRN parameters: factor=16.0, beta_fast=32.0, beta_slow=1.0, original_max_pos=65536, mscale=0.0, mscale_all_dim=0.0
 run runI_plus20: prompt 1044 tokens, replay rows 916..1044, candidate width 1536
-real                   L24: topk 2/128 rows differ (worst overlap 0.9980); attention bit-exact 0.9983 rel 1.30e-4
-real                   L28: topk 0/128 rows differ (worst overlap 1.0000); attention bit-exact 0.9997 rel 6.02e-5
+real                   L24: topk 2/128 rows differ (worst overlap 0.9980); attention bit-exact 0.9976 rel 1.62e-4
+real                   L28: topk 0/128 rows differ (worst overlap 1.0000); attention bit-exact 0.9991 rel 1.09e-4
 CTRL ik shifted 1 row  L24: topk 128/128 rows differ (worst overlap 0.5781); attention bit-exact 0.0168 rel 1.15e-1
 CTRL ik shifted 1 row  L28: topk 128/128 rows differ (worst overlap 0.5742); attention bit-exact 0.0342 rel 1.89e-1
 REPLAY GATE PASS
