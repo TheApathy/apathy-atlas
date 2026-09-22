@@ -219,6 +219,39 @@ pub fn gemm_weight_t(
     )
 }
 
+/// [`gemm_weight_t`] with an fp32 output — the accumulator is NOT rounded to bf16.
+///
+/// The engine keeps gate/up in fp32 through the SwiGLU and keeps each expert's down
+/// projection in fp32 until the six picks are summed. Rounding either to bf16 here adds
+/// error the reference does not have; see [`COMBINE_MODULE`].
+pub fn gemm_weight_t_f32out(
+    act: DevicePtr,
+    weight_bf16: DevicePtr,
+    out_f32: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    spark_runtime::cublaslt::bf16_gemm_act_weight_t_f32out(
+        act.0,
+        weight_bf16.0,
+        out_f32.0,
+        m as u32,
+        n as u32,
+        k as u32,
+        stream,
+    )
+}
+
+/// Module of the V4.1 routed epilogues (`kernels/gb10/deepseek-v4.1/cb3/dsv41_moe_combine.cu`),
+/// which round to bf16 at the engine's two points and nowhere else.
+pub const COMBINE_MODULE: &str = "dsv41_moe_combine";
+/// `h = bf16(silu(min(g,L)) * clamp(u,±L) * w_row)` from fp32 gate/up.
+pub const SWIGLU_WEIGHTED_FN: &str = "dsv41_swiglu_weighted";
+/// `out = bf16(sum_k expert_out[token_to_perm[t,k]])` over fp32, already-weighted rows.
+pub const UNPERMUTE_SUM_FN: &str = "dsv41_unpermute_sum_f32";
+
 /// Bytes of bf16 scratch one expert's reconstruct needs, for all three matrices at once.
 pub fn scratch_bytes(config: &ModelConfig) -> Result<usize> {
     let matrices = expert_matrices(config)?;
@@ -724,6 +757,28 @@ mod permutation_tests {
             assert!(
                 source.contains(&format!("__global__ void {kernel}(")),
                 "{kernel} must be defined in {file}"
+            );
+        }
+    }
+
+    /// The combine kernels must exist under the names the build gives them (file stem, no
+    /// KERNEL.toml override).
+    #[test]
+    fn combine_kernel_names_match_the_source() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
+            .to_path_buf();
+        let cu = root
+            .join("kernels/gb10/deepseek-v4.1/cb3")
+            .join(format!("{COMBINE_MODULE}.cu"));
+        let source = std::fs::read_to_string(&cu).expect("combine kernel source");
+        for kernel in [SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN] {
+            assert!(
+                source.contains(&format!("extern \"C\" __global__ void {kernel}(")),
+                "{kernel} must be a C-linkage kernel in {}",
+                cu.display()
             );
         }
     }

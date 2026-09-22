@@ -51,8 +51,9 @@ use std::path::{Path, PathBuf};
 use atlas_core::config::{ExpertPack, SERVED_PACKED_KEEP, parse_config};
 use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
 use spark_model::weight_loader::deepseek_v41::moe::{
-    Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE, PERMUTE_KERNEL, SILU_MUL_MODULE,
-    UNPERMUTE_KERNEL, expert_matrices, gemm_weight_t, group_by_expert,
+    COMBINE_MODULE, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE, PERMUTE_KERNEL,
+    SILU_MUL_MODULE, SWIGLU_WEIGHTED_FN, UNPERMUTE_KERNEL, UNPERMUTE_SUM_FN, expert_matrices,
+    gemm_weight_t, gemm_weight_t_f32out, group_by_expert,
 };
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -64,6 +65,14 @@ const K: usize = 6;
 const TOL: f64 = 8e-3;
 /// A control must land at least this many times further out than the gate.
 const MIN_SEPARATION: f64 = 10.0;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Numerics {
+    /// Round to bf16 where the engine does: at `h` and at the final sum.
+    Engine,
+    /// The generic common kernels: bf16 after every GEMM. Measured ~3.8e-3.
+    Generic,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Control {
@@ -112,6 +121,7 @@ fn main() -> Result<()> {
     let mut occurrence = 0usize;
     let mut control = Control::None;
     let mut dump: Option<PathBuf> = None;
+    let mut numerics = Numerics::Engine;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -119,6 +129,13 @@ fn main() -> Result<()> {
             "--layer" => layer = args.next().context("--layer needs a value")?.parse()?,
             "--occurrence" => {
                 occurrence = args.next().context("--occurrence needs a value")?.parse()?
+            }
+            "--numerics" => {
+                numerics = match args.next().context("--numerics needs engine|generic")?.as_str() {
+                    "engine" => Numerics::Engine,
+                    "generic" => Numerics::Generic,
+                    other => bail!("unknown numerics {other}"),
+                }
             }
             "--dump" => dump = Some(args.next().context("--dump needs a path")?.into()),
             "--control" => {
@@ -186,60 +203,117 @@ fn main() -> Result<()> {
 
     let d_in = gpu.alloc(tokens * hidden * 2)?;
     let d_perm = gpu.alloc(expanded * hidden * 2)?;
-    let d_gate = gpu.alloc(expanded * inter * 2)?;
-    let d_up = gpu.alloc(expanded * inter * 2)?;
-    let d_act = gpu.alloc(expanded * inter * 2)?;
-    let d_expert_out = gpu.alloc(expanded * hidden * 2)?;
     let d_out = gpu.alloc(tokens * hidden * 2)?;
     let d_w1 = gpu.alloc(inter * hidden * 2)?;
     let d_w3 = gpu.alloc(inter * hidden * 2)?;
     let d_w2 = gpu.alloc(hidden * inter * 2)?;
     let d_sorted = gpu.alloc(expanded * 4)?;
     let d_tok2perm = gpu.alloc(tokens * K * 4)?;
-    let d_weights = gpu.alloc(tokens * K * 4)?;
 
     let in_bits: Vec<u8> = moe_in.iter().flat_map(|v| to_bf16_bits(*v).to_le_bytes()).collect();
     gpu.copy_h2d(&in_bits, d_in)?;
     gpu.copy_h2d(bytemuck_i32(&plan.sorted_token_ids), d_sorted)?;
     gpu.copy_h2d(bytemuck_i32(&plan.token_to_perm), d_tok2perm)?;
-    gpu.copy_h2d(bytemuck_f32(&plan.weights), d_weights)?;
 
     let k_permute = gpu.kernel(MOE_PERMUTE_MODULE, PERMUTE_KERNEL)?;
-    let k_silu = gpu.kernel(SILU_MUL_MODULE, "moe_silu_mul")?;
-    let k_unperm = gpu.kernel(MOE_PERMUTE_MODULE, UNPERMUTE_KERNEL)?;
 
     // ---- gather into expert-major order
     launch(&gpu, k_permute, [expanded as u32, 1, 1], [256, 1, 1], stream,
         &mut [arg(d_in.0), arg(d_perm.0), arg(d_sorted.0), arg32(hidden as u32), arg32(expanded as u32)])?;
 
-    // ---- per expert: reconstruct, 2 GEMMs, silu, reconstruct, GEMM
     let residency = arena.layer(layer)?;
-    for (group, (begin, end)) in groups.iter().zip(&plan.group_rows) {
-        let rows = end - begin;
-        if rows == 0 { continue; }
-        let keep = arena.packed_keep();
-        reconstruct.run(residency, matrices[0], group.slot, keep, d_w1, &gpu, stream)?;
-        reconstruct.run(residency, matrices[1], group.slot, keep, d_w3, &gpu, stream)?;
-        reconstruct.run(residency, matrices[2], group.slot, keep, d_w2, &gpu, stream)?;
+    let keep = arena.packed_keep();
+    // Not on ModelConfig; read from config.json (flattened under text_config or not).
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{MODEL_DIR}/config.json"))?)?;
+    let limit = raw
+        .get("swiglu_limit")
+        .or_else(|| raw["text_config"].get("swiglu_limit"))
+        .and_then(serde_json::Value::as_f64)
+        .context("V4.1 config must carry swiglu_limit")? as f32;
+    ensure!(limit == 10.0, "swiglu_limit {limit}, the engine ran with 10.0");
+    println!("  numerics: {}", match numerics {
+        Numerics::Engine => "ENGINE (fp32 gate/up/down, bf16 at h and at the sum only)",
+        Numerics::Generic => "GENERIC (bf16 at gate, up, act, each down, and the sum)",
+    });
 
-        let act = DevicePtr(d_perm.0 + (begin * hidden * 2) as u64);
-        let gate = DevicePtr(d_gate.0 + (begin * inter * 2) as u64);
-        let up = DevicePtr(d_up.0 + (begin * inter * 2) as u64);
-        let acted = DevicePtr(d_act.0 + (begin * inter * 2) as u64);
-        let outp = DevicePtr(d_expert_out.0 + (begin * hidden * 2) as u64);
+    match numerics {
+        Numerics::Engine => {
+            // Route weight per PERMUTED row: it multiplies h, as the engine's up kernel does.
+            let mut row_weight = vec![0.0f32; expanded];
+            for (flat, row) in plan.token_to_perm.iter().enumerate() {
+                row_weight[*row as usize] = plan.weights[flat];
+            }
+            let d_row_w = gpu.alloc(expanded * 4)?;
+            gpu.copy_h2d(bytemuck_f32(&row_weight), d_row_w)?;
+            let d_gate = gpu.alloc(expanded * inter * 4)?;
+            let d_up = gpu.alloc(expanded * inter * 4)?;
+            let d_h = gpu.alloc(expanded * inter * 2)?;
+            let d_down = gpu.alloc(expanded * hidden * 4)?;
+            let k_swiglu = gpu.kernel(COMBINE_MODULE, SWIGLU_WEIGHTED_FN)?;
+            let k_sum = gpu.kernel(COMBINE_MODULE, UNPERMUTE_SUM_FN)?;
 
-        gemm_weight_t(act, d_w1, gate, rows, inter, hidden, stream)?;
-        gemm_weight_t(act, d_w3, up, rows, inter, hidden, stream)?;
-        let total = (rows * inter) as u32;
-        launch(&gpu, k_silu, [total.div_ceil(256), 1, 1], [256, 1, 1], stream,
-            &mut [arg(gate.0), arg(up.0), arg(acted.0), arg32(total)])?;
-        gemm_weight_t(acted, d_w2, outp, rows, hidden, inter, stream)?;
+            for (group, (begin, end)) in groups.iter().zip(&plan.group_rows) {
+                let rows = end - begin;
+                if rows == 0 { continue; }
+                reconstruct.run(residency, matrices[0], group.slot, keep, d_w1, &gpu, stream)?;
+                reconstruct.run(residency, matrices[1], group.slot, keep, d_w3, &gpu, stream)?;
+                reconstruct.run(residency, matrices[2], group.slot, keep, d_w2, &gpu, stream)?;
+
+                let act = DevicePtr(d_perm.0 + (begin * hidden * 2) as u64);
+                let gate = DevicePtr(d_gate.0 + (begin * inter * 4) as u64);
+                let up = DevicePtr(d_up.0 + (begin * inter * 4) as u64);
+                let h = DevicePtr(d_h.0 + (begin * inter * 2) as u64);
+                let w = DevicePtr(d_row_w.0 + (begin * 4) as u64);
+                let down = DevicePtr(d_down.0 + (begin * hidden * 4) as u64);
+
+                gemm_weight_t_f32out(act, d_w1, gate, rows, inter, hidden, stream)?;
+                gemm_weight_t_f32out(act, d_w3, up, rows, inter, hidden, stream)?;
+                let total = (rows * inter) as u32;
+                launch(&gpu, k_swiglu, [total.div_ceil(256), 1, 1], [256, 1, 1], stream,
+                    &mut [arg(gate.0), arg(up.0), arg(w.0), arg(h.0),
+                          arg32(rows as u32), arg32(inter as u32), argf(limit)])?;
+                gemm_weight_t_f32out(h, d_w2, down, rows, hidden, inter, stream)?;
+            }
+            launch(&gpu, k_sum, [tokens as u32, 1, 1], [256, 1, 1], stream,
+                &mut [arg(d_down.0), arg(d_out.0), arg(d_tok2perm.0),
+                      arg32(hidden as u32), arg32(tokens as u32), arg32(K as u32)])?;
+        }
+        Numerics::Generic => {
+            let d_gate = gpu.alloc(expanded * inter * 2)?;
+            let d_up = gpu.alloc(expanded * inter * 2)?;
+            let d_act = gpu.alloc(expanded * inter * 2)?;
+            let d_expert_out = gpu.alloc(expanded * hidden * 2)?;
+            let d_weights = gpu.alloc(tokens * K * 4)?;
+            gpu.copy_h2d(bytemuck_f32(&plan.weights), d_weights)?;
+            let k_silu = gpu.kernel(SILU_MUL_MODULE, "moe_silu_mul")?;
+            let k_unperm = gpu.kernel(MOE_PERMUTE_MODULE, UNPERMUTE_KERNEL)?;
+
+            for (group, (begin, end)) in groups.iter().zip(&plan.group_rows) {
+                let rows = end - begin;
+                if rows == 0 { continue; }
+                reconstruct.run(residency, matrices[0], group.slot, keep, d_w1, &gpu, stream)?;
+                reconstruct.run(residency, matrices[1], group.slot, keep, d_w3, &gpu, stream)?;
+                reconstruct.run(residency, matrices[2], group.slot, keep, d_w2, &gpu, stream)?;
+
+                let act = DevicePtr(d_perm.0 + (begin * hidden * 2) as u64);
+                let gate = DevicePtr(d_gate.0 + (begin * inter * 2) as u64);
+                let up = DevicePtr(d_up.0 + (begin * inter * 2) as u64);
+                let acted = DevicePtr(d_act.0 + (begin * inter * 2) as u64);
+                let outp = DevicePtr(d_expert_out.0 + (begin * hidden * 2) as u64);
+
+                gemm_weight_t(act, d_w1, gate, rows, inter, hidden, stream)?;
+                gemm_weight_t(act, d_w3, up, rows, inter, hidden, stream)?;
+                let total = (rows * inter) as u32;
+                launch(&gpu, k_silu, [total.div_ceil(256), 1, 1], [256, 1, 1], stream,
+                    &mut [arg(gate.0), arg(up.0), arg(acted.0), arg32(total)])?;
+                gemm_weight_t(acted, d_w2, outp, rows, hidden, inter, stream)?;
+            }
+            launch(&gpu, k_unperm, [tokens as u32, 1, 1], [256, 1, 1], stream,
+                &mut [arg(d_expert_out.0), arg(d_out.0), arg(d_tok2perm.0), arg(d_weights.0),
+                      arg32(hidden as u32), arg32(tokens as u32), arg32(K as u32)])?;
+        }
     }
-
-    // ---- scatter back with the engine's weights
-    launch(&gpu, k_unperm, [tokens as u32, 1, 1], [256, 1, 1], stream,
-        &mut [arg(d_expert_out.0), arg(d_out.0), arg(d_tok2perm.0), arg(d_weights.0),
-              arg32(hidden as u32), arg32(tokens as u32), arg32(K as u32)])?;
     gpu.synchronize(stream)?;
 
     // ---- compare
@@ -296,6 +370,8 @@ fn bytemuck_f32(v: &[f32]) -> &[u8] {
 enum Arg { U64(u64), U32(u32) }
 fn arg(v: u64) -> Arg { Arg::U64(v) }
 fn arg32(v: u32) -> Arg { Arg::U32(v) }
+/// An f32 kernel argument, passed as its bit pattern in a 4-byte slot.
+fn argf(v: f32) -> Arg { Arg::U32(v.to_bits()) }
 
 fn launch(
     gpu: &dyn GpuBackend,
