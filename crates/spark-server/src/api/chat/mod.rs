@@ -112,7 +112,13 @@ pub async fn chat_completions(
         return openai_error_response(StatusCode::BAD_REQUEST, error);
     }
     let echo = ResponseEcho::from(&req);
-    match chat_completions_inner(state.clone(), req_ctx, req.into(), dump_seq).await {
+    let mut ir_req: crate::ir::ChatRequest = req.into();
+    if state.dsv41 {
+        // deepseek_v41 renders from the wire body (api/dsv41.rs); the body
+        // already parsed as a ChatCompletionRequest, so it is valid JSON.
+        ir_req.raw_openai_body = serde_json::from_slice(&body).ok().map(std::sync::Arc::new);
+    }
+    match chat_completions_inner(state.clone(), req_ctx, ir_req, dump_seq).await {
         ChatOutcome::Blocking(ir) => {
             crate::openai::encode_chat_response(&state, *ir, &echo, dump_seq)
         }

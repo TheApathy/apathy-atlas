@@ -50,7 +50,10 @@ pub(super) struct Weights {
 }
 
 impl Weights {
-    pub fn load(store: &WeightStore, g: &Geometry, depth: usize) -> Result<Self> {
+    /// `has_pad`: V4-Flash-Vision ships a learned `image_pad` row; V4.1 does
+    /// not (its pad slots keep the ordinary token embedding), so its two pad
+    /// entries in `special` are null.
+    pub fn load(store: &WeightStore, g: &Geometry, depth: usize, has_pad: bool) -> Result<Self> {
         // No allocation, reinterpretation, dequantization, or data mutation.
         let tensor = |name: &str, shape: &[usize]| -> Result<DevicePtr> {
             let spec = WeightSpec {
@@ -87,7 +90,11 @@ impl Weights {
                 fc2: linear(&format!("{p}.mlp.w2"), g.hidden, g.intermediate, false)?,
             });
         }
-        let pad = tensor("image_pad", &[g.text_hidden])?;
+        let pad = if has_pad {
+            tensor("image_pad", &[g.text_hidden])?
+        } else {
+            DevicePtr(0)
+        };
         Ok(Self {
             patch: linear("vision.patch_embed.proj", g.hidden, g.patch_dim, true)?,
             blocks,

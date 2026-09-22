@@ -107,3 +107,13 @@ fn deepseek_vision_attention_probabilities_keep_fp32_precision() {
     assert_eq!(offsets[11] - offsets[10], attention_bytes);
     assert_eq!(total, 206_275_584);
 }
+
+#[test]
+fn v41_geometry_admits_5120_and_1024_tokens_only() {
+    assert!(Geometry::new(1024, 2816, 16, 14, 3, 1024, 5120).is_ok());
+    assert!(Geometry::new(1024, 2816, 16, 14, 3, 1025, 5120).is_err());
+    // the V4 limits are unchanged
+    assert!(Geometry::new(1024, 2816, 16, 14, 3, 385, 4096).is_err());
+    assert!(Geometry::new(1024, 2816, 16, 14, 3, 384, 4096).is_ok());
+    assert!(Geometry::new(1024, 2816, 16, 14, 3, 384, 7168).is_err());
+}

@@ -28,3 +28,7 @@ kv_cache_append = "kv_cache"
 moe_topk_sigmoid = "moe_topk_sig"
 moe_topk_sqrtsoftplus = "moe_topk_sqrt"
 moe_sorted_prefill = "moe_sorted"
+
+# DeepSeek-V4.1 vision tower: the V4-Flash-Vision kernels, symlinked from
+# deepseek-v4-flash/nvfp4 (the towers are identical; see
+# spark-model layers/deepseek_vision `load_v41`). Module names = file stems.
