@@ -440,6 +440,13 @@ fn main() -> Result<()> {
                 unsafe { std::env::set_var("ATLAS_DSV41_FP8_POLICY", v) }
             }
             "--prof" => unsafe { std::env::set_var("ATLAS_DSV41_PROF", "1") },
+            // --env K=V: set an environment variable for this run (before any GPU work).
+            "--env" => {
+                let kv = args.next().context("--env K=V")?;
+                let (k, v) = kv.split_once('=').context("--env needs K=V")?;
+                // SAFETY: single-threaded at argument parsing; nothing has read the env yet.
+                unsafe { std::env::set_var(k, v) }
+            }
             "--tap-layers" => {
                 let v = args.next().context("--tap-layers")?;
                 unsafe { std::env::set_var("ATLAS_DSV41_TAP_LAYERS", v) }
