@@ -274,12 +274,23 @@ fn main() -> Result<()> {
         let resident = pack.resident_ids(layer)?;
 
         for (slot, &expert_id) in resident.iter().enumerate() {
-            // Slot ORDER: the pack must agree that this expert lives at this slot.
+            // This comparison is NEARLY VACUOUS and is kept only for what it CAN catch.
+            // `resident_ids` returns `slots[..packed_keep]` and `slot_of` searches that
+            // same prefix by position, so `slot_of(resident_ids[i]) == i` by construction —
+            // unless the pack lists an expert TWICE, which is the one real defect this
+            // finds (a duplicate makes the second copy resolve to the first's slot and
+            // leaves a slot holding the wrong expert's bytes).
+            //
+            // SLOT ORDER IS ACTUALLY PROVEN BY THE BYTE COMPARISON BELOW, not here.
+            // `shard.expert` fetches by 384-space EXPERT ID while `plane_ptr` addresses by
+            // arena SLOT, so if the loader had written expert j's bytes into slot i the
+            // planes would differ. Two different quantities meeting is the evidence; this
+            // check is one quantity meeting itself.
             let pack_slot = pack.slot_of(layer, expert_id)?;
             if pack_slot != slot {
                 bail!(
                     "layer {layer}: expert {expert_id} is arena slot {slot} but the pack \
-                     resolves it to {pack_slot} — slot order disagrees"
+                     resolves it to {pack_slot} — the pack lists this expert more than once"
                 );
             }
             let bytes = shard.expert(&pack, expert_id)?;

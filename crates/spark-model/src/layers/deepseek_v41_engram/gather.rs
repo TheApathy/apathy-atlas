@@ -73,6 +73,22 @@ impl Dsv41Engram for EngramGather {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.gather_rows_gpu(row_ids, num_tokens, out, ctx.gpu, stream)
+    }
+}
+
+impl EngramGather {
+    /// [`Dsv41Engram::gather_rows`] without a `ForwardContext` — it only ever needed the
+    /// GPU handle — so drivers and tests outside the layer loop can call it.
+    pub fn gather_rows_gpu(
+        &self,
+        row_ids: &[i64],
+        num_tokens: usize,
+        out: DevicePtr,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+
         let want = num_tokens * ENGRAM_ROWS_PER_TOKEN;
         if row_ids.len() != want {
             bail!(
@@ -105,7 +121,7 @@ impl Dsv41Engram for EngramGather {
         let bytes = unsafe {
             std::slice::from_raw_parts(host.as_ptr() as *const u8, std::mem::size_of_val(&host[..]))
         };
-        ctx.gpu
+        gpu
             .copy_h2d_async(bytes, out, stream)
             .with_context(|| format!("engram layer {}: H2D of {} bytes", self.layer, bytes.len()))
     }

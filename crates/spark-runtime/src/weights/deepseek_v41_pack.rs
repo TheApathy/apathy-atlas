@@ -221,6 +221,42 @@ impl LayerShard {
         );
         Ok(bytes)
     }
+
+    /// One CONTIGUOUS byte span covering slots `0..count` of a single plane.
+    ///
+    /// ## Why this exists
+    /// Uploading the arena expert-by-expert issues `packed_keep * 12` copies per layer —
+    /// 1488 at the served keep of 124, 59,520 across the model. Measured, that path ran at
+    /// 0.24-0.43 GB/s end-to-end, which extrapolates to ~28 minutes of load at full scale.
+    /// The per-copy overhead dominates; the bytes are not the problem.
+    ///
+    /// Each plane is expert-major (`[experts, rows, bytes_per_row]`), so the RESIDENT
+    /// PREFIX — slots `0..packed_keep` — is one contiguous run inside it. That makes the
+    /// whole plane uploadable in ONE copy, turning 1488 copies per layer into 12.
+    ///
+    /// ## What this does NOT change
+    /// The twelve-planes fact still holds: one expert still lives at twelve distinct
+    /// offsets, and there is still no single "offset of expert i". This spans ONE plane
+    /// across many experts, which is the opposite axis and the reason it is contiguous at
+    /// all. `slot * bytes_per_expert` remains wrong and remains unavailable.
+    pub fn plane_span(&self, tensor: Cb3Tensor, count: usize) -> Result<&[u8]> {
+        let index = CB3_TENSORS
+            .iter()
+            .position(|candidate| *candidate == tensor)
+            .expect("CB3_TENSORS is exhaustive over Cb3Tensor");
+        let stride = tensor.bytes_per_expert() as usize;
+        let begin = self.plane_offsets[index];
+        let end = begin
+            .checked_add(stride.checked_mul(count).context("CB3 plane span overflow")?)
+            .context("CB3 plane span overflow")?;
+        ensure!(
+            end <= self.map.len(),
+            "CB3 layer {} tensor {} span of {count} slots runs past end of shard",
+            self.layer,
+            tensor.name()
+        );
+        Ok(&self.map[begin..end])
+    }
 }
 
 #[cfg(test)]

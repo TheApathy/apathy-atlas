@@ -59,11 +59,38 @@ pub fn score_of(logit: f32) -> f32 {
     softplus.sqrt()
 }
 
-/// Select experts and compute their weights.
+/// Token ids whose router row uses `gate.bias_vl` instead of `gate.bias`.
+///
+/// From the engine's `vision.image_sentinel_mask`: the image sentinel AND the image pad.
+pub const IMAGE_SENTINEL_ID: i64 = 129_264;
+pub const IMAGE_PAD_ID: i64 = 129_265;
+
+/// Which rows are image positions, per `vision.image_sentinel_mask`.
+pub fn image_rows(token_ids: &[i64]) -> Vec<bool> {
+    token_ids
+        .iter()
+        .map(|id| *id == IMAGE_SENTINEL_ID || *id == IMAGE_PAD_ID)
+        .collect()
+}
+
+/// The multimodal router bias: `gate.bias_vl` on image rows, `gate.bias` elsewhere.
+///
+/// The engine selects it PER ROW (`vision.router_bias`, a `torch.where` over the sentinel
+/// mask). Applying the text bias to an image row is not an error anywhere — it selects a
+/// different, valid expert set. runE_image measured it: 17 of 3072 L00 picks differ.
+#[derive(Clone, Copy, Debug)]
+pub struct VisionBias<'a> {
+    /// `[num_experts]` — `layers.N.ffn.gate.bias_vl`.
+    pub bias: &'a [f32],
+    /// `[num_tokens]` — see [`image_rows`].
+    pub image_rows: &'a [bool],
+}
+
+/// Select experts and compute their weights, for a TEXT-ONLY batch.
 ///
 /// * `scores` — `[num_tokens, num_experts]`, already `sqrt(softplus(y @ gate_w))`.
-/// * `bias` — `[num_experts]`, the noaux_tc correction bias (`gate.bias`, or `gate.bias_vl`
-///   on the multimodal path — the caller chooses, because that is a forward-path decision).
+/// * `bias` — `[num_experts]`, the noaux_tc correction bias `gate.bias`. A batch containing
+///   image positions must use [`select_experts_multimodal`] instead.
 /// * `resident` — `[num_experts]` allow-list from `Cb3ExpertArena::routing_mask`. Applied
 ///   as `-inf` on the logits before top-k.
 /// * `route_scale` — `config.routed_scaling_factor`, 1.5 for this checkpoint.
@@ -76,12 +103,35 @@ pub fn select_experts(
     k: usize,
     route_scale: f32,
 ) -> Result<Routing> {
+    select_experts_multimodal(scores, bias, None, resident, num_tokens, num_experts, k, route_scale)
+}
+
+/// [`select_experts`] with the per-row `gate.bias_vl` selection for image positions.
+#[allow(clippy::too_many_arguments)]
+pub fn select_experts_multimodal(
+    scores: &[f32],
+    bias: &[f32],
+    vision: Option<VisionBias<'_>>,
+    resident: &[bool],
+    num_tokens: usize,
+    num_experts: usize,
+    k: usize,
+    route_scale: f32,
+) -> Result<Routing> {
     ensure!(
         scores.len() == num_tokens * num_experts,
         "scores is {} long, expected {num_tokens} x {num_experts}",
         scores.len()
     );
     ensure!(bias.len() == num_experts, "bias must be {num_experts} wide");
+    if let Some(vision) = vision {
+        ensure!(vision.bias.len() == num_experts, "bias_vl must be {num_experts} wide");
+        ensure!(
+            vision.image_rows.len() == num_tokens,
+            "image_rows is {} long for {num_tokens} tokens",
+            vision.image_rows.len()
+        );
+    }
     ensure!(
         resident.len() == num_experts,
         "the residency mask must be {num_experts} wide"
@@ -100,6 +150,10 @@ pub fn select_experts(
 
     for token in 0..num_tokens {
         let row = &scores[token * num_experts..(token + 1) * num_experts];
+        let bias = match vision {
+            Some(vision) if vision.image_rows[token] => vision.bias,
+            _ => bias,
+        };
 
         order.clear();
         order.extend((0..num_experts as u32).filter(|expert| resident[*expert as usize]));
@@ -178,17 +232,62 @@ mod tests {
         )
     }
 
+    /// The TRUE `layers.N.ffn.gate.bias`, read from the checkpoint.
+    ///
+    /// Needed because the capture CANNOT supply it for pruned experts: their logits are all
+    /// `-inf`, so `logits - scores` recovers nothing. Any question about what routing would
+    /// do WITHOUT the mask has to read the real tensor.
+    fn checkpoint_gate_bias(layer: usize) -> Option<Vec<f32>> {
+        const MODEL: &str = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K";
+        let index: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(
+                format!("{MODEL}/model.safetensors.index.json"),
+            ).ok()?).ok()?;
+        let key = format!("layers.{layer}.ffn.gate.bias");
+        let shard = index["weight_map"][&key].as_str()?;
+        let bytes = std::fs::read(format!("{MODEL}/{shard}")).ok()?;
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().ok()?) as usize;
+        let header: serde_json::Value =
+            serde_json::from_slice(&bytes[8..8 + header_len]).ok()?;
+        let entry = &header[&key];
+        if entry["dtype"].as_str()? != "F32" {
+            return None;
+        }
+        let begin = 8 + header_len + entry["data_offsets"][0].as_u64()? as usize;
+        let end = 8 + header_len + entry["data_offsets"][1].as_u64()? as usize;
+        Some(
+            bytes[begin..end]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        )
+    }
+
     /// Recover `(bias, resident_mask)` from the capture's own `logits - scores`.
+    ///
+    /// **Only valid for RESIDENT experts.** A pruned expert's logits are all `-inf`, so its
+    /// bias is unrecoverable here and is left at 0.0 — which is NOT its real value (~9.85).
+    /// Use this only where the mask is applied; for any unmasked question use
+    /// [`checkpoint_gate_bias`]. Trusting the 0.0 is what produced a confidently wrong
+    /// finding that stood for several hours.
     ///
     /// Derived from the taps rather than loaded from the checkpoint ON PURPOSE: this test
     /// is about the routing RULE, and pulling the real bias tensor in would couple it to
     /// weight loading. `-inf` logits mark the pruned experts.
-    fn bias_and_mask(scores: &[f32], logits: &[f32]) -> (Vec<f32>, Vec<bool>) {
+    ///
+    /// Only rows where `use_row` holds are read. Image rows carry `gate.bias_vl`, a
+    /// DIFFERENT bias, so a text bias must be recovered from text rows only and vice versa —
+    /// recovering from "the first finite row" silently mixed the two on runE_image.
+    fn bias_and_mask(
+        scores: &[f32],
+        logits: &[f32],
+        use_row: impl Fn(usize) -> bool,
+    ) -> (Vec<f32>, Vec<bool>) {
         let mut bias = vec![0.0f32; NUM_EXPERTS];
         let mut mask = vec![false; NUM_EXPERTS];
         let tokens = scores.len() / NUM_EXPERTS;
         for expert in 0..NUM_EXPERTS {
-            for token in 0..tokens {
+            for token in (0..tokens).filter(|token| use_row(*token)) {
                 let logit = logits[token * NUM_EXPERTS + expert];
                 if logit.is_finite() {
                     bias[expert] = logit - scores[token * NUM_EXPERTS + expert];
@@ -198,6 +297,25 @@ mod tests {
             }
         }
         (bias, mask)
+    }
+
+    /// Image rows of the capture's first `tokens` positions, from the manifest's token ids.
+    ///
+    /// Occurrence 000 of a chunked capture is the FIRST chunk, which starts at position 0,
+    /// so its rows are `token_ids[..tokens]`.
+    fn capture_image_rows(dir: &Path, tokens: usize) -> Vec<bool> {
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("manifest.json")).expect("manifest readable"),
+        )
+        .expect("manifest parses");
+        let ids: Vec<i64> = manifest["token_ids"]
+            .as_array()
+            .expect("manifest has token_ids")
+            .iter()
+            .map(|id| id.as_i64().expect("integer token id"))
+            .collect();
+        assert!(ids.len() >= tokens, "manifest has {} ids for {tokens} rows", ids.len());
+        image_rows(&ids[..tokens])
     }
 
     /// THE TEST THAT MATTERS: replay the working engine's own router scores and require
@@ -215,6 +333,10 @@ mod tests {
         }
         let mut layers_checked = 0;
         let mut rows_checked = 0usize;
+        let mut image_rows_checked = 0usize;
+        // Picks that differ when image rows are routed with the TEXT bias. Must be > 0
+        // wherever image rows were checked, or the vl-bias branch was never exercised.
+        let mut text_bias_on_image_mismatches = 0usize;
         for dir in &dirs {
             for layer in ["L00", "L01", "L02", "L14"] {
                 let (Some(scores), Some(logits), Some(want_idx), Some(want_w)) = (
@@ -228,17 +350,43 @@ mod tests {
                 let tokens = scores.len() / NUM_EXPERTS;
                 let tag = format!("{}/{layer}", dir.file_name().unwrap().to_string_lossy());
 
-                let (bias, mask) = bias_and_mask(&scores, &logits);
+                let image = capture_image_rows(dir, tokens);
+                let (bias, mask) = bias_and_mask(&scores, &logits, |t| !image[t]);
                 let resident = mask.iter().filter(|keep| **keep).count();
                 assert_eq!(
                     resident, 124,
                     "{tag}: expected packed_keep=124 pruning, got {resident}"
                 );
+                let image_count = image.iter().filter(|row| **row).count();
+                let vl_bias = (image_count > 0).then(|| {
+                    let (vl_bias, vl_mask) = bias_and_mask(&scores, &logits, |t| image[t]);
+                    assert_eq!(vl_mask, mask, "{tag}: image rows see a different residency mask");
+                    vl_bias
+                });
+                let vision = vl_bias.as_deref().map(|bias| VisionBias {
+                    bias,
+                    image_rows: &image,
+                });
 
-                let got = select_experts(
-                    &scores, &bias, &mask, tokens, NUM_EXPERTS, K, ROUTE_SCALE,
+                let got = select_experts_multimodal(
+                    &scores, &bias, vision, &mask, tokens, NUM_EXPERTS, K, ROUTE_SCALE,
                 )
                 .expect("routing must succeed");
+
+                if image_count > 0 {
+                    // NEGATIVE CONTROL: the text bias on image rows must NOT reproduce them.
+                    let text_only = select_experts(
+                        &scores, &bias, &mask, tokens, NUM_EXPERTS, K, ROUTE_SCALE,
+                    )
+                    .unwrap();
+                    text_bias_on_image_mismatches += text_only
+                        .indices
+                        .iter()
+                        .zip(&want_idx)
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    image_rows_checked += image_count;
+                }
 
                 let mismatches = got
                     .indices
@@ -264,9 +412,17 @@ mod tests {
             }
         }
         assert!(layers_checked > 0, "the replay must have run on at least one layer");
+        if image_rows_checked > 0 {
+            assert!(
+                text_bias_on_image_mismatches > 0,
+                "routing {image_rows_checked} image rows with the TEXT bias changed nothing, so \
+                 the bias_vl branch is untested by these captures"
+            );
+        }
         eprintln!(
-            "routing replay: {layers_checked} layer-captures, {rows_checked} token-rows, \
-             across {} run(s)",
+            "routing replay: {layers_checked} layer-captures, {rows_checked} token-rows \
+             ({image_rows_checked} image rows; text bias on them: \
+             {text_bias_on_image_mismatches} picks wrong), across {} run(s)",
             dirs.len()
         );
     }
@@ -316,63 +472,103 @@ mod tests {
         );
     }
 
-    /// **The oracle replay is BLIND to the residency mask.** Measured, not assumed, and
-    /// re-measured over EVERY capture rather than the one this was first written against.
+    /// The residency mask CHANGES SELECTION on most tokens — it is load-bearing.
     ///
-    /// Across runA (prose) and runB (Python source) — two unrelated prompts, layers 0/1/2/14,
-    /// 296 token-rows — the top-6 by UNMASKED logits are ALWAYS already resident, so masked
-    /// and unmasked selection are identical. A port that skipped the mask entirely would
-    /// pass `routing_replays_the_oracle_exactly` on both.
+    /// ## This test previously asserted the OPPOSITE, and was wrong
+    /// It reported the mask never bites (0/296) and I relayed that to three people as
+    /// evidence that `packed_keep = 124` was "effectively lossless on real text". It is
+    /// not. The bug was in the test's own bias reconstruction, not in the router.
     ///
-    /// That is expected rather than alarming — `packed_keep = 124` is a RANKED PREFIX of
-    /// the most-used experts, so the top-6 for ordinary tokens nearly always fall inside
-    /// it. But it means the replay is a gate that cannot fail on this particular property,
-    /// and recording that is worth more than a control that quietly passes. The mask is
-    /// therefore tested separately, on a constructed input where it MUST bite.
+    /// [`bias_and_mask`] recovers the router bias from `logits - scores` on FINITE entries.
+    /// For a pruned expert every logit is `-inf`, so its bias is **never observable** — 0 of
+    /// 260 recovered — and the helper left it at 0.0 while resident experts recovered their
+    /// true ~9.85. That manufactured a ~9.85 handicap for exactly the experts under test, so
+    /// of course none of them ever reached the top-6.
     ///
-    /// If this ever starts failing, the capture has gained a token whose routing the mask
-    /// actually changes — that is good news, and the replay becomes a real test of it.
+    /// The real `layers.N.ffn.gate.bias` is near-CONSTANT across all 384 (min 9.59, max
+    /// 9.88, std 0.036) while scores span 0.017..1.86. So the bias barely affects ranking at
+    /// all, pruned experts compete on equal footing, and with the true bias the best
+    /// non-resident expert has median rank 3 — frequently rank 0, the top expert overall.
+    ///
+    /// Measured with the true per-layer bias read from the checkpoint: the mask changes
+    /// selection on **202 of 296 token-rows (68%)** across runA and runB.
+    ///
+    /// ## What follows from that
+    /// - `packed_keep = 124` is NOT lossless. It substantially rewrites routing.
+    /// - A port that skipped the mask would get `route_idx` wrong on ~68% of tokens, so the
+    ///   oracle replay DOES test it. There was never a blind spot here.
+    /// - The margin analysis is what caught it. A binary "does it bite" answered 0 and
+    ///   looked clean; asking HOW CLOSE it came returned "rank exactly 124, every row,
+    ///   every layer, both runs" — a suspiciously perfect number that could only come from
+    ///   the reconstruction, not from the model.
     #[test]
-    fn the_oracle_captures_do_not_exercise_the_residency_mask() {
+    fn the_residency_mask_changes_selection_on_most_tokens() {
         let dirs = ref_dirs();
         if dirs.is_empty() {
             eprintln!("skipping: no captures under {REF_ROOT}");
             return;
         }
-        let mut biting_rows = 0usize;
-        let mut total_rows = 0usize;
+        let Some(true_bias) = checkpoint_gate_bias(0) else {
+            eprintln!("skipping: checkpoint gate.bias not readable");
+            return;
+        };
+
+        let mut biting = 0usize;
+        let mut total = 0usize;
         for dir in &dirs {
-            for layer in ["L00", "L01", "L02", "L14"] {
-                let (Some(scores), Some(logits)) = (
-                    read_f32(dir, &format!("{layer}.route_scores.000.bin")),
-                    read_f32(dir, &format!("{layer}.route_logits.000.bin")),
-                ) else {
-                    continue;
-                };
-                let tokens = scores.len() / NUM_EXPERTS;
-                let (bias, mask) = bias_and_mask(&scores, &logits);
-                let all_resident = vec![true; NUM_EXPERTS];
-                let unmasked = select_experts(
-                    &scores, &bias, &all_resident, tokens, NUM_EXPERTS, K, ROUTE_SCALE,
-                )
-                .unwrap();
-                for token in 0..tokens {
-                    let picks = &unmasked.indices[token * K..(token + 1) * K];
-                    if picks.iter().any(|e| !mask[*e as usize]) {
-                        biting_rows += 1;
+            let (Some(scores), Some(logits)) = (
+                read_f32(dir, "L00.route_scores.000.bin"),
+                read_f32(dir, "L00.route_logits.000.bin"),
+            ) else {
+                continue;
+            };
+            let tokens = scores.len() / NUM_EXPERTS;
+            // TEXT rows only: image rows carry `gate.bias_vl`, which is not the tensor
+            // under test here.
+            let image = capture_image_rows(dir, tokens);
+            let (_, mask) = bias_and_mask(&scores, &logits, |t| !image[t]);
+
+            // The TRUE bias must reproduce the capture's logits on resident entries. Without
+            // this the comparison below could be measuring a mis-read tensor.
+            for token in (0..tokens).filter(|t| !image[*t]) {
+                for expert in 0..NUM_EXPERTS {
+                    if mask[expert] {
+                        let mine = scores[token * NUM_EXPERTS + expert] + true_bias[expert];
+                        let theirs = logits[token * NUM_EXPERTS + expert];
+                        assert!(
+                            (mine - theirs).abs() < 1e-3,
+                            "true bias disagrees with the capture at expert {expert}: \
+                             {mine} vs {theirs}"
+                        );
                     }
-                    total_rows += 1;
                 }
             }
+
+            let all_resident = vec![true; NUM_EXPERTS];
+            let unmasked = select_experts(
+                &scores, &true_bias, &all_resident, tokens, NUM_EXPERTS, K, ROUTE_SCALE,
+            )
+            .unwrap();
+            for token in (0..tokens).filter(|t| !image[*t]) {
+                let picks = &unmasked.indices[token * K..(token + 1) * K];
+                if picks.iter().any(|e| !mask[*e as usize]) {
+                    biting += 1;
+                }
+                total += 1;
+            }
         }
-        eprintln!(
-            "residency mask bites on {biting_rows}/{total_rows} token-rows across {} capture(s)",
-            dirs.len()
-        );
-        assert_eq!(
-            biting_rows, 0,
-            "the captures NOW exercise the mask ({biting_rows}/{total_rows} rows). Good — \
-             delete this test; `routing_replays_the_oracle_exactly` now covers it for real."
+        if total == 0 {
+            eprintln!("skipping: no L00 taps found");
+            return;
+        }
+        let fraction = biting as f64 / total as f64;
+        eprintln!("residency mask changes selection on {biting}/{total} token-rows");
+        assert!(
+            fraction > 0.4,
+            "the mask changed selection on only {biting}/{total} rows. Measured 68% on \
+             runA+runB; a collapse to near zero means the bias is being reconstructed \
+             rather than read from the checkpoint — the exact bug this test was rewritten \
+             to fix."
         );
     }
 
