@@ -182,6 +182,9 @@ pub struct Dsv41Kernels {
     /// `dsv41_hc_mixes_tb`: [`HC_TB`] tokens per block for prefill passes, bit-identical per
     /// token to `hc_mixes`. [`HC_MIX_TB_ENV`]`=1` only, until the end-to-end byte test.
     pub hc_mixes_tb: Option<KernelHandle>,
+    /// `dsv41_hc_fused_tb` + `dsv41_hc_add_post`: the fused mHC stream passes for prefill,
+    /// bit-identical to the separate kernels. [`HC_FUSED_ENV`]`=1` only, until the byte test.
+    pub hc_fused: Option<(KernelHandle, KernelHandle)>,
     /// `dsv41_decode::dsv41_fp8_gemv_m1`, used at M = 1 when [`DENSE_GEMV_ENV`] is on.
     pub fp8_gemv_m1: Option<KernelHandle>,
     /// `dsv41_fp8_gemv_m8`: the same GEMV for 2..=8 rows, each row bit-identical to the M = 1
@@ -197,6 +200,8 @@ pub struct Dsv41Kernels {
 
 /// `ATLAS_DSV41_HC_MIX_TB=1`: non-decode `hc_mixes` serve [`HC_TB`] tokens per block.
 pub const HC_MIX_TB_ENV: &str = "ATLAS_DSV41_HC_MIX_TB";
+/// `ATLAS_DSV41_HC_FUSED=1`: non-decode blocks run their mHC stream passes as two fused kernels.
+pub const HC_FUSED_ENV: &str = "ATLAS_DSV41_HC_FUSED";
 /// Tokens per block of `dsv41_hc_mixes_tb` (`DSV41_HC_TB` in the kernel).
 pub const HC_TB: usize = 4;
 
@@ -255,6 +260,11 @@ impl Dsv41Kernels {
             engram_gate: k("dsv41_engram_gate")?,
             mul_bf16_to_f32: k("dsv41_mul_bf16_to_f32")?,
             hc_mean_bf16: k("dsv41_hc_mean_bf16")?,
+            hc_fused: if std::env::var(HC_FUSED_ENV).as_deref() == Ok("1") {
+                Some((k("dsv41_hc_fused_tb")?, k("dsv41_hc_add_post")?))
+            } else {
+                None
+            },
             hc_mixes_tb: if std::env::var(HC_MIX_TB_ENV).as_deref() == Ok("1") { Some(k("dsv41_hc_mixes_tb")?) } else { None },
             fp8_gemv_m1: if std::env::var(DENSE_GEMV_ENV).as_deref() != Ok("0") {
                 Some(gpu.kernel(DECODE_DENSE_MODULE, "dsv41_fp8_gemv_m1").with_context(|| {
@@ -360,6 +370,37 @@ impl Ops<'_> {
             .arg_ptr(pre).arg_ptr(post).arg_ptr(comb)
             .arg_u32(d as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
             .launch(self.stream)
+    }
+
+    /// Whether this pass runs the fused mHC kernels ([`HC_FUSED_ENV`], never on decode passes,
+    /// which keep decode's tuned split path).
+    pub fn hc_fused_on(&self) -> bool {
+        self.k.hc_fused.is_some() && !decode_pass()
+    }
+
+    /// Fused `[hc_post(y = ya (+ yb), post_in, comb_in)] -> hc_mixes -> hc_pre(side_pre) ->
+    /// rmsnorm` over `h` (in place) into `x`; `ya == NULL` skips the post stage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_fused(
+        &self, ya: DevicePtr, yb: DevicePtr, post_in: DevicePtr, comb_in: DevicePtr, h: DevicePtr, hc: &HcParams,
+        pre: DevicePtr, post: DevicePtr, comb: DevicePtr, side_pre: DevicePtr, norm_w: DevicePtr, x: DevicePtr,
+        t: usize, d: usize, iters: u32, eps: f32, hc_eps: f32,
+    ) -> Result<()> {
+        let (fused, _) = self.k.hc_fused.context("hc_fused: kernels not loaded (ATLAS_DSV41_HC_FUSED=1)")?;
+        self.l(fused)
+            .grid([t.div_ceil(HC_TB) as u32, 1, 1])
+            .arg_ptr(ya).arg_ptr(yb).arg_ptr(post_in).arg_ptr(comb_in).arg_ptr(h)
+            .arg_ptr(hc.func).arg_ptr(hc.scale).arg_ptr(hc.base)
+            .arg_ptr(pre).arg_ptr(post).arg_ptr(comb).arg_ptr(side_pre).arg_ptr(norm_w).arg_ptr(x)
+            .arg_u32(d as u32).arg_u32(t as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
+            .launch(self.stream)
+    }
+
+    /// `add_bf16(ya, yb)` then `hc_post` in place on `h`, one pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_add_post(&self, ya: DevicePtr, yb: DevicePtr, h: DevicePtr, post: DevicePtr, comb: DevicePtr, t: usize, d: usize) -> Result<()> {
+        let (_, add_post) = self.k.hc_fused.context("hc_add_post: kernels not loaded (ATLAS_DSV41_HC_FUSED=1)")?;
+        self.l(add_post).grid([t as u32, 1, 1]).arg_ptr(ya).arg_ptr(yb).arg_ptr(h).arg_ptr(post).arg_ptr(comb).arg_u32(d as u32).launch(self.stream)
     }
 
     pub fn hc_pre(&self, h: DevicePtr, pre: DevicePtr, y: DevicePtr, t: usize, d: usize) -> Result<()> {

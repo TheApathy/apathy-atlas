@@ -301,6 +301,180 @@ extern "C" __global__ void dsv41_hc_mixes_tb(const __nv_bfloat16* __restrict__ h
     for (unsigned q = 0; q < HC * HC; ++q) comb[t * HC * HC + q] = c[q];
 }
 
+// ── fused mHC stream passes (prefill), DSV41_HC_TB tokens per block ───────────
+// One kernel for   [hc_post(y = ya (+ yb))] -> hc_mixes -> hc_pre(side_pre) -> rmsnorm
+// (the attention-side start of a block when ya == NULL; the FFN-side start after the attention
+// sub-layer otherwise). Every stage is the separate kernel's per-element / per-thread arithmetic,
+// same order, same block_sum tree, so the result is BIT-IDENTICAL to the unfused sequence:
+//   hc_post  : dsv41_hc_post (and dsv41_add_bf16 when yb != NULL), in place on h
+//   hc_mixes : dsv41_hc_mixes_tb (fn read once per TB tokens)
+//   hc_pre   : dsv41_hc_pre with the SHIFTED pre `side_pre` (not the pre computed here)
+//   rmsnorm  : dsv41_rmsnorm, in place on x
+// Saves the separate kernels' re-reads of h ([T,4,D] bf16) and x. Grid: (ceil(T/TB))  Block: 256.
+extern "C" __global__ void dsv41_hc_fused_tb(
+    const __nv_bfloat16* __restrict__ ya, const __nv_bfloat16* __restrict__ yb,
+    const float* __restrict__ post_in, const float* __restrict__ comb_in,
+    __nv_bfloat16* h,
+    const float* __restrict__ fn, const float* __restrict__ scale, const float* __restrict__ base,
+    float* __restrict__ pre_o, float* __restrict__ post_o, float* __restrict__ comb_o,
+    const float* side_pre, const __nv_bfloat16* __restrict__ norm_w,
+    __nv_bfloat16* x, const unsigned D, const unsigned T, const unsigned iters,
+    const float eps, const float hc_eps) {
+    __shared__ float red[DSV41_BLOCK];
+    __shared__ float mix[DSV41_HC_TB][DSV41_NMIX];
+    const unsigned t0 = blockIdx.x * DSV41_HC_TB;
+    const unsigned nt = min((unsigned)DSV41_HC_TB, T - t0);
+    const unsigned R = DSV41_HC * D;
+
+    // ---- stage A: hc_post (+ add), in place on h
+    if (ya != nullptr) {
+        for (unsigned b = 0; b < nt; ++b) {
+            const unsigned t = t0 + b;
+            const float* po = post_in + t * DSV41_HC;
+            const float* cb = comb_in + t * DSV41_HC * DSV41_HC;
+            for (unsigned d = threadIdx.x; d < D; d += DSV41_BLOCK) {
+                const size_t yi = (size_t)t * D + d;
+                const float yv = yb != nullptr ? bf(__float2bfloat16(bf(ya[yi]) + bf(yb[yi]))) : bf(ya[yi]);
+                float r[DSV41_HC];
+#pragma unroll
+                for (unsigned i = 0; i < DSV41_HC; ++i) r[i] = bf(h[((size_t)t * DSV41_HC + i) * D + d]);
+#pragma unroll
+                for (unsigned j = 0; j < DSV41_HC; ++j) {
+                    float acc = po[j] * yv;
+#pragma unroll
+                    for (unsigned i = 0; i < DSV41_HC; ++i) acc += cb[i * DSV41_HC + j] * r[i];
+                    h[((size_t)t * DSV41_HC + j) * D + d] = __float2bfloat16(acc);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- stage B: hc_mixes (dsv41_hc_mixes_tb's body)
+    {
+        float acc[DSV41_HC_TB][DSV41_NMIX];
+        float ss[DSV41_HC_TB];
+#pragma unroll
+        for (int b = 0; b < DSV41_HC_TB; ++b) {
+            ss[b] = 0.f;
+#pragma unroll
+            for (int m = 0; m < DSV41_NMIX; ++m) acc[b][m] = 0.f;
+        }
+        for (unsigned k = threadIdx.x; k < R; k += DSV41_BLOCK) {
+            float v[DSV41_HC_TB];
+#pragma unroll
+            for (int b = 0; b < DSV41_HC_TB; ++b) {
+                v[b] = (unsigned)b < nt ? bf(h[(size_t)(t0 + b) * R + k]) : 0.f;
+                ss[b] += v[b] * v[b];
+            }
+#pragma unroll
+            for (int m = 0; m < DSV41_NMIX; ++m) {
+                const float f = fn[(size_t)m * R + k];
+#pragma unroll
+                for (int b = 0; b < DSV41_HC_TB; ++b) acc[b][m] += v[b] * f;
+            }
+        }
+#pragma unroll
+        for (int b = 0; b < DSV41_HC_TB; ++b) {
+            const float rs = rsqrtf(block_sum(ss[b], red) / (float)R + eps);
+            for (int m = 0; m < DSV41_NMIX; ++m) {
+                const float r = block_sum(acc[b][m], red);
+                if (threadIdx.x == 0) mix[b][m] = r * rs;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < nt) {
+            const unsigned t = t0 + threadIdx.x;
+            const float* mx_ = mix[threadIdx.x];
+            const unsigned HC = DSV41_HC;
+            for (unsigned i = 0; i < HC; ++i) {
+                const float vp = mx_[i] * scale[0] + base[i];
+                pre_o[t * HC + i] = 1.f / (1.f + expf(-vp)) + hc_eps;
+                const float vq = mx_[HC + i] * scale[1] + base[HC + i];
+                post_o[t * HC + i] = 2.f * (1.f / (1.f + expf(-vq)));
+            }
+            float c[DSV41_HC * DSV41_HC];
+            for (unsigned i = 0; i < HC; ++i) {
+                float mx = -INFINITY;
+                for (unsigned j = 0; j < HC; ++j) {
+                    c[i * HC + j] = mx_[2 * HC + i * HC + j] * scale[2] + base[2 * HC + i * HC + j];
+                    mx = fmaxf(mx, c[i * HC + j]);
+                }
+                float z = 0.f;
+                for (unsigned j = 0; j < HC; ++j) {
+                    c[i * HC + j] = expf(c[i * HC + j] - mx);
+                    z += c[i * HC + j];
+                }
+                for (unsigned j = 0; j < HC; ++j) c[i * HC + j] = c[i * HC + j] / z + hc_eps;
+            }
+            for (unsigned it = 0; it < iters; ++it) {
+                if (it > 0) {
+                    for (unsigned i = 0; i < HC; ++i) {
+                        float z = 0.f;
+                        for (unsigned j = 0; j < HC; ++j) z += c[i * HC + j];
+                        z += hc_eps;
+                        for (unsigned j = 0; j < HC; ++j) c[i * HC + j] /= z;
+                    }
+                }
+                for (unsigned j = 0; j < HC; ++j) {
+                    float z = 0.f;
+                    for (unsigned i = 0; i < HC; ++i) z += c[i * HC + j];
+                    z += hc_eps;
+                    for (unsigned i = 0; i < HC; ++i) c[i * HC + j] /= z;
+                }
+            }
+            for (unsigned q = 0; q < HC * HC; ++q) comb_o[t * HC * HC + q] = c[q];
+        }
+        // side_pre may alias pre_o (the attention side of a pass reads the previous block's ffn pre,
+        // never this call's output, but keep the ordering safe).
+        __syncthreads();
+    }
+
+    // ---- stage C: hc_pre(side_pre) then rmsnorm, per token
+    for (unsigned b = 0; b < nt; ++b) {
+        const unsigned t = t0 + b;
+        const float* p = side_pre + t * DSV41_HC;
+        float ssq = 0.f;
+        for (unsigned d = threadIdx.x; d < D; d += DSV41_BLOCK) {
+            float acc = 0.f;
+#pragma unroll
+            for (unsigned i = 0; i < DSV41_HC; ++i) acc += p[i] * bf(h[((size_t)t * DSV41_HC + i) * D + d]);
+            const __nv_bfloat16 xv = __float2bfloat16(acc);
+            x[(size_t)t * D + d] = xv;
+            const float v = bf(xv);
+            ssq += v * v;
+        }
+        const float rs = rsqrtf(block_sum(ssq, red) / (float)D + eps);
+        for (unsigned d = threadIdx.x; d < D; d += DSV41_BLOCK)
+            x[(size_t)t * D + d] = __float2bfloat16(bf(norm_w[d]) * (bf(x[(size_t)t * D + d]) * rs));
+    }
+}
+
+// ── add + hc_post: dsv41_add_bf16 then dsv41_hc_post, one pass (the FFN end of a block) ──
+// Grid: (T)  Block: 256.
+extern "C" __global__ void dsv41_hc_add_post(const __nv_bfloat16* __restrict__ ya,
+                                             const __nv_bfloat16* __restrict__ yb,
+                                             __nv_bfloat16* h, const float* __restrict__ post,
+                                             const float* __restrict__ comb, const unsigned D) {
+    const unsigned t = blockIdx.x;
+    const float* po = post + t * DSV41_HC;
+    const float* cb = comb + t * DSV41_HC * DSV41_HC;
+    for (unsigned d = threadIdx.x; d < D; d += DSV41_BLOCK) {
+        const size_t yi = (size_t)t * D + d;
+        const float yv = bf(__float2bfloat16(bf(ya[yi]) + bf(yb[yi])));
+        float r[DSV41_HC];
+#pragma unroll
+        for (unsigned i = 0; i < DSV41_HC; ++i) r[i] = bf(h[((size_t)t * DSV41_HC + i) * D + d]);
+#pragma unroll
+        for (unsigned j = 0; j < DSV41_HC; ++j) {
+            float acc = po[j] * yv;
+#pragma unroll
+            for (unsigned i = 0; i < DSV41_HC; ++i) acc += cb[i * DSV41_HC + j] * r[i];
+            h[((size_t)t * DSV41_HC + j) * D + d] = __float2bfloat16(acc);
+        }
+    }
+}
+
 // ── hc_pre: v41_ref.hc_pre  y[t] = bf16(sum_i pre[t,i] * h[t,i]) ───────────────
 // Grid: (T)  Block: 256.
 extern "C" __global__ void dsv41_hc_pre(const __nv_bfloat16* __restrict__ h,

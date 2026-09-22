@@ -298,7 +298,15 @@ pub fn block(
         BlockControl::None => s.pre_mix,
         BlockControl::OwnPre => s.attn_pre,
     };
+    let fused = ops.hc_fused_on();
+    let null = DevicePtr::NULL;
     prof(ops, "mhc+norm", || {
+        if fused {
+            return ops.hc_fused(
+                null, null, null, null, s.h, &w.hc_attn, s.attn_pre, s.attn_post, s.attn_comb, attn_side_pre,
+                w.attn_norm, s.x, t, d, it, eps, hce,
+            );
+        }
         ops.hc_mixes(s.h, &w.hc_attn, s.attn_pre, s.attn_post, s.attn_comb, t, d, it, eps, hce, s.hc_raw)?;
         ops.hc_pre(s.h, attn_side_pre, s.x, t, d)?;
         ops.rmsnorm(s.x, w.attn_norm, s.x, t, d, eps)
@@ -313,6 +321,12 @@ pub fn block(
         BlockControl::OwnPre => s.ffn_pre,
     };
     prof(ops, "mhc+norm", || {
+        if fused {
+            return ops.hc_fused(
+                s.y, null, s.attn_post, s.attn_comb, s.h, &w.hc_ffn, s.ffn_pre, s.ffn_post, s.ffn_comb, ffn_side_pre,
+                w.ffn_norm, s.x, t, d, it, eps, hce,
+            );
+        }
         ops.hc_post(s.y, s.h, s.attn_post, s.attn_comb, s.h, t, d)?;
         ops.hc_mixes(s.h, &w.hc_ffn, s.ffn_pre, s.ffn_post, s.ffn_comb, t, d, it, eps, hce, s.hc_raw)?;
         ops.hc_pre(s.h, ffn_side_pre, s.x, t, d)?;
@@ -324,8 +338,12 @@ pub fn block(
     tap.bf16(ops, "moe_routed", l, s.routed, &[t, d])?;
     tap.bf16(ops, "moe_shared", l, s.shared, &[t, d])?;
     prof(ops, "mhc+norm", || {
-        ops.add_bf16(s.routed, s.shared, s.y, t * d)?;
-        ops.hc_post(s.y, s.h, s.ffn_post, s.ffn_comb, s.h, t, d)?;
+        if fused {
+            ops.hc_add_post(s.routed, s.shared, s.h, s.ffn_post, s.ffn_comb, t, d)?;
+        } else {
+            ops.add_bf16(s.routed, s.shared, s.y, t * d)?;
+            ops.hc_post(s.y, s.h, s.ffn_post, s.ffn_comb, s.h, t, d)?;
+        }
         ops.gpu.copy_d2d_async(s.ffn_pre, s.pre_mix, t * hc * 4, ops.stream)
     })?;
 
