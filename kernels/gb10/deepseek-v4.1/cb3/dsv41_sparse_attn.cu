@@ -490,7 +490,11 @@ __device__ __forceinline__ void sparse_attn_mma_body(
 }
 
 
-// Tensor-core prefill entry (16-key tiles) and the 32-key variant (half the tiles and barriers).
+
+// Tensor-core prefill entry (16-key tiles). MEASURED AND DROPPED (attn gate 2026-09-22, real
+// fixture T=148): 32-key tiles 0.85x (slower); cp.async double-buffered gather 1.01x (bit-
+// identical to this, no gain: the kernel is not gather-latency bound). It sits ~3x above the
+// bf16 MMA compute roof, a third of which is the deliberate P_hi + P_lo second MMA.
 extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
     const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ RING, const int32_t* __restrict__ WPOS,
     const __nv_bfloat16* __restrict__ CKV, const long long* __restrict__ CIDX, const float* __restrict__ SINK,
@@ -499,13 +503,6 @@ extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
     sparse_attn_mma_body<16>(Q, RING, WPOS, CKV, CIDX, SINK, O, T, NH, D, NW, NC, RING_N, win_lo, scale);
 }
 
-extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma32(
-    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ RING, const int32_t* __restrict__ WPOS,
-    const __nv_bfloat16* __restrict__ CKV, const long long* __restrict__ CIDX, const float* __restrict__ SINK,
-    __nv_bfloat16* __restrict__ O, int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
-{
-    sparse_attn_mma_body<32>(Q, RING, WPOS, CKV, CIDX, SINK, O, T, NH, D, NW, NC, RING_N, win_lo, scale);
-}
 
 // PRODUCTION entry. grid (T, NH / 8), block 256. CIDX may be null (window-only layers 0/1).
 extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn(
@@ -825,18 +822,7 @@ int main() {
                         "| CTRL compressed rows dropped: %zu differ | T=%d: one-pass %.3f ms, mma %.3f ms (%.1fx)\n",
                         mbad, no, 100.0 * (1.0 - (double)mbad / no), em.rel, eo.rel, cbad, T, t_one, t_mma, t_one / t_mma);
             prod_ok = prod_ok && em.rel <= 1e-5 + eo.rel && (double)mbad / no <= 0.01 && cbad > no / 2;
-            { FILE* f = std::fopen("ar_out_mma16.bin", "wb"); if (f) { mma(1); std::fwrite(ob.data(), 2, no, f); std::fclose(f); } }
-            // 32-key tiles: half the tiles/barriers. SAME pre-registered band as the 16-key entry.
-            dsv41_sparse_attn_mma32<<<gm, MNT>>>(d_q, d_ring, d_wpos, d_ckv, d_c64, d_sink, d_ob, T, NH, D, NW, NC, RING_N, 0, scale);
-            CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
-            CUDA_OK(cudaMemcpy(ob.data(), d_ob, no*2, cudaMemcpyDeviceToHost));
-            const size_t m32bad = bits_equal(h_ok);
-            for (size_t i = 0; i < no; ++i) of[i] = __bfloat162float(ob[i]);
-            const Err e32m = compare(of.data(), h_r32, no);
-            const float t_m32 = time_it([&] { dsv41_sparse_attn_mma32<<<gm, MNT>>>(d_q, d_ring, d_wpos, d_ckv, d_c64, d_sink, d_ob, T, NH, D, NW, NC, RING_N, 0, scale); });
-            std::printf("MMA32 prefill entry: %zu/%zu bf16 differ from bf16(one-pass) (%.4f%% identical); vs fp32 ref %.3e | T=%d: %.3f ms (%.1fx one-pass, %.2fx mma16)\n",
-                        m32bad, no, 100.0 * (1.0 - (double)m32bad / no), e32m.rel, T, t_m32, t_one / t_m32, t_mma / t_m32);
-            prod_ok = prod_ok && e32m.rel <= 1e-5 + eo.rel && (double)m32bad / no <= 0.01;
+
         }
         cudaFree(d_w64); cudaFree(d_c64); cudaFree(d_ob);
     }
