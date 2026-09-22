@@ -36,7 +36,7 @@ use super::fwd::V41RoutedMoe;
 use super::moe::{
     COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_GEMM_MODULE, FUSED_TILE_M,
     FUSED_TILE_N, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE,
-    PERMUTE_KERNEL, SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, expert_matrices, gemm_weight_t_f32out,
+    PERMUTE_KERNEL, ROUTE_TOPK_FN, SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, expert_matrices, gemm_weight_t_f32out,
     group_by_expert,
 };
 use super::ops::Dsv41Kernels;
@@ -136,6 +136,9 @@ struct Scratch {
     sorted: DevicePtr,
     tok2perm: DevicePtr,
     row_w: DevicePtr,
+    image: DevicePtr,
+    route_idx: DevicePtr,
+    route_w: DevicePtr,
 }
 
 /// Per-pass knobs that exist for NEGATIVE CONTROLS only. Each produces finite, correctly
@@ -197,6 +200,9 @@ pub struct Cb3RoutedMoe<'a> {
     control: Mutex<MoeControl>,
     work: Mutex<ExpertWork>,
     kernel: Mutex<ExpertKernel>,
+    /// Per layer: (layer, bias, bias_vl, resident u8 mask), all [384] on the device.
+    device_routers: Vec<(usize, DevicePtr, DevicePtr, DevicePtr)>,
+    k_route: KernelHandle,
     k_fused_gate_up: KernelHandle,
     k_fused_down: KernelHandle,
     tiles: DevicePtr,
@@ -246,7 +252,24 @@ impl<'a> Cb3RoutedMoe<'a> {
             sorted: a(e * 4)?,
             tok2perm: a(e * 4)?,
             row_w: a(e * 4)?,
+            image: a(max_t)?,
+            route_idx: a(e * 4)?,
+            route_w: a(e * 4)?,
         };
+        // Per layer, on the device: text bias, vision bias, residency mask (u8).
+        let mut device_routers = Vec::with_capacity(routers.len());
+        for (layer, router) in &routers {
+            let f32_bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            let bias = gpu.alloc(ROUTER_EXPERTS * 4)?;
+            gpu.copy_h2d(&f32_bytes(&router.bias), bias)?;
+            let bias_vl = gpu.alloc(ROUTER_EXPERTS * 4)?;
+            gpu.copy_h2d(&f32_bytes(&router.bias_vl), bias_vl)?;
+            let mask: Vec<u8> = arena.routing_mask(*layer)?.iter().map(|m| u8::from(*m)).collect();
+            ensure!(mask.len() == ROUTER_EXPERTS, "residency mask is {} wide", mask.len());
+            let resident = gpu.alloc(ROUTER_EXPERTS)?;
+            gpu.copy_h2d(&mask, resident)?;
+            device_routers.push((*layer, bias, bias_vl, resident));
+        }
         Ok(Self {
             gpu,
             kernels,
@@ -266,6 +289,8 @@ impl<'a> Cb3RoutedMoe<'a> {
             control: Mutex::new(MoeControl::None),
             work: Mutex::new(ExpertWork::All),
             kernel: Mutex::new(ExpertKernel::default()),
+            device_routers,
+            k_route: gpu.kernel(COMBINE_MODULE, ROUTE_TOPK_FN)?,
             k_fused_gate_up: gpu.kernel(FUSED_GEMM_MODULE, FUSED_GATE_UP_FN)?,
             k_fused_down: gpu.kernel(FUSED_GEMM_MODULE, FUSED_DOWN_FN)?,
             tiles: gpu.alloc(max_tiles * 16)?,
@@ -303,6 +328,18 @@ impl<'a> Cb3RoutedMoe<'a> {
 
     /// Router scores `sqrt(softplus(y.float() @ gate_w^T))`, `[t, 384]` fp32, on the host.
     pub fn scores(&self, layer: usize, y: DevicePtr, t: usize, stream: u64) -> Result<Vec<f32>> {
+        self.router_logits(layer, y, t, stream)?;
+        self.gpu.synchronize(stream)?;
+        let mut bytes = vec![0u8; t * ROUTER_EXPERTS * 4];
+        self.gpu.copy_d2h(self.scratch.logits, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| score_of(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+            .collect())
+    }
+
+    /// `y.float() @ gate_w^T` into `scratch.logits`, `[t, 384]` fp32. Enqueued, not synced.
+    fn router_logits(&self, layer: usize, y: DevicePtr, t: usize, stream: u64) -> Result<()> {
         ensure!(t <= self.scratch.max_t, "pass of {t} tokens exceeds scratch for {}", self.scratch.max_t);
         let router = self.router(layer)?;
         let n = t * self.hidden;
@@ -325,14 +362,54 @@ impl<'a> Cb3RoutedMoe<'a> {
             GemmDtype::F32,
             GemmDtype::F32,
             stream,
-        )?;
+        )
+    }
+
+    /// The router entirely on the device (`dsv41_route_topk`): only `[t, 6]` indices and
+    /// weights come back to the host, for the permutation plan. What `forward` runs.
+    pub fn route_device(&self, layer: usize, y: DevicePtr, t: usize, stream: u64) -> Result<Routing> {
+        let (bias, bias_vl, resident) = self
+            .device_routers
+            .iter()
+            .find(|(index, ..)| *index == layer)
+            .map(|(_, b, v, r)| (*b, *v, *r))
+            .with_context(|| format!("no device router for layer {layer}"))?;
+        let image: Vec<u8> = {
+            let tokens = self.pass_tokens.lock().expect("pass_tokens lock");
+            let ids = tokens.as_ref().context(
+                "DeepSeek-V4.1 routed MoE: set_pass_tokens was not called for this pass. Image \
+                 rows route with gate.bias_vl, and without the token ids they would silently \
+                 take the text bias.",
+            )?;
+            ensure!(ids.len() == t, "pass tokens are {} ids for a {t}-token pass", ids.len());
+            image_rows(ids).into_iter().map(u8::from).collect()
+        };
+        self.router_logits(layer, y, t, stream)?;
         self.gpu.synchronize(stream)?;
-        let mut bytes = vec![0u8; t * ROUTER_EXPERTS * 4];
-        self.gpu.copy_d2h(self.scratch.logits, &mut bytes)?;
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|c| score_of(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
-            .collect())
+        self.gpu.copy_h2d(&image, self.scratch.image)?;
+        KernelLaunch::new(self.gpu, self.k_route)
+            .block([128, 1, 1])
+            .grid([t as u32, 1, 1])
+            .arg_ptr(self.scratch.logits)
+            .arg_ptr(bias)
+            .arg_ptr(bias_vl)
+            .arg_ptr(self.scratch.image)
+            .arg_ptr(resident)
+            .arg_ptr(self.scratch.route_idx)
+            .arg_ptr(self.scratch.route_w)
+            .arg_u32(TOP_K as u32)
+            .arg_f32(self.route_scale)
+            .launch(stream)?;
+        self.gpu.synchronize(stream)?;
+        let mut idx = vec![0u8; t * TOP_K * 4];
+        let mut w = vec![0u8; t * TOP_K * 4];
+        self.gpu.copy_d2h(self.scratch.route_idx, &mut idx)?;
+        self.gpu.copy_d2h(self.scratch.route_w, &mut w)?;
+        Ok(Routing {
+            indices: idx.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64).collect(),
+            weights: w.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            k: TOP_K,
+        })
     }
 
     /// Masked, per-row-biased top-6 over `scores`.
@@ -551,9 +628,14 @@ impl<'a> Cb3RoutedMoe<'a> {
         let s = &self.scratch;
         for ptr in [
             s.y_f32, s.logits, s.perm, s.gate, s.up, s.h, s.down, s.w1, s.w3, s.w2, s.sorted,
-            s.tok2perm, s.row_w, self.tiles,
+            s.tok2perm, s.row_w, self.tiles, s.image, s.route_idx, s.route_w,
         ] {
             self.gpu.free(ptr)?;
+        }
+        for (_, bias, bias_vl, resident) in &self.device_routers {
+            for ptr in [*bias, *bias_vl, *resident] {
+                self.gpu.free(ptr)?;
+            }
         }
         for (_, router) in &self.routers {
             self.gpu.free(router.gate_w)?;
@@ -564,8 +646,7 @@ impl<'a> Cb3RoutedMoe<'a> {
 
 impl V41RoutedMoe for Cb3RoutedMoe<'_> {
     fn forward(&self, layer: usize, y: DevicePtr, out: DevicePtr, t: usize, stream: u64) -> Result<()> {
-        let scores = self.scores(layer, y, t, stream)?;
-        let routing = self.route(layer, &scores, t)?;
+        let routing = self.route_device(layer, y, t, stream)?;
         self.forward_routed(layer, y, out, t, &routing, stream)
     }
 }

@@ -122,6 +122,8 @@ fn main() -> Result<()> {
     );
     for &t in &token_counts {
         moe.set_pass_tokens(&ids[..t]);
+        // The subtraction phases only exist on the reconstruct path; Fused is the default.
+        moe.set_expert_kernel(ExpertKernel::Reconstruct);
         let time = |f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
             let mut samples = Vec::with_capacity(iters);
             for i in 0..warmup + iters {
@@ -156,6 +158,12 @@ fn main() -> Result<()> {
         moe.set_expert_work(ExpertWork::All);
         moe.set_expert_kernel(ExpertKernel::Fused);
         let fused = time(&mut || moe.forward_routed(layer, d_in, d_out, t, &routing, stream))?;
+        let dev_route = time(&mut || moe.route_device(layer, d_in, t, stream).map(|_| ()))?;
+        let full = time(&mut || spark_model::weight_loader::deepseek_v41::fwd::V41RoutedMoe::forward(&moe, layer, d_in, d_out, t, stream))?;
+        println!(
+            "      PRODUCTION forward (device router + fused): {full:.2} ms/layer [router {dev_route:.2}] -> {:.1} tok/s MoE-only",
+            t as f64 / (LAYERS as f64 * full * 1e-3)
+        );
         moe.set_expert_kernel(ExpertKernel::Reconstruct);
         let fused_tok_s = t as f64 / (LAYERS as f64 * (scores_ms + route_ms + fused) * 1e-3);
         println!(

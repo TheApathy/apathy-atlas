@@ -214,6 +214,16 @@ fn main() -> Result<()> {
             (num / den).sqrt(),
             want_idx.len()
         );
+        // The DEVICE router (what `forward` runs) against the engine AND the host router.
+        let device = moe.route_device(layer, d_in, tokens, stream)?;
+        let dev_vs_engine = device.indices.iter().zip(&want_idx).filter(|(a, b)| a != b).count();
+        let dev_vs_host = device.indices.iter().zip(&routing.indices).filter(|(a, b)| a != b).count();
+        let dw_engine = device.weights.iter().zip(&want_w).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let dw_host = device.weights.iter().zip(&routing.weights).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!(
+            "  device router: route_idx {dev_vs_engine}/{} differ vs engine, {dev_vs_host} vs host; route_w worst {dw_engine:.3e} vs engine, {dw_host:.3e} vs host",
+            want_idx.len()
+        );
         moe.forward(layer, d_in, d_out, tokens, stream)?;
     } else {
         let routing = Routing { indices: want_idx.clone(), weights: want_w.clone(), k: TOP_K };
