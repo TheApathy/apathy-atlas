@@ -265,7 +265,7 @@ fn run_model_path(
         fwd.dspark = Some(spark_model::weight_loader::deepseek_v41::mtp::DsparkWeights::load(store, &dims, config.vocab_size)?);
         fwd.enable_dspark_seed(ops.gpu)?;
     }
-    let fwd = fwd;
+    let mut fwd = fwd;
     let ds = if dspark_on {
         Some(spark_model::weight_loader::deepseek_v41::dspark::Dspark::new(&shared_dyn, &fwd, 10.0, 1.5)?)
     } else {
@@ -280,6 +280,12 @@ fn run_model_path(
     } else {
         (&fed_core, &NoHook)
     };
+    // Whole-step CUDA graphs for Decode/Verify passes (DSV41_DRIVER_GRAPH=1): shape-static core.
+    if std::env::var("DSV41_DRIVER_GRAPH").as_deref() == Ok("1") {
+        fwd.enable_graphs(ops.gpu, hook)?;
+        println!("decode: CUDA graphs ON (Decode/Verify passes captured once, replayed)");
+    }
+    let fwd = fwd;
     let fed_moe = FedMoe(&feeder, dims.hidden);
     let real;
     let moe: &dyn V41RoutedMoe = if moe_real {

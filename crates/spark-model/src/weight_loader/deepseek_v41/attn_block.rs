@@ -200,10 +200,16 @@ pub fn attention(
     ensure!(start + t <= rope.positions, "attention: position {} past the RoPE table", start + t);
     let l = w.layer;
     let gpu = ops.gpu;
-    let pos: Vec<i32> = (start..start + t).map(|p| p as i32).collect();
-    gpu.copy_h2d_async(bytemuck_i32(&pos), s.pos, ops.stream)?;
-    let wpos = window_positions(start, t);
-    gpu.copy_h2d_async(bytemuck_i32(&wpos), s.wpos, ops.stream)?;
+    let dstart = super::ops::graph_start();
+    if let Some(ds) = dstart {
+        // Graph mode: positions from the device start (identical values, no host upload).
+        ops.decode_positions(ds, s.pos, s.wpos, t, WINDOW)?;
+    } else {
+        let pos: Vec<i32> = (start..start + t).map(|p| p as i32).collect();
+        gpu.copy_h2d_async(bytemuck_i32(&pos), s.pos, ops.stream)?;
+        let wpos = window_positions(start, t);
+        gpu.copy_h2d_async(bytemuck_i32(&wpos), s.wpos, ops.stream)?;
+    }
 
     ops.linear_fp8_tiled(x, &w.wq_a, wscratch, s.qr, t)?;
     ops.rmsnorm(s.qr, w.q_norm, s.qr, t, Q_LORA, norm_eps)?;
@@ -217,12 +223,16 @@ pub fn attention(
     ops.rope_tail(s.kv, s.pos, rope, t, 1, HEAD_DIM, false)?;
     tap.bf16(ops, "kv_new", l, s.kv, &[t, HEAD_DIM])?;
     // ring[pos % RING] = kv — at most two contiguous runs.
-    let row = HEAD_DIM * 2;
-    let first = start % RING;
-    let n1 = t.min(RING - first);
-    gpu.copy_d2d_async(s.kv, ring.offset(first * row), n1 * row, ops.stream)?;
-    if n1 < t {
-        gpu.copy_d2d_async(s.kv.offset(n1 * row), ring, (t - n1) * row, ops.stream)?;
+    if let Some(ds) = dstart {
+        ops.ring_write(s.kv, ring, ds, t, RING, HEAD_DIM)?;
+    } else {
+        let row = HEAD_DIM * 2;
+        let first = start % RING;
+        let n1 = t.min(RING - first);
+        gpu.copy_d2d_async(s.kv, ring.offset(first * row), n1 * row, ops.stream)?;
+        if n1 < t {
+            gpu.copy_d2d_async(s.kv.offset(n1 * row), ring, (t - n1) * row, ops.stream)?;
+        }
     }
 
     prof(ops, "attention/core", || {

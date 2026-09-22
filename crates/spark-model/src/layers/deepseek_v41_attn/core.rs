@@ -976,6 +976,16 @@ impl PassHook for Dsv41SparseCore {
         self.rollback_inner(ops.gpu, n, restore, ops.stream)
     }
 
+    fn enable_graph(&self, dstart: DevicePtr) -> Result<()> {
+        self.set_static_decode(true);
+        self.set_device_start(Some(dstart));
+        Ok(())
+    }
+
+    fn replay_step(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
+        Dsv41SparseCore::replay_step(self, kind, start, t)
+    }
+
     fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
         ensure!(t <= self.max_chunk, "pass of {t} rows exceeds max_chunk {}", self.max_chunk);
         let mut st = self.st.lock().expect("core state poisoned");
@@ -1073,6 +1083,12 @@ impl PassHook for std::sync::Arc<Dsv41SparseCore> {
     }
     fn rollback(&self, ops: &Ops, n: usize) -> Result<()> {
         PassHook::rollback(self.as_ref(), ops, n)
+    }
+    fn enable_graph(&self, dstart: DevicePtr) -> Result<()> {
+        PassHook::enable_graph(self.as_ref(), dstart)
+    }
+    fn replay_step(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
+        PassHook::replay_step(self.as_ref(), kind, start, t)
     }
 }
 

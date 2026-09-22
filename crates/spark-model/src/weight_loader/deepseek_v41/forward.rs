@@ -126,6 +126,17 @@ pub trait PassHook {
     fn rollback(&self, _ops: &Ops, n: usize) -> Result<()> {
         anyhow::bail!("this attention core cannot roll back (to {n} positions)")
     }
+    /// CUDA-graph decode: switch the core to shape-static Decode/Verify passes reading their
+    /// start from the device i32 `dstart`. Refuses by default (a core that is not shape-static
+    /// would replay a stale shape silently).
+    fn enable_graph(&self, _dstart: DevicePtr) -> Result<()> {
+        anyhow::bail!("this attention core is not shape-static; decode graphs need one")
+    }
+    /// CUDA-graph decode: the host bookkeeping of a pass that was REPLAYED (its launches came
+    /// from a graph, `run` was not called).
+    fn replay_step(&self, kind: PassKind, start: usize, _t: usize) -> Result<()> {
+        anyhow::bail!("this attention core cannot account for a replayed {kind:?} pass at {start}")
+    }
 }
 
 /// Per-sequence state this module owns. (ckv / ik / pending belong to the attention lane.)
@@ -211,7 +222,22 @@ pub struct V41Forward {
     /// The DSpark drafter's weights (store-resident), when loaded. Consumed by dsv41-decode's
     /// draft/verify path.
     pub dspark: Option<super::mtp::DsparkWeights>,
+    /// Whole-step CUDA graphs for Decode/Verify passes (`enable_graphs`); None = eager.
+    pub graph: Option<GraphState>,
 }
+
+/// CUDA-graph state: the device start scalar, the engram rows gathered BEFORE the graph (the
+/// NVMe gather is host work and cannot be captured), and one instantiated graph per
+/// (pass kind, rows, sequence) -- the rings baked into a graph belong to one sequence.
+pub struct GraphState {
+    pub dstart: DevicePtr,
+    /// (engram layer, rows buffer `[MAX_T, 24, 256]` f32).
+    pub pre_rows: Vec<(usize, DevicePtr)>,
+    graphs: std::sync::Mutex<std::collections::HashMap<(u8, usize, u64), spark_runtime::gpu::GraphHandle>>,
+}
+
+/// Rows a graphed pass may carry (Decode = 1, Verify = 1 + drafts).
+pub const GRAPH_MAX_T: usize = 8;
 
 pub fn rope_specs() -> (RopeSpec, RopeSpec) {
     let w = RopeSpec { dim: 64, original_seq_len: 0, base: 10000.0, factor: 16.0, beta_fast: 32.0, beta_slow: 1.0 };
@@ -270,10 +296,27 @@ impl V41Forward {
             allocs: super::device_allocs::DeviceAllocs::unowned(),
             dspark_seed: None,
             dspark: None,
+            graph: None,
         })
     }
 
     /// Allocate the DSpark seed buffer (call before [`Self::own_allocations`] so it is owned too).
+    /// Turn on whole-step CUDA graphs for Decode/Verify passes. `hook` is switched to its
+    /// shape-static mode reading the same device start.
+    pub fn enable_graphs(&mut self, gpu: &dyn GpuBackend, hook: &dyn PassHook) -> Result<()> {
+        let dstart = gpu.alloc(256)?;
+        self.allocs.adopt(dstart);
+        let mut pre_rows = Vec::new();
+        for (layer, _) in &self.engram {
+            let p = gpu.alloc(GRAPH_MAX_T * N_HEAD_COLS * 256 * 4)?;
+            self.allocs.adopt(p);
+            pre_rows.push((*layer, p));
+        }
+        hook.enable_graph(dstart)?;
+        self.graph = Some(GraphState { dstart, pre_rows, graphs: std::sync::Mutex::new(std::collections::HashMap::new()) });
+        Ok(())
+    }
+
     pub fn enable_dspark_seed(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
         let rows = super::ops::tiled_rows(self.max_chunk.max(WINDOW));
         let cols = super::mtp::DSPARK_TARGET_LAYERS.len() * self.dims.hidden;
@@ -325,10 +368,33 @@ impl V41Forward {
         moe: &dyn V41RoutedMoe,
         tap: &Tap,
     ) -> Result<()> {
+        self.run_layers_pre(ops, seq, layers, t, start, win_lo, hashes, None, core, moe, tap)
+    }
+
+    /// [`Self::run_layers`] with the engram rows optionally PRE-GATHERED per layer (graph mode:
+    /// the NVMe gather ran before the capture/replay).
+    #[allow(clippy::too_many_arguments)]
+    fn run_layers_pre(
+        &self,
+        ops: &Ops,
+        seq: &mut V41Seq,
+        layers: std::ops::Range<usize>,
+        t: usize,
+        start: usize,
+        win_lo: usize,
+        hashes: Option<&[i64]>,
+        pre: Option<&[(usize, DevicePtr)]>,
+        core: &dyn AttnCore,
+        moe: &dyn V41RoutedMoe,
+        tap: &Tap,
+    ) -> Result<()> {
         let s = &self.scratch;
         for l in layers {
             let w = &self.blocks[l];
-            if let Some(e) = &w.engram {
+            if let (Some(e), Some(pre)) = (&w.engram, pre) {
+                let rows = pre.iter().find(|(pl, _)| *pl == l).context("no pre-gathered engram rows")?.1;
+                e.forward(ops, s.h, rows, s.engram_dead, t, s, &self.dims)?;
+            } else if let Some(e) = &w.engram {
                 let all = hashes.context("engram layer reached without hashes")?;
                 let li = if l == 1 { 0 } else { 1 };
                 let rows: Vec<i64> = (0..t).flat_map(|tok| all[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
@@ -572,6 +638,9 @@ impl V41Forward {
         logits: DevicePtr,
     ) -> Result<()> {
         ensure!(!ids.is_empty() && ids.len() <= super::ops::GEMV_MAX_M, "verify block of {} ids", ids.len());
+        if self.graph.is_some() {
+            return self.step_graphed(ops, seq, ids, PassKind::Verify, hook, core, moe, logits);
+        }
         let start = seq.len;
         self.pass(ops, seq, ids, start, 0..self.blocks.len(), PassKind::Verify, hook, core, moe, tap)?;
         prof(ops, "head", || super::fwd::final_logits_rows(ops, &self.dims, &self.scratch, ids.len(), self.norm, self.head, self.vocab, logits))
@@ -604,9 +673,98 @@ impl V41Forward {
         tap: &Tap,
         logits: DevicePtr,
     ) -> Result<()> {
+        if self.graph.is_some() {
+            return self.step_graphed(ops, seq, &[token], PassKind::Decode, hook, core, moe, logits);
+        }
         let start = seq.len;
         self.pass(ops, seq, &[token], start, 0..self.blocks.len(), PassKind::Decode, hook, core, moe, tap)?;
         prof(ops, "head", || super::fwd::final_logits_last_row(ops, &self.dims, &self.scratch, 1, self.norm, self.head, self.vocab, logits))
+    }
+
+    /// One Decode (t = 1) or Verify (t <= 8) pass as a CUDA GRAPH. Host work that cannot be
+    /// captured runs first: the engram hashing and both layers' NVMe row gathers, the dead-head
+    /// mask and ids uploads, the MoE's id upload, and the device start. The first step of each
+    /// (kind, t, sequence) captures the graph (the core runs and keeps its host bookkeeping);
+    /// every later one replays it (the core accounts via `replay_step`). Logits land in `logits`
+    /// exactly as the eager paths leave them (last row for Decode, all rows for Verify).
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_graphed(
+        &self,
+        ops: &Ops,
+        seq: &mut V41Seq,
+        ids: &[u32],
+        kind: PassKind,
+        hook: &dyn PassHook,
+        core: &dyn AttnCore,
+        moe: &dyn V41RoutedMoe,
+        logits: DevicePtr,
+    ) -> Result<()> {
+        let g = self.graph.as_ref().context("step_graphed without enable_graphs")?;
+        ensure!(matches!(kind, PassKind::Decode | PassKind::Verify), "only Decode/Verify passes are graphed, not {kind:?}");
+        let t = ids.len();
+        ensure!(t >= 1 && t <= GRAPH_MAX_T, "graphed pass of {t} rows");
+        let start = seq.len;
+        ensure!(start + t <= self.max_seq, "position {} exceeds max_seq {}", start + t, self.max_seq);
+        let (gpu, stream) = (ops.gpu, ops.stream);
+        // ---- host work, outside the graph
+        let hashes = seq.hash.forward(ids, start, None)?;
+        for (layer, buf) in &g.pre_rows {
+            let li = if *layer == 1 { 0 } else { 1 };
+            let rows: Vec<i64> = (0..t).flat_map(|tok| hashes[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
+            let gather = &self.engram.iter().find(|(el, _)| el == layer).context("no engram gather")?.1;
+            gather.gather_rows_gpu(&rows, t, *buf, gpu, stream)?;
+        }
+        let dead: Vec<u8> = engram_dead_heads(ids).into_iter().map(u8::from).collect();
+        gpu.copy_h2d_async(&dead, self.scratch.engram_dead, stream)?;
+        gpu.copy_h2d_async(bytemuck_u32(ids), self.ids_dev, stream)?;
+        gpu.memset_u32_async(g.dstart, start as u32, 1, stream)?;
+        super::ops::set_decode_pass(true);
+        moe.begin_pass(ids)?;
+        // ---- the graph: capture once per (kind, t, sequence), then replay
+        let key = (kind as u8, t, seq.rings[0].0);
+        let cached = g.graphs.lock().expect("graph cache poisoned").get(&key).copied();
+        super::ops::set_graph_start(Some(g.dstart));
+        let r = match cached {
+            Some(h) => hook.replay_step(kind, start, t).and_then(|_| gpu.launch_graph(h, stream)),
+            None => (|| -> Result<()> {
+                hook.begin_pass(kind, start, t)?;
+                gpu.begin_capture(stream)?;
+                let body = self.graph_body(ops, seq, t, start, kind, &g.pre_rows, core, moe, logits);
+                let graph = gpu.end_capture(stream);
+                body?;
+                let h = graph?;
+                g.graphs.lock().expect("graph cache poisoned").insert(key, h);
+                gpu.launch_graph(h, stream)
+            })(),
+        };
+        super::ops::set_graph_start(None);
+        r?;
+        seq.len = start + t;
+        Ok(())
+    }
+
+    /// Everything a graphed Decode/Verify pass launches, in eager order.
+    #[allow(clippy::too_many_arguments)]
+    fn graph_body(
+        &self,
+        ops: &Ops,
+        seq: &mut V41Seq,
+        t: usize,
+        start: usize,
+        kind: PassKind,
+        pre: &[(usize, DevicePtr)],
+        core: &dyn AttnCore,
+        moe: &dyn V41RoutedMoe,
+        logits: DevicePtr,
+    ) -> Result<()> {
+        let s = &self.scratch;
+        ops.embed(self.embed, self.ids_dev, s.x, t, self.dims.hidden)?;
+        ops.hc_expand(s.x, s.h, s.pre_mix, t, self.dims.hidden)?;
+        self.run_layers_pre(ops, seq, 0..self.blocks.len(), t, start, 0, None, Some(pre), core, moe, &Tap::off())?;
+        match kind {
+            PassKind::Decode => super::fwd::final_logits_last_row(ops, &self.dims, s, t, self.norm, self.head, self.vocab, logits),
+            _ => super::fwd::final_logits_rows(ops, &self.dims, s, t, self.norm, self.head, self.vocab, logits),
+        }
     }
 }
 
