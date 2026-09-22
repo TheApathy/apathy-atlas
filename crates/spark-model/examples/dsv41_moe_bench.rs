@@ -30,7 +30,7 @@ use std::time::Instant;
 use atlas_core::config::{ExpertPack, SERVED_PACKED_KEEP, parse_config};
 use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
 use spark_model::weight_loader::deepseek_v41::moe_forward::{
-    Cb3RoutedMoe, ExpertWork, ROUTER_EXPERTS, RouterF32, TOP_K,
+    Cb3RoutedMoe, ExpertKernel, ExpertWork, ROUTER_EXPERTS, RouterF32, TOP_K,
 };
 use spark_model::weight_loader::deepseek_v41::ops::Dsv41Kernels;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
@@ -154,6 +154,16 @@ fn main() -> Result<()> {
         let gemm = phase(ExpertWork::GemmOnly)?;
         let all = phase(ExpertWork::All)?;
         moe.set_expert_work(ExpertWork::All);
+        moe.set_expert_kernel(ExpertKernel::Fused);
+        let fused = time(&mut || moe.forward_routed(layer, d_in, d_out, t, &routing, stream))?;
+        moe.set_expert_kernel(ExpertKernel::Reconstruct);
+        let fused_tok_s = t as f64 / (LAYERS as f64 * (scores_ms + route_ms + fused) * 1e-3);
+        println!(
+            "      FUSED: {fused:.2} ms experts ({:.1}x vs reconstruct) -> layer {:.2} ms -> {fused_tok_s:.1} tok/s MoE-only; fused GEMM {:.1} TF/s",
+            all / fused,
+            scores_ms + route_ms + fused,
+            2.0 * (t * TOP_K) as f64 * (3 * inter * hidden) as f64 / ((fused - skip).max(1e-6) * 1e-3) / 1e12,
+        );
 
         let flops = 2.0 * (t * TOP_K) as f64 * (3 * inter * hidden) as f64;
         let gemm_tfs = flops / ((gemm - skip).max(1e-6) * 1e-3) / 1e12;
