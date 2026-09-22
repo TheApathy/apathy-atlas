@@ -27,7 +27,9 @@ end() {
   flock -u 9; echo "DONE $LABEL rc=$1 lowwater_GB=$((low/1024/1024))"; exit "$1"
 }
 others=$(docker ps --format '{{.Names}}' | grep -Ei 'dsv41|atlas|spark|vllm' | grep -v buildkit || true)
-procs=$(pgrep -af 'spark serve|bin/spark |v41_engine|capture_ref|examples/dsv41_forward' | grep -v "$$" | grep -v serve_window | grep -v cargo | grep -v 'flock -w' || true)
+# GPU-resident candidates by EXECUTABLE name (argv[0]), not by any command line that merely
+# mentions one: a queued job's wrapper shell contains "examples/dsv41_forward" in its script text.
+procs=$(ps -eo pid=,args= | awk '{split($2,a,"/"); e=a[length(a)]} e=="spark" || e=="dsv41_forward" || e=="dsv41_drop_gate" || (e ~ /^python/ && ($0 ~ /v41_engine|capture_ref/))' | grep -v "^ *$$ " || true)
 avail=$(memavail)
 echo "preflight: MemAvailable $((avail/1024/1024)) GB; containers: [${others}]; procs: [${procs}]"
 if [ -n "$others" ] || [ -n "$procs" ] || [ "$avail" -lt "$NEED_KB" ]; then echo "PREFLIGHT FAILED"; end 97; fi
