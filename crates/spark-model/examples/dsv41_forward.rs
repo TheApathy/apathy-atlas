@@ -258,7 +258,7 @@ fn run_model_path(
     let fed_core = FedCore(&feeder);
     let real_core;
     let (core, hook): (&dyn AttnCore, &dyn PassHook) = if attn_real {
-        real_core = Dsv41SparseCore::load(gpu_ref, store, config, 8192, max_chunk, fwd.freqs_c)?;
+        real_core = Dsv41SparseCore::load_prefix(gpu_ref, store, config, 8192, max_chunk, fwd.freqs_c, n_layers)?;
         (&real_core, &real_core)
     } else {
         (&fed_core, &NoHook)
@@ -339,11 +339,17 @@ fn run_model_path(
         let to_f32 = |h: &[u8]| -> Vec<f32> { h.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect() };
         let mut got = vec![report(0, &v)];
         let t1 = std::time::Instant::now();
+        let mut steps_ms = Vec::with_capacity(decode_n);
+        let mut hashes: Vec<u64> = Vec::with_capacity(decode_n);
         for step in 1..decode_n {
             let input = if force_decode { want[step - 1] } else { *got.last().unwrap() };
+            let ts = std::time::Instant::now();
             fwd.decode(ops, &mut seq, input, hook, core, moe, &Tap::off(), logits)?;
             ops.gpu.synchronize(ops.stream)?;
+            steps_ms.push(ts.elapsed().as_secs_f64() * 1e3);
             ops.gpu.copy_d2h(logits, &mut host)?;
+            // FNV-1a over the step's raw bf16 logits: arms that must be bit-identical compare these.
+            hashes.push(host.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)));
             got.push(report(step, &to_f32(&host)));
         }
         let dt = t1.elapsed().as_secs_f64();
@@ -353,7 +359,18 @@ fn run_model_path(
         let agree = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
         let matches = got.iter().zip(&want).filter(|(a, b)| a == b).count();
         println!("decode ({}): {} steps in {dt:.2}s ({:.2} tok/s)", if force_decode { "teacher-forced" } else { "free" }, got.len() - 1, (got.len() - 1) as f64 / dt);
+        if steps_ms.len() > 2 {
+            // Warm steps: drop the first (cold caches, first-touch of lazily resolved kernels).
+            let mut w = steps_ms[1..].to_vec();
+            w.sort_by(f64::total_cmp);
+            println!(
+                "decode step ms (warm, n={}): median {:.2}  min {:.2}  max {:.2}  first {:.2}",
+                w.len(), w[w.len() / 2], w[0], w[w.len() - 1], steps_ms[0]
+            );
+        }
         println!("decode ours:   {got:?}");
+        println!("decode logits fnv: {:016x}", hashes.iter().fold(0u64, |a, h| a.rotate_left(7) ^ h));
+        println!("decode logits fnv per step: {:x?}", hashes);
         println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
         println!("decode: first {agree} identical; top-1 agreement {matches}/{}", got.len().min(want.len()));
     }

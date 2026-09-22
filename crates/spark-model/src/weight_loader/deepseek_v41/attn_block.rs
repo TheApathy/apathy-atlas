@@ -233,6 +233,11 @@ pub fn attention(
 
     // grouped wo_a: o [T, 8, 4096] -> o2 [T, 8, 1024], group g uses wo_a rows g*1024..
     let grp_k = HEAD_DIM * N_HEADS / O_GROUPS;
+    if t == 1 && ops.k.fp8_gemv_m1.is_some() {
+        // One grouped fp8 GEMV: output row n reads activation group n / 1024.
+        ops.fp8_gemv_m1(s.o, &w.wo_a, s.o2, O_LORA, grp_k)?;
+        return ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t);
+    }
     // `v41_ref.wo_a_proj` runs the grouped fp8 kernel (row-invariant, not row-tiled), so the
     // same row policy as `linear_fp8_tiled`: one GEMM per group at M > 16, one tile at M <= 16.
     prof(ops, "dense/dequant", || ops.dequant(&w.wo_a, wscratch))?;

@@ -34,6 +34,7 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 use super::cb3_arena::Cb3ExpertArena;
 use super::device_allocs::{DeviceAllocs, SharedGpu};
 use super::fwd::V41RoutedMoe;
+use super::moe_decode::{self, MAX_DECODE_T, MoeDecode};
 use super::moe::{
     COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_GEMM_MODULE, FUSED_TILE_M,
     FUSED_TILE_N, GEMV_DOWN_FN, GEMV_GATE_UP_FN, GEMV_ROWS_PER_BLOCK, GEMV_TILE_M, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE,
@@ -66,6 +67,10 @@ const BLOCK: u32 = 256;
 /// kept on the host: top-k runs there.
 pub struct RouterF32 {
     pub gate_w: DevicePtr,
+    /// The ORIGINAL bf16 `gate.weight` (store-owned, never freed here), when loaded from the
+    /// store. The decode router reads this instead of the widened copy: bf16 -> fp32 is exact,
+    /// so the logits are bit-identical at half the bytes (moe_decode.rs).
+    pub gate_w_bf16: Option<DevicePtr>,
     pub bias: Vec<f32>,
     pub bias_vl: Vec<f32>,
 }
@@ -105,6 +110,7 @@ impl RouterF32 {
         };
         Ok(Self {
             gate_w,
+            gate_w_bf16: Some(w.ptr),
             bias: host_f32(&format!("{p}.bias"))?,
             bias_vl: host_f32(&format!("{p}.bias_vl"))?,
         })
@@ -127,7 +133,7 @@ impl RouterF32 {
             .collect();
         let gate_w = gpu.alloc(wide.len())?;
         gpu.copy_h2d(&wide, gate_w)?;
-        Ok(Self { gate_w, bias, bias_vl })
+        Ok(Self { gate_w, gate_w_bf16: None, bias, bias_vl })
     }
 }
 
@@ -217,6 +223,8 @@ pub struct Cb3RoutedMoe {
     pass_tokens: Mutex<Option<Vec<i64>>>,
     control: Mutex<MoeControl>,
     work: Mutex<ExpertWork>,
+    /// The decode-size path (t <= 8): GPU routing + CB3 GEMV. On unless `ATLAS_DSV41_MOE_DECODE=0`.
+    decode: Option<MoeDecode>,
     kernel: Mutex<ExpertKernel>,
     /// Per layer: (layer, bias, bias_vl, resident u8 mask), all [384] on the device.
     device_routers: Vec<(usize, DevicePtr, DevicePtr, DevicePtr)>,
@@ -255,6 +263,7 @@ impl Cb3RoutedMoe {
         for (layer, _) in &routers {
             arena.layer(*layer).with_context(|| format!("router for layer {layer} has no resident experts"))?;
         }
+        let decode = if moe_decode::enabled() { Some(MoeDecode::new(shared.as_ref(), &arena, &routers)?) } else { None };
         ensure!(
             inter % FUSED_TILE_N == 0 && hidden % FUSED_TILE_N == 0 && inter % 32 == 0 && hidden % 32 == 0,
             "fused CB3 GEMM needs N % {FUSED_TILE_N} == 0 and K % 32 == 0 (hidden {hidden}, inter {inter})"
@@ -324,6 +333,7 @@ impl Cb3RoutedMoe {
             pass_tokens: Mutex::new(None),
             control: Mutex::new(MoeControl::None),
             work: Mutex::new(ExpertWork::All),
+            decode,
             kernel: Mutex::new(ExpertKernel::default()),
             device_routers,
             k_route: gpu.kernel(COMBINE_MODULE, ROUTE_TOPK_FN)?,
@@ -341,6 +351,49 @@ impl Cb3RoutedMoe {
     /// Token ids of the NEXT pass, so image rows route with `gate.bias_vl`. Required.
     pub fn set_pass_tokens(&self, token_ids: &[i64]) {
         *self.pass_tokens.lock().expect("pass_tokens lock") = Some(token_ids.to_vec());
+    }
+
+    /// Whether a `t`-row pass takes the decode path.
+    pub fn uses_decode_path(&self, t: usize) -> bool {
+        self.decode.is_some() && t <= MAX_DECODE_T
+    }
+
+    /// The decode path's last device routing (synchronous; gates only).
+    pub fn decode_routing(&self, t: usize, stream: u64) -> Result<Routing> {
+        self.decode.as_ref().context("decode path is off")?.read_routing(self.gpu.as_ref(), t, stream)
+    }
+
+    /// Fails if any decode routing kernel picked a non-resident expert (synchronous).
+    pub fn check_decode_error(&self, stream: u64) -> Result<()> {
+        match &self.decode {
+            Some(d) => d.check_error(self.gpu.as_ref(), stream),
+            None => Ok(()),
+        }
+    }
+
+    /// Decode path, expert half, from a routing decision already on the device, with the
+    /// negative controls applied through a host round trip (controls only; never timed).
+    fn decode_experts(&self, d: &MoeDecode, layer: usize, y: DevicePtr, out: DevicePtr, t: usize, host: Option<&Routing>, stream: u64) -> Result<()> {
+        let control = *self.control.lock().expect("control lock");
+        if host.is_some() || control != MoeControl::None {
+            let mut routing = match host {
+                Some(r) => r.clone(),
+                None => d.read_routing(self.gpu.as_ref(), t, stream)?,
+            };
+            if control == MoeControl::ReverseWeights {
+                for token in routing.weights.chunks_exact_mut(TOP_K) {
+                    token.reverse();
+                }
+            }
+            let keep = self.arena.packed_keep();
+            let next = control == MoeControl::NextSlot;
+            self.gpu.synchronize(stream)?;
+            d.upload_routing(self.gpu.as_ref(), &routing, t, |id| {
+                let s = self.arena.slot_of(layer, id)?;
+                Ok(if next && s >= 0 { (s + 1) % keep as i32 } else { s })
+            })?;
+        }
+        d.experts(self.gpu.as_ref(), self.arena.layer(layer)?, self.arena.packed_keep(), &self.matrices, y, out, t, self.swiglu_limit, stream)
     }
 
     /// Negative controls only.
@@ -506,6 +559,9 @@ impl Cb3RoutedMoe {
     ) -> Result<()> {
         ensure!(t <= self.scratch.max_t, "pass of {t} tokens exceeds scratch for {}", self.scratch.max_t);
         ensure!(routing.k == TOP_K, "routing k {} is not {TOP_K}", routing.k);
+        if let Some(d) = self.decode.as_ref().filter(|_| t <= MAX_DECODE_T) {
+            return self.decode_experts(d, layer, y, out, t, Some(routing), stream);
+        }
         let control = *self.control.lock().expect("control lock");
         let (hidden, inter, s) = (self.hidden, self.inter, &self.scratch);
 
@@ -719,21 +775,42 @@ impl Cb3RoutedMoe {
     }
 
     /// Whether dropping this MoE returns its device memory (always, for this type).
+    /// (The decode path's buffers are freed by `Drop for Cb3RoutedMoe` below.)
     pub fn frees_on_drop(&self) -> bool {
         self.allocs.is_owned()
     }
 }
 
 
+impl Drop for Cb3RoutedMoe {
+    /// The decode path (dsv41-decode's `MoeDecode`) allocates outside `DeviceAllocs`; free it
+    /// here so dropping the MoE returns ALL of its memory.
+    fn drop(&mut self) {
+        if let Some(d) = self.decode.take() {
+            if let Err(e) = d.free(self.gpu.as_ref()) {
+                tracing::warn!("Cb3RoutedMoe drop: freeing the decode path failed: {e}");
+            }
+        }
+    }
+}
+
 impl V41RoutedMoe for Cb3RoutedMoe {
     fn begin_pass(&self, token_ids: &[u32]) -> Result<()> {
         let ids: Vec<i64> = token_ids.iter().map(|&t| t as i64).collect();
         self.set_pass_tokens(&ids);
+        if let Some(d) = self.decode.as_ref().filter(|_| token_ids.len() <= MAX_DECODE_T) {
+            d.set_ids(self.gpu.as_ref(), token_ids)?;
+        }
         Ok(())
     }
 
     fn forward(&self, ops: &Ops, layer: usize, y: DevicePtr, out: DevicePtr, t: usize) -> Result<()> {
         let stream = ops.stream;
+        if let Some(d) = self.decode.as_ref().filter(|_| t <= MAX_DECODE_T) {
+            let router = self.router(layer)?;
+            d.route(self.gpu.as_ref(), layer, router, y, t, self.route_scale, stream)?;
+            return self.decode_experts(d, layer, y, out, t, None, stream);
+        }
         let routing = self.route_device(layer, y, t, stream)?;
         self.forward_routed(layer, y, out, t, &routing, stream)
     }
