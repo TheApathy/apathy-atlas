@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atlas_core::config::parse_config;
-use spark_model::layers::deepseek_v41_engram::{EngramGather, EngramHashState, EngramLayout};
+use spark_model::layers::deepseek_v41_engram::{EngramGather, EngramHashState, EngramLayout, engram_dead_heads};
 use spark_model::weight_loader::deepseek_v41::fwd::{
     BlockControl, PassScratch, Tap, V41AttentionBlock, V41BlockWeights, V41Dims, V41RoutedMoe, block,
     final_logits_last_row,
@@ -242,11 +242,19 @@ fn main() -> Result<()> {
         gpu.copy_h2d(bytemuck_u32(chunk_ids), d_ids)?;
         ops.embed(embed, d_ids, s.x, t, dims.hidden)?;
         ops.hc_expand(s.x, s.h, s.pre_mix, t, dims.hidden)?;
+        // `engram_dead_heads` is a pure function of this chunk's own token ids (no cross-chunk
+        // carry -- see deepseek_v41_engram::dead_heads's module doc) and is layer-independent,
+        // so one upload into the pre-allocated `s.engram_dead` scratch covers both engram
+        // layers for this chunk.
+        if engram_live {
+            let dead_host: Vec<u8> = engram_dead_heads(chunk_ids).iter().map(|&d| u8::from(d)).collect();
+            gpu.copy_h2d(&dead_host, s.engram_dead)?;
+        }
         for w in &blocks {
             if let Some(e) = &w.engram {
-                match (&hashes, gathers.get(&w.layer)) {
+                let dead_ptr = match (&hashes, gathers.get(&w.layer)) {
                     (Some(all), Some(g)) => {
-                        // [T][layer][24] -> this layer's [T, 24]. Text-only here, so no dead heads.
+                        // [T][layer][24] -> this layer's [T, 24].
                         let li = if w.layer == 1 { 0 } else { 1 };
                         let rows: Vec<i64> = (0..t).flat_map(|tok| all[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
                         let rb: Vec<u8> = rows.iter().flat_map(|r| r.to_le_bytes()).collect();
@@ -256,13 +264,18 @@ fn main() -> Result<()> {
                         gpu.free(tmp)?;
                         g.gather_rows_gpu(&rows, t, s.engram_rows, gpu.as_ref(), stream)?;
                         tap.f32(&ops, "engram_rows", w.layer, s.engram_rows, &[t, 24, 256])?;
+                        // Live gather returns PRE-mask rows (EngramGather's own contract); the
+                        // dead-head mask is applied downstream, inside EngramProj::forward.
+                        s.engram_dead
                     }
                     _ => {
-                        // Rows come from the capture (POST-mask), so no mask is applied here.
+                        // Rows come from the capture (POST-mask already applied there), so no
+                        // mask is applied again here -- NULL, not a double mask.
                         feeder.feed_raw("engram_rows", w.layer, s.engram_rows, t * 24 * 256 * 4)?;
+                        DevicePtr::NULL
                     }
-                }
-                e.forward(&ops, s.h, s.engram_rows, DevicePtr::NULL, t, &s, &dims)?;
+                };
+                e.forward(&ops, s.h, s.engram_rows, dead_ptr, t, &s, &dims)?;
                 tap.bf16(&ops, "engram_out", w.layer, s.h, &[t, dims.hc, dims.hidden])?;
             }
             block(&ops, w, &dims, &s, t, start, attn, moe, &tap, control)?;
