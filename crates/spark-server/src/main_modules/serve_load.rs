@@ -737,6 +737,16 @@ pub(crate) fn load_model(
         .unwrap_or(ptx_set.behavior.max_thinking_budget);
     // Moved into the scheduler thread; `None` leaves the gate disarmed.
     let scheduler_mtp_gate = args.mtp_gate.clone();
+    // Tool call parser resolution: CLI > MODEL.toml > defaults table.
+    //
+    // Resolved here, before the spawn below, not after it: this is fallible
+    // (`?`), and a `?` after the scheduler thread already owns `scheduler_model`
+    // would return `Err` with that thread detached and running — nothing left
+    // to join it, so its GPU memory (weights, KV cache, SSM pools, buffer
+    // arena) can never be reclaimed by `GpuBackend::free_all_allocations` at
+    // the next swap. Spawn only after every fallible step above has
+    // succeeded.
+    let tool_call_parser = serve_phases::resolve_tool_call_parser(&args, &ptx_set, &config)?;
     let scheduler_handle = std::thread::spawn(move || {
         scheduler::run(
             scheduler_model,
@@ -775,9 +785,6 @@ pub(crate) fn load_model(
             Arc::new(crate::scheduler::levers::SchedLevers::from_env());
         let _ = tx.send(crate::tui::RunHandles { levers });
     }
-
-    // Tool call parser resolution: CLI > MODEL.toml > defaults table.
-    let tool_call_parser = serve_phases::resolve_tool_call_parser(&args, &ptx_set, &config)?;
 
     // 8. Build app state
     let model_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
