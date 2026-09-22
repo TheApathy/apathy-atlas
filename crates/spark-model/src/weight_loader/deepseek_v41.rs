@@ -34,6 +34,7 @@ mod load_layers;
 pub use load_layers::resolve_model_dir;
 pub mod ops;
 pub mod moe;
+pub mod moe_decode;
 pub mod moe_forward;
 pub mod routing;
 pub mod seams;

@@ -33,6 +33,7 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::cb3_arena::Cb3ExpertArena;
 use super::fwd::V41RoutedMoe;
+use super::moe_decode::{self, MAX_DECODE_T, MoeDecode};
 use super::moe::{
     COMBINE_MODULE, Cb3Matrix, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE,
     PERMUTE_KERNEL, SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, expert_matrices, gemm_weight_t_f32out,
@@ -181,6 +182,8 @@ pub struct Cb3RoutedMoe<'a> {
     pass_tokens: Mutex<Option<Vec<i64>>>,
     control: Mutex<MoeControl>,
     work: Mutex<ExpertWork>,
+    /// The decode-size path (t <= 8): GPU routing + CB3 GEMV. `ATLAS_DSV41_MOE_DECODE=1`.
+    decode: Option<MoeDecode>,
 }
 
 impl<'a> Cb3RoutedMoe<'a> {
@@ -203,6 +206,7 @@ impl<'a> Cb3RoutedMoe<'a> {
         for (layer, _) in &routers {
             arena.layer(*layer).with_context(|| format!("router for layer {layer} has no resident experts"))?;
         }
+        let decode = if moe_decode::enabled() { Some(MoeDecode::new(gpu, &arena, &routers)?) } else { None };
         let e = max_t * TOP_K;
         let a = |bytes: usize| gpu.alloc(bytes);
         let scratch = Scratch {
@@ -239,12 +243,56 @@ impl<'a> Cb3RoutedMoe<'a> {
             pass_tokens: Mutex::new(None),
             control: Mutex::new(MoeControl::None),
             work: Mutex::new(ExpertWork::All),
+            decode,
         })
     }
 
     /// Token ids of the NEXT pass, so image rows route with `gate.bias_vl`. Required.
     pub fn set_pass_tokens(&self, token_ids: &[i64]) {
         *self.pass_tokens.lock().expect("pass_tokens lock") = Some(token_ids.to_vec());
+    }
+
+    /// Whether a `t`-row pass takes the decode path.
+    pub fn uses_decode_path(&self, t: usize) -> bool {
+        self.decode.is_some() && t <= MAX_DECODE_T
+    }
+
+    /// The decode path's last device routing (synchronous; gates only).
+    pub fn decode_routing(&self, t: usize, stream: u64) -> Result<Routing> {
+        self.decode.as_ref().context("decode path is off")?.read_routing(self.gpu, t, stream)
+    }
+
+    /// Fails if any decode routing kernel picked a non-resident expert (synchronous).
+    pub fn check_decode_error(&self, stream: u64) -> Result<()> {
+        match &self.decode {
+            Some(d) => d.check_error(self.gpu, stream),
+            None => Ok(()),
+        }
+    }
+
+    /// Decode path, expert half, from a routing decision already on the device, with the
+    /// negative controls applied through a host round trip (controls only; never timed).
+    fn decode_experts(&self, d: &MoeDecode, layer: usize, y: DevicePtr, out: DevicePtr, t: usize, host: Option<&Routing>, stream: u64) -> Result<()> {
+        let control = *self.control.lock().expect("control lock");
+        if host.is_some() || control != MoeControl::None {
+            let mut routing = match host {
+                Some(r) => r.clone(),
+                None => d.read_routing(self.gpu, t, stream)?,
+            };
+            if control == MoeControl::ReverseWeights {
+                for token in routing.weights.chunks_exact_mut(TOP_K) {
+                    token.reverse();
+                }
+            }
+            let keep = self.arena.packed_keep();
+            let next = control == MoeControl::NextSlot;
+            self.gpu.synchronize(stream)?;
+            d.upload_routing(self.gpu, &routing, t, |id| {
+                let s = self.arena.slot_of(layer, id)?;
+                Ok(if next && s >= 0 { (s + 1) % keep as i32 } else { s })
+            })?;
+        }
+        d.experts(self.gpu, self.arena.layer(layer)?, self.arena.packed_keep(), &self.matrices, y, out, t, self.swiglu_limit, stream)
     }
 
     /// Negative controls only.
@@ -336,6 +384,9 @@ impl<'a> Cb3RoutedMoe<'a> {
     ) -> Result<()> {
         ensure!(t <= self.scratch.max_t, "pass of {t} tokens exceeds scratch for {}", self.scratch.max_t);
         ensure!(routing.k == TOP_K, "routing k {} is not {TOP_K}", routing.k);
+        if let Some(d) = self.decode.as_ref().filter(|_| t <= MAX_DECODE_T) {
+            return self.decode_experts(d, layer, y, out, t, Some(routing), stream);
+        }
         let control = *self.control.lock().expect("control lock");
         let (hidden, inter, s) = (self.hidden, self.inter, &self.scratch);
 
@@ -443,6 +494,9 @@ impl<'a> Cb3RoutedMoe<'a> {
         for (_, router) in &self.routers {
             self.gpu.free(router.gate_w)?;
         }
+        if let Some(d) = self.decode {
+            d.free(self.gpu)?;
+        }
         Ok(())
     }
 }
@@ -451,11 +505,19 @@ impl V41RoutedMoe for Cb3RoutedMoe<'_> {
     fn begin_pass(&self, token_ids: &[u32]) -> Result<()> {
         let ids: Vec<i64> = token_ids.iter().map(|&t| t as i64).collect();
         self.set_pass_tokens(&ids);
+        if let Some(d) = self.decode.as_ref().filter(|_| token_ids.len() <= MAX_DECODE_T) {
+            d.set_ids(self.gpu, token_ids)?;
+        }
         Ok(())
     }
 
     fn forward(&self, ops: &Ops, layer: usize, y: DevicePtr, out: DevicePtr, t: usize) -> Result<()> {
         let stream = ops.stream;
+        if let Some(d) = self.decode.as_ref().filter(|_| t <= MAX_DECODE_T) {
+            let router = self.router(layer)?;
+            d.route(self.gpu, layer, router, y, t, self.route_scale, stream)?;
+            return self.decode_experts(d, layer, y, out, t, None, stream);
+        }
         let scores = self.scores(layer, y, t, stream)?;
         let routing = self.route(layer, &scores, t)?;
         self.forward_routed(layer, y, out, t, &routing, stream)

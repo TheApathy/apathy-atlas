@@ -25,6 +25,10 @@
 //!
 //! `--control weights|expert` must FAIL at >= 10x the gate.
 //!
+//! `--rows S:N` keeps only rows S..S+N of the tap (the decode-size cases, N <= 8). With
+//! `ATLAS_DSV41_MOE_DECODE=1` such a pass takes the decode path (GPU routing + CB3 GEMV);
+//! `--routing ours` then also compares the DEVICE routing with the capture.
+//!
 //! ```text
 //! cargo run -p spark-model --release --example cb3_moe_oracle_microtest \
 //!   --features cuda,gpu-examples -- --run runA --layer 0 [--routing ours] [--dump out.bin]
@@ -101,12 +105,18 @@ fn main() -> Result<()> {
     let mut ours = false;
     let mut control = MoeControl::None;
     let mut dump: Option<PathBuf> = None;
+    let mut rows: Option<(usize, usize)> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--run" => run = args.next().context("--run needs a value")?,
             "--layer" => layer = args.next().context("--layer needs a value")?.parse()?,
             "--occurrence" => occurrence = args.next().context("--occurrence needs a value")?.parse()?,
+            "--rows" => {
+                let v = args.next().context("--rows needs S:N")?;
+                let (a, b) = v.split_once(':').context("--rows S:N")?;
+                rows = Some((a.parse()?, b.parse()?));
+            }
             "--dump" => dump = Some(args.next().context("--dump needs a path")?.into()),
             "--routing" => {
                 ours = match args.next().context("--routing needs engine|ours")?.as_str() {
@@ -141,12 +151,24 @@ fn main() -> Result<()> {
     ensure!(limit == 10.0 && route_scale == 1.5, "config limit {limit} / scale {route_scale}");
     let hidden = config.hidden_size;
 
-    let moe_in = read_bytes(&tap("moe_in"))?;
-    let want_idx = read_i64(&tap("route_idx"))?;
-    let want_w = read_f32(&tap("route_w"))?;
-    let want = read_f32(&tap("moe_routed"))?;
-    let tokens = moe_in.len() / (hidden * 2);
-    ensure!(want_idx.len() == tokens * TOP_K && want.len() == tokens * hidden, "tap extents");
+    let mut moe_in = read_bytes(&tap("moe_in"))?;
+    let mut want_idx = read_i64(&tap("route_idx"))?;
+    let mut want_w = read_f32(&tap("route_w"))?;
+    let mut want = read_f32(&tap("moe_routed"))?;
+    let mut want_scores_all = read_f32(&tap("route_scores")).unwrap_or_default();
+    let full_tokens = moe_in.len() / (hidden * 2);
+    ensure!(want_idx.len() == full_tokens * TOP_K && want.len() == full_tokens * hidden, "tap extents");
+    let (row0, tokens) = rows.unwrap_or((0, full_tokens));
+    ensure!(row0 + tokens <= full_tokens && tokens > 0, "--rows {row0}:{tokens} past {full_tokens} rows");
+    if rows.is_some() {
+        moe_in = moe_in[row0 * hidden * 2..(row0 + tokens) * hidden * 2].to_vec();
+        want_idx = want_idx[row0 * TOP_K..(row0 + tokens) * TOP_K].to_vec();
+        want_w = want_w[row0 * TOP_K..(row0 + tokens) * TOP_K].to_vec();
+        want = want[row0 * hidden..(row0 + tokens) * hidden].to_vec();
+        if !want_scores_all.is_empty() {
+            want_scores_all = want_scores_all[row0 * ROUTER_EXPERTS..(row0 + tokens) * ROUTER_EXPERTS].to_vec();
+        }
+    }
 
     // Occurrence o of an equally-chunked capture starts at o * tokens.
     let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)?;
@@ -157,8 +179,8 @@ fn main() -> Result<()> {
         .map(|v| v.as_i64().context("token id"))
         .collect::<Result<_>>()?;
     let chunk = manifest["env"]["DSV41_PREFILL_CHUNK"].as_str().and_then(|s| s.parse::<usize>().ok());
-    ensure!(occurrence == 0 || chunk == Some(tokens), "occurrence {occurrence} start is only derivable for equal chunks");
-    let start = occurrence * tokens;
+    ensure!(occurrence == 0 || chunk == Some(full_tokens), "occurrence {occurrence} start is only derivable for equal chunks");
+    let start = occurrence * full_tokens + row0;
     let pass_ids = &all_ids[start..start + tokens];
     println!(
         "{run}/{tag}.{occurrence:03}: {tokens} tokens, routing {}, {} image rows",
@@ -173,7 +195,10 @@ fn main() -> Result<()> {
     let arena = Arc::new(Cb3ExpertArena::load_one_layer(&pack_dir, &pack, layer, &gpu)?);
     let router = router_from_checkpoint(layer, hidden, &gpu)?;
     let moe = Cb3RoutedMoe::new(&gpu, &kernels, &config, arena, vec![(layer, router)], limit, route_scale, tokens)?;
-    moe.set_pass_tokens(pass_ids);
+    let pass_u32: Vec<u32> = pass_ids.iter().map(|&i| i as u32).collect();
+    moe.begin_pass(&pass_u32)?;
+    let decode_path = moe.uses_decode_path(tokens);
+    println!("  expert path: {}", if decode_path { "DECODE (GPU routing + CB3 GEMV)" } else { "reconstruct + cuBLASLt" });
     moe.set_control(control);
     if control != MoeControl::None {
         println!("  [control {control:?}] — MUST FAIL");
@@ -187,9 +212,10 @@ fn main() -> Result<()> {
     if ours {
         // The router, checked on its own before its output is used.
         let scores = moe.scores(layer, d_in, tokens, stream)?;
-        let want_scores = read_f32(&tap("route_scores"))?;
+        let want_scores = &want_scores_all;
+        ensure!(want_scores.len() == tokens * ROUTER_EXPERTS, "route_scores tap missing or wrong extent");
         let (mut num, mut den) = (0.0f64, 0.0f64);
-        for (a, b) in scores.iter().zip(&want_scores) {
+        for (a, b) in scores.iter().zip(want_scores.iter()) {
             num += ((a - b) as f64).powi(2);
             den += (*b as f64).powi(2);
         }
@@ -205,6 +231,18 @@ fn main() -> Result<()> {
             want_idx.len()
         );
         moe.forward(&Ops { gpu: &gpu, k: &kernels, stream }, layer, d_in, d_out, tokens)?;
+        if decode_path && control == MoeControl::None {
+            let dev = moe.decode_routing(tokens, stream)?;
+            let idx_dev = dev.indices.iter().zip(&want_idx).filter(|(a, b)| a != b).count();
+            let vs_host = dev.indices.iter().zip(&routing.indices).filter(|(a, b)| a != b).count();
+            let w_dev = dev.weights.iter().zip(&want_w).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            println!(
+                "  DEVICE router: route_idx {idx_dev}/{} differ from the capture, {vs_host} from the host router; route_w worst {w_dev:.3e}",
+                want_idx.len()
+            );
+            moe.check_decode_error(stream)?;
+            ensure!(idx_dev == 0, "FAIL: device routing picks differ from the capture");
+        }
     } else {
         let routing = Routing { indices: want_idx.clone(), weights: want_w.clone(), k: TOP_K };
         moe.forward_routed(layer, d_in, d_out, tokens, &routing, stream)?;

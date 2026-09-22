@@ -35,7 +35,6 @@ use atlas_core::config::{ExpertPack, SERVED_PACKED_KEEP};
 use spark_model::layers::deepseek_v41_attn::core::Dsv41SparseCore;
 use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
 use spark_model::weight_loader::deepseek_v41::moe_forward::{Cb3RoutedMoe, RouterF32};
-use spark_model::layers::deepseek_v41_attn::core::Dsv41SparseCore;
 use spark_model::weight_loader::deepseek_v41::forward::{PassHook, PassKind, PrefillMode, V41Forward, V41Seq};
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops, RopeSpec, RopeTable, bf16_tensor, bytemuck_u32};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
@@ -239,7 +238,7 @@ fn run_model_path(
     let fed_core = FedCore(&feeder);
     let real_core;
     let (core, hook): (&dyn AttnCore, &dyn PassHook) = if attn_real {
-        real_core = Dsv41SparseCore::load(gpu_ref, store, config, 8192, max_chunk, fwd.freqs_c)?;
+        real_core = Dsv41SparseCore::load_prefix(gpu_ref, store, config, 8192, max_chunk, fwd.freqs_c, n_layers)?;
         (&real_core, &real_core)
     } else {
         (&fed_core, &NoHook)
@@ -274,11 +273,17 @@ fn run_model_path(
         let want: Vec<u32> = m["greedy_continuation"].as_array().map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect()).unwrap_or_default();
         let mut got = vec![arg as u32];
         let t1 = std::time::Instant::now();
+        let mut steps_ms = Vec::with_capacity(decode_n);
+        let mut hashes: Vec<u64> = Vec::with_capacity(decode_n);
         for _ in 1..decode_n {
             let tok = *got.last().unwrap();
+            let ts = std::time::Instant::now();
             fwd.decode(ops, &mut seq, tok, hook, core, moe, &Tap::off(), logits)?;
             ops.gpu.synchronize(ops.stream)?;
+            steps_ms.push(ts.elapsed().as_secs_f64() * 1e3);
             ops.gpu.copy_d2h(logits, &mut host)?;
+            // FNV-1a over the step's raw bf16 logits: arms that must be bit-identical compare these.
+            hashes.push(host.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)));
             let v: Vec<f32> = host.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect();
             let a = v.iter().enumerate().fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0;
             got.push(a as u32);
@@ -286,7 +291,18 @@ fn run_model_path(
         let dt = t1.elapsed().as_secs_f64();
         let agree = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
         println!("decode: {} tokens in {dt:.2}s ({:.2} tok/s)", got.len() - 1, (got.len() - 1) as f64 / dt);
+        if steps_ms.len() > 2 {
+            // Warm steps: drop the first (cold caches, first-touch of lazily resolved kernels).
+            let mut w = steps_ms[1..].to_vec();
+            w.sort_by(f64::total_cmp);
+            println!(
+                "decode step ms (warm, n={}): median {:.2}  min {:.2}  max {:.2}  first {:.2}",
+                w.len(), w[w.len() / 2], w[0], w[w.len() - 1], steps_ms[0]
+            );
+        }
         println!("decode ours:   {got:?}");
+        println!("decode logits fnv: {:016x}", hashes.iter().fold(0u64, |a, h| a.rotate_left(7) ^ h));
+        println!("decode logits fnv per step: {:x?}", hashes);
         println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
         println!("decode: first {agree} of {} greedy tokens identical to the oracle", got.len());
     }

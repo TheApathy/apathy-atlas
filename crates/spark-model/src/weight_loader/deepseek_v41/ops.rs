@@ -52,10 +52,29 @@ pub struct Dsv41Kernels {
     pub engram_rows_bf16: KernelHandle,
     pub engram_gate: KernelHandle,
     pub mul_bf16_to_f32: KernelHandle,
+    /// `dsv41_decode::dsv41_fp8_gemv_m1`, used at M = 1 when [`DENSE_GEMV_ENV`] is on.
+    pub fp8_gemv_m1: Option<KernelHandle>,
+    /// The bit-identical split `hc_mixes` for T = 1 ([`HC_SPLIT_ENV`]): (dot, finish, raw scratch).
+    pub hc_split: Option<(KernelHandle, KernelHandle, DevicePtr)>,
 }
+
+/// `ATLAS_DSV41_HC_SPLIT=1`: at T = 1, `hc_mixes` runs as 25 blocks + an epilogue instead of one
+/// block per token. Bit-identical by construction (same per-thread order, same tree).
+pub const HC_SPLIT_ENV: &str = "ATLAS_DSV41_HC_SPLIT";
+
+/// Module compiled from `kernels/gb10/deepseek-v4.1/cb3/dsv41_decode.cu`.
+pub const DECODE_DENSE_MODULE: &str = "dsv41_decode";
+/// Opt-in until gated end to end: `ATLAS_DSV41_DENSE_GEMV=1` runs every M = 1 FP8 linear as
+/// a direct fp8 GEMV instead of dequant-to-bf16 + a 16-row GEMM.
+pub const DENSE_GEMV_ENV: &str = "ATLAS_DSV41_DENSE_GEMV";
+const GEMV_WARPS: u32 = 8;
 
 impl Dsv41Kernels {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
+        let k2 = |name: &str| {
+            gpu.kernel(DECODE_DENSE_MODULE, name)
+                .with_context(|| format!("{DECODE_DENSE_MODULE}::{name} is not in the compiled PTX"))
+        };
         let k = |name: &str| {
             gpu.kernel(FWD_MODULE, name).with_context(|| {
                 format!(
@@ -81,6 +100,19 @@ impl Dsv41Kernels {
             engram_rows_bf16: k("dsv41_engram_rows_bf16")?,
             engram_gate: k("dsv41_engram_gate")?,
             mul_bf16_to_f32: k("dsv41_mul_bf16_to_f32")?,
+            fp8_gemv_m1: if std::env::var(DENSE_GEMV_ENV).as_deref() == Ok("1") {
+                Some(gpu.kernel(DECODE_DENSE_MODULE, "dsv41_fp8_gemv_m1").with_context(|| {
+                    format!("{DENSE_GEMV_ENV}=1 but {DECODE_DENSE_MODULE}::dsv41_fp8_gemv_m1 is not in the PTX")
+                })?)
+            } else {
+                None
+            },
+            hc_split: if std::env::var(HC_SPLIT_ENV).as_deref() == Ok("1") {
+                let raw = gpu.alloc(MM_TILE * 25 * 4)?;
+                Some((k2("dsv41_hc_mix_dot")?, k2("dsv41_hc_mix_finish")?, raw))
+            } else {
+                None
+            },
         })
     }
 }
@@ -131,6 +163,20 @@ impl Ops<'_> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn hc_mixes(&self, h: DevicePtr, hc: &HcParams, pre: DevicePtr, post: DevicePtr, comb: DevicePtr, t: usize, d: usize, iters: u32, eps: f32, hc_eps: f32) -> Result<()> {
+        if let Some((dot, finish, raw)) = self.k.hc_split.filter(|_| t == 1) {
+            KernelLaunch::new(self.gpu, dot)
+                .grid([25, 1, 1])
+                .block([BLOCK, 1, 1])
+                .arg_ptr(h).arg_ptr(hc.func).arg_ptr(raw).arg_u32(d as u32)
+                .launch(self.stream)?;
+            return KernelLaunch::new(self.gpu, finish)
+                .grid([1, 1, 1])
+                .block([32, 1, 1])
+                .arg_ptr(raw).arg_ptr(hc.scale).arg_ptr(hc.base)
+                .arg_ptr(pre).arg_ptr(post).arg_ptr(comb)
+                .arg_u32(d as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
+                .launch(self.stream);
+        }
         self.l(self.k.hc_mixes)
             .grid([t as u32, 1, 1])
             .arg_ptr(h).arg_ptr(hc.func).arg_ptr(hc.scale).arg_ptr(hc.base)
@@ -221,8 +267,26 @@ impl Ops<'_> {
 
     /// [`Self::linear_fp8`] with the GEMM tiled; same slack-row contract.
     pub fn linear_fp8_tiled(&self, x: DevicePtr, w: &Fp8Linear, scratch: DevicePtr, out: DevicePtr, m: usize) -> Result<()> {
+        if m == 1 && self.k.fp8_gemv_m1.is_some() {
+            return self.fp8_gemv_m1(x, w, out, w.n, 0);
+        }
         self.dequant(w, scratch)?;
         self.linear_bf16_tiled(x, w.k, scratch, out, w.n, m, w.n, w.k)
+    }
+
+    /// `out[n] = x_g . dequant(w)[n]` for ONE activation row, reading the fp8 weight directly
+    /// (`dsv41_decode.cu`). Row n uses activation group `n / n_per_group`, which starts
+    /// `x_group_stride` elements after the previous one (0 for a plain linear).
+    pub fn fp8_gemv_m1(&self, x: DevicePtr, w: &Fp8Linear, out: DevicePtr, n_per_group: usize, x_group_stride: usize) -> Result<()> {
+        let kernel = self.k.fp8_gemv_m1.context("fp8 GEMV not loaded")?;
+        ensure!(w.k % 16 == 0 && (n_per_group == w.n || n_per_group % 32 == 0), "fp8 GEMV extents: n {} k {} group {n_per_group}", w.n, w.k);
+        KernelLaunch::new(self.gpu, kernel)
+            .grid([(w.n as u32).div_ceil(GEMV_WARPS), 1, 1])
+            .block([32 * GEMV_WARPS, 1, 1])
+            .arg_ptr(x).arg_ptr(w.weight).arg_ptr(w.scale).arg_ptr(out)
+            .arg_u32(w.n as u32).arg_u32(w.k as u32)
+            .arg_u32(n_per_group as u32).arg_u32(x_group_stride as u32)
+            .launch(self.stream)
     }
 
     /// Dequantize `w` to bf16 into `scratch` (at least `w.n * w.k * 2` bytes).
