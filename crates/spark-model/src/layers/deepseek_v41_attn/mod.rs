@@ -8,6 +8,7 @@
 //! fallback for this architecture is a DIFFERENT MODEL producing wrong output,
 //! not a slower one, and must hard-stop rather than ship silently.
 
+pub mod index;
 pub mod schedule;
 
 pub use schedule::{

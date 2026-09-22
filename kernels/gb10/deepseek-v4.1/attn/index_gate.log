@@ -1,0 +1,107 @@
+== idx_fixtures/runD_L20_kernel_L02_0  T=512 n_c=256 n_pad=512 pos0=0 ratio=2 cand=no src=0 | discriminating rows 0/512, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/512 rows differ  PASS
+  SCORE   seq          bit-exact 0.95847 of 65536 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   pairwise     bit-exact 0.99049 of 65536 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   butterfly    bit-exact 0.97720 of 65536 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   CTRL-noround bit-exact 0.00003 of 65536 finite, worst_abs 1.514e-02, -inf position mismatches 0 | END2END rows differ 0/512
+  END2END production order (pairwise): 0/512 rows differ  EXACT
+  CTRL    no discriminating rows: selection is NOT TESTED by this case (every finite column is kept)
+== idx_fixtures/runD_L20_kernel_L02_1  T=512 n_c=512 n_pad=512 pos0=512 ratio=2 cand=no src=0 | discriminating rows 0/512, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/512 rows differ  PASS
+  SCORE   seq          bit-exact 0.96539 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   pairwise     bit-exact 0.99249 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   butterfly    bit-exact 0.97679 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   CTRL-noround bit-exact 0.00004 of 196608 finite, worst_abs 1.274e-02, -inf position mismatches 0 | END2END rows differ 0/512
+  END2END production order (pairwise): 0/512 rows differ  EXACT
+  CTRL    no discriminating rows: selection is NOT TESTED by this case (every finite column is kept)
+== idx_fixtures/runD_L20_kernel_L14_1  T=512 n_c=512 n_pad=512 pos0=512 ratio=2 cand=no src=0 | discriminating rows 0/512, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/512 rows differ  PASS
+  SCORE   seq          bit-exact 0.96132 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   pairwise     bit-exact 0.99398 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   butterfly    bit-exact 0.99036 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   CTRL-noround bit-exact 0.00001 of 196608 finite, worst_abs 1.090e-02, -inf position mismatches 0 | END2END rows differ 0/512
+  END2END production order (pairwise): 0/512 rows differ  EXACT
+  CTRL    no discriminating rows: selection is NOT TESTED by this case (every finite column is kept)
+== idx_fixtures/runD_L20_kernel_L20_0  T=512 n_c=512 n_pad=512 pos0=0 ratio=1 cand=no src=1 | discriminating rows 0/512, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/512 rows differ  PASS
+  CAND    @2048 vs ref cand_out: 0/262144 differ (ref keeps 0.508) | CTRL block-size 16: 2048 differ  PASS
+  SCORE   seq          bit-exact 0.97736 of 131328 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   pairwise     bit-exact 0.99175 of 131328 finite, worst_abs 2.384e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   butterfly    bit-exact 0.98060 of 131328 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   CTRL-noround bit-exact 0.00001 of 131328 finite, worst_abs 1.201e-02, -inf position mismatches 0 | END2END rows differ 0/512
+  END2END production order (pairwise): 0/512 rows differ  EXACT
+  CTRL    no discriminating rows: selection is NOT TESTED by this case (every finite column is kept)
+== idx_fixtures/runD_L20_kernel_L20_1  T=512 n_c=1024 n_pad=1024 pos0=512 ratio=1 cand=no src=1 | discriminating rows 512/512, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/512 rows differ  PASS
+  CAND    @2048 vs ref cand_out: 0/524288 differ (ref keeps 0.754) | CTRL block-size 16: 2048 differ  PASS
+  CAND    @96 (reference algorithm) : 0/524288 differ | CTRL force-keep shifted one block: 64 differ  PASS
+  POOL    96-block pool mask -> score -> topk vs reference: 0/512 rows differ | CTRL pool dropped: 219 differ  PASS
+  SCORE   seq          bit-exact 0.98192 of 393472 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   pairwise     bit-exact 0.99366 of 393472 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   butterfly    bit-exact 0.98640 of 393472 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   CTRL-noround bit-exact 0.00003 of 393472 finite, worst_abs 1.243e-02, -inf position mismatches 0 | END2END rows differ 259/512
+  END2END production order (pairwise): 0/512 rows differ  EXACT
+  CTRL    lens-1: 511 rows differ; no-bf16-round: 259 rows differ  (controls bite)
+== idx_fixtures/runD_L20_kernel_L24_0  T=128 n_c=1024 n_pad=1024 pos0=896 ratio=1 cand=yes src=0 | discriminating rows 128/128, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/128 rows differ  PASS
+  POOL    96-block pool mask -> score -> topk vs reference: 0/128 rows differ | CTRL pool dropped: 128 differ  PASS
+  SCORE   seq          bit-exact 0.97884 of 122944 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/128
+  SCORE   pairwise     bit-exact 0.99654 of 122944 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/128
+  SCORE   butterfly    bit-exact 0.99062 of 122944 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/128
+  SCORE   CTRL-noround bit-exact 0.00006 of 122944 finite, worst_abs 8.703e-03, -inf position mismatches 0 | END2END rows differ 100/128
+  END2END production order (pairwise): 0/128 rows differ  EXACT
+  CTRL    lens-1: 112 rows differ; no-bf16-round: 100 rows differ; no-candidates: 0 rows differ (layer 20's pool == visibility at this length: pruning is exercised by POOL, not here)  (controls bite)
+== idx_fixtures/runE_torch_L02_0  T=512 n_c=256 n_pad=512 pos0=0 ratio=2 cand=no src=0 | discriminating rows 0/512, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/512 rows differ  PASS
+  SCORE   seq          bit-exact 0.95088 of 65536 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   pairwise     bit-exact 0.97516 of 65536 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   butterfly    bit-exact 0.98492 of 65536 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   CTRL-noround bit-exact 0.00003 of 65536 finite, worst_abs 1.778e-02, -inf position mismatches 0 | END2END rows differ 0/512
+  END2END production order (pairwise): 0/512 rows differ  EXACT
+  CTRL    no discriminating rows: selection is NOT TESTED by this case (every finite column is kept)
+== idx_fixtures/runE_torch_L02_1  T=512 n_c=512 n_pad=512 pos0=512 ratio=2 cand=no src=0 | discriminating rows 0/512, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/512 rows differ  PASS
+  SCORE   seq          bit-exact 0.96096 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   pairwise     bit-exact 0.98103 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   butterfly    bit-exact 0.98733 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   CTRL-noround bit-exact 0.00003 of 196608 finite, worst_abs 1.216e-02, -inf position mismatches 0 | END2END rows differ 0/512
+  END2END production order (pairwise): 0/512 rows differ  EXACT
+  CTRL    no discriminating rows: selection is NOT TESTED by this case (every finite column is kept)
+== idx_fixtures/runE_torch_L14_1  T=512 n_c=512 n_pad=512 pos0=512 ratio=2 cand=no src=0 | discriminating rows 0/512, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/512 rows differ  PASS
+  SCORE   seq          bit-exact 0.96596 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   pairwise     bit-exact 0.98531 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   butterfly    bit-exact 0.99201 of 196608 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   CTRL-noround bit-exact 0.00003 of 196608 finite, worst_abs 1.115e-02, -inf position mismatches 0 | END2END rows differ 0/512
+  END2END production order (pairwise): 0/512 rows differ  EXACT
+  CTRL    no discriminating rows: selection is NOT TESTED by this case (every finite column is kept)
+== idx_fixtures/runE_torch_L20_0  T=512 n_c=512 n_pad=512 pos0=0 ratio=1 cand=no src=1 | discriminating rows 0/512, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/512 rows differ  PASS
+  CAND    @2048 vs ref cand_out: 0/262144 differ (ref keeps 0.508) | CTRL block-size 16: 2048 differ  PASS
+  SCORE   seq          bit-exact 0.97740 of 131328 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   pairwise     bit-exact 0.97568 of 131328 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   butterfly    bit-exact 0.98573 of 131328 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   CTRL-noround bit-exact 0.00005 of 131328 finite, worst_abs 1.290e-02, -inf position mismatches 0 | END2END rows differ 0/512
+  END2END production order (pairwise): 0/512 rows differ  EXACT
+  CTRL    no discriminating rows: selection is NOT TESTED by this case (every finite column is kept)
+== idx_fixtures/runE_torch_L20_1  T=512 n_c=1024 n_pad=1024 pos0=512 ratio=1 cand=no src=1 | discriminating rows 512/512, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/512 rows differ  PASS
+  CAND    @2048 vs ref cand_out: 0/524288 differ (ref keeps 0.754) | CTRL block-size 16: 2048 differ  PASS
+  CAND    @96 (reference algorithm) : 0/524288 differ | CTRL force-keep shifted one block: 48 differ  PASS
+  POOL    96-block pool mask -> score -> topk vs reference: 0/512 rows differ | CTRL pool dropped: 226 differ  PASS
+  SCORE   seq          bit-exact 0.98271 of 393472 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   pairwise     bit-exact 0.98312 of 393472 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   butterfly    bit-exact 0.99032 of 393472 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/512
+  SCORE   CTRL-noround bit-exact 0.00001 of 393472 finite, worst_abs 1.412e-02, -inf position mismatches 0 | END2END rows differ 268/512
+  END2END production order (pairwise): 0/512 rows differ  EXACT
+  CTRL    lens-1: 512 rows differ; no-bf16-round: 268 rows differ  (controls bite)
+== idx_fixtures/runE_torch_L24_0  T=128 n_c=1024 n_pad=1024 pos0=896 ratio=1 cand=yes src=0 | discriminating rows 128/128, ref boundary ties 0
+  SELECT  topk(ref score) vs ref topk: 0/128 rows differ  PASS
+  POOL    96-block pool mask -> score -> topk vs reference: 0/128 rows differ | CTRL pool dropped: 128 differ  PASS
+  SCORE   seq          bit-exact 0.97734 of 122944 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/128
+  SCORE   pairwise     bit-exact 0.99013 of 122944 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/128
+  SCORE   butterfly    bit-exact 0.99122 of 122944 finite, worst_abs 4.768e-07, -inf position mismatches 0 | END2END rows differ 0/128
+  SCORE   CTRL-noround bit-exact 0.00008 of 122944 finite, worst_abs 8.327e-03, -inf position mismatches 0 | END2END rows differ 102/128
+  END2END production order (pairwise): 0/128 rows differ  EXACT
+  CTRL    lens-1: 113 rows differ; no-bf16-round: 102 rows differ; no-candidates: 0 rows differ (layer 20's pool == visibility at this length: pruning is exercised by POOL, not here)  (controls bite)
+GATE PASS (0 hard failures; END2END mismatches are reported, not failed)
