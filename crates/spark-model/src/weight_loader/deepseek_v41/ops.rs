@@ -11,7 +11,7 @@
 //! NOT reproduced here — see DSV41_PORT/integrate.)
 
 use anyhow::{Context, Result, ensure};
-use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed_ex};
+use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed_ex, gemm_act_weight_t_typed_pinned};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use spark_runtime::weights::{WeightDtype, WeightStore};
@@ -66,6 +66,34 @@ pub fn fp8_fixed_m() -> usize {
         return 0;
     }
     FP8_FIXED_M.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How an FP8 dense GEMM with M > 16 is issued (`ATLAS_DSV41_FP8_POLICY`, default `fixedm`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fp8Policy {
+    /// One GEMM at the true M, cuBLASLt's per-M algorithm (NOT chunk-invariant, measured).
+    Untiled,
+    /// 16-row tiles (chunk-invariant, re-reads the weight per tile).
+    RowTile,
+    /// One GEMM padded to the forward's fixed M (one algorithm; slack rows).
+    FixedM,
+    /// One GEMM at the true M with ONE algorithm per shape, chosen at the fixed M.
+    Pinned,
+}
+
+pub fn fp8_policy() -> Fp8Policy {
+    static P: std::sync::OnceLock<Fp8Policy> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        if std::env::var("ATLAS_DSV41_FP8_ROWTILE").as_deref() == Ok("1") {
+            return Fp8Policy::RowTile;
+        }
+        match std::env::var("ATLAS_DSV41_FP8_POLICY").as_deref() {
+            Ok("untiled") => Fp8Policy::Untiled,
+            Ok("rowtile") => Fp8Policy::RowTile,
+            Ok("pinned") => Fp8Policy::Pinned,
+            _ => Fp8Policy::FixedM,
+        }
+    })
 }
 
 /// `ATLAS_DSV41_FP8_ROWTILE=1`: run FP8 dense GEMMs as 16-row tiles at every M (the
@@ -305,13 +333,26 @@ impl Ops<'_> {
         prof(self, "dense/dequant", || self.dequant(w, scratch))?;
         prof(self, "dense/gemm", || {
             if m > MM_TILE && !fp8_force_rowtile() {
-                let fm = fp8_fixed_m();
-                let mm = if fm >= m { fm } else { m };
-                self.linear_bf16_strided(x, w.k, scratch, out, w.n, mm, w.n, w.k)
+                self.linear_bf16_policy(x, w.k, scratch, out, w.n, m, w.n, w.k)
             } else {
                 self.linear_bf16_tiled(x, w.k, scratch, out, w.n, m, w.n, w.k)
             }
         })
+    }
+
+    /// A bf16 GEMM with M > MM_TILE issued under [`fp8_policy`] (the FP8 dense row policy).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_bf16_policy(&self, x: DevicePtr, lda: usize, w: DevicePtr, out: DevicePtr, ldc: usize, m: usize, n: usize, k: usize) -> Result<()> {
+        let fm = fp8_fixed_m();
+        match fp8_policy() {
+            Fp8Policy::RowTile => self.linear_bf16_tiled(x, lda, w, out, ldc, m, n, k),
+            Fp8Policy::Untiled => self.linear_bf16_strided(x, lda, w, out, ldc, m, n, k),
+            Fp8Policy::FixedM => self.linear_bf16_strided(x, lda, w, out, ldc, if fm >= m { fm } else { m }, n, k),
+            Fp8Policy::Pinned => gemm_act_weight_t_typed_pinned(
+                x.0, lda as u32, w.0, out.0, ldc as u32, m as u32, n as u32, k as u32,
+                GemmDtype::Bf16, GemmDtype::Bf16, NO_SPLIT_K, fm.max(MM_TILE * 32) as u32, self.stream,
+            ),
+        }
     }
 
     /// Dequantize `w` to bf16 into `scratch` (at least `w.n * w.k * 2` bytes).

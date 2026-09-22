@@ -233,8 +233,7 @@ pub fn attention(
     prof(ops, "dense/dequant", || ops.dequant(&w.wo_a, wscratch))?;
     let grouped = |x: DevicePtr, lda: usize, wt: DevicePtr, o: DevicePtr, ldc: usize, m: usize, n: usize, k: usize| {
         if m > MM_TILE && !super::ops::fp8_force_rowtile() {
-            let fm = super::ops::fp8_fixed_m();
-            ops.linear_bf16_strided(x, lda, wt, o, ldc, if fm >= m { fm } else { m }, n, k)
+            ops.linear_bf16_policy(x, lda, wt, o, ldc, m, n, k)
         } else { ops.linear_bf16_tiled(x, lda, wt, o, ldc, m, n, k) }
     };
     for g in 0..O_GROUPS {

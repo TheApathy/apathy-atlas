@@ -407,7 +407,15 @@ fn main() -> Result<()> {
             // Per-run switches for the env-gated ops (read once, so set before any GPU work).
             // SAFETY: single-threaded at argument parsing; nothing has read the environment yet.
             "--fp8-rowtile" => unsafe { std::env::set_var("ATLAS_DSV41_FP8_ROWTILE", "1") },
+            "--fp8-policy" => {
+                let v = args.next().context("--fp8-policy")?;
+                unsafe { std::env::set_var("ATLAS_DSV41_FP8_POLICY", v) }
+            }
             "--prof" => unsafe { std::env::set_var("ATLAS_DSV41_PROF", "1") },
+            "--tap-layers" => {
+                let v = args.next().context("--tap-layers")?;
+                unsafe { std::env::set_var("ATLAS_DSV41_TAP_LAYERS", v) }
+            }
             "--tap-names" => {
                 let v = args.next().context("--tap-names")?;
                 unsafe { std::env::set_var("ATLAS_DSV41_TAP_NAMES", v) }

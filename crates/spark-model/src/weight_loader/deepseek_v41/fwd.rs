@@ -350,6 +350,12 @@ impl Tap {
         if !self.layers.is_empty() && !self.layers.contains(&layer) {
             return Ok(());
         }
+        // ATLAS_DSV41_TAP_LAYERS=0,1,40 restricts the dump to those layers.
+        if let Ok(only) = std::env::var("ATLAS_DSV41_TAP_LAYERS")
+            && !only.split(',').any(|l| l.parse::<usize>().ok() == Some(layer))
+        {
+            return Ok(());
+        }
         // ATLAS_DSV41_TAP_NAMES=h,logits_last restricts the dump to those tap names.
         if let Ok(only) = std::env::var("ATLAS_DSV41_TAP_NAMES")
             && !only.split(',').any(|n| n == name)

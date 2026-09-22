@@ -81,6 +81,58 @@ pub fn gemm_act_weight_t_typed_ex(
     no_split_k: bool,
     stream: u64,
 ) -> Result<()> {
+    typed_impl(act, lda, weight, out, ldc, m, n, k, in_dtype, out_dtype, no_split_k, None, stream)
+}
+
+/// [`gemm_act_weight_t_typed_ex`] with ONE algorithm per shape, independent of M: the heuristic
+/// runs once per (n, k, lda, ldc, dtypes, no_split_k) at M = `ref_m`, and that algorithm is then
+/// issued at the TRUE M of every call. With a fixed tile configuration and no split-K, an output
+/// element's K-loop does not depend on how many rows share the call, so results become
+/// M-invariant without padding M (the property DeepSeek-V4.1's chunk invariance needs).
+/// Measured, not assumed: see bench/dsv41/compare_splits.py.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_act_weight_t_typed_pinned(
+    act: u64,
+    lda: u32,
+    weight: u64,
+    out: u64,
+    ldc: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    in_dtype: GemmDtype,
+    out_dtype: GemmDtype,
+    no_split_k: bool,
+    ref_m: u32,
+    stream: u64,
+) -> Result<()> {
+    typed_impl(act, lda, weight, out, ldc, m, n, k, in_dtype, out_dtype, no_split_k, Some(ref_m), stream)
+}
+
+type PinKey = (u32, u32, u32, u32, i32, i32, bool, u32);
+
+fn pinned_algos() -> &'static std::sync::Mutex<std::collections::HashMap<PinKey, [u8; 128]>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PinKey, [u8; 128]>>> =
+        std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_impl(
+    act: u64,
+    lda: u32,
+    weight: u64,
+    out: u64,
+    ldc: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    in_dtype: GemmDtype,
+    out_dtype: GemmDtype,
+    no_split_k: bool,
+    pin_ref_m: Option<u32>,
+    stream: u64,
+) -> Result<()> {
     if lda < k || ldc < n {
         bail!("cuBLASLt typed: lda ({lda}) < k ({k}) or ldc ({ldc}) < n ({n})");
     }
@@ -137,18 +189,45 @@ pub fn gemm_act_weight_t_typed_ex(
         }
         let mut result = [0u8; 128];
         let mut returned: i32 = 0;
-        let heur = cublasLtMatmulAlgoGetHeuristic(
-            ctx.handle,
-            desc,
-            la,
-            lb,
-            ld_,
-            ld_,
-            pref,
-            1,
-            result.as_mut_ptr() as *mut c_void,
-            &mut returned,
-        );
+        let pin_key: Option<PinKey> =
+            pin_ref_m.map(|r| (n, k, lda, ldc, ti, to, no_split_k, r));
+        let cached = pin_key.and_then(|key| pinned_algos().lock().ok()?.get(&key).copied());
+        let heur = if let Some(c) = cached {
+            result = c;
+            returned = 1;
+            0
+        } else if let Some(r) = pin_ref_m {
+            // Choose the algorithm at the REFERENCE M, then reuse it at every M.
+            let mut lb_r: cublasLtMatrixLayout_t = std::ptr::null_mut();
+            let mut ld_r: cublasLtMatrixLayout_t = std::ptr::null_mut();
+            chk(cublasLtMatrixLayoutCreate(&mut lb_r, ti, k as u64, r as u64, lda as i64), "LayoutBref")?;
+            chk(cublasLtMatrixLayoutCreate(&mut ld_r, to, n as u64, r as u64, ldc as i64), "LayoutDref")?;
+            let h = cublasLtMatmulAlgoGetHeuristic(
+                ctx.handle, desc, la, lb_r, ld_r, ld_r, pref, 1,
+                result.as_mut_ptr() as *mut c_void, &mut returned,
+            );
+            cublasLtMatrixLayoutDestroy(lb_r);
+            cublasLtMatrixLayoutDestroy(ld_r);
+            if h == 0 && returned >= 1 {
+                if let (Some(key), Ok(mut t)) = (pin_key, pinned_algos().lock()) {
+                    t.insert(key, result);
+                }
+            }
+            h
+        } else {
+            cublasLtMatmulAlgoGetHeuristic(
+                ctx.handle,
+                desc,
+                la,
+                lb,
+                ld_,
+                ld_,
+                pref,
+                1,
+                result.as_mut_ptr() as *mut c_void,
+                &mut returned,
+            )
+        };
         let status = if heur != 0 || returned < 1 {
             None
         } else {
