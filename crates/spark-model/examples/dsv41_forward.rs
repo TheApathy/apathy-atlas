@@ -198,25 +198,27 @@ fn manifest_chunks(dir: &Path, n: usize) -> Result<Vec<(usize, usize)>> {
 
 /// The engine lane's routed MoE over an arena holding layers `0..n_layers` (1.79 GB each at
 /// keep=124). The full 40-layer load is 71.7 GB and needs lead approval.
-fn real_moe<'a>(
+fn real_moe(
     store: &spark_runtime::weights::WeightStore,
-    gpu: &'a AtlasCudaBackend,
-    kernels: &'a Dsv41Kernels,
+    backend: &Arc<AtlasCudaBackend>,
+    kernels: &Dsv41Kernels,
     config: &atlas_core::config::ModelConfig,
     n_layers: usize,
     max_t: usize,
-) -> Result<Cb3RoutedMoe<'a>> {
+) -> Result<Cb3RoutedMoe> {
+    let shared: spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu = backend.clone();
+    let gpu = backend.as_ref();
     let pack_dir = Path::new(MODEL_DIR).join("k154-cb3");
     let pack = ExpertPack::parse(&std::fs::read_to_string(pack_dir.join("manifest.json"))?, SERVED_PACKED_KEEP)?;
     let layers: Vec<usize> = (0..n_layers).collect();
-    let arena = Arc::new(Cb3ExpertArena::load_layer_subset(&pack_dir, &pack, &layers, gpu)?);
+    let arena = Arc::new(Cb3ExpertArena::load_layer_subset(&pack_dir, &pack, &layers, &shared)?);
     println!("routed MoE: {} layers resident, {:.2} GB", layers.len(), arena.resident_bytes() as f64 / 1e9);
     let stream = gpu.default_stream();
     let routers = layers
         .iter()
         .map(|&l| Ok((l, RouterF32::load(store, l, config.hidden_size, gpu, kernels, stream)?)))
         .collect::<Result<Vec<_>>>()?;
-    Cb3RoutedMoe::new(gpu, kernels, config, arena, routers, 10.0, 1.5, max_t)
+    Cb3RoutedMoe::new(shared, *kernels, config, arena, routers, 10.0, 1.5, max_t)
 }
 
 struct NoHook;
@@ -263,7 +265,7 @@ fn run_model_path(
     let fed_moe = FedMoe(&feeder, dims.hidden);
     let real;
     let moe: &dyn V41RoutedMoe = if moe_real {
-        real = real_moe(store, gpu_ref, ops.k, config, n_layers, max_chunk.max(128))?;
+        real = real_moe(store, &feeder.gpu, ops.k, config, n_layers, max_chunk.max(128))?;
         &real
     } else {
         &fed_moe
@@ -571,7 +573,7 @@ fn main() -> Result<()> {
     let moe: &dyn V41RoutedMoe = if feed.iter().any(|f| f == "moe") {
         &fed_moe
     } else if moe_real {
-        real = real_moe(&store, gpu.as_ref(), &kernels, &config, n_layers, max_t)?;
+        real = real_moe(&store, &gpu, &kernels, &config, n_layers, max_t)?;
         &real
     } else {
         &Refuse("routed MoE")

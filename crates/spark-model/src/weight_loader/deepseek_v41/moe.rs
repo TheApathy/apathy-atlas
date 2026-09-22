@@ -270,6 +270,12 @@ pub const FUSED_DOWN_FN: &str = "cb3_moe_down";
 /// [`FUSED_TILE_N`], K by 32.
 pub const FUSED_TILE_M: usize = 128;
 pub const FUSED_TILE_N: usize = 64;
+/// Few-rows path in the same module: one warp per output row, CB3 decoded in registers.
+pub const GEMV_GATE_UP_FN: &str = "cb3_moe_gemv_gate_up";
+pub const GEMV_DOWN_FN: &str = "cb3_moe_gemv_down";
+/// Rows per GEMV tile (`GEMV_ROWS` in the .cu) and output rows per GEMV block (`GEMV_WARPS`).
+pub const GEMV_TILE_M: usize = 4;
+pub const GEMV_ROWS_PER_BLOCK: usize = 8;
 
 /// Bytes of bf16 scratch one expert's reconstruct needs, for all three matrices at once.
 pub fn scratch_bytes(config: &ModelConfig) -> Result<usize> {

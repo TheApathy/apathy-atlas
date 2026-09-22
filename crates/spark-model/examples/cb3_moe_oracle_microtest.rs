@@ -43,7 +43,7 @@ use spark_model::weight_loader::deepseek_v41::moe_forward::{
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops};
 use spark_model::weight_loader::deepseek_v41::routing::Routing;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
-use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 const MODEL_DIR: &str = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K";
 const REF_ROOT: &str = "/home/flocka/atlas/DSV41_PORT/oracle/ref";
@@ -102,6 +102,9 @@ fn main() -> Result<()> {
     let mut control = MoeControl::None;
     let mut dump: Option<PathBuf> = None;
     let mut kernel = ExpertKernel::Reconstruct;
+    let mut gemv_max: Option<usize> = None;
+    let mut gemv_pass_t: Option<usize> = None;
+    let mut invariance: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -109,6 +112,9 @@ fn main() -> Result<()> {
             "--layer" => layer = args.next().context("--layer needs a value")?.parse()?,
             "--occurrence" => occurrence = args.next().context("--occurrence needs a value")?.parse()?,
             "--dump" => dump = Some(args.next().context("--dump needs a path")?.into()),
+            "--gemv-pass-t" => gemv_pass_t = Some(args.next().context("--gemv-pass-t")?.parse()?),
+            "--invariance" => invariance = Some(args.next().context("--invariance needs SPLIT[;SPLIT]")?),
+            "--gemv-max-rows" => gemv_max = Some(args.next().context("--gemv-max-rows")?.parse()?),
             "--kernel" => {
                 kernel = match args.next().context("--kernel needs fused|reconstruct")?.as_str() {
                     "fused" => ExpertKernel::Fused,
@@ -174,17 +180,26 @@ fn main() -> Result<()> {
         pass_ids.iter().filter(|id| **id == 129_264 || **id == 129_265).count()
     );
 
-    let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
-    let kernels = Dsv41Kernels::load(&gpu)?;
+    let backend = Arc::new(AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?);
+    let shared: spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu = backend.clone();
+    let gpu: &AtlasCudaBackend = &backend;
+    let kernels = Dsv41Kernels::load(gpu)?;
     let pack_dir = PathBuf::from(MODEL_DIR).join("k154-cb3");
     let pack = ExpertPack::parse(&std::fs::read_to_string(pack_dir.join("manifest.json"))?, SERVED_PACKED_KEEP)?;
-    let arena = Arc::new(Cb3ExpertArena::load_one_layer(&pack_dir, &pack, layer, &gpu)?);
-    let router = router_from_checkpoint(layer, hidden, &gpu)?;
-    let moe = Cb3RoutedMoe::new(&gpu, &kernels, &config, arena, vec![(layer, router)], limit, route_scale, tokens)?;
+    let free_before = gpu.free_memory()? as i64;
+    let arena = Arc::new(Cb3ExpertArena::load_one_layer(&pack_dir, &pack, layer, &shared)?);
+    let router = router_from_checkpoint(layer, hidden, gpu)?;
+    let moe = Cb3RoutedMoe::new(shared.clone(), kernels, &config, arena, vec![(layer, router)], limit, route_scale, tokens)?;
     moe.set_pass_tokens(pass_ids);
     moe.set_control(control);
     moe.set_expert_kernel(kernel);
-    println!("  expert kernel: {kernel:?}");
+    if let Some(t) = gemv_pass_t {
+        moe.set_gemv_pass_t(t);
+    }
+    if let Some(rows) = gemv_max {
+        moe.set_gemv_max_rows(rows);
+    }
+    println!("  expert kernel: {kernel:?}, gemv_max_rows {gemv_max:?}");
     if control != MoeControl::None {
         println!("  [control {control:?}] — MUST FAIL");
     }
@@ -224,7 +239,7 @@ fn main() -> Result<()> {
             "  device router: route_idx {dev_vs_engine}/{} differ vs engine, {dev_vs_host} vs host; route_w worst {dw_engine:.3e} vs engine, {dw_host:.3e} vs host",
             want_idx.len()
         );
-        moe.forward(&Ops { gpu: &gpu, k: &kernels, stream }, layer, d_in, d_out, tokens)?;
+        moe.forward(&Ops { gpu, k: &kernels, stream }, layer, d_in, d_out, tokens)?;
     } else {
         let routing = Routing { indices: want_idx.clone(), weights: want_w.clone(), k: TOP_K };
         moe.forward_routed(layer, d_in, d_out, tokens, &routing, stream)?;
@@ -264,7 +279,59 @@ fn main() -> Result<()> {
         std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
         println!("  candidate dumped to {} (float32, [{tokens}, {hidden}])", path.display());
     }
-    moe.free()?;
+    // CHUNK INVARIANCE: the same rows split into different chunks must give the SAME BYTES.
+    // Each split is a list of chunk sizes summing to T, e.g. "512,512,512,512;1000,1048".
+    if let Some(spec) = &invariance {
+        ensure!(ours, "--invariance runs the production forward: use --routing ours");
+        let d_split = gpu.alloc(tokens * hidden * 2)?;
+        let ops = Ops { gpu, k: &kernels, stream };
+        let mut all_identical = true;
+        for split in spec.split(';') {
+            let sizes: Vec<usize> = split.split(',').map(str::parse).collect::<Result<_, _>>()?;
+            ensure!(sizes.iter().sum::<usize>() == tokens, "split {split} does not sum to {tokens}");
+            let mut start = 0usize;
+            for &n in &sizes {
+                moe.set_pass_tokens(&pass_ids[start..start + n]);
+                let off = (start * hidden * 2) as u64;
+                moe.forward(&ops, layer, DevicePtr(d_in.0 + off), DevicePtr(d_split.0 + off), n)?;
+                start += n;
+            }
+            gpu.synchronize(stream)?;
+            let mut bytes = vec![0u8; tokens * hidden * 2];
+            gpu.copy_d2h(d_split, &mut bytes)?;
+            let differ = bytes.chunks_exact(2).zip(out_bytes.chunks_exact(2)).filter(|(a, b)| a != b).count();
+            let rows = (0..tokens)
+                .filter(|r| bytes[r * hidden * 2..(r + 1) * hidden * 2] != out_bytes[r * hidden * 2..(r + 1) * hidden * 2])
+                .count();
+            println!("  invariance [{split}] vs one pass of {tokens}: {differ} values differ on {rows} rows");
+            all_identical &= differ == 0;
+        }
+        moe.set_pass_tokens(pass_ids);
+        println!("  CHUNK INVARIANCE: {}", if all_identical { "BYTE-IDENTICAL" } else { "DIFFERS" });
+        if control == MoeControl::None && gemv_pass_t.is_none() {
+            ensure!(all_identical, "the routed MoE is not chunk-invariant");
+        }
+    }
+
+    // OWNERSHIP CHECK on the real driver: the MoE and the arena free on drop. The arena is
+    // 1.79 GB and the MoE scratch is sized by T, so "most of it came back" is a real check;
+    // the control is the loaded state (free memory must have DROPPED by >= the arena first).
+    let free_loaded = gpu.free_memory()? as i64;
+    drop(moe); // frees the scratch, tiles and router weights; the arena goes with its last Arc
+    let free_after = gpu.free_memory()? as i64;
+    let taken = free_before - free_loaded;
+    let returned = free_after - free_loaded;
+    println!(
+        "  ownership: load took {:.3} GB, drop returned {:.3} GB ({:.1}%)",
+        taken as f64 / 1e9,
+        returned as f64 / 1e9,
+        100.0 * returned as f64 / taken.max(1) as f64
+    );
+    ensure!(taken >= 1_700_000_000, "loading one layer took only {taken} bytes — the check cannot see a leak");
+    ensure!(
+        returned as f64 >= 0.95 * taken as f64,
+        "dropping the MoE returned only {returned} of {taken} bytes — something still owns device memory"
+    );
 
     if control != MoeControl::None {
         let floor = TOL * MIN_SEPARATION;

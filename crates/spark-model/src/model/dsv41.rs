@@ -43,6 +43,7 @@ fn build_lanes(
     config: &ModelConfig,
     gpu: &'static dyn GpuBackend,
     kernels: &'static Dsv41Kernels,
+    shared: &crate::weight_loader::deepseek_v41::device_allocs::SharedGpu,
     fwd: &V41Forward,
     model_dir: &std::path::Path,
     max_seq: usize,
@@ -56,13 +57,14 @@ fn build_lanes(
     let manifest = std::fs::read_to_string(pack_dir.join("manifest.json"))
         .with_context(|| format!("DeepSeek-V4.1 expert pack manifest at {}", pack_dir.display()))?;
     let pack = atlas_core::config::ExpertPack::parse(&manifest, resolve_packed_keep()?)?;
-    let arena = std::sync::Arc::new(Cb3ExpertArena::load(&pack_dir, &pack, gpu)?);
+    // The arena and the MoE own an Arc to the backend and FREE their memory on drop.
+    let arena = std::sync::Arc::new(Cb3ExpertArena::load(&pack_dir, &pack, shared)?);
     tracing::info!("DeepSeek-V4.1: {:.2} GB of CB3 experts resident (keep={})", arena.resident_bytes() as f64 / 1e9, arena.packed_keep());
     let stream = gpu.default_stream();
     let routers = (0..config.num_hidden_layers)
         .map(|l| Ok((l, RouterF32::load(store, l, config.hidden_size, gpu, kernels, stream)?)))
         .collect::<Result<Vec<_>>>()?;
-    let moe = Cb3RoutedMoe::new(gpu, kernels, config, arena, routers, 10.0, 1.5, max_chunk.max(128))?;
+    let moe = Cb3RoutedMoe::new(shared.clone(), *kernels, config, arena, routers, 10.0, 1.5, max_chunk.max(128))?;
     Ok(V41Lanes { hook: Box::new(core.clone()), core: Box::new(core), moe: Box::new(moe) })
 }
 
@@ -98,7 +100,13 @@ impl Dsv41Model {
         max_chunk: usize,
     ) -> Result<Self> {
         gpu.bind_to_thread()?;
-        let gpu: &'static dyn GpuBackend = Box::leak(gpu);
+        // The routed MoE and the CB3 arena own an Arc (and free on drop). The rest of the model
+        // still borrows `&'static`, so ONE Arc clone is leaked to back that reference: the
+        // backend handle outlives the model, the device memory the MoE/arena own does not.
+        let shared: crate::weight_loader::deepseek_v41::device_allocs::SharedGpu = std::sync::Arc::from(gpu);
+        let leaked: &'static crate::weight_loader::deepseek_v41::device_allocs::SharedGpu =
+            Box::leak(Box::new(shared.clone()));
+        let gpu: &'static dyn GpuBackend = leaked.as_ref();
         let dims = V41Dims::from_config(config)?;
         let kernels: &'static Dsv41Kernels = Box::leak(Box::new(Dsv41Kernels::load(gpu)?));
         let stream = gpu.default_stream();
@@ -106,7 +114,7 @@ impl Dsv41Model {
         let threads = std::env::var("ATLAS_DSV41_ENGRAM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
         let mut fwd = V41Forward::load(store, &ops, dims, config.vocab_size, config.num_hidden_layers, max_chunk, max_seq, model_dir, threads)?;
         fwd.vision = load_vision(store, model_dir, dims.hidden, gpu)?;
-        let lanes = build_lanes(store, config, gpu, kernels, &fwd, model_dir, max_seq, max_chunk)?;
+        let lanes = build_lanes(store, config, gpu, kernels, &shared, &fwd, model_dir, max_seq, max_chunk)?;
         let mode = match std::env::var("ATLAS_DSV41_PREFILL").ok().as_deref() {
             None | Some("replay") => PrefillMode::Replay,
             Some("full") => {
