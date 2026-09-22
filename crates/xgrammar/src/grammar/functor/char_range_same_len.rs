@@ -9,6 +9,15 @@ use crate::fsm::FsmWithStartEnd;
 
 /// Decompose `[min, max]` of packed UTF-8 values of the *same byte
 /// length* into byte-range edges from state `from` to state `to`.
+///
+/// The `byte_*[i] -= 1` / `+= 1` steps are `wrapping_*` on purpose: the C++
+/// original works on `uint8_t` and relies on the wrap. A plain `-=` panics
+/// in debug builds (release builds already wrapped, so release behaviour is
+/// unchanged). FIXED UPSTREAM BUG: the 3-byte `tmax` recursion passed
+/// `0x0080` where the two continuation bytes `0x8080` are meant (upstream C++
+/// xgrammar has the same constant), so `[\u0000-\uFF5B]` lost U+F000..U+FF3F.
+/// `char_range_tests::codepoint_ranges_are_exact_across_utf8_lengths` checks
+/// every BMP codepoint.
 pub fn add_same_length_range(
     fsm: &mut FsmWithStartEnd,
     from: usize,
@@ -96,7 +105,7 @@ pub fn add_same_length_range(
             let tmax = fsm.add_state();
             fsm.fsm_mut()
                 .add_edge(from, tmax, byte_max[2] as i16, byte_max[2] as i16);
-            add_same_length_range(fsm, tmax, to, 0x0080, max & 0x00FFFF);
+            add_same_length_range(fsm, tmax, to, 0x8080, max & 0x00FFFF);
         } else {
             byte_max[2] += 1;
         }
