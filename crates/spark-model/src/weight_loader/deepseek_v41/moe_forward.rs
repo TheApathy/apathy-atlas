@@ -149,6 +149,20 @@ pub enum MoeControl {
     NextSlot,
 }
 
+/// Which parts of the per-expert loop run. **TIMING ONLY** — every value but `All` produces
+/// wrong output, on purpose, so the cost of each part can be read by subtraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ExpertWork {
+    #[default]
+    All,
+    /// CB3 reconstruct only; no GEMMs, no SwiGLU.
+    ReconstructOnly,
+    /// GEMMs + SwiGLU against whatever the scratch weights hold; no reconstruct.
+    GemmOnly,
+    /// Neither: what remains is host planning, uploads, permute and the final sum.
+    Skip,
+}
+
 pub struct Cb3RoutedMoe<'a> {
     gpu: &'a dyn GpuBackend,
     kernels: &'a Dsv41Kernels,
@@ -166,6 +180,7 @@ pub struct Cb3RoutedMoe<'a> {
     scratch: Scratch,
     pass_tokens: Mutex<Option<Vec<i64>>>,
     control: Mutex<MoeControl>,
+    work: Mutex<ExpertWork>,
 }
 
 impl<'a> Cb3RoutedMoe<'a> {
@@ -223,6 +238,7 @@ impl<'a> Cb3RoutedMoe<'a> {
             scratch,
             pass_tokens: Mutex::new(None),
             control: Mutex::new(MoeControl::None),
+            work: Mutex::new(ExpertWork::All),
         })
     }
 
@@ -234,6 +250,11 @@ impl<'a> Cb3RoutedMoe<'a> {
     /// Negative controls only.
     pub fn set_control(&self, control: MoeControl) {
         *self.control.lock().expect("control lock") = control;
+    }
+
+    /// TIMING ONLY; see [`ExpertWork`].
+    pub fn set_expert_work(&self, work: ExpertWork) {
+        *self.work.lock().expect("work lock") = work;
     }
 
     fn router(&self, layer: usize) -> Result<&RouterF32> {
@@ -359,13 +380,25 @@ impl<'a> Cb3RoutedMoe<'a> {
 
         let residency = self.arena.layer(layer)?;
         let keep = self.arena.packed_keep();
+        let work = *self.work.lock().expect("work lock");
+        let (do_reconstruct, do_gemm) = match work {
+            ExpertWork::All => (true, true),
+            ExpertWork::ReconstructOnly => (true, false),
+            ExpertWork::GemmOnly => (false, true),
+            ExpertWork::Skip => (false, false),
+        };
         for (group, (begin, end)) in groups.iter().zip(&plan.group_rows) {
             let rows = end - begin;
             if rows == 0 {
                 continue;
             }
-            for (matrix, dst) in self.matrices.iter().zip([s.w1, s.w3, s.w2]) {
-                self.reconstruct.run(residency, *matrix, group.slot, keep, dst, self.gpu, stream)?;
+            if do_reconstruct {
+                for (matrix, dst) in self.matrices.iter().zip([s.w1, s.w3, s.w2]) {
+                    self.reconstruct.run(residency, *matrix, group.slot, keep, dst, self.gpu, stream)?;
+                }
+            }
+            if !do_gemm {
+                continue;
             }
             let at = |base: DevicePtr, width: usize, elem: usize| DevicePtr(base.0 + (begin * width * elem) as u64);
             let (act, gate, up) = (at(s.perm, hidden, 2), at(s.gate, inter, 4), at(s.up, inter, 4));
