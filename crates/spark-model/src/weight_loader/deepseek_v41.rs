@@ -31,6 +31,7 @@ pub mod layer;
 mod load_layers;
 pub mod ops;
 pub mod moe;
+pub mod moe_forward;
 pub mod routing;
 pub mod seams;
 

@@ -233,13 +233,18 @@ pub fn gemm_weight_t_f32out(
     k: usize,
     stream: u64,
 ) -> Result<()> {
-    spark_runtime::cublaslt::bf16_gemm_act_weight_t_f32out(
+    use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed};
+    gemm_act_weight_t_typed(
         act.0,
+        k as u32,
         weight_bf16.0,
         out_f32.0,
+        n as u32,
         m as u32,
         n as u32,
         k as u32,
+        GemmDtype::Bf16,
+        GemmDtype::F32,
         stream,
     )
 }

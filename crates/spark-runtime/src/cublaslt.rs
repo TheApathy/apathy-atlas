@@ -493,38 +493,6 @@ pub fn bf16_gemm_act_weight_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    gemm_act_weight_t_bf16_in(act, weight, out, CUDA_R_16BF, m, n, k, stream)
-}
-
-/// [`bf16_gemm_act_weight_t`] with an **fp32** output: bf16 operands, fp32 accumulate,
-/// and the accumulator written WITHOUT the final bf16 rounding.
-///
-/// For callers whose reference keeps a GEMM result in fp32 through a nonlinearity (the
-/// DeepSeek-V4.1 routed SwiGLU clamps and gates the fp32 accumulators before its only
-/// bf16 rounding). Same plan search, same math; only `D`'s dtype differs.
-pub fn bf16_gemm_act_weight_t_f32out(
-    act: u64,
-    weight: u64,
-    out: u64,
-    m: u32,
-    n: u32,
-    k: u32,
-    stream: u64,
-) -> Result<()> {
-    gemm_act_weight_t_bf16_in(act, weight, out, CUDA_R_32F, m, n, k, stream)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn gemm_act_weight_t_bf16_in(
-    act: u64,
-    weight: u64,
-    out: u64,
-    out_dtype: i32,
-    m: u32,
-    n: u32,
-    k: u32,
-    stream: u64,
-) -> Result<()> {
     let ctx = ctx()?;
     unsafe {
         let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
@@ -567,7 +535,7 @@ fn gemm_act_weight_t_bf16_in(
             "LayoutB",
         )?;
         chk(
-            cublasLtMatrixLayoutCreate(&mut ld_, out_dtype, n as u64, m as u64, n as i64),
+            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64),
             "LayoutD",
         )?;
         let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
