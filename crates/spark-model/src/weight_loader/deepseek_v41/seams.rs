@@ -46,43 +46,75 @@ pub const INDEX_TOPK: usize = 512;
 
 /// Cross-layer state for ONE forward pass, threaded through all 40 layers.
 ///
-/// ## Where this lives, and why it is here rather than on `ForwardContext`
-/// The lifetime asked for is "persists across the whole 40-layer loop of one forward,
-/// resets per forward". That does **not** fit [`crate::layer::LayerState`], which is
-/// per-layer. The structurally right home is `ForwardContext`, which this lane does not
-/// own.
+/// ## Where this lives, and why it is NOT on `ForwardContext`
+/// The lifetime wanted is "persists across the whole 40-layer loop of one forward, resets
+/// per forward". That does not fit [`crate::layer::LayerState`], which is per-layer, so the
+/// obvious move is a field on `ForwardContext`.
 ///
-/// So the layers share one `Arc<Mutex<SparseShared>>` and **layer 0 resets it**. That is
-/// sound rather than merely convenient: layer 0 runs exactly once per forward, and it has
-/// `compress_ratio == 0`, so it does no sparse work that a reset could destroy. It is
-/// still a workaround — if `ForwardContext` ever gains a per-forward slot, move it there.
+/// I checked before doing that, and the reason not to is concrete. The layers share one
+/// `Arc<Mutex<SparseShared>>`, and the objection to a shared mutable singleton is that two
+/// concurrent forwards would corrupt each other. **They cannot.** `spark-server`'s
+/// scheduler takes `mut model: Box<dyn Model>` by value
+/// (`crates/spark-server/src/scheduler/mod.rs:206`) — the model is MOVED into one thread and
+/// exactly one forward runs at a time. Batched decode batches WITHIN a forward; it does not
+/// run forwards concurrently. So the singleton is sound, and a field on `ForwardContext`
+/// would buy nothing while touching 34 construction sites across files two other lanes are
+/// editing.
+///
+/// The lock is taken ONCE PER LAYER, not per token — about 40 uncontended acquisitions per
+/// forward, which is not a measurable cost. (An earlier note of mine called this a
+/// "per-token path". That was wrong: the seam is called once per layer per chunk.)
+///
+/// If the scheduler ever grows concurrent forwards over one model, this becomes a real bug
+/// and `ForwardContext` becomes the right answer. That is the trigger to watch for.
 ///
 /// ## What is NOT here
 /// The compressor's `pending` (one unpaired position per ratio-2 layer) carries across
 /// CHUNKS, not just across layers, so it belongs in the KV cache. Putting it here would
 /// silently drop it between chunks of the same sequence.
+///
+/// ## ONE SEMANTIC I CANNOT SETTLE — dsv41-attention must
+/// [`Self::begin_pass`] is called by layer 0, which runs once per CHUNK during prefill, not
+/// once per sequence. So today everything here is rebuilt per chunk. That is certainly right
+/// for `topk` (it is `[num_tokens, 512]`, indexed by the current chunk's tokens) but it is
+/// NOT obviously right for `ckv`, which is compressed KV over the sequence so far and may
+/// need to accumulate across chunks. Whichever it is, it is an attention-semantics question,
+/// so `ckv` is deliberately cleared by `begin_pass` and that is FLAGGED rather than quietly
+/// chosen: if it must survive, move it out of `begin_pass` (and say so), do not add a
+/// special case at a call site.
 #[derive(Default)]
 pub struct SparseShared {
-    /// Per layer, the inherited compressed-KV rows: `[n, 512]` bf16. Written on
+    /// Per layer, the inherited compressed-KV rows: `[ckv_rows, 512]` bf16. Written on
     /// [`KV_SOURCE_LAYERS`], read by their inheritors.
     pub ckv: Option<DevicePtr>,
     /// Rows currently in `ckv`.
     pub ckv_rows: usize,
     /// Index keys built alongside `ckv` on the same layers.
     pub index_keys: Option<DevicePtr>,
-    /// Per layer, the inherited selection: `[T, 512]` i64, -1 = none. Written on
+    /// Per layer, the inherited selection: `[num_tokens, 512]` i64, -1 = none. Written on
     /// [`INDEX_SOURCE_LAYERS`], read by their inheritors. ALWAYS 512 wide.
     pub topk: Option<DevicePtr>,
     /// The candidate block mask from layer 20's indexer alone, pruning 24/28/32/36.
     pub candidates: Option<DevicePtr>,
     /// `compress_ratios[layer]` of whichever layer last wrote `ckv`. Flips 2 -> 1 at 20.
     pub ratio: usize,
+    /// Chunk start of the pass currently in flight, for debugging a stale-state bug.
+    pub pass_start: usize,
+    /// Passes begun since construction. Lets a caller assert the reset actually ran.
+    pub passes: u64,
 }
 
 impl SparseShared {
-    /// Called by layer 0 at the top of every forward. See the note on the struct.
-    pub fn reset_for_new_forward(&mut self) {
+    /// Begin one pass over the 40 layers. Called by LAYER 0 and nowhere else.
+    ///
+    /// Layer 0 is a sound reset point for a reason, not by convenience: it runs exactly once
+    /// per pass and it has `compress_ratio == 0`, so it performs no sparse work that a reset
+    /// could destroy. See the struct note for the one open question about `ckv`.
+    pub fn begin_pass(&mut self, chunk_start: usize) {
+        let passes = self.passes;
         *self = Self::default();
+        self.pass_start = chunk_start;
+        self.passes = passes + 1;
     }
 }
 
@@ -392,10 +424,17 @@ mod tests {
             ratio: 2,
             ..Default::default()
         };
-        shared.reset_for_new_forward();
-        assert!(shared.ckv.is_none());
+        shared.begin_pass(2048);
+        assert!(shared.ckv.is_none(), "stale ckv must not survive a pass boundary");
         assert_eq!(shared.ckv_rows, 0);
         assert_eq!(shared.ratio, 0);
+        assert_eq!(shared.pass_start, 2048);
+        // The pass counter must SURVIVE the reset, or "did layer 0 actually reset?" is
+        // unanswerable from outside — which is the debugging question this exists for.
+        assert_eq!(shared.passes, 1);
+        shared.begin_pass(4096);
+        assert_eq!(shared.passes, 2);
+        assert_eq!(shared.pass_start, 4096);
     }
 
     /// Engram belongs to exactly two layers, with the shape the engram lane specified.
