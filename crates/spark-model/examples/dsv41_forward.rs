@@ -152,6 +152,20 @@ impl V41AttentionBlock for ProjAttention<'_> {
     }
 }
 
+/// Three-arm attribution for the dead-head mask (lead's request): compare each
+/// against the oracle with no magnitude reasoning required -- whichever arm is
+/// closest answers "does the mask matter, and is it applied correctly" directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadArm {
+    /// The mask as ported: `engram_dead_heads(chunk_ids)`.
+    Ported,
+    /// Forced all-False: what a port that silently dropped masking would produce.
+    Off,
+    /// The mask shifted forward one position (the off-by-one this lane's own
+    /// tests already use as a negative control) -- a wrong-but-plausible mask.
+    Shifted,
+}
+
 struct Refuse(&'static str);
 impl V41AttentionBlock for Refuse {
     fn forward(&self, _: &Ops, l: usize, _: DevicePtr, _: DevicePtr, _: usize, _: usize) -> Result<()> {
@@ -184,25 +198,27 @@ fn manifest_chunks(dir: &Path, n: usize) -> Result<Vec<(usize, usize)>> {
 
 /// The engine lane's routed MoE over an arena holding layers `0..n_layers` (1.79 GB each at
 /// keep=124). The full 40-layer load is 71.7 GB and needs lead approval.
-fn real_moe<'a>(
+fn real_moe(
     store: &spark_runtime::weights::WeightStore,
-    gpu: &'a AtlasCudaBackend,
-    kernels: &'a Dsv41Kernels,
+    backend: &Arc<AtlasCudaBackend>,
+    kernels: &Dsv41Kernels,
     config: &atlas_core::config::ModelConfig,
     n_layers: usize,
     max_t: usize,
-) -> Result<Cb3RoutedMoe<'a>> {
+) -> Result<Cb3RoutedMoe> {
+    let shared: spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu = backend.clone();
+    let gpu = backend.as_ref();
     let pack_dir = Path::new(MODEL_DIR).join("k154-cb3");
     let pack = ExpertPack::parse(&std::fs::read_to_string(pack_dir.join("manifest.json"))?, SERVED_PACKED_KEEP)?;
     let layers: Vec<usize> = (0..n_layers).collect();
-    let arena = Arc::new(Cb3ExpertArena::load_layer_subset(&pack_dir, &pack, &layers, gpu)?);
+    let arena = Arc::new(Cb3ExpertArena::load_layer_subset(&pack_dir, &pack, &layers, &shared)?);
     println!("routed MoE: {} layers resident, {:.2} GB", layers.len(), arena.resident_bytes() as f64 / 1e9);
     let stream = gpu.default_stream();
     let routers = layers
         .iter()
         .map(|&l| Ok((l, RouterF32::load(store, l, config.hidden_size, gpu, kernels, stream)?)))
         .collect::<Result<Vec<_>>>()?;
-    Cb3RoutedMoe::new(gpu, kernels, config, arena, routers, 10.0, 1.5, max_t)
+    Cb3RoutedMoe::new(shared, *kernels, config, arena, routers, 10.0, 1.5, max_t)
 }
 
 struct NoHook;
@@ -235,13 +251,14 @@ fn run_model_path(
     splits: Vec<Vec<usize>>,
 ) -> Result<()> {
     let gpu_ref: &AtlasCudaBackend = &Arc::clone(&gpu);
+    spark_model::model::dsv41::log_run_identity("driver", ops.stream);
     let max_chunk = splits.iter().flatten().copied().chain(chunks.iter().map(|c| c.1)).max().unwrap_or(1);
     let fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, 8192, Path::new(MODEL_DIR), 128)?;
     let feeder = Feeder { dir: ref_dir.to_path_buf(), counts: RefCell::new(HashMap::new()), gpu };
     let fed_core = FedCore(&feeder);
     let real_core;
     let (core, hook): (&dyn AttnCore, &dyn PassHook) = if attn_real {
-        real_core = Dsv41SparseCore::load(gpu_ref, store, config, 8192, max_chunk, fwd.freqs_c)?;
+        real_core = Dsv41SparseCore::load_prefix(gpu_ref, store, config, 8192, max_chunk, fwd.freqs_c, n_layers)?;
         (&real_core, &real_core)
     } else {
         (&fed_core, &NoHook)
@@ -249,7 +266,7 @@ fn run_model_path(
     let fed_moe = FedMoe(&feeder, dims.hidden);
     let real;
     let moe: &dyn V41RoutedMoe = if moe_real {
-        real = real_moe(store, gpu_ref, ops.k, config, n_layers, max_chunk.max(128))?;
+        real = real_moe(store, &feeder.gpu, ops.k, config, n_layers, max_chunk.max(128))?;
         &real
     } else {
         &fed_moe
@@ -322,11 +339,17 @@ fn run_model_path(
         let to_f32 = |h: &[u8]| -> Vec<f32> { h.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect() };
         let mut got = vec![report(0, &v)];
         let t1 = std::time::Instant::now();
+        let mut steps_ms = Vec::with_capacity(decode_n);
+        let mut hashes: Vec<u64> = Vec::with_capacity(decode_n);
         for step in 1..decode_n {
             let input = if force_decode { want[step - 1] } else { *got.last().unwrap() };
+            let ts = std::time::Instant::now();
             fwd.decode(ops, &mut seq, input, hook, core, moe, &Tap::off(), logits)?;
             ops.gpu.synchronize(ops.stream)?;
+            steps_ms.push(ts.elapsed().as_secs_f64() * 1e3);
             ops.gpu.copy_d2h(logits, &mut host)?;
+            // FNV-1a over the step's raw bf16 logits: arms that must be bit-identical compare these.
+            hashes.push(host.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)));
             got.push(report(step, &to_f32(&host)));
         }
         let dt = t1.elapsed().as_secs_f64();
@@ -336,7 +359,18 @@ fn run_model_path(
         let agree = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
         let matches = got.iter().zip(&want).filter(|(a, b)| a == b).count();
         println!("decode ({}): {} steps in {dt:.2}s ({:.2} tok/s)", if force_decode { "teacher-forced" } else { "free" }, got.len() - 1, (got.len() - 1) as f64 / dt);
+        if steps_ms.len() > 2 {
+            // Warm steps: drop the first (cold caches, first-touch of lazily resolved kernels).
+            let mut w = steps_ms[1..].to_vec();
+            w.sort_by(f64::total_cmp);
+            println!(
+                "decode step ms (warm, n={}): median {:.2}  min {:.2}  max {:.2}  first {:.2}",
+                w.len(), w[w.len() / 2], w[0], w[w.len() - 1], steps_ms[0]
+            );
+        }
         println!("decode ours:   {got:?}");
+        println!("decode logits fnv: {:016x}", hashes.iter().fold(0u64, |a, h| a.rotate_left(7) ^ h));
+        println!("decode logits fnv per step: {:x?}", hashes);
         println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
         println!("decode: first {agree} identical; top-1 agreement {matches}/{}", got.len().min(want.len()));
     }
@@ -373,6 +407,8 @@ fn main() -> Result<()> {
     let mut warm_prefill = false;
     let mut splits: Vec<Vec<usize>> = Vec::new();
     let mut engram_live = false;
+    let mut engram_feed_h = false;
+    let mut dead_arm = DeadArm::Ported;
     let mut head_test = false;
     let mut core_real = false;
     let mut args = std::env::args().skip(1);
@@ -387,6 +423,15 @@ fn main() -> Result<()> {
                     "live" => true,
                     "feed" => false,
                     o => bail!("--engram live|feed, got {o}"),
+                }
+            }
+            "--engram-feed-h" => engram_feed_h = true,
+            "--dead-arm" => {
+                dead_arm = match args.next().context("--dead-arm")?.as_str() {
+                    "ported" => DeadArm::Ported,
+                    "off" => DeadArm::Off,
+                    "shifted" => DeadArm::Shifted,
+                    o => bail!("--dead-arm ported|off|shifted, got {o}"),
                 }
             }
             "--head-test" => head_test = true,
@@ -407,7 +452,22 @@ fn main() -> Result<()> {
             // Per-run switches for the env-gated ops (read once, so set before any GPU work).
             // SAFETY: single-threaded at argument parsing; nothing has read the environment yet.
             "--fp8-rowtile" => unsafe { std::env::set_var("ATLAS_DSV41_FP8_ROWTILE", "1") },
+            "--fp8-policy" => {
+                let v = args.next().context("--fp8-policy")?;
+                unsafe { std::env::set_var("ATLAS_DSV41_FP8_POLICY", v) }
+            }
             "--prof" => unsafe { std::env::set_var("ATLAS_DSV41_PROF", "1") },
+            // --env K=V: set an environment variable for this run (before any GPU work).
+            "--env" => {
+                let kv = args.next().context("--env K=V")?;
+                let (k, v) = kv.split_once('=').context("--env needs K=V")?;
+                // SAFETY: single-threaded at argument parsing; nothing has read the env yet.
+                unsafe { std::env::set_var(k, v) }
+            }
+            "--tap-layers" => {
+                let v = args.next().context("--tap-layers")?;
+                unsafe { std::env::set_var("ATLAS_DSV41_TAP_LAYERS", v) }
+            }
             "--tap-names" => {
                 let v = args.next().context("--tap-names")?;
                 unsafe { std::env::set_var("ATLAS_DSV41_TAP_NAMES", v) }
@@ -538,7 +598,7 @@ fn main() -> Result<()> {
     let moe: &dyn V41RoutedMoe = if feed.iter().any(|f| f == "moe") {
         &fed_moe
     } else if moe_real {
-        real = real_moe(&store, gpu.as_ref(), &kernels, &config, n_layers, max_t)?;
+        real = real_moe(&store, &gpu, &kernels, &config, n_layers, max_t)?;
         &real
     } else {
         &Refuse("routed MoE")
@@ -575,8 +635,34 @@ fn main() -> Result<()> {
         ops.embed(embed, d_ids, s.x, t, dims.hidden)?;
         ops.hc_expand(s.x, s.h, s.pre_mix, t, dims.hidden)?;
         if engram_live {
-            let dead_host: Vec<u8> = engram_dead_heads(chunk_ids).iter().map(|&d| u8::from(d)).collect();
+            let real = engram_dead_heads(chunk_ids);
+            let dead_bools: Vec<bool> = match dead_arm {
+                DeadArm::Ported => real,
+                DeadArm::Off => vec![false; real.len()],
+                DeadArm::Shifted => {
+                    // Same construction as dead_heads.rs's own `shifted_mask_is_a_different_function`
+                    // negative control: OR the mask with itself shifted forward one position.
+                    let cols = 24usize;
+                    let tt = chunk_ids.len();
+                    let mut wrong = real.clone();
+                    for p in (1..tt).rev() {
+                        for c in 0..cols {
+                            wrong[p * cols + c] = real[p * cols + c] || real[(p - 1) * cols + c];
+                        }
+                    }
+                    wrong
+                }
+            };
+            let dead_host: Vec<u8> = dead_bools.iter().map(|&d| u8::from(d)).collect();
+            eprintln!(
+                "DEBUG dead_arm={dead_arm:?} dead_host True count = {} / {}",
+                dead_host.iter().filter(|&&d| d != 0).count(),
+                dead_host.len()
+            );
             gpu.copy_h2d(&dead_host, d_dead)?;
+            let mut readback = vec![0u8; dead_host.len()];
+            gpu.copy_d2h(d_dead, &mut readback)?;
+            eprintln!("DEBUG readback True count = {} / {}", readback.iter().filter(|&&d| d != 0).count(), readback.len());
         }
         for w in &blocks {
             if let Some(e) = &w.engram {
@@ -603,6 +689,14 @@ fn main() -> Result<()> {
                         DevicePtr::NULL
                     }
                 };
+                if engram_feed_h {
+                    // Isolate engram+mask from this driver's own block-glue h reconstruction:
+                    // overwrite s.h with the CAPTURE's own input to this layer's engram_forward
+                    // (the "h" tap of layer-1, i.e. the prior layer's own end-of-block output --
+                    // only valid for the FIRST engram layer, where that predecessor was captured).
+                    ensure!(w.layer >= 1, "--engram-feed-h needs a captured predecessor layer");
+                    feeder.feed_raw("h", w.layer - 1, s.h, t * dims.hc * dims.hidden * 2)?;
+                }
                 e.forward(&ops, s.h, s.engram_rows, dead_ptr, t, &s, &dims)?;
                 tap.bf16(&ops, "engram_out", w.layer, s.h, &[t, dims.hc, dims.hidden])?;
             }

@@ -26,7 +26,7 @@ end() { echo "$(date -u +%FT%TZ) dsv41-integrate KEEP124 $LABEL window END rc=$1
 # Model-holding things only: a buildkit builder container or a cargo build is not resident on
 # the GPU (a build is reported as a warning: it slows GPU work but cannot OOM the device).
 others=$(docker ps --format '{{.Names}}' | grep -Ei 'dsv41|atlas|spark|vllm' | grep -v buildkit || true)
-procs=$(pgrep -af 'spark serve|bin/spark |v41_engine|capture_ref|examples/dsv41_forward' | grep -v "$$" | grep -v keep124_window | grep -v cargo || true)
+procs=$(pgrep -af 'spark serve|bin/spark |v41_engine|capture_ref|examples/dsv41_forward' | grep -v "$$" | grep -v keep124_window | grep -v cargo | grep -v 'flock -w' || true)
 builds=$(pgrep -af 'cargo build|rustc|nvcc' | head -3 || true)
 [ -n "$builds" ] && echo "WARNING: builds running (slow GPU work, not memory-resident): [${builds}]"
 avail=$(memavail)

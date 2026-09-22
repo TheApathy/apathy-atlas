@@ -12,7 +12,10 @@ pub mod hash;
 #[cfg(feature = "engram-tokenizer")]
 pub mod token_map;
 
-pub use dead_heads::{IMAGE_PAD_ID, IMAGE_SENTINEL_ID, apply_dead_mask, engram_dead_heads};
+pub use dead_heads::{
+    IMAGE_PAD_ID, IMAGE_SENTINEL_ID, MAX_LOOKBACK, N_HEAD_COLS, apply_dead_mask, engram_dead_heads,
+    engram_dead_heads_with_carry, max_ngram_size_matches, update_dead_carry,
+};
 pub use gather::{EngramGather, EngramLoader, register};
 pub use hash::{DEAD, EngramHashState, EngramLayout};
 #[cfg(feature = "engram-tokenizer")]

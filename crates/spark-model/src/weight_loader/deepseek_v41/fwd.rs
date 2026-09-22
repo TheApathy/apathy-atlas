@@ -187,6 +187,11 @@ pub struct PassScratch {
 }
 
 impl PassScratch {
+    /// The device buffers this scratch allocated (for an owner that frees them on drop).
+    pub fn allocations(&self) -> &[DevicePtr] {
+        &self.allocations
+    }
+
     pub fn new(gpu: &dyn GpuBackend, dims: &V41Dims, max_t: usize, largest_fp8_weight: usize) -> Result<Self> {
         let mut allocations = Vec::new();
         let mut a = |bytes: usize| -> Result<DevicePtr> {
@@ -348,6 +353,12 @@ impl Tap {
     fn write(&self, ops: &Ops, name: &str, layer: usize, ptr: DevicePtr, bytes: usize) -> Result<()> {
         let Some(dir) = &self.dir else { return Ok(()) };
         if !self.layers.is_empty() && !self.layers.contains(&layer) {
+            return Ok(());
+        }
+        // ATLAS_DSV41_TAP_LAYERS=0,1,40 restricts the dump to those layers.
+        if let Ok(only) = std::env::var("ATLAS_DSV41_TAP_LAYERS")
+            && !only.split(',').any(|l| l.parse::<usize>().ok() == Some(layer))
+        {
             return Ok(());
         }
         // ATLAS_DSV41_TAP_NAMES=h,logits_last restricts the dump to those tap names.

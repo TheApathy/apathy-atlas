@@ -11,7 +11,7 @@
 //! NOT reproduced here — see DSV41_PORT/integrate.)
 
 use anyhow::{Context, Result, ensure};
-use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed_ex};
+use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed_ex, gemm_act_weight_t_typed_pinned};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use spark_runtime::weights::{WeightDtype, WeightStore};
@@ -47,6 +47,57 @@ pub mod profile {
         out += &format!("{:<34} {:>9.1}\n", "TOTAL (top-level scopes)", total * 1e3);
         out
     }
+}
+
+/// The M every FP8 dense GEMM with M > MM_TILE is ISSUED at (rows past the real M are slack).
+/// 0 = issue at the real M. Set once by the forward from its max chunk: a GEMM whose M changes
+/// with chunking lets cuBLASLt pick a different algorithm per M, and the untiled FP8 path was
+/// measured NOT chunk-invariant ([500,544] vs [512,512,20]: 72,443 of 21.4M h values differ at L00).
+/// Issuing at one fixed M keeps one algorithm for every chunk.
+static FP8_FIXED_M: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_fp8_fixed_m(m: usize) {
+    FP8_FIXED_M.store(m, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn fp8_fixed_m() -> usize {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("ATLAS_DSV41_FP8_FIXED_M").as_deref() == Ok("0")) {
+        return 0;
+    }
+    FP8_FIXED_M.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How an FP8 dense GEMM with M > 16 is issued (`ATLAS_DSV41_FP8_POLICY`, default `pinned`).
+///
+/// Measured (runI prompt as [512,512,20] vs [500,544], 241 tapped tensors incl. logits):
+/// pinned and fixedm are BYTE-IDENTICAL across chunkings; untiled is not. pinned does no
+/// padding, so it is the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fp8Policy {
+    /// One GEMM at the true M, cuBLASLt's per-M algorithm (NOT chunk-invariant, measured).
+    Untiled,
+    /// 16-row tiles (chunk-invariant, re-reads the weight per tile).
+    RowTile,
+    /// One GEMM padded to the forward's fixed M (one algorithm; slack rows).
+    FixedM,
+    /// One GEMM at the true M with ONE algorithm per shape, chosen at the fixed M.
+    Pinned,
+}
+
+pub fn fp8_policy() -> Fp8Policy {
+    static P: std::sync::OnceLock<Fp8Policy> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        if std::env::var("ATLAS_DSV41_FP8_ROWTILE").as_deref() == Ok("1") {
+            return Fp8Policy::RowTile;
+        }
+        match std::env::var("ATLAS_DSV41_FP8_POLICY").as_deref() {
+            Ok("untiled") => Fp8Policy::Untiled,
+            Ok("rowtile") => Fp8Policy::RowTile,
+            Ok("fixedm") => Fp8Policy::FixedM,
+            _ => Fp8Policy::Pinned,
+        }
+    })
 }
 
 /// `ATLAS_DSV41_FP8_ROWTILE=1`: run FP8 dense GEMMs as 16-row tiles at every M (the
@@ -109,10 +160,29 @@ pub struct Dsv41Kernels {
     pub engram_rows_bf16: KernelHandle,
     pub engram_gate: KernelHandle,
     pub mul_bf16_to_f32: KernelHandle,
+    /// `dsv41_decode::dsv41_fp8_gemv_m1`, used at M = 1 when [`DENSE_GEMV_ENV`] is on.
+    pub fp8_gemv_m1: Option<KernelHandle>,
+    /// The bit-identical split `hc_mixes` for T = 1 ([`HC_SPLIT_ENV`]): (dot, finish, raw scratch).
+    pub hc_split: Option<(KernelHandle, KernelHandle, DevicePtr)>,
 }
+
+/// ON by default (`ATLAS_DSV41_HC_SPLIT=0` turns it off): at T = 1, `hc_mixes` runs as 25 blocks + an epilogue instead of one
+/// block per token. Bit-identical by construction (same per-thread order, same tree).
+pub const HC_SPLIT_ENV: &str = "ATLAS_DSV41_HC_SPLIT";
+
+/// Module compiled from `kernels/gb10/deepseek-v4.1/cb3/dsv41_decode.cu`.
+pub const DECODE_DENSE_MODULE: &str = "dsv41_decode";
+/// ON by default (`ATLAS_DSV41_DENSE_GEMV=0` turns it off): every M = 1 FP8 linear runs as
+/// a direct fp8 GEMV instead of dequant-to-bf16 + a 16-row GEMM.
+pub const DENSE_GEMV_ENV: &str = "ATLAS_DSV41_DENSE_GEMV";
+const GEMV_WARPS: u32 = 8;
 
 impl Dsv41Kernels {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
+        let k2 = |name: &str| {
+            gpu.kernel(DECODE_DENSE_MODULE, name)
+                .with_context(|| format!("{DECODE_DENSE_MODULE}::{name} is not in the compiled PTX"))
+        };
         let k = |name: &str| {
             gpu.kernel(FWD_MODULE, name).with_context(|| {
                 format!(
@@ -138,6 +208,19 @@ impl Dsv41Kernels {
             engram_rows_bf16: k("dsv41_engram_rows_bf16")?,
             engram_gate: k("dsv41_engram_gate")?,
             mul_bf16_to_f32: k("dsv41_mul_bf16_to_f32")?,
+            fp8_gemv_m1: if std::env::var(DENSE_GEMV_ENV).as_deref() != Ok("0") {
+                Some(gpu.kernel(DECODE_DENSE_MODULE, "dsv41_fp8_gemv_m1").with_context(|| {
+                    format!("{DENSE_GEMV_ENV}=1 but {DECODE_DENSE_MODULE}::dsv41_fp8_gemv_m1 is not in the PTX")
+                })?)
+            } else {
+                None
+            },
+            hc_split: if std::env::var(HC_SPLIT_ENV).as_deref() != Ok("0") {
+                let raw = gpu.alloc(MM_TILE * 25 * 4)?;
+                Some((k2("dsv41_hc_mix_dot")?, k2("dsv41_hc_mix_finish")?, raw))
+            } else {
+                None
+            },
         })
     }
 }
@@ -188,6 +271,20 @@ impl Ops<'_> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn hc_mixes(&self, h: DevicePtr, hc: &HcParams, pre: DevicePtr, post: DevicePtr, comb: DevicePtr, t: usize, d: usize, iters: u32, eps: f32, hc_eps: f32) -> Result<()> {
+        if let Some((dot, finish, raw)) = self.k.hc_split.filter(|_| t == 1) {
+            KernelLaunch::new(self.gpu, dot)
+                .grid([25, 1, 1])
+                .block([BLOCK, 1, 1])
+                .arg_ptr(h).arg_ptr(hc.func).arg_ptr(raw).arg_u32(d as u32)
+                .launch(self.stream)?;
+            return KernelLaunch::new(self.gpu, finish)
+                .grid([1, 1, 1])
+                .block([32, 1, 1])
+                .arg_ptr(raw).arg_ptr(hc.scale).arg_ptr(hc.base)
+                .arg_ptr(pre).arg_ptr(post).arg_ptr(comb)
+                .arg_u32(d as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
+                .launch(self.stream);
+        }
         self.l(self.k.hc_mixes)
             .grid([t as u32, 1, 1])
             .arg_ptr(h).arg_ptr(hc.func).arg_ptr(hc.scale).arg_ptr(hc.base)
@@ -283,14 +380,47 @@ impl Ops<'_> {
     /// Measured: untiled vs 16-row-tiled gave bit-identical h over all 40 layers at M=512, and
     /// the tiled form re-reads the whole bf16 weight once per 16 rows (32x per 512-row chunk).
     pub fn linear_fp8_tiled(&self, x: DevicePtr, w: &Fp8Linear, scratch: DevicePtr, out: DevicePtr, m: usize) -> Result<()> {
+        if m == 1 && self.k.fp8_gemv_m1.is_some() {
+            return self.fp8_gemv_m1(x, w, out, w.n, 0);
+        }
         prof(self, "dense/dequant", || self.dequant(w, scratch))?;
         prof(self, "dense/gemm", || {
             if m > MM_TILE && !fp8_force_rowtile() {
-                self.linear_bf16_strided(x, w.k, scratch, out, w.n, m, w.n, w.k)
+                self.linear_bf16_policy(x, w.k, scratch, out, w.n, m, w.n, w.k)
             } else {
                 self.linear_bf16_tiled(x, w.k, scratch, out, w.n, m, w.n, w.k)
             }
         })
+    }
+
+    /// A bf16 GEMM with M > MM_TILE issued under [`fp8_policy`] (the FP8 dense row policy).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_bf16_policy(&self, x: DevicePtr, lda: usize, w: DevicePtr, out: DevicePtr, ldc: usize, m: usize, n: usize, k: usize) -> Result<()> {
+        let fm = fp8_fixed_m();
+        match fp8_policy() {
+            Fp8Policy::RowTile => self.linear_bf16_tiled(x, lda, w, out, ldc, m, n, k),
+            Fp8Policy::Untiled => self.linear_bf16_strided(x, lda, w, out, ldc, m, n, k),
+            Fp8Policy::FixedM => self.linear_bf16_strided(x, lda, w, out, ldc, if fm >= m { fm } else { m }, n, k),
+            Fp8Policy::Pinned => gemm_act_weight_t_typed_pinned(
+                x.0, lda as u32, w.0, out.0, ldc as u32, m as u32, n as u32, k as u32,
+                GemmDtype::Bf16, GemmDtype::Bf16, NO_SPLIT_K, fm.max(MM_TILE * 32) as u32, self.stream,
+            ),
+        }
+    }
+
+    /// `out[n] = x_g . dequant(w)[n]` for ONE activation row, reading the fp8 weight directly
+    /// (`dsv41_decode.cu`). Row n uses activation group `n / n_per_group`, which starts
+    /// `x_group_stride` elements after the previous one (0 for a plain linear).
+    pub fn fp8_gemv_m1(&self, x: DevicePtr, w: &Fp8Linear, out: DevicePtr, n_per_group: usize, x_group_stride: usize) -> Result<()> {
+        let kernel = self.k.fp8_gemv_m1.context("fp8 GEMV not loaded")?;
+        ensure!(w.k % 16 == 0 && (n_per_group == w.n || n_per_group % 32 == 0), "fp8 GEMV extents: n {} k {} group {n_per_group}", w.n, w.k);
+        KernelLaunch::new(self.gpu, kernel)
+            .grid([(w.n as u32).div_ceil(GEMV_WARPS), 1, 1])
+            .block([32 * GEMV_WARPS, 1, 1])
+            .arg_ptr(x).arg_ptr(w.weight).arg_ptr(w.scale).arg_ptr(out)
+            .arg_u32(w.n as u32).arg_u32(w.k as u32)
+            .arg_u32(n_per_group as u32).arg_u32(x_group_stride as u32)
+            .launch(self.stream)
     }
 
     /// Dequantize `w` to bf16 into `scratch` (at least `w.n * w.k * 2` bytes).

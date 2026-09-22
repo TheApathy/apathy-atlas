@@ -178,7 +178,9 @@ fn main() -> Result<()> {
     };
 
     let started = std::time::Instant::now();
-    let arena = Cb3ExpertArena::load(&pack_dir, &pack, &gpu)?;
+    // Unowned on purpose: this microtest reads planes back through `gpu` after the load and
+    // exits; it does not exercise the drop path.
+    let arena = Cb3ExpertArena::load_unowned(&pack_dir, &pack, &gpu)?;
     let upload_secs = started.elapsed().as_secs_f64();
     let sectors_after = device_sectors_read();
     sampling.store(false, std::sync::atomic::Ordering::Relaxed);

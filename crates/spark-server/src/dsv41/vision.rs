@@ -6,7 +6,8 @@
 //!
 //! The pixel resampling (Pillow 10.4 BICUBIC, gray-127 `ImageOps.pad`) is
 //! reused from the V4-Vision path (`deepseek_vision_preprocess::bicubic`),
-//! which already matches Pillow. What differs from V4 is everything around
+//! which already matches Pillow. JPEG decode goes through libjpeg-turbo
+//! (`super::turbojpeg`), as Pillow's does. What differs from V4 is everything around
 //! it: the resize solver and token budget (1024 tokens, not 384), the token
 //! layout, and EXIF orientation.
 //!
@@ -115,8 +116,15 @@ fn percent_decode(s: &str) -> Vec<u8> {
 }
 
 /// `decode_image_record`: an encoder image record (`{"url"|"data"|"source": ...}`)
-/// or a bare string -> RGB, EXIF-transposed. Remote URLs are refused.
+/// or a bare string -> RGB, EXIF-transposed. Remote URLs are refused. JPEGs
+/// decode through libjpeg-turbo (Pillow's decoder) when it is installed.
 pub fn decode_image_record(record: &Value) -> Result<RgbImage> {
+    decode_image_record_with(record, true)
+}
+
+/// `use_turbo = false` forces the zune-jpeg path (the fallback, and the
+/// negative control in the tests).
+pub(crate) fn decode_image_record_with(record: &Value, use_turbo: bool) -> Result<RgbImage> {
     let value = match record {
         Value::Object(m) => m
             .get("data")
@@ -152,8 +160,16 @@ pub fn decode_image_record(record: &Value) -> Result<RgbImage> {
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(decoder)
-        .map_err(|_| anyhow::anyhow!("invalid PNG/JPEG image"))?;
+    let turbo = if format == ImageFormat::Jpeg && use_turbo {
+        super::turbojpeg::decode_rgb(&raw)?
+    } else {
+        None
+    };
+    let mut img = match turbo {
+        Some(rgb) => DynamicImage::ImageRgb8(rgb),
+        None => DynamicImage::from_decoder(decoder)
+            .map_err(|_| anyhow::anyhow!("invalid PNG/JPEG image"))?,
+    };
     img.apply_orientation(orientation);
     Ok(img.to_rgb8())
 }
@@ -405,15 +421,14 @@ mod tests {
             );
             let want_types: Vec<u8> = serde_json::from_value(c["types"].clone()).unwrap();
             assert_eq!(prep.types, want_types, "{name}: types");
-            if name.starts_with("jpeg") && std::env::var("DSV41_JPEG_PIXELS").is_err() {
-                // KNOWN GAP: image's zune-jpeg and Pillow's libjpeg-turbo decode the
-                // same JPEG differently (measured on these fixtures: 28% of RGB
-                // values differ, max 9-12 levels). Geometry, orientation and
-                // types above are exact; the pixels are checked by
-                // `jpeg_pixels_match_pillow` (ignored until a libjpeg-turbo
-                // decoder is linked). PNG pixels ARE bit-exact.
+            if name.starts_with("jpeg") {
+                // JPEG pixels are exact only through libjpeg-turbo; without it
+                // this test must fail rather than quietly skip them.
+                assert!(
+                    super::super::turbojpeg::available(),
+                    "libturbojpeg.so.0 is required for JPEG parity"
+                );
                 jpeg += 1;
-                continue;
             }
             let head: Vec<f32> = serde_json::from_value(c["patches_head"].clone()).unwrap();
             assert_eq!(
@@ -429,7 +444,7 @@ mod tests {
             ok += 1;
         }
         assert!(
-            ok >= 9 && jpeg == 2 && refused >= 3,
+            ok >= 11 && jpeg == 2 && refused >= 3,
             "{ok} images, {jpeg} jpeg, {refused} refusals"
         );
         // the oversized payload is not stored in the fixture: build one
@@ -448,14 +463,29 @@ mod tests {
         assert!(err.contains("pixel limit"), "{err}");
     }
 
-    /// Fails today (see the KNOWN GAP above). Run with
-    /// `DSV41_JPEG_PIXELS=1 cargo test ... -- --ignored jpeg_pixels`.
+    /// NEGATIVE CONTROL: the zune-jpeg fallback must NOT reproduce Pillow's
+    /// JPEG pixels (measured: 28% of RGB values differ), or the JPEG check
+    /// above could not tell the two decoders apart.
     #[test]
-    #[ignore = "zune-jpeg != libjpeg-turbo: 28% of values differ by up to 12 levels"]
-    fn jpeg_pixels_match_pillow() {
-        // SAFETY of the env var: read-only toggle consumed by the test above.
-        unsafe { std::env::set_var("DSV41_JPEG_PIXELS", "1") };
-        preprocessing_matches_vision_py_bit_exact();
+    fn zune_jpeg_fallback_disagrees_with_pillow() {
+        let fx = fixture();
+        let cfg = config();
+        for c in fx["images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["name"].as_str().unwrap().starts_with("jpeg"))
+        {
+            let rec = serde_json::json!({"type": "image", "url": c["uri"]});
+            let zune =
+                preprocess_image(&decode_image_record_with(&rec, false).unwrap(), &cfg).unwrap();
+            assert_ne!(
+                fnv_bf16(&zune.patches),
+                c["patches_fnv"].as_str().unwrap(),
+                "{}",
+                c["name"]
+            );
+        }
     }
 
     #[test]
@@ -517,5 +547,111 @@ mod tests {
             want,
             "orientation 6 must swap the sides"
         );
+    }
+}
+
+#[cfg(test)]
+mod e2e_prompt_tests {
+    //! The two pre-registered vision e2e requests (DSV41_PORT/parity/vision_e2e):
+    //! the Atlas server's rendering + image expansion, and the engram dead-head
+    //! mask the Atlas forward computes chunk by chunk (512-token chunks, the
+    //! carry), must equal production's full-prompt result
+    //! (dead_heads_oracle.json, from app.py + vision.py on CPU).
+    use super::*;
+    use spark_model::layers::deepseek_v41_engram::{
+        engram_dead_heads, engram_dead_heads_with_carry, update_dead_carry,
+    };
+
+    const DIR: &str = "/home/flocka/atlas/DSV41_PORT/parity/vision_e2e";
+
+    fn atlas_ids(name: &str) -> Vec<u32> {
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{DIR}/{name}.json")).unwrap())
+                .unwrap();
+        let r = crate::dsv41::request::render_request(&body).unwrap();
+        let tok = tokenizers::Tokenizer::from_file(
+            "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K/tokenizer.json",
+        )
+        .unwrap();
+        let ids = tok
+            .encode(r.prompt.as_str(), false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        let cfg = super::tests_support::config();
+        let lens: Vec<usize> = r
+            .images
+            .iter()
+            .map(|rec| {
+                let img = decode_image_record(&Value::Object(rec.clone())).unwrap();
+                preprocess_image(&img, &cfg).unwrap().types.len()
+            })
+            .collect();
+        expand_image_placeholders(&ids, &lens).unwrap().0
+    }
+
+    fn chunked_dead(ids: &[u32], chunk: usize, carry_on: bool) -> Vec<bool> {
+        let mut carry = Vec::new();
+        let mut out = Vec::new();
+        for c in ids.chunks(chunk) {
+            out.extend(if carry_on {
+                engram_dead_heads_with_carry(&carry, c)
+            } else {
+                engram_dead_heads(c)
+            });
+            update_dead_carry(&mut carry, c);
+        }
+        out
+    }
+
+    #[test]
+    fn atlas_prompt_and_dead_heads_equal_production_on_the_boundary_requests() {
+        let oracle: Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{DIR}/dead_heads_oracle.json")).unwrap(),
+        )
+        .unwrap();
+        for name in ["01_chat_image_boundary", "02_chat_image_ends_at_chunk"] {
+            let o = &oracle[name];
+            let want_ids: Vec<u32> = serde_json::from_value(o["expanded_ids"].clone()).unwrap();
+            let ids = atlas_ids(name);
+            assert_eq!(ids, want_ids, "{name}: expanded prompt ids");
+            let want: Vec<bool> = o["dead_heads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|r| {
+                    r.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.as_i64().unwrap() != 0)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                chunked_dead(&ids, 512, true),
+                want,
+                "{name}: dead heads with the carry"
+            );
+        }
+        // CONTROL: without the carry, request 02 must differ at exactly chunk 1's first two rows.
+        let ids = atlas_ids("02_chat_image_ends_at_chunk");
+        let (with, without) = (
+            chunked_dead(&ids, 512, true),
+            chunked_dead(&ids, 512, false),
+        );
+        let rows: Vec<usize> = (0..ids.len())
+            .filter(|&p| with[p * 24..(p + 1) * 24] != without[p * 24..(p + 1) * 24])
+            .collect();
+        assert_eq!(rows, vec![512, 513]);
+    }
+}
+
+#[cfg(test)]
+mod tests_support {
+    pub(super) fn config() -> super::VisionConfig {
+        let path = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K/config.json";
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        super::VisionConfig::from_config_json(&cfg).unwrap()
     }
 }

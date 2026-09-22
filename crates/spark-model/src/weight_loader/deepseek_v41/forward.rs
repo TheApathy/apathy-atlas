@@ -23,7 +23,69 @@ use spark_runtime::weights::WeightStore;
 use super::attn_block::{self, AttnCore, AttnScratch, HEAD_DIM, RING, V41AttnWeights, WINDOW, compress_ratio};
 use super::fwd::{BlockControl, PassScratch, Tap, V41AttentionBlock, V41BlockWeights, V41Dims, V41RoutedMoe, block};
 use super::ops::{Ops, RopeSpec, RopeTable, bf16_tensor, bytemuck_u32, prof};
-use crate::layers::deepseek_v41_engram::{EngramGather, EngramHashState, engram_dead_heads};
+use crate::layers::deepseek_v41_engram::{
+    EngramGather, EngramHashState, N_HEAD_COLS, engram_dead_heads, engram_dead_heads_with_carry,
+    update_dead_carry,
+};
+
+/// Set to dump `engram_in` (the block's `h` going INTO the engram projection),
+/// `engram_rows_masked` (the post-mask, cast-to-bf16 rows the wkv linear
+/// actually reads) alongside the existing `engram_out` tap, and to log the
+/// masked-head count per chunk from the EXECUTING path (host-side, from the
+/// same buffer that gets uploaded to the device -- not a separate recompute).
+/// Off by default: the extra taps cost a D2H copy nobody wants paying for on
+/// every run.
+pub const ENGRAM_DEBUG_ENV: &str = "ATLAS_DSV41_ENGRAM_DEBUG";
+
+fn engram_debug() -> bool {
+    std::env::var(ENGRAM_DEBUG_ENV).is_ok()
+}
+
+/// Attribution tool (team-lead's 3-arm plan): override the PREFILL dead-head mask on the
+/// EXECUTING path, so a comparison against the oracle needs no magnitude reasoning --
+/// whichever arm lands closest answers directly. `ported` (default, unset) is the real path
+/// and is a no-op. Never applies to decode: decode's own correctness (block-local, no carry)
+/// is a separate, already-tested question, and overriding it here would conflate the two.
+pub const ENGRAM_DEAD_ARM_ENV: &str = "ATLAS_DSV41_ENGRAM_DEAD_ARM";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadArm {
+    Ported,
+    Off,
+    Shifted,
+}
+
+fn dead_arm() -> Result<DeadArm> {
+    match std::env::var(ENGRAM_DEAD_ARM_ENV) {
+        Err(_) => Ok(DeadArm::Ported),
+        Ok(v) => match v.as_str() {
+            "ported" => Ok(DeadArm::Ported),
+            "off" => Ok(DeadArm::Off),
+            "shifted" => Ok(DeadArm::Shifted),
+            other => anyhow::bail!("{ENGRAM_DEAD_ARM_ENV}: ported|off|shifted, got {other}"),
+        },
+    }
+}
+
+/// Apply `arm` to an already-computed [T, N_HEAD_COLS] mask. `Ported` is a no-op (returns
+/// `dead` unchanged); the other two exist only for this attribution tool.
+fn apply_dead_arm(arm: DeadArm, dead: Vec<bool>, t: usize) -> Vec<bool> {
+    match arm {
+        DeadArm::Ported => dead,
+        DeadArm::Off => vec![false; dead.len()],
+        DeadArm::Shifted => {
+            // Same construction as dead_heads.rs's own negative control: OR the mask with
+            // itself shifted forward one position.
+            let mut wrong = dead.clone();
+            for p in (1..t).rev() {
+                for c in 0..N_HEAD_COLS {
+                    wrong[p * N_HEAD_COLS + c] = dead[p * N_HEAD_COLS + c] || dead[(p - 1) * N_HEAD_COLS + c];
+                }
+            }
+            wrong
+        }
+    }
+}
 
 /// `candidate_source_layer`: the last encoder layer.
 pub const ENCODER_LAST: usize = 20;
@@ -71,6 +133,13 @@ pub struct V41Seq {
     pub tail_rows: usize,
     /// Token ids of those tail rows (the replay's MoE routes by them).
     pub tail_ids: Vec<u32>,
+    /// The trailing up-to-`MAX_LOOKBACK` raw ids from the most recently processed
+    /// chunk/token, carried so `engram_dead_heads_with_carry` sees look-back
+    /// across a chunk boundary the way `engine/v41_engine.py:755` does (it hashes
+    /// the WHOLE image-expanded prompt once, then slices per chunk) rather than
+    /// `engine/model.py:747`'s local fallback, which only applies to decode/text
+    /// (dsv41-parity, 2026-09-22).
+    pub dead_carry: Vec<u32>,
 }
 
 impl V41Seq {
@@ -90,6 +159,7 @@ impl V41Seq {
             tail_pre: gpu.alloc(WINDOW * dims.hc * 4)?,
             tail_rows: 0,
             tail_ids: Vec::new(),
+            dead_carry: Vec::new(),
         })
     }
 
@@ -116,9 +186,15 @@ pub struct V41Forward {
     pub scratch: PassScratch,
     pub attn_scratch: AttnScratch,
     pub engram: Vec<(usize, EngramGather)>,
+    /// V4.1 image input (the tower + prompt-embedding splice); None = text-only.
+    pub vision: Option<super::image_splice::V41ImageSplice>,
     pub ids_dev: DevicePtr,
     pub max_chunk: usize,
     pub max_seq: usize,
+    /// Every device allocation this forward made (scratch, RoPE tables, ids, the engram
+    /// q*k weight products), freed on drop once [`Self::own_allocations`] hands it a backend.
+    /// Until then (the driver) it only records them.
+    pub allocs: super::device_allocs::DeviceAllocs,
 }
 
 pub fn rope_specs() -> (RopeSpec, RopeSpec) {
@@ -150,6 +226,9 @@ impl V41Forward {
             .max()
             .unwrap_or(0);
         let (c, w) = rope_specs();
+        // FP8 dense GEMMs at M > 16 are issued at ONE M for every chunk (see ops::fp8_fixed_m);
+        // every activation buffer below holds tiled_rows(max(max_chunk, 128)) rows.
+        super::ops::set_fp8_fixed_m(super::ops::tiled_rows(max_chunk.max(WINDOW)));
         let engram = blocks
             .iter()
             .filter(|b| b.engram.is_some())
@@ -169,9 +248,31 @@ impl V41Forward {
             blocks,
             attn,
             engram,
+            vision: None,
             max_chunk,
             max_seq,
+            allocs: super::device_allocs::DeviceAllocs::unowned(),
         })
+    }
+
+    /// Take ownership of every allocation made in [`Self::load`] so dropping the forward frees
+    /// it (serving). The driver skips this and lets process exit clean up.
+    pub fn own_allocations(&mut self, gpu: super::device_allocs::SharedGpu) {
+        let mut a = super::device_allocs::DeviceAllocs::owned(gpu);
+        for p in self.scratch.allocations().iter().chain(self.attn_scratch.allocations()) {
+            a.adopt(*p);
+        }
+        for t in [self.freqs_c, self.freqs_w] {
+            a.adopt(t.cos);
+            a.adopt(t.sin);
+        }
+        a.adopt(self.ids_dev);
+        for b in &self.blocks {
+            if let Some(e) = &b.engram {
+                a.adopt(e.weight);
+            }
+        }
+        self.allocs = a;
     }
 
     fn rope(&self, layer: usize) -> &RopeTable {
@@ -202,8 +303,19 @@ impl V41Forward {
                 let rows: Vec<i64> = (0..t).flat_map(|tok| all[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
                 let g = &self.engram.iter().find(|(el, _)| *el == l).context("no engram gather")?.1;
                 prof(ops, "engram.gather", || g.gather_rows_gpu(&rows, t, s.engram_rows, ops.gpu, ops.stream))?;
+                let debug = engram_debug();
+                if debug {
+                    tap.bf16(ops, "engram_in", l, s.h, &[t, self.dims.hc, self.dims.hidden])?;
+                    tap.f32(ops, "engram_rows_premask", l, s.engram_rows, &[t, N_HEAD_COLS, 256])?;
+                }
                 // `pass` uploaded this chunk's dead-head mask into `s.engram_dead`.
                 prof(ops, "engram.proj", || e.forward(ops, s.h, s.engram_rows, s.engram_dead, t, s, &self.dims))?;
+                if debug {
+                    // The mask+cast the wkv linear actually reads, AFTER dsv41_engram_rows_bf16
+                    // runs -- if this doesn't differ from engram_rows_premask on a chunk the
+                    // executing mask log says has masked cells, the mask isn't reaching the GEMM.
+                    tap.bf16(ops, "engram_rows_masked", l, s.engram_rows_bf16, &[t, N_HEAD_COLS, 256])?;
+                }
                 tap.bf16(ops, "engram_out", l, s.h, &[t, self.dims.hc, self.dims.hidden])?;
             }
             let adapter = AttnAdapter { fwd: self, ring: seq.rings[l], win_lo, core, tap };
@@ -231,12 +343,49 @@ impl V41Forward {
         ensure!(seq.len == start, "sequence holds {} positions, pass starts at {start}", seq.len);
         ensure!(start + t <= self.max_seq, "position {} exceeds max_seq {}", start + t, self.max_seq);
         let hashes = seq.hash.forward(ids, start, None)?;
-        // `engram_dead_heads` is a pure function of THIS forward's ids (model.py:747, no
-        // cross-chunk carry); all-False for text.
-        let dead: Vec<u8> = engram_dead_heads(ids).into_iter().map(u8::from).collect();
+        // PREFILL (`engine/v41_engine.py:755`) hashes the WHOLE image-expanded prompt once and
+        // slices per chunk -- carrying the trailing MAX_LOOKBACK raw ids across chunks is the
+        // exact equivalent (see deepseek_v41_engram::dead_heads's module doc). DECODE does NOT
+        // carry: `m.forward(block, pos, prefill=False)` (v41_engine.py:912, 1037) passes no
+        // dead_heads, so `model.py:746-747`'s fallback computes it fresh from that call's own
+        // (single-token) ids with no history. Corrected 2026-09-22 by dsv41-parity: an earlier
+        // version of this carried on decode too, which is wrong at exactly the position right
+        // after an image-ending prompt's first generated token. Replay never reaches an engram
+        // layer, so it never exercises this branch either way.
+        let mut dead_bools = match kind {
+            PassKind::Decode => engram_dead_heads(ids),
+            _ => engram_dead_heads_with_carry(&seq.dead_carry, ids),
+        };
+        if kind != PassKind::Decode {
+            // Attribution tool only, real path is a no-op (`DeadArm::Ported`) -- see
+            // `apply_dead_arm`'s doc. Applied AFTER the carry, so `--dead-arm shifted`'s shift
+            // is relative to what the executing path actually computed, not a re-derivation.
+            dead_bools = apply_dead_arm(dead_arm()?, dead_bools, t);
+        }
+        let dead: Vec<u8> = dead_bools.into_iter().map(u8::from).collect();
+        if kind != PassKind::Decode {
+            update_dead_carry(&mut seq.dead_carry, ids);
+        }
+        if engram_debug() {
+            // Straight off the host buffer this chunk is about to upload -- proves the mask
+            // reaches the point of upload, not merely that it was computed somewhere upstream.
+            let masked_cells = dead.iter().filter(|&&d| d != 0).count();
+            let masked_positions = dead.chunks(N_HEAD_COLS).filter(|row| row.iter().any(|&d| d != 0)).count();
+            eprintln!(
+                "ENGRAM_DEBUG pass start={start} t={t}: masked_cells={masked_cells}/{} masked_positions={masked_positions}/{t}",
+                dead.len()
+            );
+        }
         ops.gpu.copy_h2d_async(&dead, self.scratch.engram_dead, ops.stream)?;
         ops.gpu.copy_h2d_async(bytemuck_u32(ids), self.ids_dev, ops.stream)?;
         ops.embed(self.embed, self.ids_dev, self.scratch.x, t, self.dims.hidden)?;
+        // Image spans (prefill only; decode ids are never image ids). A no-op, with no
+        // GPU work, unless this request encoded images.
+        if kind != PassKind::Decode
+            && let Some(v) = &self.vision
+        {
+            v.splice(ops.gpu, ops.stream, self.embed, ids, start, self.scratch.x)?;
+        }
         ops.hc_expand(self.scratch.x, self.scratch.h, self.scratch.pre_mix, t, self.dims.hidden)?;
         hook.begin_pass(kind, start, t)?;
         moe.begin_pass(ids)?;
@@ -293,6 +442,11 @@ impl V41Forward {
         if start == 0 {
             seq.tail_rows = 0;
             seq.tail_ids.clear();
+            // Robustness (dsv41-parity): V41Seq is rebuilt per request today
+            // (Dsv41Model::alloc_sequence), so this is currently unreachable with a nonempty
+            // carry -- but if a sequence slot is ever reused, a stale dead_carry from the
+            // PREVIOUS request would otherwise silently leak into this request's first chunk.
+            seq.dead_carry.clear();
         }
         let n = self.blocks.len();
         match mode {

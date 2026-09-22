@@ -83,7 +83,9 @@ pub fn load_all_layers(
     );
 
     // (3) RESIDENCY. One arena, shared by every layer.
-    let arena = Arc::new(Cb3ExpertArena::load(&pack_dir, &pack, gpu)?);
+    // This legacy path holds only `&dyn GpuBackend`, so the arena cannot own a handle and
+    // is never freed. The served model (`model/dsv41.rs`) uses the owning `load`.
+    let arena = Arc::new(Cb3ExpertArena::load_unowned(&pack_dir, &pack, gpu)?);
 
     // (4) LAYERS.
     let reconstruct = Cb3Reconstruct::new(gpu)?;

@@ -95,6 +95,11 @@ pub struct AttnScratch {
 }
 
 impl AttnScratch {
+    /// The device buffers this scratch allocated (for an owner that frees them on drop).
+    pub fn allocations(&self) -> &[DevicePtr] {
+        &self.allocations
+    }
+
     pub fn new(gpu: &dyn GpuBackend, max_t: usize) -> Result<Self> {
         let mut allocations = Vec::new();
         let mut a = |bytes: usize| -> Result<DevicePtr> {
@@ -228,11 +233,18 @@ pub fn attention(
 
     // grouped wo_a: o [T, 8, 4096] -> o2 [T, 8, 1024], group g uses wo_a rows g*1024..
     let grp_k = HEAD_DIM * N_HEADS / O_GROUPS;
+    if t == 1 && ops.k.fp8_gemv_m1.is_some() {
+        // One grouped fp8 GEMV: output row n reads activation group n / 1024.
+        ops.fp8_gemv_m1(s.o, &w.wo_a, s.o2, O_LORA, grp_k)?;
+        return ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t);
+    }
     // `v41_ref.wo_a_proj` runs the grouped fp8 kernel (row-invariant, not row-tiled), so the
     // same row policy as `linear_fp8_tiled`: one GEMM per group at M > 16, one tile at M <= 16.
     prof(ops, "dense/dequant", || ops.dequant(&w.wo_a, wscratch))?;
     let grouped = |x: DevicePtr, lda: usize, wt: DevicePtr, o: DevicePtr, ldc: usize, m: usize, n: usize, k: usize| {
-        if m > MM_TILE && !super::ops::fp8_force_rowtile() { ops.linear_bf16_strided(x, lda, wt, o, ldc, m, n, k) } else { ops.linear_bf16_tiled(x, lda, wt, o, ldc, m, n, k) }
+        if m > MM_TILE && !super::ops::fp8_force_rowtile() {
+            ops.linear_bf16_policy(x, lda, wt, o, ldc, m, n, k)
+        } else { ops.linear_bf16_tiled(x, lda, wt, o, ldc, m, n, k) }
     };
     for g in 0..O_GROUPS {
         grouped(

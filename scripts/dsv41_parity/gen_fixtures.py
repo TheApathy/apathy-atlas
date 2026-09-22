@@ -281,6 +281,37 @@ MASK_STREAMS = {
 }
 
 
+def _byte_table():
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs, n = bs[:], 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {chr(c): b for b, c in zip(bs, cs)}
+
+
+def hole_tokens():
+    """Tokens whose bytes could belong to a U+F000..U+FF3F character: EF followed by 80..BC,
+    a trailing EF, or a leading continuation byte. xgrammar 0.1.32 wrongly excludes that
+    range from [\u0000-\uFF5B]; the Rust port fixes it, so masks are compared WITHOUT these."""
+    table = _byte_table()
+    out = set()
+    for piece, i in TOK._tk.get_vocab(with_added_tokens=True).items():
+        try:
+            b = bytes(table[c] for c in piece)
+        except KeyError:
+            b = piece.encode()
+        if (b and (0x80 <= b[0] <= 0xBF or b[-1] == 0xEF)) or any(
+                b[k] == 0xEF and 0x80 <= b[k + 1] <= 0xBC for k in range(len(b) - 1)):
+            out.add(i)
+    return out
+
+
+_HOLE = []
+
+
 def mask_trace(ebnf, text):
     import torch  # noqa: F401 - xgrammar's bitmask helpers need it
     import xgrammar as xgr
@@ -295,12 +326,17 @@ def mask_trace(ebnf, text):
         words = bm[0].tolist()
         allowed = [i for i in range(f.vocab_size) if (words[i >> 5] >> (i & 31)) & 1]
         ok = bool(m.accept_token(t))
-        steps.append({"n_allowed": len(allowed),
+        if not _HOLE:
+            _HOLE.append(hole_tokens())
+        rest = [i for i in allowed if i not in _HOLE[0]]
+        steps.append({"n_allowed": len(allowed), "n_allowed_nohole": len(rest),
+                      "digest_nohole": fnv1a64(",".join(map(str, rest)).encode()),
                       "digest": fnv1a64(",".join(map(str, allowed)).encode()),
                       "token": t, "accepted": ok})
         if not ok:
             break
-    return {"text": text, "ids": ids, "steps": steps, "terminated": bool(m.is_terminated())}
+    return {"text": text, "ids": ids, "steps": steps, "terminated": bool(m.is_terminated()),
+            "hole_in_text": any(0xF000 <= ord(c) <= 0xFF3F for c in text)}
 
 
 _FACTORY = []
@@ -426,16 +462,43 @@ def torch_int16():
     return torch.int16
 
 
+EFFORT_FORMS = [90, "90", " 7 ", "high", "HIGH", " Max ", "low", "none", "medium", "xhigh", None, 1, 100,
+                True, 0.5, 90.0, 0, 101, -1, -5, "-1", "-5", "extreme", "", {"x": 1}, [1]]
+
+
+def effort_cases():
+    """Every effort form, in all three places the server reads it, through app.resolve_thinking."""
+    out = []
+    for where in ("reasoning_effort", "reasoning.effort", "ctk.reasoning_effort"):
+        for f in EFFORT_FORMS:
+            b = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            if where == "reasoning_effort":
+                b["reasoning_effort"] = f
+            elif where == "reasoning.effort":
+                b["reasoning"] = {"effort": f}
+            else:
+                b["chat_template_kwargs"] = {"reasoning_effort": f}
+            try:
+                th, ef = app.resolve_thinking(copy.deepcopy(b), False, 75)
+                out.append({"where": where, "body": b, "thinking": th, "effort": ef})
+            except app.APIError as e:
+                out.append({"where": where, "body": b, "error": e.status})
+    return out
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     render = [render_case(n, b) for n, b in RENDER_CASES]
     parse = [parse_case(*c) for c in PARSE_CASES]
     _FACTORY.append(tool_grammar.ToolGrammarFactory(TOK, eos_id=1))
     grammar = []
+    meta_hole = None
     for n, t in GRAMMAR_CASES:
         ebnf = tool_grammar.build_tool_grammar(t)
         grammar.append({"name": n, "tools": t, "ebnf": ebnf,
                         "streams": [mask_trace(ebnf, x) for x in MASK_STREAMS.get(n, [])]})
+    with open(os.path.join(OUT, "effort_forms.json"), "w") as f:
+        json.dump({"cases": effort_cases()}, f)
     with open(os.path.join(OUT, "vision.json"), "w") as f:
         json.dump(vision_cases(), f)
     with open(os.path.join(OUT, "repetition.json"), "w") as f:

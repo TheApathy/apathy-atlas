@@ -92,7 +92,8 @@ fn deepseek_vision_angles_kernel_is_required_before_scratch_allocation() {
     let load = source
         .find("angles:gpu.kernel(\"deepseek_vision_angles\",\"deepseek_vision_angles\")?")
         .expect("new angle kernel must be a required handle, not an optional fallback");
-    assert!(load < source.find("letarena=gpu.alloc(bytes)?").unwrap());
+    // The scratch arena is allocated through the (owned or unowned) DeviceAllocs guard.
+    assert!(load < source.find("letarena=allocs.alloc(gpu,bytes)?").unwrap());
 }
 
 #[test]

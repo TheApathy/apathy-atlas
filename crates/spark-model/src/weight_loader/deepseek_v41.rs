@@ -26,14 +26,17 @@
 
 pub mod attn_block;
 pub mod cb3_arena;
+pub mod device_allocs;
 pub mod forward;
 pub mod fwd;
+pub mod image_splice;
 pub mod indexer;
 pub mod layer;
 mod load_layers;
 pub use load_layers::resolve_model_dir;
 pub mod ops;
 pub mod moe;
+pub mod moe_decode;
 pub mod moe_forward;
 pub mod routing;
 pub mod seams;

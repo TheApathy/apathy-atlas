@@ -25,7 +25,23 @@ use crate::traits::{Model, SequenceState};
 use crate::weight_loader::deepseek_v41::forward::{PassHook, PrefillMode, V41Forward, V41Seq};
 use crate::weight_loader::deepseek_v41::fwd::{Tap, V41Dims, V41RoutedMoe};
 use crate::weight_loader::deepseek_v41::attn_block::AttnCore;
+use crate::weight_loader::deepseek_v41::device_allocs::{DeviceAllocs, SharedGpu};
 use crate::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops};
+
+/// ATLAS_LOG_PINNED_ALGO=1: print the stream and every ATLAS_*/DSV41_* variable, so a serve
+/// process and a driver process can be diffed for the environment they actually ran with.
+pub fn log_run_identity(who: &str, stream: u64) {
+    if std::env::var("ATLAS_LOG_PINNED_ALGO").as_deref() != Ok("1") {
+        return;
+    }
+    eprintln!("RUN_IDENTITY {who} stream={stream:#x}");
+    let mut vars: Vec<(String, String)> =
+        std::env::vars().filter(|(k, _)| k.starts_with("ATLAS_") || k.starts_with("DSV41_")).collect();
+    vars.sort();
+    for (k, v) in vars {
+        eprintln!("RUN_ENV {who} {k}={v}");
+    }
+}
 
 /// The lanes' halves of the forward: the attention core (compress / index / sparse
 /// attention) with its per-pass hook, and the routed MoE.
@@ -41,8 +57,9 @@ pub struct V41Lanes {
 fn build_lanes(
     store: &WeightStore,
     config: &ModelConfig,
-    gpu: &'static dyn GpuBackend,
-    kernels: &'static Dsv41Kernels,
+    gpu: &dyn GpuBackend,
+    kernels: &Dsv41Kernels,
+    shared: &crate::weight_loader::deepseek_v41::device_allocs::SharedGpu,
     fwd: &V41Forward,
     model_dir: &std::path::Path,
     max_seq: usize,
@@ -56,28 +73,29 @@ fn build_lanes(
     let manifest = std::fs::read_to_string(pack_dir.join("manifest.json"))
         .with_context(|| format!("DeepSeek-V4.1 expert pack manifest at {}", pack_dir.display()))?;
     let pack = atlas_core::config::ExpertPack::parse(&manifest, resolve_packed_keep()?)?;
-    let arena = std::sync::Arc::new(Cb3ExpertArena::load(&pack_dir, &pack, gpu)?);
+    // The arena and the MoE own an Arc to the backend and FREE their memory on drop.
+    let arena = std::sync::Arc::new(Cb3ExpertArena::load(&pack_dir, &pack, shared)?);
     tracing::info!("DeepSeek-V4.1: {:.2} GB of CB3 experts resident (keep={})", arena.resident_bytes() as f64 / 1e9, arena.packed_keep());
     let stream = gpu.default_stream();
     let routers = (0..config.num_hidden_layers)
         .map(|l| Ok((l, RouterF32::load(store, l, config.hidden_size, gpu, kernels, stream)?)))
         .collect::<Result<Vec<_>>>()?;
-    let moe = Cb3RoutedMoe::new(gpu, kernels, config, arena, routers, 10.0, 1.5, max_chunk.max(128))?;
+    let moe = Cb3RoutedMoe::new(shared.clone(), *kernels, config, arena, routers, 10.0, 1.5, max_chunk.max(128))?;
     Ok(V41Lanes { hook: Box::new(core.clone()), core: Box::new(core), moe: Box::new(moe) })
 }
 
 pub struct Dsv41Model {
-    /// LEAKED for the process lifetime: the routed MoE (`Cb3RoutedMoe<'a>`) borrows the
-    /// backend and the kernel table, and a served model lives until exit anyway. A second
-    /// model load in one process would leak one backend handle (not device memory: the arena
-    /// and weights are freed by their owners).
-    gpu: &'static dyn GpuBackend,
-    kernels: &'static Dsv41Kernels,
+    /// Owned backend handle. Every owner of device memory below holds its OWN clone, so the
+    /// backend outlives all of them whatever the field drop order.
+    gpu: SharedGpu,
+    kernels: Dsv41Kernels,
     fwd: V41Forward,
     lanes: V41Lanes,
     model_dir: std::path::PathBuf,
     vocab: usize,
     mode: PrefillMode,
+    /// The model's own allocations (the logits), freed on drop.
+    own: DeviceAllocs,
     /// bf16 `[vocab]` logits of the last prefill / decode.
     logits: DevicePtr,
     seqs: Mutex<HashMap<usize, V41Seq>>,
@@ -98,14 +116,22 @@ impl Dsv41Model {
         max_chunk: usize,
     ) -> Result<Self> {
         gpu.bind_to_thread()?;
-        let gpu: &'static dyn GpuBackend = Box::leak(gpu);
+        // Nothing is leaked: every owner of device memory (the forward's scratch/tables, each
+        // sequence's rings, the logits, the MoE, the arena) holds an Arc to the backend and frees
+        // on drop, so dropping the model returns its device memory (TUI model swap).
+        let shared: SharedGpu = std::sync::Arc::from(gpu);
+        let gpu: &dyn GpuBackend = shared.as_ref();
         let dims = V41Dims::from_config(config)?;
-        let kernels: &'static Dsv41Kernels = Box::leak(Box::new(Dsv41Kernels::load(gpu)?));
+        let kernels_owned = Dsv41Kernels::load(gpu)?;
+        let kernels = &kernels_owned;
         let stream = gpu.default_stream();
         let ops = Ops { gpu, k: kernels, stream };
+        log_run_identity("serve", stream);
         let threads = std::env::var("ATLAS_DSV41_ENGRAM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
-        let fwd = V41Forward::load(store, &ops, dims, config.vocab_size, config.num_hidden_layers, max_chunk, max_seq, model_dir, threads)?;
-        let lanes = build_lanes(store, config, gpu, kernels, &fwd, model_dir, max_seq, max_chunk)?;
+        let mut fwd = V41Forward::load(store, &ops, dims, config.vocab_size, config.num_hidden_layers, max_chunk, max_seq, model_dir, threads)?;
+        fwd.own_allocations(shared.clone());
+        fwd.vision = load_vision(store, model_dir, dims.hidden, &shared)?;
+        let lanes = build_lanes(store, config, gpu, kernels, &shared, &fwd, model_dir, max_seq, max_chunk)?;
         let mode = match std::env::var("ATLAS_DSV41_PREFILL").ok().as_deref() {
             None | Some("replay") => PrefillMode::Replay,
             Some("full") => {
@@ -115,15 +141,17 @@ impl Dsv41Model {
             Some(o) => bail!("ATLAS_DSV41_PREFILL={o}: use replay (default) or full"),
         };
         // MM_TILE rows: the head GEMM runs as one 16-row tile; row 0 is the result.
-        let logits = gpu.alloc(crate::weight_loader::deepseek_v41::ops::MM_TILE * config.vocab_size * 2)?;
+        let mut own = DeviceAllocs::owned(shared.clone());
+        let logits = own.alloc(gpu, crate::weight_loader::deepseek_v41::ops::MM_TILE * config.vocab_size * 2)?;
         let tap = match std::env::var("ATLAS_DSV41_TAP_DIR") {
             Ok(d) => Tap::to_dir(d.into(), Vec::new())?,
             Err(_) => Tap::off(),
         };
         tracing::info!("DeepSeek-V4.1 served model ready: max_seq {max_seq}, chunk {max_chunk}, prefill {mode:?}");
         Ok(Self {
-            gpu,
-            kernels,
+            gpu: shared.clone(),
+            kernels: kernels_owned,
+            own,
             fwd,
             lanes,
             model_dir: model_dir.to_path_buf(),
@@ -137,7 +165,7 @@ impl Dsv41Model {
     }
 
     fn ops(&self) -> Ops<'_> {
-        Ops { gpu: self.gpu, k: self.kernels, stream: self.gpu.default_stream() }
+        Ops { gpu: self.gpu.as_ref(), k: &self.kernels, stream: self.gpu.default_stream() }
     }
 
     fn with_seq<R>(&self, slot: usize, f: impl FnOnce(&mut V41Seq) -> Result<R>) -> Result<R> {
@@ -183,7 +211,68 @@ impl Dsv41Model {
     }
 }
 
+/// The V4.1 vision tower, when the checkpoint has one (`vision.*` tensors and a
+/// `vision_config`). None for a text-only checkpoint.
+fn load_vision(
+    store: &WeightStore,
+    model_dir: &std::path::Path,
+    hidden: usize,
+    shared: &SharedGpu,
+) -> Result<Option<crate::weight_loader::deepseek_v41::image_splice::V41ImageSplice>> {
+    let gpu = shared.as_ref();
+    if store.get("vision.patch_embed.proj.weight").is_err() {
+        return Ok(None);
+    }
+    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
+    let v = &raw["vision_config"];
+    let u = |k: &str| v[k].as_u64().map(|x| x as usize).with_context(|| format!("vision_config.{k}"));
+    let enc = crate::layers::deepseek_vision::DeepSeekVisionEncoder::load_v41(
+        store,
+        u("hidden_size")?,
+        u("intermediate_size")?,
+        u("num_attention_heads")?,
+        u("num_hidden_layers")?,
+        u("patch_size")?,
+        u("downsample_ratio")?,
+        v["rope_theta"].as_f64().context("vision_config.rope_theta")?,
+        u("max_image_tokens")?,
+        hidden,
+        gpu,
+        Some(shared.clone()),
+    )?;
+    // Memory: the tower's weights (~0.97 GB) are already in the store; this is the
+    // encoder scratch arena on top (sized for max_image_tokens, allocated here once).
+    tracing::info!(
+        "DeepSeek-V4.1 vision tower loaded (image input enabled): encoder scratch {:.2} GB \
+         + ~0.97 GB of vision/aligner weights in the store",
+        enc.scratch_bytes()? as f64 / 1e9
+    );
+    Ok(Some(crate::weight_loader::deepseek_v41::image_splice::V41ImageSplice::new(enc, hidden, Some(shared.clone()))))
+}
+
+impl Drop for Dsv41Model {
+    /// Sequences still allocated when the model goes (a TUI swap mid-request) are freed here;
+    /// everything else frees through its own `DeviceAllocs`.
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.seqs.lock() {
+            for (_, s) in map.drain() {
+                if let Err(e) = s.free(self.gpu.as_ref()) {
+                    tracing::warn!("Dsv41Model drop: freeing a live sequence failed: {e}");
+                }
+            }
+        }
+    }
+}
+
 impl Model for Dsv41Model {
+    fn prepare_vision_embed(&self, images: &[(Vec<f32>, usize, usize)]) -> Result<()> {
+        match &self.fwd.vision {
+            Some(v) => v.encode(self.gpu.as_ref(), images),
+            None if images.is_empty() => Ok(()),
+            None => bail!("image input, but this DeepSeek-V4.1 model has no vision tower loaded"),
+        }
+    }
+
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
         self.prefill_all(tokens, seq, 0, true)
     }
@@ -240,7 +329,7 @@ impl Model for Dsv41Model {
             *n += 1;
             *n
         };
-        map.insert(slot, V41Seq::new(self.gpu, &self.fwd.dims, hash)?);
+        map.insert(slot, V41Seq::new(self.gpu.as_ref(), &self.fwd.dims, hash)?);
         Ok(SequenceState {
             adapter_id: 0,
             adapter_slot: -1,
@@ -283,7 +372,7 @@ impl Model for Dsv41Model {
             return Ok(());
         }
         if let Some(s) = self.seqs.lock().expect("dsv41 seqs poisoned").remove(&seq.slot_idx) {
-            s.free(self.gpu)?;
+            s.free(self.gpu.as_ref())?;
         }
         Ok(())
     }
