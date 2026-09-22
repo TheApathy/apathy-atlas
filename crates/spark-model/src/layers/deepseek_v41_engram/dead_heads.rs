@@ -176,6 +176,34 @@ mod tests {
         assert_ne!(real, wrong, "an off-by-one lookback produced the same mask as the real one");
     }
 
+    /// Cross-check against an INDEPENDENT oracle: dsv41-parity's own run of
+    /// `engine/vision.py::engram_dead_heads` (not this lane's captures), on a
+    /// 10-token fixture built to exercise PAD and SENTINEL together and every
+    /// n-gram group's offsets in one short sequence.
+    /// `dsv41-parity/crates/spark-server/tests/fixtures/dsv41/vision.json`.
+    #[test]
+    fn matches_dsv41_parity_independent_fixture() {
+        let path = "/home/flocka/atlas/dsv41-parity/crates/spark-server/tests/fixtures/dsv41/vision.json";
+        let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not present on this box");
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("parse vision.json");
+        let fixture = &v["dead_heads"];
+        let ids: Vec<u32> = fixture["ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        let want: Vec<bool> = fixture["dead"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| row.as_array().unwrap().iter().map(|b| b.as_u64().unwrap() != 0))
+            .collect();
+
+        let got = engram_dead_heads(&ids);
+        assert_eq!(got.len(), want.len(), "column count mismatch against the parity fixture");
+        let mismatches = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        assert_eq!(mismatches, 0, "{mismatches}/{} entries differ from dsv41-parity's fixture", got.len());
+    }
+
     /// `apply_dead_mask` must zero exactly the dead `(position, col)` slices and
     /// leave every alive one untouched.
     #[test]
