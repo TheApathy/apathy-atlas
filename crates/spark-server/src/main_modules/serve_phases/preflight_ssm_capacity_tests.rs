@@ -73,7 +73,11 @@ fn server_and_constructor_share_flat_tree_and_lazy_geometry() {
     let flat = checked_ssm_speculative_geometry(true, true, 15, None).unwrap();
     let wide = checked_ssm_speculative_geometry(true, true, 15, Some(31)).unwrap();
     assert_eq!(flat.num_intermediates, 17);
-    assert_eq!(wide.num_intermediates, 32);
+    // f19b3482b gated the tree term on ATLAS_DDTREE_UNCAP (the same flag the
+    // draft budget reads): without it the tree can never grow past `flat`, so
+    // the pool no longer buys the 32 rows nothing could write. The UNCAP=1
+    // arm is pinned in spark-model's ssm_pool_capacity_tests.
+    assert_eq!(wide.num_intermediates, 17);
 }
 
 #[test]

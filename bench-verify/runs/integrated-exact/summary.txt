@@ -1,0 +1,7 @@
+('warmup', 1817.8424450000002, 2048, 1, 0, 'The', 'length')
+('trial-1', 1522.4469009999998, 2048, 1, 0, 'The', 'length')
+('trial-2', 1521.9755400000001, 2048, 1, 0, 'The', 'length')
+('trial-3', 1524.098568, 2048, 1, 0, 'The', 'length')
+('trial-4', 1523.234998, 2048, 1, 0, 'The', 'length')
+('trial-5', 1525.96078, 2048, 1, 0, 'The', 'length')
+median TTFT 1523.235 ms  -> 1344.5 tok/s (prompt_tokens=2048) texts=['The', 'The', 'The', 'The', 'The']

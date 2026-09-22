@@ -537,10 +537,15 @@ pub const GDN_PREFILL_BLOCK_X: u32 = 128;
 /// Kept as a separate entry point rather than adding a parameter to the original so
 /// that no existing call site changes behaviour.
 ///
-/// WARNING before wiring any kernel here at a width other than [`GDN_PREFILL_BLOCK_X`]:
-/// the only one that ever did was the WY32 gate-cache K-split, REJECTED ON NUMERICS —
-/// +8.62% legal-domain NLL against a +3.22% precedent, argmax 95-96% against a 100%
-/// standard, attribution closed by a same-ELF control. Needs a fresh per-domain gate.
+/// WARNING, before wiring any kernel here at a width other than
+/// [`GDN_PREFILL_BLOCK_X`]: the only kernel that ever did was the WY32 gate-cache
+/// K-split, and it was REJECTED ON NUMERICS, not on speed. It was +4.6% and
+/// receipted, but cost +8.62% legal-domain NLL against a +3.22% precedent, with
+/// argmax agreement 95-96% where every banked result in this campaign is 100%.
+/// Attribution was closed with a same-ELF control. A harness receipt is not a
+/// quality gate: reassociating the j-sums looks like a 1-ulp effect per call and
+/// compounds through a 48-layer recurrence. Any new wide-block kernel needs a fresh
+/// PER-DOMAIN gate before it goes behind this parameter.
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_prefill_persistent_smem_blocked(
     gpu: &dyn GpuBackend,

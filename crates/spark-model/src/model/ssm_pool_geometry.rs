@@ -113,8 +113,28 @@ pub fn checked_ssm_speculative_geometry(
     };
     let num_intermediates = if has_mtp {
         let flat = checked_add(num_drafts, 2, "drafts + 2 intermediates")?;
-        let tree = checked_add(ddtree_capacity, 1, "DDTree capacity + 1 intermediates")?;
-        flat.max(tree)
+        // THE TREE TERM IS ONLY PAID FOR WHEN THE TREE CAN ACTUALLY PLACE A
+        // NODE, and it cannot unless `ATLAS_DDTREE_UNCAP=1`.
+        //
+        // `draft_budget::DflashDraftBudget::new` caps `tree_nodes` at `flat`
+        // unless that flag is set, so `remaining = tree_nodes - flat` is always
+        // zero and the branch builder exits before its first node — the reason
+        // DDTree measured as an exact no-op (2026-08-19: gamma=15 tree and flat
+        // both reported k=16 and accepted 7.03 to three figures).
+        //
+        // Sizing the intermediate pool for `ddtree_capacity + 1` regardless
+        // therefore bought slots nothing could ever write: max(9, 17) = 17 at
+        // the shipped geometry, against the 9 the flat path uses. THE SAME FLAG
+        // has to govern both, or the pool and the budget disagree about how
+        // many rows exist — which is how this came to cost 2.3 GB and 7 ms per
+        // reset_slot for a feature that was off.
+        let uncap_tree = std::env::var("ATLAS_DDTREE_UNCAP").ok().as_deref() == Some("1");
+        if uncap_tree {
+            let tree = checked_add(ddtree_capacity, 1, "DDTree capacity + 1 intermediates")?;
+            flat.max(tree)
+        } else {
+            flat
+        }
     } else {
         0
     };
