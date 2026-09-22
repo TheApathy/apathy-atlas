@@ -10,7 +10,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <vector>
-#include "cb3_decode.cuh"
+#include "../cb3_decode.cuh"
 
 __global__ void run(const uint32_t* L, const uint32_t* H, const uint32_t* A,
                     const uint32_t* B, const int* variant, uint32_t* out, int n) {
