@@ -1,0 +1,40 @@
+# Built-in recipe: DeepSeek-V4.1-Flash-Next (CB3 K124 expert pack) on one GB10.
+#
+# Built in rather than fetched because it is not in the public atlas-recipes index yet, and a
+# model the TUI cannot see is a model the TUI cannot launch. Settings are the ones the
+# dsv41 lanes measured (DSV41_PORT/BRIEF.md, serve windows 4-6):
+#   - spark serve text == the Python-oracle driver; greedy KL ~2.8e-4 vs the oracle
+#   - keep=124 routed experts resident = 71.7 GB of CB3 planes; ~84 GB total with the rest
+#   - DSpark (MTP drafter) OFF until its gate passes: +7.93 GB, low-water 23 GB when on
+recipe_version: "2"
+model: DeepSeek-V4.1-Flash-Next-DGX-Spark-512K
+runtime: atlas
+container: local
+metadata:
+  maintainer: dsv41-engine
+  category: agent
+  model_params: 284B
+  quantization: cb3
+  kv_dtype: bf16
+  description: |
+    DeepSeek-V4.1-Flash-Next, 124 of 384 routed experts per layer resident as CB3 (71.7 GB),
+    fused CB3 grouped-GEMM MoE, device routing, 512-token prefill chunks. Needs the whole
+    GB10: the TUI refuses to start it unless ~84 GB plus a 16 GB floor is free after the
+    previous model is released.
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  max_model_len: 8192
+  max_batch_size: 1
+  kv_cache_dtype: bf16
+# Atlas extension block, read by `main_modules::model_profile` (Recipe::parse ignores it).
+atlas:
+  model_type: deepseek_v41
+  resident_gb: 84
+  dspark_extra_gb: 8
+  headroom_gb: 16
+  run_alone: true
+  env:
+    ATLAS_DSV41_PACKED_KEEP: "124"
+    ATLAS_DSV41_CHUNK: "512"
+    ATLAS_DSV41_DSPARK: "0"

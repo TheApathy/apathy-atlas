@@ -104,7 +104,9 @@ fn refuse_if_shutting_down(shutting_down: bool) -> Result<()> {
 /// long after the outgoing model has been torn down. Discovering it there costs
 /// a live server its model for a reason that was knowable from a JSON file
 /// before anything was touched.
-fn preflight_kernel_target(args: &cli::ServeArgs) -> Result<()> {
+/// Returns the checkpoint's `model_type` so the caller can look up its launch profile
+/// without reading config.json twice.
+fn preflight_kernel_target(args: &cli::ServeArgs) -> Result<String> {
     let model_dir = super::serve_phases::resolve_model_dir(args)?;
     let (config, _) = super::serve_phases::load_model_config(&model_dir)?;
     if atlas_kernels::ptx_for_config(&config.model_type, config.hidden_size).is_none() {
@@ -119,7 +121,7 @@ fn preflight_kernel_target(args: &cli::ServeArgs) -> Result<()> {
                 .collect::<Vec<_>>()
         );
     }
-    Ok(())
+    Ok(config.model_type)
 }
 
 /// Copy the flags that describe the PROCESS, not the model, from the argv that
@@ -323,7 +325,23 @@ pub(crate) fn swap(host: &Arc<ModelHost>, next: cli::ServeArgs) -> Result<SwapOu
 
     // Cheapest checks first: this one reads the checkpoint's config.json, so it
     // runs after the ones that need nothing but the argv.
-    preflight_kernel_target(&next)?;
+    let model_type = preflight_kernel_target(&next)?;
+
+    // A model with a launch profile (memory, run-alone, env) — DeepSeek-V4.1 today. Refused
+    // HERE, before anything is released, only when it could never fit on this machine at all;
+    // the real admission is after the release below, on the memory that is actually free.
+    let profile = super::model_profile::profile_for_model_type(&model_type);
+    if let Some(p) = profile.as_ref().filter(|p| p.run_alone) {
+        let total = super::model_profile::mem_total_bytes()?;
+        anyhow::ensure!(
+            total >= p.required_bytes(false),
+            "{} needs {:.1} GB free but this machine has {:.1} GB in total — the running model \
+             is untouched",
+            p.recipe_id,
+            p.required_bytes(false) as f64 / 1e9,
+            total as f64 / 1e9
+        );
+    }
 
     // The policy the host has held since boot. NOT rebuilt from `next`: a
     // recipe's argv must not be able to drop `--require-auth` from a server
@@ -352,7 +370,26 @@ pub(crate) fn swap(host: &Arc<ModelHost>, next: cli::ServeArgs) -> Result<SwapOu
     // the indirection change. Restoring this line means restoring that
     // parameter and the `RunHandles` send beside the scheduler spawn.
     let tui_handles_tx = host.tui_handles();
-    let load_err = match load_model(next, tui_handles_tx.clone(), carried.clone(), auth.clone()) {
+    // Launch profile: its environment first (the loader reads it), then run-alone admission
+    // on the memory that is free NOW that the outgoing model is gone. A refusal is treated
+    // exactly like a failed load: the previous model is restored below.
+    let admitted = match profile.as_ref() {
+        None => Ok(()),
+        Some(p) => {
+            let set = super::model_profile::apply_env(p);
+            if !set.is_empty() {
+                tracing::info!("{}: launch environment {:?}", p.recipe_id, set);
+            }
+            let dspark_on = std::env::var("ATLAS_DSV41_DSPARK").is_ok_and(|v| v == "1");
+            super::model_profile::mem_available_bytes()
+                .and_then(|available| super::model_profile::admit(p, available, dspark_on))
+        }
+    };
+    let load_result = match admitted {
+        Ok(()) => load_model(next, tui_handles_tx.clone(), carried.clone(), auth.clone()),
+        Err(e) => Err(e),
+    };
+    let load_err = match load_result {
         Ok(Some(prepared)) => {
             // 6.
             host.set_scheduler(prepared.scheduler);

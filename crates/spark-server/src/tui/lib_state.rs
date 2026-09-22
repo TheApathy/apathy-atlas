@@ -193,7 +193,14 @@ impl LibState {
     pub fn rebuild(&mut self, local: &[LibraryEntry]) {
         let anchor = self.current().map(|e| e.model.clone());
         let card_anchor = self.selected_card().map(|r| r.id.clone());
-        self.rows = catalogue::join(&self.index.recipes, local);
+        // Built-in recipes (models the public index does not carry yet) beneath the fetched
+        // ones — only for checkpoints that are ON DISK here: a built-in's model is a local
+        // directory name, not a downloadable HF id, so listing it anywhere else would offer a
+        // model that cannot be fetched. A published recipe with the same id replaces it.
+        let recipes = crate::recipe::builtin::with_builtins_for(&self.index.recipes, |model| {
+            local.iter().any(|e| e.id == model)
+        });
+        self.rows = catalogue::join(&recipes, local);
 
         if let Some(model) = anchor {
             match self.visible().iter().position(|e| e.model == model) {
@@ -382,9 +389,14 @@ impl LibState {
         // recipe that cannot produce a legal command line is a form error the
         // user can fix, and it must read as one — not as a load that starts,
         // tears the running model down, and then discovers the same thing.
-        let args = recipe
+        let mut args = recipe
             .serve_args_edited(&self.overrides, &self.removed)
             .map_err(|e| problem_line(&format!("{e:#}")))?;
+        // A checkpoint listed from `ATLAS_MODEL_DIRS` is named by its DIRECTORY, which the
+        // model resolver cannot find from anywhere but that root. Serve its path instead.
+        if let Some(path) = local_model_path(&recipe.model, self.current().and_then(|e| e.local.as_ref())) {
+            args.model = Some(path.to_string_lossy().into_owned());
+        }
 
         let host = host.clone();
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -466,3 +478,29 @@ mod recipe_tests;
 #[cfg(test)]
 #[path = "lib_state_list_tests.rs"]
 mod list_tests;
+
+#[cfg(test)]
+#[path = "lib_state_localpath_tests.rs"]
+mod localpath_tests;
+
+/// The on-disk path to serve for a model listed from a plain directory root.
+///
+/// `None` for a HuggingFace id (`org/name`, resolved through the hub cache) and for a row with
+/// no local copy. A plain-root row's id is its directory NAME; passed as the model argument it
+/// resolves only when the process happens to run inside that root, so the TUI serves the
+/// snapshot path the scan already found.
+pub(crate) fn local_model_path(
+    model: &str,
+    local: Option<&crate::tui::data::library::LibraryEntry>,
+) -> Option<std::path::PathBuf> {
+    let entry = local?;
+    if model.contains('/') || entry.id != model {
+        return None;
+    }
+    entry
+        .snapshot_dir
+        .join("config.json")
+        .is_file()
+        .then(|| entry.snapshot_dir.clone())
+}
+
