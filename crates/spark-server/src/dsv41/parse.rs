@@ -50,7 +50,11 @@ pub struct StrictCall {
 // ------------------------------------------------------------------ strict
 
 /// `_read_until_stop`: earliest stop wins; on a tie the earlier-listed one.
-fn read_until_stop<'a>(index: usize, text: &'a str, stops: &[&'a str]) -> (usize, &'a str, Option<&'a str>) {
+fn read_until_stop<'a>(
+    index: usize,
+    text: &'a str,
+    stops: &[&'a str],
+) -> (usize, &'a str, Option<&'a str>) {
     let mut best: Option<(usize, &str)> = None;
     for s in stops {
         if let Some(p) = text[index..].find(s) {
@@ -69,7 +73,9 @@ fn read_until_stop<'a>(index: usize, text: &'a str, stops: &[&'a str]) -> (usize
 /// `^\s*name="(.*?)">\n$` (DOTALL, and `re.findall` needs exactly one match).
 fn match_tool_name(s: &str) -> Option<&str> {
     let rest = s.trim_start_matches(is_py_space).strip_prefix("name=\"")?;
-    let inner = rest.strip_suffix("\">\n").or_else(|| rest.strip_suffix("\">\n\n"))?;
+    let inner = rest
+        .strip_suffix("\">\n")
+        .or_else(|| rest.strip_suffix("\">\n\n"))?;
     // `.*?` is lazy but anchored at both ends, so any inner text matches;
     // it is the unique match unless the inner text itself ends the pattern
     // earlier, which the `$` anchor rules out. Python `$` also matches before
@@ -98,7 +104,10 @@ fn match_param(s: &str) -> Option<(&str, &str, &str)> {
     None
 }
 
-fn parse_tool_calls_strict(mut index: usize, text: &str) -> Result<(usize, Option<String>, Vec<StrictCall>), String> {
+fn parse_tool_calls_strict(
+    mut index: usize,
+    text: &str,
+) -> Result<(usize, Option<String>, Vec<StrictCall>), String> {
     let calls_end = format!("</{DSML}{CALLS_BLOCK}>");
     let call_start = format!("<{DSML}{INVOKE_TAG}");
     let call_end = format!("</{DSML}{INVOKE_TAG}");
@@ -110,7 +119,9 @@ fn parse_tool_calls_strict(mut index: usize, text: &str) -> Result<(usize, Optio
         let (i, gap, s) = read_until_stop(index, text, &[&call_start, &calls_end]);
         index = i;
         if gap != ">\n" {
-            return Err(format!("Tool call format error: expected '>\\n' but got '{gap}'"));
+            return Err(format!(
+                "Tool call format error: expected '>\\n' but got '{gap}'"
+            ));
         }
         stop = s.map(str::to_string);
         if s == Some(calls_end.as_str()) {
@@ -122,12 +133,14 @@ fn parse_tool_calls_strict(mut index: usize, text: &str) -> Result<(usize, Optio
         let (i, name_part, s) = read_until_stop(index, text, &[&param_start, &call_end]);
         index = i;
         let mut s = s.map(str::to_string);
-        let name = match_tool_name(name_part).ok_or_else(|| format!("Tool name format error: '{name_part}'"))?;
+        let name = match_tool_name(name_part)
+            .ok_or_else(|| format!("Tool name format error: '{name_part}'"))?;
         let mut args: Vec<(String, String, String)> = Vec::new();
         while s.as_deref() == Some(param_start.as_str()) {
             let (i, pc, _) = read_until_stop(index, text, &[&param_end]);
             index = i;
-            let (k, flag, v) = match_param(pc).ok_or_else(|| format!("Parameter format error: '{pc}'"))?;
+            let (k, flag, v) =
+                match_param(pc).ok_or_else(|| format!("Parameter format error: '{pc}'"))?;
             if args.iter().any(|(ek, _, _)| ek == k) {
                 return Err(format!("Duplicate parameter name: '{k}'"));
             }
@@ -135,7 +148,9 @@ fn parse_tool_calls_strict(mut index: usize, text: &str) -> Result<(usize, Optio
             let (i, gap, s2) = read_until_stop(index, text, &[&param_start, &call_end]);
             index = i;
             if gap != ">\n" {
-                return Err(format!("Parameter format error: expected '>\\n' but got '{gap}'"));
+                return Err(format!(
+                    "Parameter format error: expected '>\\n' but got '{gap}'"
+                ));
             }
             s = s2.map(str::to_string);
         }
@@ -143,12 +158,20 @@ fn parse_tool_calls_strict(mut index: usize, text: &str) -> Result<(usize, Optio
         let body: Vec<String> = args
             .iter()
             .map(|(k, v, flag)| {
-                let value = if flag == "true" { dumps(&Value::String(v.clone())) } else { v.clone() };
+                let value = if flag == "true" {
+                    dumps(&Value::String(v.clone()))
+                } else {
+                    v.clone()
+                };
                 format!("{}: {value}", dumps(&Value::String(k.clone())))
             })
             .collect();
         let (namespace, bare) = split_tool_name(name, None).map_err(|e| e.0)?;
-        calls.push(StrictCall { name: bare, namespace, arguments: format!("{{{}}}", body.join(", ")) });
+        calls.push(StrictCall {
+            name: bare,
+            namespace,
+            arguments: format!("{{{}}}", body.join(", ")),
+        });
         stop = s;
     }
     Ok((index, stop, calls))
@@ -193,7 +216,11 @@ pub fn parse_strict(text: &str, thinking: bool) -> Result<StrictMessage, String>
             return Err(format!("Unexpected special token '{sp}' in content"));
         }
     }
-    Ok(StrictMessage { content: summary.into(), reasoning_content: reasoning.into(), tool_calls })
+    Ok(StrictMessage {
+        content: summary.into(),
+        reasoning_content: reasoning.into(),
+        tool_calls,
+    })
 }
 
 // ------------------------------------------------------------------ tolerant
@@ -251,7 +278,13 @@ fn tolerant_spec_params(body: &str) -> Vec<(&str, &str, &str)> {
             let q = body[k0..].find('"')?;
             let key = &body[k0..k0 + q];
             let rest = body[k0 + q..].strip_prefix("\" string=\"")?;
-            let flag = if rest.starts_with("true") { "true" } else if rest.starts_with("false") { "false" } else { return None };
+            let flag = if rest.starts_with("true") {
+                "true"
+            } else if rest.starts_with("false") {
+                "false"
+            } else {
+                return None;
+            };
             let rest = rest[flag.len()..].strip_prefix('"')?;
             let trimmed = rest.trim_start_matches(is_py_space);
             let rest = trimmed.strip_prefix('>')?;
@@ -331,7 +364,10 @@ pub fn parse_tolerant(text: &str) -> Vec<ParsedCall> {
                 args.insert(k.to_string(), Value::String(v.to_string()));
             }
         }
-        out.push(ParsedCall { name: name.to_string(), arguments: dumps(&Value::Object(args)) });
+        out.push(ParsedCall {
+            name: name.to_string(),
+            arguments: dumps(&Value::Object(args)),
+        });
     }
     out
 }
@@ -378,7 +414,11 @@ fn held_suffix_len(text: &str, markers: &[&str]) -> usize {
 impl OutputRouter {
     pub fn new(thinking: bool, stop_strings: Vec<String>, detect_tool_calls: bool) -> Self {
         Self {
-            phase: if thinking { Phase::Reasoning } else { Phase::Content },
+            phase: if thinking {
+                Phase::Reasoning
+            } else {
+                Phase::Content
+            },
             pending: String::new(),
             stop_strings: stop_strings.into_iter().filter(|s| !s.is_empty()).collect(),
             detect_tool_calls,
@@ -499,7 +539,9 @@ impl OutputRouter {
             Err(e) => {
                 let recovered = parse_tolerant(&text);
                 if recovered.is_empty() {
-                    tracing::warn!("dsv41 tool-call parse failed ({e}); returning raw text as content");
+                    tracing::warn!(
+                        "dsv41 tool-call parse failed ({e}); returning raw text as content"
+                    );
                     let t = std::mem::take(&mut self.tool_text);
                     self.content.push_str(&t);
                     return Vec::new();

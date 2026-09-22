@@ -69,7 +69,8 @@ fn role(m: &Value) -> Option<&str> {
 }
 
 fn obj_mut(v: &mut Value) -> R<&mut Map<String, Value>> {
-    v.as_object_mut().ok_or_else(|| EncodeError("message is not an object".into()))
+    v.as_object_mut()
+        .ok_or_else(|| EncodeError("message is not an object".into()))
 }
 
 // ------------------------------------------------------------------ tool names
@@ -145,7 +146,10 @@ pub fn tools_from_openai_format(tools: &[Value]) -> R<Vec<Value>> {
                 Some(d) if truthy(Some(d)) => py_str(d),
                 _ => String::new(),
             };
-            function.insert("description".into(), Value::String(format!("{head}\n{tail}")));
+            function.insert(
+                "description".into(),
+                Value::String(format!("{head}\n{tail}")),
+            );
         }
         out.push(Value::Object(function));
     }
@@ -262,7 +266,11 @@ fn find_last_user_index(messages: &[Value]) -> isize {
 
 fn text_or_empty(v: Option<&Value>) -> String {
     // `x or ""`, then str.format: falsy -> "", anything else -> str(x).
-    if truthy(v) { py_str(v.unwrap_or(&Value::Null)) } else { String::new() }
+    if truthy(v) {
+        py_str(v.unwrap_or(&Value::Null))
+    } else {
+        String::new()
+    }
 }
 
 fn render_message(
@@ -355,8 +363,10 @@ fn render_message(
             }
             let summary = text_or_empty(msg.get("content"));
             let rc = text_or_empty(msg.get("reasoning_content"));
-            let prev_has_task =
-                index >= 1 && messages[index - 1].get("task").is_some_and(|t| !t.is_null());
+            let prev_has_task = index >= 1
+                && messages[index - 1]
+                    .get("task")
+                    .is_some_and(|t| !t.is_null());
             let mut thinking_part = String::new();
             if thinking && !prev_has_task && (!drop_thinking || index as isize > last_user_idx) {
                 thinking_part = format!("{rc}{THINK_END}");
@@ -411,7 +421,10 @@ fn render_user_block(block: &Value) -> R<String> {
     Ok(match ty.as_str() {
         Some("text") => py_str(b.get("text").unwrap_or(&Value::String(String::new()))),
         Some("tool_result") => {
-            let content = b.get("content").cloned().unwrap_or(Value::String(String::new()));
+            let content = b
+                .get("content")
+                .cloned()
+                .unwrap_or(Value::String(String::new()));
             let text = match &content {
                 Value::Array(items) => {
                     let mut parts = Vec::with_capacity(items.len());
@@ -465,7 +478,9 @@ fn merge_tool_messages(messages: Vec<Value>) -> R<Vec<Value>> {
             Some("user") => {
                 let blocks = match msg.get("content_blocks") {
                     None | Some(Value::Null) => {
-                        vec![json!({"type": "text", "text": msg.get("content").cloned().unwrap_or(Value::String(String::new()))})]
+                        vec![
+                            json!({"type": "text", "text": msg.get("content").cloned().unwrap_or(Value::String(String::new()))}),
+                        ]
                     }
                     Some(Value::Array(a)) => a.clone(),
                     Some(_) => return err("content_blocks must be a list"),
@@ -518,8 +533,10 @@ fn sort_tool_results_by_call_order(messages: &mut [Value]) {
                 let Some(Value::Array(blocks)) = msg.get_mut("content_blocks") else {
                     continue;
                 };
-                let is_tr = |b: &Value| b.get("type").and_then(Value::as_str) == Some("tool_result");
-                let mut tool_blocks: Vec<Value> = blocks.iter().filter(|b| is_tr(b)).cloned().collect();
+                let is_tr =
+                    |b: &Value| b.get("type").and_then(Value::as_str) == Some("tool_result");
+                let mut tool_blocks: Vec<Value> =
+                    blocks.iter().filter(|b| is_tr(b)).cloned().collect();
                 if tool_blocks.len() > 1 && !order.is_empty() {
                     let key = |b: &Value| {
                         let id = b.get("tool_use_id").map(py_str).unwrap_or_default();
@@ -544,7 +561,13 @@ fn sort_tool_results_by_call_order(messages: &mut [Value]) {
 /// `_drop_thinking_messages`.
 fn drop_thinking_messages(messages: Vec<Value>) -> Vec<Value> {
     let last_user_idx = find_last_user_index(&messages);
-    const KEEP: [&str; 5] = ["user", "system", "tool", "latest_reminder", "direct_search_results"];
+    const KEEP: [&str; 5] = [
+        "user",
+        "system",
+        "tool",
+        "latest_reminder",
+        "direct_search_results",
+    ];
     let mut out = Vec::with_capacity(messages.len());
     for (idx, mut msg) in messages.into_iter().enumerate() {
         let r = role(&msg);
@@ -567,7 +590,10 @@ fn drop_thinking_messages(messages: Vec<Value>) -> Vec<Value> {
 pub type ImageRecord = Map<String, Value>;
 
 fn is_image_block(b: &Value) -> bool {
-    matches!(b.get("type").and_then(Value::as_str), Some("image") | Some("image_url"))
+    matches!(
+        b.get("type").and_then(Value::as_str),
+        Some("image") | Some("image_url")
+    )
 }
 
 fn extract_image(block: &Value) -> R<ImageRecord> {
@@ -576,7 +602,10 @@ fn extract_image(block: &Value) -> R<ImageRecord> {
     if block.get("type").and_then(Value::as_str) == Some("image_url") {
         let url = match block.get("image_url") {
             Some(Value::String(s)) => Value::String(s.clone()),
-            Some(Value::Object(m)) => m.get("url").cloned().unwrap_or(Value::String(String::new())),
+            Some(Value::Object(m)) => m
+                .get("url")
+                .cloned()
+                .unwrap_or(Value::String(String::new())),
             _ => Value::String(String::new()),
         };
         rec.insert("url".into(), url);
@@ -587,7 +616,10 @@ fn extract_image(block: &Value) -> R<ImageRecord> {
             }
         }
     }
-    if !["source", "url", "data"].iter().any(|k| truthy(rec.get(*k))) {
+    if !["source", "url", "data"]
+        .iter()
+        .any(|k| truthy(rec.get(*k)))
+    {
         return err("Image block does not contain a valid source");
     }
     Ok(rec)
@@ -633,7 +665,9 @@ fn process_image_messages(messages: &[Value]) -> R<(Vec<Value>, Vec<ImageRecord>
             if let Some(Value::String(s)) = msg.get(key)
                 && s.contains(IMAGE_PLACEHOLDER)
             {
-                return err(format!("{key} contains image special token '{IMAGE_PLACEHOLDER}'"));
+                return err(format!(
+                    "{key} contains image special token '{IMAGE_PLACEHOLDER}'"
+                ));
             }
         }
         let m = obj_mut(&mut msg)?;
@@ -672,7 +706,9 @@ pub fn encode_messages(
     effort: u32,
 ) -> R<(String, Vec<ImageRecord>)> {
     if !(1..=100).contains(&effort) {
-        return err(format!("Invalid reasoning effort for deepseek_v41: {effort}"));
+        return err(format!(
+            "Invalid reasoning effort for deepseek_v41: {effort}"
+        ));
     }
     let (processed, images) = process_image_messages(messages)?;
     let mut msgs = merge_tool_messages(processed)?;

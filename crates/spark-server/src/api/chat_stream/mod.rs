@@ -305,7 +305,7 @@ fn dsv41_stream(
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> crate::ir::DeltaStream {
     let mut st = super::dsv41::StreamState::new(
-        &ctx.state,
+        &ctx.state.tokenizer,
         ctx.enable_thinking,
         ctx.stop_strings.clone(),
         cancel_flag,
@@ -314,7 +314,7 @@ fn dsv41_stream(
         use futures::StreamExt;
         let deltas = match event {
             StreamEvent::Token(tok) | StreamEvent::TokenWithLogprobs(tok, _) => {
-                st.on_token(&ctx.state, tok)
+                st.on_token(&ctx.state.tokenizer, tok)
             }
             StreamEvent::PromptLogprobs(_) => Vec::new(),
             StreamEvent::Done {
@@ -341,7 +341,7 @@ fn dsv41_stream(
                     response_tokens_per_second: tps,
                     engine: Some(engine),
                 };
-                st.on_done(&ctx.state, finish_reason, usage)
+                st.on_done(&ctx.state.tokenizer, finish_reason, usage)
             }
             StreamEvent::Error(msg) => handle_error::handle_error(&ctx, msg),
         };

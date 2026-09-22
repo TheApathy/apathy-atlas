@@ -47,7 +47,10 @@ impl ToolCallParser for DsmlV41Parser {
                 params.join("\n")
             ));
         }
-        format!("\n\n<{DSML}{CALLS_BLOCK}>\n{}\n</{DSML}{CALLS_BLOCK}>", invokes.join("\n"))
+        format!(
+            "\n\n<{DSML}{CALLS_BLOCK}>\n{}\n</{DSML}{CALLS_BLOCK}>",
+            invokes.join("\n")
+        )
     }
 
     fn format_tool_response(&self, content: &str) -> String {

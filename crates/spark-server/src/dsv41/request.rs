@@ -17,8 +17,13 @@ use super::pyjson::truthy;
 pub const DEFAULT_EFFORT: u32 = 75;
 pub const DEFAULT_THINKING: bool = false;
 
-const EFFORT_ALIASES: [(&str, u32); 5] =
-    [("low", 50), ("medium", 60), ("high", 75), ("xhigh", 90), ("max", 100)];
+const EFFORT_ALIASES: [(&str, u32); 5] = [
+    ("low", 50),
+    ("medium", 60),
+    ("high", 75),
+    ("xhigh", 90),
+    ("max", 100),
+];
 const NO_THINKING_EFFORTS: [&str; 2] = ["none", "low"];
 
 /// A client error. The Python server renders these as HTTP 400.
@@ -37,7 +42,10 @@ impl std::fmt::Display for RequestError {
 impl std::error::Error for RequestError {}
 
 fn bad<T>(message: impl Into<String>, param: &str) -> Result<T, RequestError> {
-    Err(RequestError { message: message.into(), param: Some(param.to_string()) })
+    Err(RequestError {
+        message: message.into(),
+        param: Some(param.to_string()),
+    })
 }
 
 fn get<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
@@ -54,7 +62,10 @@ pub fn resolve_thinking(
     let ctk = match body.get("chat_template_kwargs") {
         Some(v) if truthy(Some(v)) => {
             if !v.is_object() {
-                return bad("`chat_template_kwargs` must be an object", "chat_template_kwargs");
+                return bad(
+                    "`chat_template_kwargs` must be an object",
+                    "chat_template_kwargs",
+                );
             }
             v
         }
@@ -62,7 +73,11 @@ pub fn resolve_thinking(
     };
 
     let mut thinking: Option<bool> = None;
-    for (src, key) in [(ctk, "thinking"), (body, "enable_thinking"), (ctk, "enable_thinking")] {
+    for (src, key) in [
+        (ctk, "thinking"),
+        (body, "enable_thinking"),
+        (ctk, "enable_thinking"),
+    ] {
         if let Some(v) = get(src, key) {
             match v.as_bool() {
                 Some(b) => thinking = Some(b),
@@ -82,7 +97,9 @@ pub fn resolve_thinking(
     if let Some(raw) = raw {
         const P: &str = "reasoning_effort";
         let as_int = match raw {
-            Value::Bool(_) => return bad("reasoning effort must be a string or an integer 1-100", P),
+            Value::Bool(_) => {
+                return bad("reasoning effort must be a string or an integer 1-100", P);
+            }
             Value::Number(n) => match n.as_i64() {
                 Some(i) => Some(i),
                 None => return bad("reasoning effort must be a string or an integer 1-100", P),
@@ -151,13 +168,20 @@ pub struct ChatPrompt {
 }
 
 /// `build_chat_prompt(body, enc, tok, thinking, effort)`, text part.
-pub fn build_chat_prompt(body: &Value, thinking: bool, effort: u32) -> Result<ChatPrompt, RequestError> {
+pub fn build_chat_prompt(
+    body: &Value,
+    thinking: bool,
+    effort: u32,
+) -> Result<ChatPrompt, RequestError> {
     let Some(Value::Array(messages)) = body.get("messages").filter(|m| truthy(Some(m))) else {
         return bad("`messages` must be a non-empty list", "messages");
     };
     for (i, m) in messages.iter().enumerate() {
         if !m.get("role").is_some_and(Value::is_string) {
-            return bad(format!("messages[{i}] must be an object with a `role`"), &format!("messages[{i}]"));
+            return bad(
+                format!("messages[{i}] must be an object with a `role`"),
+                &format!("messages[{i}]"),
+            );
         }
     }
     let mut messages = messages.clone();
@@ -188,19 +212,34 @@ pub fn build_chat_prompt(body: &Value, thinking: bool, effort: u32) -> Result<Ch
             first.insert("tools".into(), tools.clone().unwrap_or(Value::Null));
         }
         if has_schema {
-            first.insert("response_format".into(), schema.clone().unwrap_or(Value::Null));
+            first.insert(
+                "response_format".into(),
+                schema.clone().unwrap_or(Value::Null),
+            );
         }
     }
 
-    let mode = if thinking { ThinkingMode::Thinking } else { ThinkingMode::Chat };
-    let (prompt, images) = encoding::encode_messages(&messages, mode, effort).map_err(|e| {
-        RequestError { message: format!("cannot encode messages: {e}"), param: Some("messages".into()) }
-    })?;
+    let mode = if thinking {
+        ThinkingMode::Thinking
+    } else {
+        ThinkingMode::Chat
+    };
+    let (prompt, images) =
+        encoding::encode_messages(&messages, mode, effort).map_err(|e| RequestError {
+            message: format!("cannot encode messages: {e}"),
+            param: Some("messages".into()),
+        })?;
     let grammar_tools = match &tools {
         Some(Value::Array(t)) if !t.is_empty() => encoding::tools_from_openai_format(t).ok(),
         _ => None,
     };
-    Ok(ChatPrompt { prompt, images, grammar_tools, thinking, effort })
+    Ok(ChatPrompt {
+        prompt,
+        images,
+        grammar_tools,
+        thinking,
+        effort,
+    })
 }
 
 /// Both steps, as `_chat` runs them.

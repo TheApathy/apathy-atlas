@@ -73,7 +73,11 @@ pub fn float_repr(f: f64) -> String {
         return "NaN".into();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        return if f > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
     }
     // `{:e}` gives the shortest round-trip mantissa, e.g. "1.5e20", "1e-5".
     let sci = format!("{f:e}");
@@ -122,10 +126,19 @@ mod tests {
     fn matches_python_json_dumps() {
         // Expected strings produced by CPython 3 json.dumps(..., ensure_ascii=False).
         let v = json!({"b": [1, 2.5, true, null], "a": "é\n\t\"\\\u{1}", "c": {}});
-        assert_eq!(dumps(&v), r#"{"b": [1, 2.5, true, null], "a": "é\n\t\"\\\u0001", "c": {}}"#);
+        assert_eq!(
+            dumps(&v),
+            r#"{"b": [1, 2.5, true, null], "a": "é\n\t\"\\\u0001", "c": {}}"#
+        );
         for (f, want) in [
-            (1.0, "1.0"), (0.1, "0.1"), (1e16, "1e+16"), (1e15, "1000000000000000.0"),
-            (1.5e20, "1.5e+20"), (1e-5, "1e-05"), (0.0001, "0.0001"), (-2.5e-7, "-2.5e-07"),
+            (1.0, "1.0"),
+            (0.1, "0.1"),
+            (1e16, "1e+16"),
+            (1e15, "1000000000000000.0"),
+            (1.5e20, "1.5e+20"),
+            (1e-5, "1e-05"),
+            (0.0001, "0.0001"),
+            (-2.5e-7, "-2.5e-07"),
             (123456.789, "123456.789"),
         ] {
             assert_eq!(float_repr(f), want, "{f}");

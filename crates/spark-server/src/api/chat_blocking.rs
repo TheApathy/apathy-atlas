@@ -205,7 +205,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
 
             if state.dsv41 {
                 let mut choice = super::dsv41::blocking_choice(
-                    &state,
+                    &state.tokenizer,
                     &response.output_tokens,
                     response.finish_reason.as_str(),
                     enable_thinking,

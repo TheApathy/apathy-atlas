@@ -42,7 +42,11 @@ pub fn banned_ngram_tokens(history: &[u32], n: usize) -> Vec<u32> {
         return Vec::new();
     }
     // Python `history[-(n - 1):]`; for n == 1 that slice is the whole list.
-    let prefix = if n == 1 { history } else { &history[len - (n - 1)..] };
+    let prefix = if n == 1 {
+        history
+    } else {
+        &history[len - (n - 1)..]
+    };
     let mut banned: Vec<u32> = (0..=len - n)
         .filter(|&i| &history[i..i + n - 1] == prefix)
         .map(|i| history[i + n - 1])
@@ -64,9 +68,13 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
 /// Reads the same environment variables as the Python engine.
 pub fn configure(model_is_dsv41: bool) {
     let cfg = Config {
-        cycle_break: model_is_dsv41 && std::env::var("DSV41_CYCLE_BREAK").as_deref().unwrap_or("1") == "1",
+        cycle_break: model_is_dsv41
+            && std::env::var("DSV41_CYCLE_BREAK").as_deref().unwrap_or("1") == "1",
         no_repeat_ngram: if model_is_dsv41 {
-            std::env::var("DSV41_NO_REPEAT_NGRAM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+            std::env::var("DSV41_NO_REPEAT_NGRAM")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
         } else {
             0
         },
@@ -83,7 +91,9 @@ pub fn configure(model_is_dsv41: bool) {
 /// Ban, in place, what the Python engine would ban at this step. Returns
 /// true when anything was banned. A no-op unless [`configure`] enabled it.
 pub fn apply(logits: &mut [f32], history: &[u32]) -> bool {
-    let Some(cfg) = CONFIG.get() else { return false };
+    let Some(cfg) = CONFIG.get() else {
+        return false;
+    };
     let mut hit = false;
     let mut ban = |t: u32| {
         if let Some(l) = logits.get_mut(t as usize) {
@@ -108,24 +118,40 @@ mod tests {
 
     #[test]
     fn matches_python_penalties() {
-        let path = format!("{}/tests/fixtures/dsv41/repetition.json", env!("CARGO_MANIFEST_DIR"));
-        let fx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let path = format!(
+            "{}/tests/fixtures/dsv41/repetition.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let fx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let cases = fx["cases"].as_array().unwrap();
         let (mut cycles, mut bans) = (0, 0);
         for c in cases {
-            let h: Vec<u32> = c["history"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+            let h: Vec<u32> = c["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect();
             let want = c["cycle"].as_u64().map(|x| x as u32);
             assert_eq!(cycle_token(&h), want, "cycle {h:?}");
             cycles += usize::from(want.is_some());
             for n in [0usize, 2, 3, 4] {
-                let want: Vec<u32> =
-                    c[format!("ngram{n}")].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+                let want: Vec<u32> = c[format!("ngram{n}")]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_u64().unwrap() as u32)
+                    .collect();
                 assert_eq!(banned_ngram_tokens(&h, n), want, "ngram{n} {h:?}");
                 bans += usize::from(!want.is_empty());
             }
         }
         // Both answers occur: the comparison can fail either way.
-        assert!(cycles > 10 && cycles < cases.len() && bans > 10, "{cycles} cycles, {bans} bans");
+        assert!(
+            cycles > 10 && cycles < cases.len() && bans > 10,
+            "{cycles} cycles, {bans} bans"
+        );
     }
 
     /// NEGATIVE CONTROL: three repeats instead of four must disagree with Python.
@@ -135,7 +161,9 @@ mod tests {
             let len = h.len();
             (1..=16.min(len / 3)).find_map(|p| {
                 let b = &h[len - p..];
-                (1..3).all(|i| &h[len - p * (i + 1)..len - p * i] == b).then(|| b[0])
+                (1..3)
+                    .all(|i| &h[len - p * (i + 1)..len - p * i] == b)
+                    .then(|| b[0])
             })
         };
         let h = [9, 1, 2, 1, 2, 1, 2];
