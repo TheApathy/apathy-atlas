@@ -190,6 +190,33 @@ fn main() -> Result<()> {
             experts as f64 * bf16_bytes / 1e9,
         );
     }
+    // GEMV cut-over sweep on the production forward, every T, rounds interleaved.
+    for &t in &token_counts {
+        moe.set_pass_tokens(&ids[..t]);
+        moe.set_expert_kernel(ExpertKernel::Fused);
+        let routing = moe.route_device(layer, d_in, t, stream)?;
+        let cuts = [0usize, 2, 4, 8, 16, 32, 64];
+        let mut best: Vec<Vec<f64>> = vec![Vec::new(); cuts.len()];
+        for _round in 0..3 {
+            for (i, &cut) in cuts.iter().enumerate() {
+                moe.set_gemv_max_rows(cut);
+                let mut samples = Vec::new();
+                for j in 0..warmup + iters {
+                    gpu.synchronize(stream)?;
+                    let start = Instant::now();
+                    moe.forward_routed(layer, d_in, d_out, t, &routing, stream)?;
+                    gpu.synchronize(stream)?;
+                    if j >= warmup {
+                        samples.push(start.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+                best[i].push(median(samples));
+            }
+        }
+        let line: Vec<String> = cuts.iter().zip(&best).map(|(c, v)| format!("{c}:{:.2}", median(v.clone()))).collect();
+        println!("GEMV cut sweep T={t} (experts ms, cut:median-of-3-rounds): {}", line.join("  "));
+    }
+    moe.set_gemv_max_rows(spark_model::weight_loader::deepseek_v41::moe_forward::DEFAULT_GEMV_MAX_ROWS);
     let _ = ROUTER_EXPERTS;
     println!("DONE");
     moe.free()

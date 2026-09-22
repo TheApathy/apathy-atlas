@@ -35,7 +35,7 @@ use super::cb3_arena::Cb3ExpertArena;
 use super::fwd::V41RoutedMoe;
 use super::moe::{
     COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_GEMM_MODULE, FUSED_TILE_M,
-    FUSED_TILE_N, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE,
+    FUSED_TILE_N, GEMV_DOWN_FN, GEMV_GATE_UP_FN, GEMV_ROWS_PER_BLOCK, GEMV_TILE_M, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE,
     PERMUTE_KERNEL, ROUTE_TOPK_FN, SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, expert_matrices, gemm_weight_t_f32out,
     group_by_expert,
 };
@@ -44,6 +44,10 @@ use super::routing::{Routing, image_rows, score_of, select_experts_multimodal};
 
 /// `num_experts_per_tok`.
 pub const TOP_K: usize = 6;
+/// GEMV cut-over, rows per expert. Clean sweep (runC_2048 L02, 3 interleaved rounds): cut 2
+/// is best or tied at every T — T=1 0.74 ms (MMA-only 1.05), T=16 5.12 (5.60), T=128 13.54
+/// (14.07), T=512 18.53 (18.64), T=2048 unchanged; cut 8 costs T=512 +21%.
+pub const DEFAULT_GEMV_MAX_ROWS: usize = 2;
 /// Router id space.
 pub const ROUTER_EXPERTS: usize = 384;
 const BLOCK: u32 = 256;
@@ -205,6 +209,10 @@ pub struct Cb3RoutedMoe<'a> {
     k_route: KernelHandle,
     k_fused_gate_up: KernelHandle,
     k_fused_down: KernelHandle,
+    k_gemv_gate_up: KernelHandle,
+    k_gemv_down: KernelHandle,
+    /// Experts with at most this many rows take the GEMV kernels.
+    gemv_max_rows: Mutex<usize>,
     tiles: DevicePtr,
     max_tiles: usize,
 }
@@ -235,7 +243,8 @@ impl<'a> Cb3RoutedMoe<'a> {
         );
         let e = max_t * TOP_K;
         // Every group contributes ceil(rows / BM) tiles: at most e / BM + one partial per expert.
-        let max_tiles = e / FUSED_TILE_M + ROUTER_EXPERTS;
+        // MMA tiles: at most e / 128 + one partial per expert; GEMV tiles: at most one per row.
+        let max_tiles = e + e / FUSED_TILE_M + ROUTER_EXPERTS;
         let a = |bytes: usize| gpu.alloc(bytes);
         let scratch = Scratch {
             max_t,
@@ -293,6 +302,9 @@ impl<'a> Cb3RoutedMoe<'a> {
             k_route: gpu.kernel(COMBINE_MODULE, ROUTE_TOPK_FN)?,
             k_fused_gate_up: gpu.kernel(FUSED_GEMM_MODULE, FUSED_GATE_UP_FN)?,
             k_fused_down: gpu.kernel(FUSED_GEMM_MODULE, FUSED_DOWN_FN)?,
+            k_gemv_gate_up: gpu.kernel(FUSED_GEMM_MODULE, GEMV_GATE_UP_FN)?,
+            k_gemv_down: gpu.kernel(FUSED_GEMM_MODULE, GEMV_DOWN_FN)?,
+            gemv_max_rows: Mutex::new(DEFAULT_GEMV_MAX_ROWS),
             tiles: gpu.alloc(max_tiles * 16)?,
             max_tiles,
         })
@@ -311,6 +323,12 @@ impl<'a> Cb3RoutedMoe<'a> {
     /// Select the expert GEMM path (A/B and gating against the reconstruct baseline).
     pub fn set_expert_kernel(&self, kernel: ExpertKernel) {
         *self.kernel.lock().expect("kernel lock") = kernel;
+    }
+
+    /// Experts routed at most this many rows use the GEMV kernels (0 = never). Tuning knob;
+    /// both paths are gated against the oracle.
+    pub fn set_gemv_max_rows(&self, rows: usize) {
+        *self.gemv_max_rows.lock().expect("gemv lock") = rows;
     }
 
     /// TIMING ONLY; see [`ExpertWork`].
@@ -565,21 +583,31 @@ impl<'a> Cb3RoutedMoe<'a> {
         stream: u64,
     ) -> Result<()> {
         let s = &self.scratch;
-        let mut tiles: Vec<i32> = Vec::with_capacity(4 * self.max_tiles);
+        let gemv_max = *self.gemv_max_rows.lock().expect("gemv lock");
+        // Experts with few rows take the GEMV kernels (4-row tiles), the rest the MMA
+        // kernels (128-row tiles). One upload: MMA tiles first, then GEMV tiles.
+        let (mut mma, mut gemv): (Vec<i32>, Vec<i32>) = (Vec::new(), Vec::new());
         for (group, (begin, end)) in groups.iter().zip(group_rows) {
+            let (list, step) = if end - begin <= gemv_max {
+                (&mut gemv, GEMV_TILE_M)
+            } else {
+                (&mut mma, FUSED_TILE_M)
+            };
             let mut row = *begin;
             while row < *end {
-                let rows = (end - row).min(FUSED_TILE_M);
-                tiles.extend_from_slice(&[row as i32, rows as i32, group.slot as i32, 0]);
+                let rows = (end - row).min(step);
+                list.extend_from_slice(&[row as i32, rows as i32, group.slot as i32, 0]);
                 row += rows;
             }
         }
-        let n_tiles = tiles.len() / 4;
-        if n_tiles == 0 {
+        let (n_mma, n_gemv) = (mma.len() / 4, gemv.len() / 4);
+        if n_mma + n_gemv == 0 {
             return Ok(());
         }
-        ensure!(n_tiles <= self.max_tiles, "{n_tiles} tiles exceed the {} allocated", self.max_tiles);
-        self.gpu.copy_h2d(as_bytes_i32(&tiles), self.tiles)?;
+        ensure!(n_mma + n_gemv <= self.max_tiles, "{} tiles exceed the {} allocated", n_mma + n_gemv, self.max_tiles);
+        mma.extend_from_slice(&gemv);
+        self.gpu.copy_h2d(as_bytes_i32(&mma), self.tiles)?;
+        let gemv_tiles = DevicePtr(self.tiles.0 + (n_mma * 16) as u64);
 
         let [gate, up, down] = &self.matrices;
         let base = |t| residency.plane_base(t);
@@ -592,35 +620,54 @@ impl<'a> Cb3RoutedMoe<'a> {
         let (w3_cb, cb3) = base(up.cb);
         let (w3_sc, sc3) = base(up.scale);
         ensure!((lo3, hi3, cb3, sc3) == (lo_s, hi_s, cb_s, sc_s), "w1 and w3 plane strides differ");
-        let launch = |kernel: KernelHandle| KernelLaunch::new(self.gpu, kernel).block([256, 1, 1]);
-        launch(self.k_fused_gate_up)
-            .grid([(gate.rows / FUSED_TILE_N) as u32, n_tiles as u32, 1])
-            .arg_ptr(s.perm)
-            .arg_ptr(self.tiles)
-            .arg_ptr(w1_lo).arg_ptr(w1_hi).arg_ptr(w1_cb).arg_ptr(w1_sc)
-            .arg_ptr(w3_lo).arg_ptr(w3_hi).arg_ptr(w3_cb).arg_ptr(w3_sc)
-            .arg_u64(lo_s).arg_u64(hi_s).arg_u64(cb_s).arg_u64(sc_s)
-            .arg_ptr(s.row_w)
-            .arg_ptr(s.h)
-            .arg_i32(gate.rows as i32)
-            .arg_i32(gate.cols as i32)
-            .arg_f32(self.swiglu_limit)
-            .launch(stream)?;
-
         let (w2_lo, lo2) = base(down.lo);
         let (w2_hi, hi2) = base(down.hi);
         let (w2_cb, cb2) = base(down.cb);
         let (w2_sc, sc2) = base(down.scale);
-        launch(self.k_fused_down)
-            .grid([(down.rows / FUSED_TILE_N) as u32, n_tiles as u32, 1])
-            .arg_ptr(s.h)
-            .arg_ptr(self.tiles)
-            .arg_ptr(w2_lo).arg_ptr(w2_hi).arg_ptr(w2_cb).arg_ptr(w2_sc)
-            .arg_u64(lo2).arg_u64(hi2).arg_u64(cb2).arg_u64(sc2)
-            .arg_ptr(s.down)
-            .arg_i32(down.rows as i32)
-            .arg_i32(down.cols as i32)
-            .launch(stream)
+
+        // Both kernel families take identical arguments; only the grid's N split differs.
+        let gate_up = |kernel: KernelHandle, tiles: DevicePtr, n: usize, per_block: usize| {
+            KernelLaunch::new(self.gpu, kernel)
+                .block([256, 1, 1])
+                .grid([(gate.rows / per_block) as u32, n as u32, 1])
+                .arg_ptr(s.perm)
+                .arg_ptr(tiles)
+                .arg_ptr(w1_lo).arg_ptr(w1_hi).arg_ptr(w1_cb).arg_ptr(w1_sc)
+                .arg_ptr(w3_lo).arg_ptr(w3_hi).arg_ptr(w3_cb).arg_ptr(w3_sc)
+                .arg_u64(lo_s).arg_u64(hi_s).arg_u64(cb_s).arg_u64(sc_s)
+                .arg_ptr(s.row_w)
+                .arg_ptr(s.h)
+                .arg_i32(gate.rows as i32)
+                .arg_i32(gate.cols as i32)
+                .arg_f32(self.swiglu_limit)
+                .launch(stream)
+        };
+        let down_proj = |kernel: KernelHandle, tiles: DevicePtr, n: usize, per_block: usize| {
+            KernelLaunch::new(self.gpu, kernel)
+                .block([256, 1, 1])
+                .grid([(down.rows / per_block) as u32, n as u32, 1])
+                .arg_ptr(s.h)
+                .arg_ptr(tiles)
+                .arg_ptr(w2_lo).arg_ptr(w2_hi).arg_ptr(w2_cb).arg_ptr(w2_sc)
+                .arg_u64(lo2).arg_u64(hi2).arg_u64(cb2).arg_u64(sc2)
+                .arg_ptr(s.down)
+                .arg_i32(down.rows as i32)
+                .arg_i32(down.cols as i32)
+                .launch(stream)
+        };
+        if n_mma > 0 {
+            gate_up(self.k_fused_gate_up, self.tiles, n_mma, FUSED_TILE_N)?;
+        }
+        if n_gemv > 0 {
+            gate_up(self.k_gemv_gate_up, gemv_tiles, n_gemv, GEMV_ROWS_PER_BLOCK)?;
+        }
+        if n_mma > 0 {
+            down_proj(self.k_fused_down, self.tiles, n_mma, FUSED_TILE_N)?;
+        }
+        if n_gemv > 0 {
+            down_proj(self.k_gemv_down, gemv_tiles, n_gemv, GEMV_ROWS_PER_BLOCK)?;
+        }
+        Ok(())
     }
 
     /// Release the scratch and the widened router weights.

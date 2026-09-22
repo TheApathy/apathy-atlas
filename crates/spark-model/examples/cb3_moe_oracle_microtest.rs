@@ -102,6 +102,7 @@ fn main() -> Result<()> {
     let mut control = MoeControl::None;
     let mut dump: Option<PathBuf> = None;
     let mut kernel = ExpertKernel::Reconstruct;
+    let mut gemv_max: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -109,6 +110,7 @@ fn main() -> Result<()> {
             "--layer" => layer = args.next().context("--layer needs a value")?.parse()?,
             "--occurrence" => occurrence = args.next().context("--occurrence needs a value")?.parse()?,
             "--dump" => dump = Some(args.next().context("--dump needs a path")?.into()),
+            "--gemv-max-rows" => gemv_max = Some(args.next().context("--gemv-max-rows")?.parse()?),
             "--kernel" => {
                 kernel = match args.next().context("--kernel needs fused|reconstruct")?.as_str() {
                     "fused" => ExpertKernel::Fused,
@@ -184,7 +186,10 @@ fn main() -> Result<()> {
     moe.set_pass_tokens(pass_ids);
     moe.set_control(control);
     moe.set_expert_kernel(kernel);
-    println!("  expert kernel: {kernel:?}");
+    if let Some(rows) = gemv_max {
+        moe.set_gemv_max_rows(rows);
+    }
+    println!("  expert kernel: {kernel:?}, gemv_max_rows {gemv_max:?}");
     if control != MoeControl::None {
         println!("  [control {control:?}] — MUST FAIL");
     }
