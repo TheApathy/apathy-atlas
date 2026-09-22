@@ -216,6 +216,7 @@ across two runs.
     all-masked row (token 0)         finite, max|o| = 0.000e+00   (no NaN)
     CONTROL gather (sequential rows) rel_l2 1.197e+00   -> 2,520,753x separation
     CONTROL order  (reordered)       rel_l2 6.086e-07 vs the correct order  -> DOES NOT SEPARATE
+                                     and does not separate at ANY skew in 0.031..32 (see sec 5)
 
 Independently confirmed by `DSV41_PORT/oracle/compare.py` (PASS against the fp32 reference;
 its own `--negative-control` watched rejecting on this data).
