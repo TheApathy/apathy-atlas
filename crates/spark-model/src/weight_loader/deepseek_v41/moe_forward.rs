@@ -626,9 +626,10 @@ impl<'a> Cb3RoutedMoe<'a> {
         let (w2_sc, sc2) = base(down.scale);
 
         // Both kernel families take identical arguments; only the grid's N split differs.
-        let gate_up = |kernel: KernelHandle, tiles: DevicePtr, n: usize, per_block: usize| {
+        let gate_up = |kernel: KernelHandle, tiles: DevicePtr, n: usize, per_block: usize, threads: u32, smem: u32| {
             KernelLaunch::new(self.gpu, kernel)
-                .block([256, 1, 1])
+                .block([threads, 1, 1])
+                .shared_mem(smem)
                 .grid([(gate.rows / per_block) as u32, n as u32, 1])
                 .arg_ptr(s.perm)
                 .arg_ptr(tiles)
@@ -642,9 +643,10 @@ impl<'a> Cb3RoutedMoe<'a> {
                 .arg_f32(self.swiglu_limit)
                 .launch(stream)
         };
-        let down_proj = |kernel: KernelHandle, tiles: DevicePtr, n: usize, per_block: usize| {
+        let down_proj = |kernel: KernelHandle, tiles: DevicePtr, n: usize, per_block: usize, threads: u32, smem: u32| {
             KernelLaunch::new(self.gpu, kernel)
-                .block([256, 1, 1])
+                .block([threads, 1, 1])
+                .shared_mem(smem)
                 .grid([(down.rows / per_block) as u32, n as u32, 1])
                 .arg_ptr(s.h)
                 .arg_ptr(tiles)
@@ -656,16 +658,16 @@ impl<'a> Cb3RoutedMoe<'a> {
                 .launch(stream)
         };
         if n_mma > 0 {
-            gate_up(self.k_fused_gate_up, self.tiles, n_mma, FUSED_TILE_N)?;
+            gate_up(self.k_fused_gate_up, self.tiles, n_mma, FUSED_TILE_N, 256, 0)?;
         }
         if n_gemv > 0 {
-            gate_up(self.k_gemv_gate_up, gemv_tiles, n_gemv, GEMV_ROWS_PER_BLOCK)?;
+            gate_up(self.k_gemv_gate_up, gemv_tiles, n_gemv, GEMV_ROWS_PER_BLOCK, 256, 0)?;
         }
         if n_mma > 0 {
-            down_proj(self.k_fused_down, self.tiles, n_mma, FUSED_TILE_N)?;
+            down_proj(self.k_fused_down, self.tiles, n_mma, FUSED_TILE_N, 256, 0)?;
         }
         if n_gemv > 0 {
-            down_proj(self.k_gemv_down, gemv_tiles, n_gemv, GEMV_ROWS_PER_BLOCK)?;
+            down_proj(self.k_gemv_down, gemv_tiles, n_gemv, GEMV_ROWS_PER_BLOCK, 256, 0)?;
         }
         Ok(())
     }

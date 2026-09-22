@@ -25,7 +25,14 @@
 // tile, so its activation rows are read from DRAM once and then hit L2. With tiles fastest,
 // every wave touched ~48 different experts' activations and re-read them per N tile:
 // ~13 GB of activation traffic per layer at T=2048, more than the whole weight stream.
-// Grid: Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
+// MEASURED AND REJECTED (2026-09-22, interleaved A/B, 6 rounds, clean window):
+//   - __launch_bounds__(256, 2) for 2 CTAs/SM: 128 regs + ~90 B spill, 14% SLOWER at T=2048.
+//   - Warp specialisation (8 MMA warps + 4 producer warps decoding the next K step into a
+//     second dynamic-smem stage, cp.async activations): bit-identical, but 38.2 vs 32.5 ms
+//     at T=2048, 24.3 vs 18.8 at T=512, 17.0 vs 14.0 at T=128. Concentrating the decode on
+//     4 warps made it the critical path: decode, not MMA, bounds this kernel (ncu: tensor
+//     pipe 28.7%, IPC 1.12). The lever is cheaper or less redundant decode, not overlap.
+// Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
 
 #include <cstdint>
 #include <cuda_bf16.h>
