@@ -499,3 +499,204 @@ mod combine_tests {
         );
     }
 }
+
+/// The permutation that turns token-major routing into expert-major rows.
+///
+/// ## The trap this exists to avoid
+/// `kernels/gb10/common/moe_permute.cu` ships TWO unpermute kernels and they assume
+/// different layouts:
+///
+/// - `moe_unpermute_reduce` hardcodes `perm_row = token * topk + k`. That is TOKEN-MAJOR:
+///   a token's `topk` rows are contiguous, and an expert's rows are scattered.
+/// - `moe_unpermute_reduce_indexed` takes an explicit `token_to_perm[token, k]` map and
+///   imposes no layout at all.
+///
+/// [`group_by_expert`] produces EXPERT-major order, because that is what lets one expert be
+/// reconstructed once and applied as a single batched GEMM. Pairing expert-major rows with
+/// the token-major kernel would read whichever rows happened to sit at `token * topk + k` —
+/// real expert outputs, correctly shaped, belonging to the wrong tokens. No error, no NaN,
+/// fluent wrong output.
+///
+/// So this plan carries BOTH index arrays and [`Cb3Permutation::verify_round_trip`] checks
+/// they invert each other, and the doc names `moe_unpermute_reduce_indexed` as the only
+/// correct consumer.
+pub struct Cb3Permutation {
+    /// `[total_expanded]` — permuted row -> original token. Feeds `moe_permute_tokens`.
+    pub sorted_token_ids: Vec<i32>,
+    /// `[num_tokens, topk]` — (token, pick) -> permuted row. Feeds
+    /// `moe_unpermute_reduce_indexed`. **Not** `moe_unpermute_reduce`.
+    pub token_to_perm: Vec<i32>,
+    /// `[num_tokens, topk]` routing weights, in the caller's original order.
+    pub weights: Vec<f32>,
+    /// Row ranges into the permuted buffer, one per expert, in `groups` order.
+    pub group_rows: Vec<(usize, usize)>,
+    pub total_expanded: usize,
+}
+
+/// The unpermute kernel this plan is valid for. Spelled once.
+pub const UNPERMUTE_KERNEL: &str = "moe_unpermute_reduce_indexed";
+/// The gather kernel.
+pub const PERMUTE_KERNEL: &str = "moe_permute_tokens";
+
+impl Cb3Permutation {
+    /// Build the expert-major permutation from grouped routing.
+    pub fn build(groups: &[ExpertGroup], num_tokens: usize, k: usize) -> Result<Self> {
+        let total_expanded = num_tokens * k;
+        let mut sorted_token_ids = vec![-1i32; total_expanded];
+        let mut token_to_perm = vec![-1i32; total_expanded];
+        let mut weights = vec![0.0f32; total_expanded];
+        let mut group_rows = Vec::with_capacity(groups.len());
+        // How many picks of each token have been placed, so a token routed to several
+        // experts gets distinct (token, pick) slots.
+        let mut placed = vec![0usize; num_tokens];
+
+        let mut row = 0usize;
+        for group in groups {
+            let begin = row;
+            for (token, weight) in group.tokens.iter().zip(&group.weights) {
+                let token = *token as usize;
+                ensure!(token < num_tokens, "token {token} is outside {num_tokens}");
+                let pick = placed[token];
+                ensure!(
+                    pick < k,
+                    "token {token} routed to more than {k} experts — routing produced \
+                     duplicate picks"
+                );
+                sorted_token_ids[row] = token as i32;
+                token_to_perm[token * k + pick] = row as i32;
+                weights[token * k + pick] = *weight;
+                placed[token] = pick + 1;
+                row += 1;
+            }
+            group_rows.push((begin, row));
+        }
+
+        ensure!(
+            row == total_expanded,
+            "permutation placed {row} rows, expected {total_expanded}"
+        );
+        ensure!(
+            placed.iter().all(|count| *count == k),
+            "some token was not routed to exactly {k} experts"
+        );
+        let plan = Self {
+            sorted_token_ids,
+            token_to_perm,
+            weights,
+            group_rows,
+            total_expanded,
+        };
+        plan.verify_round_trip(num_tokens, k)?;
+        Ok(plan)
+    }
+
+    /// The two index arrays must invert each other.
+    ///
+    /// Cheap (O(num_tokens * k)) and run on every build, because the failure it catches is
+    /// silent: a permutation that is internally inconsistent still produces finite output.
+    pub fn verify_round_trip(&self, num_tokens: usize, k: usize) -> Result<()> {
+        for token in 0..num_tokens {
+            for pick in 0..k {
+                let row = self.token_to_perm[token * k + pick];
+                ensure!(row >= 0, "token {token} pick {pick} has no permuted row");
+                let back = self.sorted_token_ids[row as usize];
+                ensure!(
+                    back == token as i32,
+                    "permutation is inconsistent: token {token} pick {pick} -> row {row} -> \
+                     token {back}. The forward and reverse maps disagree, which would make \
+                     the unpermute read another token's expert output."
+                );
+            }
+        }
+        ensure!(
+            self.sorted_token_ids.iter().all(|t| *t >= 0),
+            "a permuted row was never assigned a token"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod permutation_tests {
+    use super::*;
+
+    fn resident(id: u32) -> Result<i32> {
+        Ok(id as i32)
+    }
+
+    /// The plan must round-trip, and each expert's rows must be CONTIGUOUS — that
+    /// contiguity is the entire reason for grouping.
+    #[test]
+    fn the_permutation_is_expert_major_and_round_trips() {
+        // 3 tokens, k=2: t0 -> {5,9}, t1 -> {5,7}, t2 -> {9,5}
+        let indices: Vec<i64> = vec![5, 9, 5, 7, 9, 5];
+        let weights: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let groups = group_by_expert(&indices, &weights, 3, 2, resident).unwrap();
+        let plan = Cb3Permutation::build(&groups, 3, 2).unwrap();
+
+        assert_eq!(plan.total_expanded, 6);
+        // Expert 5 has three tokens, then 7 has one, then 9 has two — contiguous ranges.
+        assert_eq!(plan.group_rows, vec![(0, 3), (3, 4), (4, 6)]);
+        assert_eq!(plan.sorted_token_ids, vec![0, 1, 2, 1, 0, 2]);
+        // Round-trip is checked inside build(); assert it independently too.
+        plan.verify_round_trip(3, 2).unwrap();
+
+        // Every weight must land with its own (token, pick) slot.
+        for token in 0..3usize {
+            let mut got: Vec<f32> = (0..2).map(|p| plan.weights[token * 2 + p]).collect();
+            let mut want: Vec<f32> = (0..2).map(|p| weights[token * 2 + p]).collect();
+            got.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            want.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!(got, want, "token {token} lost or duplicated a weight");
+        }
+    }
+
+    /// THE TRAP, as a test: expert-major rows do NOT satisfy the token-major kernel's
+    /// assumption, so pairing them would silently read the wrong rows.
+    ///
+    /// `moe_unpermute_reduce` assumes `perm_row == token * topk + k`. If that happened to
+    /// hold for expert-major order, the two kernels would be interchangeable and this
+    /// distinction would not matter. It does not hold — asserted here so the constraint is
+    /// demonstrated rather than described.
+    #[test]
+    fn expert_major_rows_violate_the_token_major_kernels_assumption() {
+        let indices: Vec<i64> = vec![5, 9, 5, 7, 9, 5];
+        let weights: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let groups = group_by_expert(&indices, &weights, 3, 2, resident).unwrap();
+        let plan = Cb3Permutation::build(&groups, 3, 2).unwrap();
+
+        let token_major_would_read: Vec<i32> = (0..3)
+            .flat_map(|t| (0..2).map(move |k| (t * 2 + k) as i32))
+            .collect();
+        assert_ne!(
+            plan.token_to_perm, token_major_would_read,
+            "if these matched, moe_unpermute_reduce would be safe here and the _indexed \
+             variant unnecessary — the whole reason for UNPERMUTE_KERNEL would be gone"
+        );
+        // And name the kernel that IS correct, so the constant cannot drift from the doc.
+        assert_eq!(UNPERMUTE_KERNEL, "moe_unpermute_reduce_indexed");
+    }
+
+    /// An inconsistent permutation must be REFUSED, not silently used.
+    #[test]
+    fn a_broken_round_trip_is_caught() {
+        let indices: Vec<i64> = vec![5, 9];
+        let weights: Vec<f32> = vec![0.5, 0.5];
+        let groups = group_by_expert(&indices, &weights, 1, 2, resident).unwrap();
+        let mut plan = Cb3Permutation::build(&groups, 1, 2).unwrap();
+        plan.verify_round_trip(1, 2).expect("the built plan is consistent");
+
+        // Corrupt the reverse map so it points at the other expert's row.
+        plan.token_to_perm[0] = 1;
+        plan.sorted_token_ids[1] = 99;
+        let err = plan
+            .verify_round_trip(1, 2)
+            .expect_err("an inconsistent permutation must be refused")
+            .to_string();
+        assert!(err.contains("inconsistent"), "{err}");
+        assert!(
+            err.contains("another token's expert output"),
+            "the error must name the consequence: {err}"
+        );
+    }
+}
