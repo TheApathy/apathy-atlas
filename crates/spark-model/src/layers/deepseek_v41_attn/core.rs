@@ -187,6 +187,8 @@ struct Scratch {
     blocks: DevicePtr,
     pad_in: DevicePtr,
     pad_out: DevicePtr,
+    /// Static decode: the pass's index-key rows before they are published `[DECODE_MAX_T, 128]`.
+    iks: DevicePtr,
 }
 
 /// Mutable per-sequence / per-pass state.
@@ -208,6 +210,10 @@ struct SeqState {
     pass_start: usize,
     pass_t: usize,
     tail: TailState,
+    /// Static decode: where the pass start lives on the device when the caller owns it (graph
+    /// replay), and whether the core has written its own copy for the current pass otherwise.
+    dstart_ext: Option<DevicePtr>,
+    dstart_written: bool,
 }
 
 #[derive(Default)]
@@ -250,6 +256,13 @@ pub struct Dsv41SparseCore {
     /// weights_proj as the reference issues them (cuBLASLt, 16-row tiles) instead of the
     /// deterministic `dsv41_gemm_f32_nt` / `dsv41_gemm_bf16_smalln` (A/B arm only).
     comp_cublas_tiled: bool,
+    /// `ATLAS_DSV41_CORE_STATIC=1` (or [`Self::set_static_decode`]): Decode/Verify passes with
+    /// T <= DECODE_MAX_T run shape-static -- no launch reads a host value that changes per step.
+    static_on: std::sync::atomic::AtomicBool,
+    /// The core's own device copy of the pass start, used when no caller pointer is set.
+    own_dstart: DevicePtr,
+    /// Static decode score width: `score_width(max_seq)`, the widest any pass can need.
+    static_ld: usize,
     /// Owns every device allocation above; frees them when the core drops.
     allocs: DeviceAllocs,
 }
@@ -408,7 +421,9 @@ impl Dsv41SparseCore {
             blocks: alloc(max_chunk * n_pad_max.div_ceil(CANDIDATE_BLOCK_SIZE) * 4)?,
             pad_in: alloc(MM_TILE * HIDDEN * 4)?,
             pad_out: alloc(MM_TILE * INDEX_HEADS * INDEX_HEAD_DIM * 4)?,
+            iks: alloc(DECODE_MAX_T * INDEX_HEAD_DIM * 2)?,
         };
+        let own_dstart = alloc(4)?;
         let part = alloc(DECODE_MAX_T * 64 * (WINDOW + INDEX_TOPK).div_ceil(DECODE_SLICE) * (2 + HEAD_DIM) * 4)?;
         let tail = Tail {
             topk: [alloc(REPLAY_ROWS * INDEX_TOPK * 8)?, alloc(REPLAY_ROWS * INDEX_TOPK * 8)?],
@@ -421,6 +436,10 @@ impl Dsv41SparseCore {
             total.get() as f64 / 1e9,
             score_bytes as f64 / 1e6
         );
+        if std::env::var("ATLAS_DSV41_GEMV_F32").as_deref() == Ok("0") {
+            // A/B arm only: the ratio-2 compressor's small-M projections back on the 64x64 GEMM.
+            super::index::GEMV_F32_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(Self {
             layers,
             eps: config.rms_norm_eps as f32,
@@ -440,6 +459,9 @@ impl Dsv41SparseCore {
             allocs: allocs.into_inner(),
             split_on: std::env::var("ATLAS_DSV41_ATTN_SPLIT").as_deref() != Ok("0"),
             comp_cublas_tiled: std::env::var("ATLAS_DSV41_COMP_CUBLAS").as_deref() == Ok("1"),
+            static_on: std::sync::atomic::AtomicBool::new(std::env::var("ATLAS_DSV41_CORE_STATIC").as_deref() == Ok("1")),
+            own_dstart,
+            static_ld: n_pad_max,
         })
     }
 
@@ -645,7 +667,130 @@ impl Dsv41SparseCore {
         Ok(())
     }
 
-    fn index(&self, ops: &Ops, a: &CoreArgs, st: &mut SeqState) -> Result<()> {
+    /// Shape-static form of [`Self::compress`] for Decode/Verify (`ATLAS_DSV41_CORE_STATIC`): the
+    /// same kernels on FIXED shapes, the parity, row offsets and row counts read on the device
+    /// from `dstart`. The projections always land at slots 1..=t, a pending row at slot 0, and
+    /// the pairs start at slot 1 - p; up to `ceil(t / 2)` rows are normalised and RoPE'd, and only
+    /// the pass's `(t + p) / 2` are published. Host bookkeeping is the dynamic path's.
+    fn compress_static(&self, ops: &Ops, a: &CoreArgs, st: &mut SeqState, dstart: DevicePtr) -> Result<()> {
+        let (layer, t, start, stream) = (a.layer, a.t, a.start, ops.stream);
+        let c = self.layers[layer].kv.as_ref().expect("kv-source");
+        let gpu = ops.gpu;
+        let iops = IndexOps { gpu, k: &self.idx, stream };
+        let s = &self.s;
+        let r = c.ratio;
+        let row = HEAD_DIM * 4;
+        // The unpublished rows are RoPE'd too: their positions must stay inside the table.
+        ensure!(start + t <= self.rope_c.positions, "static compress at {start}+{t} past freqs_c ({})", self.rope_c.positions);
+        let nmax = if r == 2 {
+            // Every pass is contiguous from 0 (begin_pass), so the pending row exists exactly when
+            // start is odd -- the device's p. Derived, not asserted: the skip-restore rollback
+            // CONTROL leaves has_pending stale on purpose and must diverge, not stop.
+            let pend = start % 2 == 1;
+            gpu.copy_d2d_async(c.pending, c.before, 2 * row, stream)?; // for rollback (read only if pend)
+            st.last[layer] = Some((start, t, pend));
+            ops.bf16_to_f32(a.x, s.xf, t * HIDDEN)?;
+            iops.comp2_pending_in(c.pending, s.kvl, s.sc, HEAD_DIM, dstart)?;
+            let wgate = c.wgate.expect("ratio-2 has a gate");
+            let (kv1, sc1) = (s.kvl.offset(row), s.sc.offset(row));
+            if self.comp_cublas_tiled {
+                tiled(gpu, s.pad_in, s.pad_out, s.xf, kv1, t, HIDDEN * 4, row, stream, |x, o| {
+                    ops.linear_f32(x, c.wkv, o, MM_TILE, HEAD_DIM, HIDDEN)
+                })?;
+                tiled(gpu, s.pad_in, s.pad_out, s.xf, sc1, t, HIDDEN * 4, row, stream, |x, o| {
+                    ops.linear_f32(x, wgate, o, MM_TILE, HEAD_DIM, HIDDEN)
+                })?;
+            } else {
+                iops.gemm_f32(s.xf, c.wkv, kv1, t, HEAD_DIM, HIDDEN)?;
+                iops.gemm_f32(s.xf, wgate, sc1, t, HEAD_DIM, HIDDEN)?;
+            }
+            gpu.copy_d2d_async(kv1, c.save_kv, t * row, stream)?; // for rollback
+            gpu.copy_d2d_async(sc1, c.save_sc, t * row, stream)?;
+            iops.comp2_pending_out(s.kvl, s.sc, c.pending, HEAD_DIM, t, dstart)?;
+            st.has_pending[layer] = (t + usize::from(pend)) % 2 == 1;
+            iops.combine2_dev(s.kvl, s.sc, s.latent, t.div_ceil(2), HEAD_DIM, dstart)?;
+            t.div_ceil(2)
+        } else {
+            tiled(gpu, s.pad_in, s.pad_out, a.x, s.latent, t, HIDDEN * 2, HEAD_DIM * 2, stream, |x, o| {
+                ops.linear_bf16(x, c.wkv, o, MM_TILE, HEAD_DIM, HIDDEN)
+            })?;
+            t
+        };
+        let (j0, nj) = if r == 2 { ((start - start % 2) / 2, (t + start % 2) / 2) } else { (start, t) };
+        ensure!(j0 + nj <= c.rows_cap, "layer {layer}: compressed row {} past the cache ({} rows)", j0 + nj, c.rows_cap);
+        ops.rmsnorm(s.latent, c.norm, s.latent, nmax, HEAD_DIM, self.eps)?;
+        iops.iota_dev(s.pos, dstart, r == 2, r, nmax)?;
+        tiled(gpu, s.pad_in, s.pad_out, s.latent, s.iks, nmax, HEAD_DIM * 2, INDEX_HEAD_DIM * 2, stream, |x, o| {
+            ops.linear_bf16(x, c.wk, o, MM_TILE, INDEX_HEAD_DIM, HEAD_DIM)
+        })?;
+        ops.rmsnorm(s.iks, c.k_norm, s.iks, nmax, INDEX_HEAD_DIM, self.eps)?;
+        ops.rope_tail(s.iks, s.pos, &self.rope_c, nmax, 1, INDEX_HEAD_DIM, false)?;
+        iops.publish_rows(s.iks, c.ik, INDEX_HEAD_DIM * 2, nmax, r, t, dstart)?;
+        ops.rope_tail(s.latent, s.pos, &self.rope_c, nmax, 1, HEAD_DIM, false)?;
+        iops.publish_rows(s.latent, c.ckv, HEAD_DIM * 2, nmax, r, t, dstart)?;
+        st.published = Some((c.ckv, c.ik, j0 + nj, r));
+        Ok(())
+    }
+
+    /// The device pass start when this pass runs shape-static, else `None`. Without a caller
+    /// pointer the core writes its own copy once per pass (fine ungraphed; a graph must use
+    /// [`Self::set_device_start`], or the write would be captured with a frozen value).
+    fn static_start(&self, ops: &Ops, st: &mut SeqState) -> Result<Option<DevicePtr>> {
+        let on = self.static_on.load(std::sync::atomic::Ordering::Relaxed)
+            && matches!(st.kind, Some(PassKind::Decode | PassKind::Verify))
+            && st.pass_t <= DECODE_MAX_T;
+        if !on {
+            return Ok(None);
+        }
+        if let Some(d) = st.dstart_ext {
+            return Ok(Some(d));
+        }
+        if !st.dstart_written {
+            let v = u32::try_from(st.pass_start).context("start overflows the device i32")?;
+            ops.gpu.memset_u32_async(self.own_dstart, v, 1, ops.stream)?;
+            st.dstart_written = true;
+        }
+        Ok(Some(self.own_dstart))
+    }
+
+    /// Turn shape-static Decode/Verify passes on or off (gates A/B both arms on one core).
+    pub fn set_static_decode(&self, on: bool) {
+        self.static_on.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// GRAPH REPLAY: the device i32 holding each pass's start (the position of row 0), written by
+    /// the caller BEFORE the core's first launch of the pass and not changed until its last. The
+    /// POINTER may be changed between passes (any call; a graph bakes in the one it captured
+    /// with), never within a pass. One scalar can serve Decode and Verify alike. `None` = the
+    /// core's own copy, written by the core itself (ungraphed runs only).
+    pub fn set_device_start(&self, ptr: Option<DevicePtr>) {
+        self.st.lock().expect("core state poisoned").dstart_ext = ptr;
+    }
+
+    /// GRAPH REPLAY: the host bookkeeping of a static Decode/Verify pass that was REPLAYED rather
+    /// than run (the core's `run` is not called): `begin_pass` plus each ratio-2 layer's pending
+    /// and rollback record, exactly as `compress_static` leaves them. Launches nothing.
+    pub fn replay_step(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
+        ensure!(
+            self.static_on.load(std::sync::atomic::Ordering::Relaxed) && matches!(kind, PassKind::Decode | PassKind::Verify) && t <= DECODE_MAX_T,
+            "replay_step({kind:?}, {start}, {t}) is not a static pass"
+        );
+        PassHook::begin_pass(self, kind, start, t)?;
+        let mut st = self.st.lock().expect("core state poisoned");
+        ensure!(st.dstart_ext.is_some(), "replay_step without a caller-owned device start");
+        for (layer, lw) in self.layers.iter().enumerate() {
+            // Only layers the forward actually drives (every ratio-2 layer in the model; a gate
+            // driving a subset must not gain rollback records for layers it never ran).
+            if lw.kv.as_ref().is_some_and(|c| c.ratio == 2) && st.last[layer].is_some() {
+                let pend = start % 2 == 1; // as compress_static
+                st.last[layer] = Some((start, t, pend));
+                st.has_pending[layer] = (t + usize::from(pend)) % 2 == 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn index(&self, ops: &Ops, a: &CoreArgs, st: &mut SeqState, dstart: Option<DevicePtr>) -> Result<()> {
         let (layer, t, start, stream) = (a.layer, a.t, a.start, ops.stream);
         let lw = &self.layers[layer];
         let w = lw.idx.as_ref().expect("index-source");
@@ -657,12 +802,13 @@ impl Dsv41SparseCore {
         let s = &self.s;
         let n_c = (start + t) / ratio;
         ensure!(n_c <= rows, "layer {layer}: {n_c} compressed rows visible, {rows} published");
-        if n_c == 0 {
+        if n_c == 0 && dstart.is_none() {
             gpu.memset_async(w.topk, 0xFF, t * INDEX_TOPK * 8, stream)?; // all -1
             st.topk = Some(w.topk);
             return Ok(());
         }
-        let n_pad = score_width(n_c);
+        // Static: one fixed width; the kernels stop at score_width(n_c) for the start they read.
+        let n_pad = if dstart.is_some() { self.static_ld } else { score_width(n_c) };
         ensure!(t * n_pad * 4 <= s.score_bytes, "score [{t}, {n_pad}] exceeds the scratch");
 
         // q_i = rope_c(bf16(qr @ dequant(wq_b)^T)); wts = bf16(x @ weights_proj^T) * 1/64
@@ -674,7 +820,10 @@ impl Dsv41SparseCore {
             ops.linear_bf16(x, s.deq, o, MM_TILE, w.wq_b.n, w.wq_b.k)
         })?;
         self.prof.mark(ops, "index.q_gemm")?;
-        iops.iota(s.pos, start, 1, t)?;
+        match dstart {
+            Some(d) => iops.iota_dev(s.pos, d, false, 1, t)?,
+            None => iops.iota(s.pos, start, 1, t)?,
+        }
         ops.rope_tail(s.qi, s.pos, &self.rope_c, t, INDEX_HEADS, INDEX_HEAD_DIM, false)?;
         if self.comp_cublas_tiled {
             tiled(gpu, s.pad_in, s.pad_out, a.x, s.wraw, t, HIDDEN * 2, INDEX_HEADS * 2, stream, |x, o| {
@@ -691,14 +840,23 @@ impl Dsv41SparseCore {
             Some((mask, ld)) if layer > CANDIDATE_SOURCE_LAYER => Some(CandidateMask { mask, ld }),
             _ => None,
         };
-        iops.score(s.qi, ik, s.wts, cand_in, s.score, t, rows, n_pad, start, ratio)?;
+        match dstart {
+            Some(d) => iops.score_dev(s.qi, ik, s.wts, cand_in, s.score, t, n_pad, d, ratio)?,
+            None => iops.score(s.qi, ik, s.wts, cand_in, s.score, t, rows, n_pad, start, ratio)?,
+        }
         self.prof.mark(ops, "index.score")?;
         if layer == CANDIDATE_SOURCE_LAYER {
-            iops.select_candidates(s.score, s.blocks, s.cand, t, n_pad, start, ratio, CANDIDATE_TOPK_BLOCKS, CANDIDATE_BLOCK_SIZE)?;
+            match dstart {
+                Some(d) => iops.select_candidates_dev(s.score, s.blocks, s.cand, t, n_pad, d, ratio, CANDIDATE_TOPK_BLOCKS, CANDIDATE_BLOCK_SIZE)?,
+                None => iops.select_candidates(s.score, s.blocks, s.cand, t, n_pad, start, ratio, CANDIDATE_TOPK_BLOCKS, CANDIDATE_BLOCK_SIZE)?,
+            }
             st.cand = Some((s.cand, n_pad));
             self.prof.mark(ops, "index.candidates")?;
         }
-        iops.topk(s.score, w.topk, t, n_pad, n_c)?;
+        match dstart {
+            Some(d) => iops.topk_dev(s.score, w.topk, t, n_pad, d, ratio)?,
+            None => iops.topk(s.score, w.topk, t, n_pad, n_c)?,
+        }
         st.topk = Some(w.topk);
         self.prof.mark(ops, "index.topk")?;
         if layer == CANDIDATE_SOURCE_LAYER && st.kind == Some(PassKind::EncoderChunk) {
@@ -850,6 +1008,7 @@ impl PassHook for Dsv41SparseCore {
         st.kind = Some(kind);
         st.pass_start = start;
         st.pass_t = t;
+        st.dstart_written = false;
         match kind {
             PassKind::Replay => {
                 // Layers 21..23 attend with L20's tail selection; 24..36 score inside its
@@ -881,11 +1040,15 @@ impl AttnCore for Dsv41SparseCore {
             st.pass_t
         );
         let lw = &self.layers[a.layer];
+        let dstart = self.static_start(ops, &mut st)?;
         if lw.kv.is_some() {
-            self.compress(ops, a, &mut st)?;
+            match dstart {
+                Some(d) => self.compress_static(ops, a, &mut st, d)?,
+                None => self.compress(ops, a, &mut st)?,
+            }
         }
         if lw.idx.is_some() {
-            self.index(ops, a, &mut st)?;
+            self.index(ops, a, &mut st, dstart)?;
         }
         self.prof.begin(ops)?;
         self.attend(ops, a, &st)?;
