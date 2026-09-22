@@ -36,6 +36,7 @@ mod load_layers;
 pub use load_layers::resolve_model_dir;
 pub mod ops;
 pub mod moe;
+pub mod mtp;
 pub mod moe_decode;
 pub mod moe_forward;
 pub mod routing;
@@ -73,10 +74,17 @@ pub fn v41_key(prefix: &str, suffix: &str) -> String {
 /// - `layers.{1,14}.engram.embed.*`: two ~95 GB tables. They cannot fit next to the expert
 ///   arena on a 119.7 GB box and are row-gathered from NVMe by the engram lane. Uploading them
 ///   would over-allocate unified memory, which takes the HOST down, not the process.
-/// - `mtp.*`: the three DSpark modules (incl. in-shard FP8 routed experts). Nothing consumes
-///   them until MTP is ported; loading them is pure memory cost.
+/// - `mtp.*`: the three DSpark drafter blocks (~7.9 GB incl. 7.2 GB of FP4 experts), loaded ONLY
+///   when `ATLAS_DSV41_DSPARK=1` (see `mtp::DsparkWeights`), so the drafter costs nothing when
+///   speculation is off.
 pub fn skip_tensor_for_serving(name: &str) -> bool {
-    name.contains(".engram.embed.") || name.starts_with("mtp.")
+    name.contains(".engram.embed.") || (name.starts_with("mtp.") && !dspark_enabled())
+}
+
+/// `ATLAS_DSV41_DSPARK=1`: load the DSpark drafter (speculation stays OFF by default until its
+/// end-to-end gate passes).
+pub fn dspark_enabled() -> bool {
+    std::env::var("ATLAS_DSV41_DSPARK").as_deref() == Ok("1")
 }
 
 /// DeepSeek-V4.1-Flash-Next weight loader.

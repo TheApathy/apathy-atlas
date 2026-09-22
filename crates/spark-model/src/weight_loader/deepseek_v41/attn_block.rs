@@ -59,7 +59,11 @@ pub struct V41AttnWeights {
 
 impl V41AttnWeights {
     pub fn load(store: &WeightStore, layer: usize, hidden: usize) -> Result<Self> {
-        let p = format!("layers.{layer}.attn");
+        Self::load_prefixed(store, &format!("layers.{layer}.attn"), layer, hidden)
+    }
+
+    /// Same tensors under another prefix (the DSpark blocks: `mtp.{k}.attn`).
+    pub fn load_prefixed(store: &WeightStore, p: &str, layer: usize, hidden: usize) -> Result<Self> {
         let grp_k = HEAD_DIM * N_HEADS / O_GROUPS;
         Ok(Self {
             layer,

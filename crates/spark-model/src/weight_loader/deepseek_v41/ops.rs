@@ -160,6 +160,8 @@ pub struct Dsv41Kernels {
     pub engram_rows_bf16: KernelHandle,
     pub engram_gate: KernelHandle,
     pub mul_bf16_to_f32: KernelHandle,
+    /// `dsv41_hc_mean_bf16`: the DSpark seed (mean over the hc streams).
+    pub hc_mean_bf16: KernelHandle,
     /// `dsv41_decode::dsv41_fp8_gemv_m1`, used at M = 1 when [`DENSE_GEMV_ENV`] is on.
     pub fp8_gemv_m1: Option<KernelHandle>,
     /// The bit-identical split `hc_mixes` for T = 1 ([`HC_SPLIT_ENV`]): (dot, finish, raw scratch).
@@ -208,6 +210,7 @@ impl Dsv41Kernels {
             engram_rows_bf16: k("dsv41_engram_rows_bf16")?,
             engram_gate: k("dsv41_engram_gate")?,
             mul_bf16_to_f32: k("dsv41_mul_bf16_to_f32")?,
+            hc_mean_bf16: k("dsv41_hc_mean_bf16")?,
             fp8_gemv_m1: if std::env::var(DENSE_GEMV_ENV).as_deref() != Ok("0") {
                 Some(gpu.kernel(DECODE_DENSE_MODULE, "dsv41_fp8_gemv_m1").with_context(|| {
                     format!("{DENSE_GEMV_ENV}=1 but {DECODE_DENSE_MODULE}::dsv41_fp8_gemv_m1 is not in the PTX")
@@ -328,6 +331,14 @@ impl Ops<'_> {
 
     pub fn engram_gate(&self, h: DevicePtr, kv: DevicePtr, weight: DevicePtr, t: usize, hc: usize, d: usize, eps: f32) -> Result<()> {
         self.l(self.k.engram_gate).grid([t as u32, hc as u32, 1]).arg_ptr(h).arg_ptr(kv).arg_ptr(weight).arg_u32(d as u32).arg_f32(eps).launch(self.stream)
+    }
+
+    /// DSpark seed column block: `out[t, off..off+d] = bf16(mean_i h[t, i, :])`, row stride `ld`.
+    pub fn hc_mean_bf16(&self, h: DevicePtr, out: DevicePtr, t: usize, d: usize, ld: usize, off: usize) -> Result<()> {
+        if t == 0 {
+            return Ok(());
+        }
+        self.l(self.k.hc_mean_bf16).grid([t as u32, 1, 1]).arg_ptr(h).arg_ptr(out).arg_u32(d as u32).arg_u32(ld as u32).arg_u32(off as u32).launch(self.stream)
     }
 
     pub fn mul_bf16_to_f32(&self, a: DevicePtr, b: DevicePtr, out: DevicePtr, n: usize) -> Result<()> {

@@ -68,7 +68,11 @@ pub struct SharedExpert {
 
 impl SharedExpert {
     pub fn load(store: &WeightStore, layer: usize, dims: &V41Dims) -> Result<Self> {
-        let p = format!("layers.{layer}.ffn.shared_experts");
+        Self::load_prefixed(store, &format!("layers.{layer}.ffn.shared_experts"), dims)
+    }
+
+    /// Same tensors under another prefix (the DSpark blocks: `mtp.{k}.ffn.shared_experts`).
+    pub fn load_prefixed(store: &WeightStore, p: &str, dims: &V41Dims) -> Result<Self> {
         Ok(Self {
             w1: Fp8Linear::load(store, &format!("{p}.w1"), dims.moe_inter, dims.hidden)?,
             w2: Fp8Linear::load(store, &format!("{p}.w2"), dims.hidden, dims.moe_inter)?,
