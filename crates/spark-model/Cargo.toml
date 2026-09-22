@@ -103,6 +103,13 @@ required-features = ["cuda", "gpu-examples"]
 name = "cb3_arena_residency_microtest"
 required-features = ["cuda", "gpu-examples"]
 
+# The first comparison of an actual MoE OUTPUT against the serving engine:
+# feeds the oracle's moe_in through CB3 reconstruct + cuBLASLt and checks
+# moe_routed. `--control` reverses the routing weights and must FAIL.
+[[example]]
+name = "cb3_moe_oracle_microtest"
+required-features = ["cuda", "gpu-examples"]
+
 [[example]]
 name = "gemv_fp4_vs_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]

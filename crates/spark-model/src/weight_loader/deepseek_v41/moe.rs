@@ -533,6 +533,15 @@ pub struct Cb3Permutation {
     pub total_expanded: usize,
 }
 
+/// Module holding [`PERMUTE_KERNEL`] and [`UNPERMUTE_KERNEL`].
+///
+/// NOT the file stem: `kernels/gb10/common/moe_permute.cu` is renamed to `moe` by the
+/// `[modules]` table in `kernels/gb10/deepseek-v4.1/cb3/KERNEL.toml`, so a lookup of
+/// `"moe_permute"` fails at `gpu.kernel()`. Pinned to that file by a test.
+pub const MOE_PERMUTE_MODULE: &str = "moe";
+/// Module holding `moe_silu_mul` (the swiglu_limit-clamped routed SwiGLU). Not renamed, so
+/// the stem is the module name.
+pub const SILU_MUL_MODULE: &str = "moe_silu_mul";
 /// The unpermute kernel this plan is valid for. Spelled once.
 pub const UNPERMUTE_KERNEL: &str = "moe_unpermute_reduce_indexed";
 /// The gather kernel.
@@ -675,6 +684,48 @@ mod permutation_tests {
         );
         // And name the kernel that IS correct, so the constant cannot drift from the doc.
         assert_eq!(UNPERMUTE_KERNEL, "moe_unpermute_reduce_indexed");
+    }
+
+    /// The module names must be the ones the cb3 target's `KERNEL.toml` actually produces.
+    ///
+    /// The previous agent's first GPU run failed at `gpu.kernel("moe_permute", ..)` because
+    /// the target renames that stem. This ties the constants to the file, so the next rename
+    /// fails here rather than at load time on the GPU.
+    #[test]
+    fn moe_module_names_match_the_cb3_kernel_toml() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
+            .to_path_buf();
+        let toml = std::fs::read_to_string(root.join("kernels/gb10/deepseek-v4.1/cb3/KERNEL.toml"))
+            .expect("cb3 KERNEL.toml readable");
+        let renamed_to = |stem: &str| -> Option<String> {
+            toml.lines()
+                .map(str::trim)
+                .filter(|line| !line.starts_with('#'))
+                .find_map(|line| {
+                    let (key, value) = line.split_once('=')?;
+                    (key.trim() == stem).then(|| value.trim().trim_matches('"').to_string())
+                })
+        };
+        // The stem IS renamed, so the stem is the wrong lookup name — the bug this pins.
+        assert_eq!(renamed_to("moe_permute").as_deref(), Some(MOE_PERMUTE_MODULE));
+        assert_ne!(MOE_PERMUTE_MODULE, "moe_permute");
+        // silu_mul is NOT renamed, so its stem is its module name.
+        assert_eq!(renamed_to(SILU_MUL_MODULE), None);
+        let common = root.join("kernels/gb10/common");
+        for (file, kernel) in [
+            ("moe_permute.cu", PERMUTE_KERNEL),
+            ("moe_permute.cu", UNPERMUTE_KERNEL),
+            ("moe_silu_mul.cu", "moe_silu_mul"),
+        ] {
+            let source = std::fs::read_to_string(common.join(file)).expect("kernel source");
+            assert!(
+                source.contains(&format!("__global__ void {kernel}(")),
+                "{kernel} must be defined in {file}"
+            );
+        }
     }
 
     /// An inconsistent permutation must be REFUSED, not silently used.
