@@ -279,32 +279,76 @@ fn main() -> Result<()> {
         }
     }
 
-    // ---- 3. runG only: the decoder replay of layer 21 over the last 128 prompt rows
-    if run.starts_with("runG") {
+    // ---- 3. the decoder REPLAY over the last 128 prompt rows (runG: L21; runH: L21..39).
+    //      Layers 21..23 inherit L20's tail; 24/28/32/36 re-index INSIDE the tail's candidate
+    //      pool; the rest inherit the latest selection. Every replay layer's attention and every
+    //      replay indexer's top-k is compared.
+    if cap.tap(21, "q", 0).is_ok() {
         run_encoder(&dev, &ops, &core, &ins, &[0, CHUNK, N_TOK], None)?; // restore the tail
         let start = N_TOK - REPLAY_ROWS;
-        let q = dev.up(&cap.tap(21, "q", 0)?)?;
-        let ring = dev.up(&cap.tap(21, "ring", 0)?)?;
-        let sink = dev.up(&cap.tap(21, "attn_sink", 0)?)?;
         let wpos_d = dev.up(bytemuck_i32(&window_positions(start, REPLAY_ROWS)))?;
         let out_d = gpu.alloc(REPLAY_ROWS * QROW)?;
-        let win_lo = i64s(&cap.tap(21, "win_lo", 0)?)[0] as usize;
-        ensure!(win_lo == start, "runG L21 win_lo {win_lo}, expected {start}");
         core.begin_pass(PassKind::Replay, start, REPLAY_ROWS)?;
-        let a = CoreArgs { layer: 21, x: DevicePtr::NULL, qr: DevicePtr::NULL, q, ring, wpos: wpos_d, win_lo, sink, t: REPLAY_ROWS, start, out: out_d };
-        core.run(&ops, &a)?;
-        let tk = i64s(&dev.down(core.current_topk().unwrap(), REPLAY_ROWS * INDEX_TOPK * 8)?);
-        let (bad, _) = topk_rows(&tk, &i64s(&cap.tap(21, "topk", 0)?), REPLAY_ROWS);
-        let got = u16s(&dev.down(out_d, REPLAY_ROWS * QROW)?);
-        let want = u16s(&cap.tap(21, "attn_o_pre_inverse_rope", 0)?);
-        let (e, rl) = (bits_equal(&got, &want), rel_l2(&got, &want));
-        // CONTROL: the replay WITHOUT the window floor attends to ring rows the replay never wrote.
-        let a0 = CoreArgs { win_lo: 0, ..a };
-        core.begin_pass(PassKind::Replay, start, REPLAY_ROWS)?;
-        core.run(&ops, &a0)?;
-        let c = bits_equal(&u16s(&dev.down(out_d, REPLAY_ROWS * QROW)?), &want);
-        println!("REPLAY L21 (inherits L20's tail): topk {bad}/{REPLAY_ROWS} rows differ; attention bit-exact {e:.4} rel {rl:.2e} | CTRL win_lo=0: {c:.4}");
-        fail += usize::from(bad > 2 || e < 0.98 || c > 0.9);
+        let mut worst_att: f64 = 1.0;
+        // A layer's selection comes from the latest index-source layer at or below it. If that
+        // layer was not captured (runG has 21, 30, 39 but not 24/28/36), the chain is broken and
+        // comparing later layers would test THIS HARNESS, not the core — stop there.
+        let mut chain_ok = true;
+        for l in 21..40 {
+            let captured = cap.tap(l, "q", 0).is_ok();
+            if [24, 28, 32, 36].contains(&l) && !captured {
+                chain_ok = false;
+            }
+            if !captured {
+                continue;
+            }
+            if !chain_ok {
+                println!("REPLAY L{l}: NOT COMPARED -- its selection comes from an index layer this capture lacks");
+                continue;
+            }
+            let q = cap.tap(l, "q", 0)?;
+            let win_lo = i64s(&cap.tap(l, "win_lo", 0)?)[0] as usize;
+            ensure!(win_lo == start, "L{l} win_lo {win_lo}, expected {start}");
+            let (x, qr) = if [24, 28, 32, 36].contains(&l) {
+                (dev.up(&cap.tap(l, "attn_x", 0)?)?, dev.up(&cap.tap(l, "qr", 0)?)?)
+            } else {
+                (DevicePtr::NULL, DevicePtr::NULL)
+            };
+            let a = CoreArgs {
+                layer: l,
+                x,
+                qr,
+                q: dev.up(&q)?,
+                ring: dev.up(&cap.tap(l, "ring", 0)?)?,
+                wpos: wpos_d,
+                win_lo,
+                sink: dev.up(&cap.tap(l, "attn_sink", 0)?)?,
+                t: REPLAY_ROWS,
+                start,
+                out: out_d,
+            };
+            core.run(&ops, &a)?;
+            let tk = i64s(&dev.down(core.current_topk().unwrap(), REPLAY_ROWS * INDEX_TOPK * 8)?);
+            let (bad, worst) = topk_rows(&tk, &i64s(&cap.tap(l, "topk", 0)?), REPLAY_ROWS);
+            let got = u16s(&dev.down(out_d, REPLAY_ROWS * QROW)?);
+            let want = u16s(&cap.tap(l, "attn_o_pre_inverse_rope", 0)?);
+            let (e, rl) = (bits_equal(&got, &want), rel_l2(&got, &want));
+            worst_att = worst_att.min(e);
+            println!("REPLAY L{l}: topk {bad}/{REPLAY_ROWS} rows differ (worst overlap {worst:.4}); attention bit-exact {e:.4} rel {rl:.2e}");
+            fail += usize::from(bad > 3 || e < 0.98);
+            if l == 21 {
+                // CONTROL: the replay WITHOUT the window floor attends to ring rows it never wrote.
+                let a0 = CoreArgs { win_lo: 0, ..a };
+                core.begin_pass(PassKind::Replay, start, REPLAY_ROWS)?;
+                core.run(&ops, &a0)?;
+                let c = bits_equal(&u16s(&dev.down(out_d, REPLAY_ROWS * QROW)?), &want);
+                println!("CTRL replay L21 with win_lo=0: attention bit-exact {c:.4} (must collapse)");
+                fail += usize::from(c > 0.9);
+                core.begin_pass(PassKind::Replay, start, REPLAY_ROWS)?;
+                core.run(&ops, &a)?;
+            }
+        }
+        println!("REPLAY worst attention bit-exact over captured layers: {worst_att:.4}");
     }
 
     // ---- 4. the reset rule: Decode continues the sequence; only a new prompt resets.

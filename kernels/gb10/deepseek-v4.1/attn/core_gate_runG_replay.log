@@ -21,6 +21,10 @@ L14 chunk invariance [0, 511, 1000, 1023, 1024] vs 2x512: topk 0/1024 rows diffe
 L20 chunk invariance [0, 511, 1000, 1023, 1024] vs 2x512: topk 0/1024 rows differ (worst 1.0000), attention bit-identical 1.000000
 odd splits: replay tail 128 rows spanning 3 chunks, == own last 128 rows: true
 CTRL dropped pending at 511: REFUSED loudly (layer 2: 500 compressed rows visible, 499 published)
-REPLAY L21 (inherits L20's tail): topk 0/128 rows differ; attention bit-exact 0.9997 rel 5.58e-5 | CTRL win_lo=0: 0.0207
+REPLAY L21: topk 0/128 rows differ (worst overlap 1.0000); attention bit-exact 0.9997 rel 5.58e-5
+CTRL replay L21 with win_lo=0: attention bit-exact 0.0207 (must collapse)
+REPLAY L30: NOT COMPARED -- its selection comes from an index layer this capture lacks
+REPLAY L39: NOT COMPARED -- its selection comes from an index layer this capture lacks
+REPLAY worst attention bit-exact over captured layers: 0.9997
 RESET RULE: after Decode(pos 1024) the tail still holds 128 rows; after a new prompt 0
 CORE GATE PASS
