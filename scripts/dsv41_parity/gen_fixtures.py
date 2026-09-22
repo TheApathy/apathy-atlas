@@ -462,6 +462,30 @@ def torch_int16():
     return torch.int16
 
 
+EFFORT_FORMS = [90, "90", " 7 ", "high", "HIGH", " Max ", "low", "none", "medium", "xhigh", None, 1, 100,
+                True, 0.5, 90.0, 0, 101, -1, -5, "-1", "-5", "extreme", "", {"x": 1}, [1]]
+
+
+def effort_cases():
+    """Every effort form, in all three places the server reads it, through app.resolve_thinking."""
+    out = []
+    for where in ("reasoning_effort", "reasoning.effort", "ctk.reasoning_effort"):
+        for f in EFFORT_FORMS:
+            b = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            if where == "reasoning_effort":
+                b["reasoning_effort"] = f
+            elif where == "reasoning.effort":
+                b["reasoning"] = {"effort": f}
+            else:
+                b["chat_template_kwargs"] = {"reasoning_effort": f}
+            try:
+                th, ef = app.resolve_thinking(copy.deepcopy(b), False, 75)
+                out.append({"where": where, "body": b, "thinking": th, "effort": ef})
+            except app.APIError as e:
+                out.append({"where": where, "body": b, "error": e.status})
+    return out
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     render = [render_case(n, b) for n, b in RENDER_CASES]
@@ -473,6 +497,8 @@ def main():
         ebnf = tool_grammar.build_tool_grammar(t)
         grammar.append({"name": n, "tools": t, "ebnf": ebnf,
                         "streams": [mask_trace(ebnf, x) for x in MASK_STREAMS.get(n, [])]})
+    with open(os.path.join(OUT, "effort_forms.json"), "w") as f:
+        json.dump({"cases": effort_cases()}, f)
     with open(os.path.join(OUT, "vision.json"), "w") as f:
         json.dump(vision_cases(), f)
     with open(os.path.join(OUT, "repetition.json"), "w") as f:
