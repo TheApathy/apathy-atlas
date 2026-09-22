@@ -191,6 +191,10 @@ pub struct V41Forward {
     pub ids_dev: DevicePtr,
     pub max_chunk: usize,
     pub max_seq: usize,
+    /// Every device allocation this forward made (scratch, RoPE tables, ids, the engram
+    /// q*k weight products), freed on drop once [`Self::own_allocations`] hands it a backend.
+    /// Until then (the driver) it only records them.
+    pub allocs: super::device_allocs::DeviceAllocs,
 }
 
 pub fn rope_specs() -> (RopeSpec, RopeSpec) {
@@ -247,7 +251,28 @@ impl V41Forward {
             vision: None,
             max_chunk,
             max_seq,
+            allocs: super::device_allocs::DeviceAllocs::unowned(),
         })
+    }
+
+    /// Take ownership of every allocation made in [`Self::load`] so dropping the forward frees
+    /// it (serving). The driver skips this and lets process exit clean up.
+    pub fn own_allocations(&mut self, gpu: super::device_allocs::SharedGpu) {
+        let mut a = super::device_allocs::DeviceAllocs::owned(gpu);
+        for p in self.scratch.allocations().iter().chain(self.attn_scratch.allocations()) {
+            a.adopt(*p);
+        }
+        for t in [self.freqs_c, self.freqs_w] {
+            a.adopt(t.cos);
+            a.adopt(t.sin);
+        }
+        a.adopt(self.ids_dev);
+        for b in &self.blocks {
+            if let Some(e) = &b.engram {
+                a.adopt(e.weight);
+            }
+        }
+        self.allocs = a;
     }
 
     fn rope(&self, layer: usize) -> &RopeTable {

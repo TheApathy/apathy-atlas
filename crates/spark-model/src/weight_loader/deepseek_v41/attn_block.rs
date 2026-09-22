@@ -95,6 +95,11 @@ pub struct AttnScratch {
 }
 
 impl AttnScratch {
+    /// The device buffers this scratch allocated (for an owner that frees them on drop).
+    pub fn allocations(&self) -> &[DevicePtr] {
+        &self.allocations
+    }
+
     pub fn new(gpu: &dyn GpuBackend, max_t: usize) -> Result<Self> {
         let mut allocations = Vec::new();
         let mut a = |bytes: usize| -> Result<DevicePtr> {

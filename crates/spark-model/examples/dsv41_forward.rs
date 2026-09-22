@@ -251,6 +251,7 @@ fn run_model_path(
     splits: Vec<Vec<usize>>,
 ) -> Result<()> {
     let gpu_ref: &AtlasCudaBackend = &Arc::clone(&gpu);
+    spark_model::model::dsv41::log_run_identity("driver", ops.stream);
     let max_chunk = splits.iter().flatten().copied().chain(chunks.iter().map(|c| c.1)).max().unwrap_or(1);
     let fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, 8192, Path::new(MODEL_DIR), 128)?;
     let feeder = Feeder { dir: ref_dir.to_path_buf(), counts: RefCell::new(HashMap::new()), gpu };

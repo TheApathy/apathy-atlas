@@ -212,6 +212,16 @@ fn typed_impl(
                 if let (Some(key), Ok(mut t)) = (pin_key, pinned_algos().lock()) {
                     t.insert(key, result);
                 }
+                // ATLAS_LOG_PINNED_ALGO=1: one line per pinned shape, so two processes can be
+                // diffed. The heuristic can pick differently when the workspace, stream or
+                // allocation alignment differ; this makes that visible instead of inferred.
+                if std::env::var("ATLAS_LOG_PINNED_ALGO").as_deref() == Ok("1") {
+                    let hex: String = result[..64].iter().map(|b| format!("{b:02x}")).collect();
+                    eprintln!(
+                        "PINNED_ALGO n={n} k={k} lda={lda} ldc={ldc} in={ti} out={to} no_split_k={no_split_k} ref_m={r} ws={} stream={stream:#x} algo={hex}",
+                        ctx.ws_size
+                    );
+                }
             }
             h
         } else {
