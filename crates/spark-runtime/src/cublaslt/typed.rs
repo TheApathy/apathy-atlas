@@ -89,14 +89,6 @@ pub fn gemm_act_weight_t_typed(
             ),
             "PrefWorkspace",
         )?;
-        // EXPERIMENT (dsv41-attention, local only): restrict split-K reduction schemes.
-        if let Ok(v) = std::env::var("DSV41_LT_REDUCTION_MASK") {
-            let mask: u32 = v.parse().unwrap_or(7);
-            chk(
-                cublasLtMatmulPreferenceSetAttribute(pref, 3, &mask as *const u32 as *const c_void, 4),
-                "PrefReductionMask",
-            )?;
-        }
         let mut result = [0u8; 128];
         let mut returned: i32 = 0;
         let heur = cublasLtMatmulAlgoGetHeuristic(

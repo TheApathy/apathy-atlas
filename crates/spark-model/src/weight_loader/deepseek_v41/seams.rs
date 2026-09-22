@@ -111,11 +111,6 @@ pub struct SparseShared {
     /// The candidate block mask from layer 20's indexer alone, pruning 24/28/32/36.
     /// RESET per chunk.
     pub candidates: Option<DevicePtr>,
-    pub candidates_ld: usize,
-    pub replay_topk: Option<DevicePtr>,
-    pub replay_candidates: Option<DevicePtr>,
-    pub replay_candidates_ld: usize,
-    pub replay_rows: usize,
     /// Chunk start of the pass in flight, for debugging a stale-state bug.
     pub pass_start: usize,
     /// Passes begun since construction. Lets a caller assert the reset actually ran.
@@ -162,18 +157,6 @@ impl SparseShared {
 /// Split into two entry points on purpose: the indexer runs on 8 layers and attention on
 /// 40. Collapsing them hides exactly the asymmetry that must stay visible.
 pub trait Dsv41Attention: Send + Sync {
-    #[allow(clippy::too_many_arguments)]
-    fn compress(
-        &self,
-        x: DevicePtr,
-        layer: usize,
-        chunk_start: usize,
-        num_tokens: usize,
-        shared: &mut SparseShared,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()>;
-
     /// Recompute the sparse selection. Called **only** for `layer` in
     /// [`INDEX_SOURCE_LAYERS`]; every other layer inherits `shared.topk` untouched.
     ///
@@ -366,10 +349,6 @@ fn attention_stop(layer: usize, phase: &str) -> anyhow::Error {
 }
 
 impl Dsv41Attention for MissingAttention {
-    fn compress(&self, _x: DevicePtr, _layer: usize, _c: usize, _n: usize, _s: &mut SparseShared, _ctx: &ForwardContext, _st: u64) -> Result<()> {
-        bail!(attention_stop(self.layer, "compress"))
-    }
-
     fn sparse_index_select(
         &self,
         _x: DevicePtr,
