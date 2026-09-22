@@ -229,13 +229,6 @@ impl PassScratch {
         };
         Ok(Self { allocations, ..s })
     }
-
-    pub fn free(self, gpu: &dyn GpuBackend) -> Result<()> {
-        for p in self.allocations {
-            gpu.free(p)?;
-        }
-        Ok(())
-    }
 }
 
 /// One sub-layer's worth of attention: post-`attn_norm` x `[T, hidden]` -> `[T, hidden]`.
