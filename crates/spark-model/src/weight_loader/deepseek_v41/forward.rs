@@ -71,6 +71,9 @@ pub struct V41Seq {
     pub tail_rows: usize,
     /// Token ids of those tail rows (the replay's MoE routes by them).
     pub tail_ids: Vec<u32>,
+    /// The last (max_ngram - 1) = 3 PROMPT ids absorbed, so a prefill chunk's dead-head mask can
+    /// look back across the chunk boundary.
+    pub recent_prompt_ids: Vec<u32>,
 }
 
 impl V41Seq {
@@ -90,6 +93,7 @@ impl V41Seq {
             tail_pre: gpu.alloc(WINDOW * dims.hc * 4)?,
             tail_rows: 0,
             tail_ids: Vec::new(),
+            recent_prompt_ids: Vec::new(),
         })
     }
 
@@ -234,9 +238,30 @@ impl V41Forward {
         ensure!(seq.len == start, "sequence holds {} positions, pass starts at {start}", seq.len);
         ensure!(start + t <= self.max_seq, "position {} exceeds max_seq {}", start + t, self.max_seq);
         let hashes = seq.hash.forward(ids, start, None)?;
-        // `engram_dead_heads` is a pure function of THIS forward's ids (model.py:747, no
-        // cross-chunk carry); all-False for text.
-        let dead: Vec<u8> = engram_dead_heads(ids).into_iter().map(u8::from).collect();
+        // Dead heads. PREFILL: production (v41_engine.py:755) computes the mask ONCE over the
+        // whole prompt and slices it per chunk, so a chunk's first positions look back into the
+        // previous chunk (an image span ending just before the boundary kills them). The mask
+        // at p depends only on ids p-3..=p, so prepending the last 3 prompt ids reproduces the
+        // whole-prompt slice exactly. DECODE: model.py:747 computes it per call with no
+        // look-back, and that is what we mirror there. All-False for text either way.
+        const LOOKBACK: usize = 3;
+        let prefill_kind = matches!(kind, PassKind::EncoderChunk | PassKind::FullChunk);
+        if prefill_kind && start == 0 {
+            seq.recent_prompt_ids.clear();
+        }
+        let dead: Vec<u8> = if prefill_kind && !seq.recent_prompt_ids.is_empty() {
+            let back = seq.recent_prompt_ids.len();
+            let ctx: Vec<u32> = seq.recent_prompt_ids.iter().chain(ids).copied().collect();
+            engram_dead_heads(&ctx)[back * 24..].iter().map(|&d| u8::from(d)).collect()
+        } else {
+            engram_dead_heads(ids).into_iter().map(u8::from).collect()
+        };
+        if prefill_kind {
+            let mut r: Vec<u32> = seq.recent_prompt_ids.iter().chain(ids).copied().collect();
+            let drop = r.len().saturating_sub(LOOKBACK);
+            r.drain(..drop);
+            seq.recent_prompt_ids = r;
+        }
         ops.gpu.copy_h2d_async(&dead, self.scratch.engram_dead, ops.stream)?;
         ops.gpu.copy_h2d_async(bytemuck_u32(ids), self.ids_dev, ops.stream)?;
         ops.embed(self.embed, self.ids_dev, self.scratch.x, t, self.dims.hidden)?;
