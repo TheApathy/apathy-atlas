@@ -52,7 +52,7 @@ fn setup_model(
     );
 
     let ptx_modules = atlas_kernels::ptx_modules();
-    let gpu: Box<dyn spark_runtime::gpu::GpuBackend> = Box::new(
+    let gpu: std::sync::Arc<dyn spark_runtime::gpu::GpuBackend> = std::sync::Arc::new(
         spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &ptx_modules)?,
     );
     let total = gpu.total_memory()?;

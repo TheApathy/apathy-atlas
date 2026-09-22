@@ -40,7 +40,7 @@ impl TransformerModel {
         kv_cache: PagedKvCache,
         mtp_weights: Vec<MtpWeights>,
         mtp_dense_weights: Option<crate::weight_map::MtpDenseWeights>,
-        gpu: Box<dyn GpuBackend>,
+        gpu: std::sync::Arc<dyn GpuBackend>,
         max_seq_len: usize,
         max_batch_size: usize,
         mtp_quant: crate::layers::MtpQuantization,

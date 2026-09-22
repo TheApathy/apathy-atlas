@@ -100,6 +100,14 @@ pub(crate) struct Prepared {
     /// Not an `Option`: a rank that produces a `Prepared` always has one, and
     /// the EP-worker rank that does not returns `Ok(None)` instead.
     pub scheduler: std::thread::JoinHandle<()>,
+    /// The GPU backend instance this model was built and served with.
+    ///
+    /// Kept alongside `scheduler`, not just handed to the model, because a
+    /// swap needs it AFTER the model itself has already dropped (inside the
+    /// scheduler thread's unwind, when `scheduler` is joined) to reclaim
+    /// every allocation that thread's model never freed — see
+    /// `GpuBackend::free_all_allocations` and `model_swap::swap`.
+    pub gpu: std::sync::Arc<dyn spark_runtime::gpu::GpuBackend>,
 }
 
 /// Load one model and start its scheduler.
@@ -288,6 +296,12 @@ pub(crate) fn load_model(
     serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);
 
     let (gpu, free_mem) = serve_phases::init_gpu_backend(&args, &ptx_set)?;
+    // Kept alongside the scheduler handle in `Prepared` so a swap can free
+    // every allocation this specific backend instance made, once it is
+    // provably quiescent — see `GpuBackend::free_all_allocations` and
+    // `model_swap::swap`. An `Arc` clone, not the original: `gpu` below is
+    // still moved into the model by value.
+    let gpu_handle = gpu.clone();
 
     // ── Pre-load reserve preflight ──
     let serve_phases::ReservePreflight {
@@ -836,5 +850,6 @@ pub(crate) fn load_model(
         bind: args.bind,
         port: args.port,
         scheduler: scheduler_handle,
+        gpu: gpu_handle,
     }))
 }

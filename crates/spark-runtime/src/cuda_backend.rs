@@ -68,6 +68,14 @@ pub struct AtlasCudaBackend {
     default_stream: u64,
     /// CUDA context handle for cross-thread binding.
     cuda_ctx: u64,
+    /// Every device pointer this instance has handed out via `alloc`/
+    /// `alloc_managed` and not yet individually freed via `free`, keyed to
+    /// its byte size. Model weights, KV cache, SSM pools and the buffer
+    /// arena never call `free()` themselves (BUG #29 — see the doc on
+    /// `GpuBackend::free_all_allocations`), so without this table nothing
+    /// ever reclaims them until the process exits. Drained in one pass by
+    /// `free_all_allocations` at model teardown.
+    live_allocations: std::sync::Mutex<std::collections::HashMap<u64, usize>>,
 }
 
 impl AtlasCudaBackend {
@@ -97,6 +105,7 @@ impl AtlasCudaBackend {
         Ok(Self {
             default_stream,
             cuda_ctx,
+            live_allocations: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 

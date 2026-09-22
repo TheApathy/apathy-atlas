@@ -81,6 +81,7 @@ pub(crate) async fn serve(
     // outgoing scheduler can then never be joined, and without that join
     // teardown races live kernels.
     host.set_scheduler(prepared.scheduler);
+    host.set_gpu_backend(prepared.gpu);
     crate::main_modules::serve_router::build_and_serve(host, &prepared.bind, prepared.port).await
 }
 

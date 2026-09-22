@@ -121,5 +121,27 @@ impl Drop for TransformerModel {
                 self.secondary_event
             );
         }
+
+        // Everything above is graphs, vision buffers and events — the small
+        // set of GPU allocations this Drop impl already knew how to name.
+        // Everything else this model holds (weights, KV cache, `BufferArena`,
+        // the SSM pools, and the long tail of ad-hoc persistent `DevicePtr`
+        // fields on this struct) is a raw, `Copy` pointer with no destructor
+        // of its own, and DELIBERATELY stays unfreed here — see the doc on
+        // `GpuBackend::free_all_allocations`.
+        //
+        // `Drop` is the wrong place to call it: `TransformerModel` drops on
+        // whatever thread happens to hold the last reference, which is NOT
+        // always the quiescent moment BUG #29 requires. A model that fails
+        // to load partway through construction drops on the swap thread
+        // while nothing else is concurrently allocating — fine — but a
+        // model that drops for any less-analysed reason (a panic unwind,
+        // a future EP-worker teardown path) could race concurrent GPU
+        // traffic, which is the exact interleaving BUG #29 corrupts.
+        // `model_swap::swap` calls `free_all_allocations` explicitly, on
+        // the specific backend handle it kept for this purpose, at the one
+        // point its own design already reasoned about: right after the
+        // scheduler thread — the sole other owner of this model — has been
+        // joined, and before the next model starts allocating. See there.
     }
 }
