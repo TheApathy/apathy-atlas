@@ -944,6 +944,17 @@ pub fn prefill_ffn_fast_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_FFN_FAST").ok().as_deref() != Some("0"))
 }
 
+/// True only when `ATLAS_PREFILL_FFN_FAST=1` was set explicitly. The gate
+/// above defaults ON, so an unset variable must not be treated as a request:
+/// a checkpoint loaded without the transposed FFN weights (e.g.
+/// Qwen3.5-27B-Text-NVFP4-MTP) then fails every prefill of >=128 tokens with
+/// "requires transformed gate/up/down weights". Only an explicit request
+/// fails closed; the default falls back to the M_TILE=64 route.
+pub fn prefill_ffn_fast_explicit() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_FFN_FAST").ok().as_deref() == Some("1"))
+}
+
 /// Enables the repository-native FlashInfer/CUTLASS W4A4 dense-FFN prefill
 /// route on SM121.
 ///

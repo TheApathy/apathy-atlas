@@ -81,7 +81,16 @@ pub(crate) async fn serve(
     // outgoing scheduler can then never be joined, and without that join
     // teardown races live kernels.
     host.set_scheduler(prepared.scheduler);
-    crate::main_modules::serve_router::build_and_serve(host, &prepared.bind, prepared.port).await
+    let serve_result =
+        crate::main_modules::serve_router::build_and_serve(host.clone(), &prepared.bind, prepared.port)
+            .await;
+    // Join the scheduler (and so the model's drop) before `main` returns;
+    // see `model_swap::retire_for_shutdown`.
+    let scheduler_join = tokio::task::spawn_blocking(move || {
+        crate::main_modules::model_swap::retire_for_shutdown(&host)
+    })
+    .await;
+    crate::main_modules::serve_shutdown::resolve_serve_result(serve_result, scheduler_join)
 }
 
 /// The once-per-process half. Everything here is either global state or a

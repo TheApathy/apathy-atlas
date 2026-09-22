@@ -4209,6 +4209,17 @@ impl DenseFfnLayer {
         );
         let fast_path = match fast_route {
             PrefillFfnFastRoute::Complete => true,
+            PrefillFfnFastRoute::Missing if !crate::layers::prefill_ffn_fast_explicit() => {
+                static DEFAULT_MISSING: std::sync::Once = std::sync::Once::new();
+                DEFAULT_MISSING.call_once(|| {
+                    tracing::warn!(
+                        "default-on ATLAS_PREFILL_FFN_FAST skipped: transposed FFN weights or \
+                         w4a16_gemm_t_m16/m128 are absent for this checkpoint; using the \
+                         M_TILE=64 route (set ATLAS_PREFILL_FFN_FAST=1 to fail closed instead)"
+                    );
+                });
+                false
+            }
             PrefillFfnFastRoute::Missing => {
                 bail!(
                     "ATLAS_PREFILL_FFN_FAST=1 requires transformed gate/up/down weights plus w4a16_gemm_t_m16 and w4a16_gemm_t_m128 before gate projection"

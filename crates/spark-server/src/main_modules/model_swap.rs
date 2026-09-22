@@ -207,6 +207,24 @@ fn release_state(host: &Arc<ModelHost>, grace: std::time::Duration) -> Result<Ca
     Ok(carried)
 }
 
+/// Release the serving model and JOIN its scheduler before the process exits.
+///
+/// Returning from `main` while the scheduler thread is still dropping the model
+/// races process teardown: the CUDA driver deinitialises underneath the drop,
+/// `TransformerModel::drop`'s stream sync fails with CUDA_ERROR_DEINITIALIZED
+/// and aborts, and every clean Ctrl+C dumps core. Same two steps a swap takes
+/// before loading (release the state that owns `request_tx`, then join), under
+/// the same guard so a swap in flight is not torn in half. This carries
+/// phaseA-a1's `serve_shutdown` intent onto the ModelHost design.
+pub(crate) fn retire_for_shutdown(host: &Arc<ModelHost>) -> Result<()> {
+    let _swapping = host.swap_guard();
+    release_state(host, DRAIN_GRACE)?;
+    match host.take_scheduler() {
+        Some(handle) => super::serve_shutdown::join_scheduler(handle),
+        None => Ok(()),
+    }
+}
+
 /// Mark the router/listening phases done and announce ready.
 ///
 /// The listener is bound at boot and a swap never touches it, so `load_model`
