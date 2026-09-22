@@ -34,6 +34,7 @@ pub use cuda_module::{CudaEvent, CudaModule, launch_kernel};
 pub mod attention_ref;
 pub mod cascade_policy;
 pub mod config;
+pub mod engram_tier;
 pub mod eviction;
 pub mod expert;
 pub mod expert_pack;
