@@ -359,9 +359,13 @@ fn main() -> Result<()> {
         100.0 * returned as f64 / taken.max(1) as f64
     );
     ensure!(taken >= 1_700_000_000, "loading one layer took only {taken} bytes — the check cannot see a leak");
-    // Cycles 2..=6. BAND (set by the lead, not by me after the fact): cycles 3-6 must EACH
-    // return >= 99% of what they took with |drift| <= 0.05 GB — no accumulation after warm-up.
+    // Cycles 2..=6. BAND (ruled by the lead from 6 runs of noise data, before any new run):
+    // over cycles 3-6, |cumulative drift| <= 0.2 GB AND mean returned >= 99%. free_memory on
+    // GB10 is system-wide unified memory and moves +-0.1 GB per cycle with other processes, so
+    // a per-cycle band of 0.05 GB failed non-leaking runs in BOTH directions; a real leak here
+    // is -1.8 GB per cycle (-7.2 GB cumulative), > 30x outside this band.
     let mut prev_after = free_after;
+    let (mut cum_drift, mut returned_pct): (i64, Vec<f64>) = (0, Vec::new());
     for cycle in 2..=6 {
         let before = gpu.free_memory()? as i64;
         let arena = Arc::new(if leak_control {
@@ -387,11 +391,18 @@ fn main() -> Result<()> {
         );
         ensure!(took >= 1_700_000_000, "cycle {cycle} took only {took} bytes — the check cannot see a leak");
         if cycle >= 3 {
-            ensure!(gave as f64 >= 0.99 * took as f64, "cycle {cycle}: drop returned only {gave} of {took} bytes");
-            ensure!(drift.abs() <= 50_000_000, "cycle {cycle}: free memory drifted by {drift} bytes");
+            cum_drift += drift;
+            returned_pct.push(100.0 * gave as f64 / took.max(1) as f64);
         }
         prev_after = after;
     }
+    let mean_returned = returned_pct.iter().sum::<f64>() / returned_pct.len() as f64;
+    println!(
+        "  ownership band (cycles 3-6): cumulative drift {:+.3} GB (|.| <= 0.2), mean returned {mean_returned:.1}% (>= 99)",
+        cum_drift as f64 / 1e9
+    );
+    ensure!(cum_drift.abs() <= 200_000_000, "cycles 3-6: cumulative drift {cum_drift} bytes — memory accumulates");
+    ensure!(mean_returned >= 99.0, "cycles 3-6: mean returned {mean_returned:.1}% < 99%");
 
     if control != MoeControl::None {
         let floor = TOL * MIN_SEPARATION;
