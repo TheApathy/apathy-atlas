@@ -97,7 +97,8 @@ impl Dsv41Model {
             }
             Some(o) => bail!("ATLAS_DSV41_PREFILL={o}: use replay (default) or full"),
         };
-        let logits = gpu.alloc(config.vocab_size * 2)?;
+        // MM_TILE rows: the head GEMM runs as one 16-row tile; row 0 is the result.
+        let logits = gpu.alloc(crate::weight_loader::deepseek_v41::ops::MM_TILE * config.vocab_size * 2)?;
         let tap = match std::env::var("ATLAS_DSV41_TAP_DIR") {
             Ok(d) => Tap::to_dir(d.into(), Vec::new())?,
             Err(_) => Tap::off(),

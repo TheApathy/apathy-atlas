@@ -102,7 +102,7 @@ impl AttnScratch {
             allocations.push(p);
             Ok(p)
         };
-        let t = max_t;
+        let t = super::ops::tiled_rows(max_t);
         let s = Self {
             max_t,
             qr: a(t * Q_LORA * 2)?,
@@ -196,14 +196,14 @@ pub fn attention(
     let wpos = window_positions(start, t);
     gpu.copy_h2d_async(bytemuck_i32(&wpos), s.wpos, ops.stream)?;
 
-    ops.linear_fp8(x, &w.wq_a, wscratch, s.qr, t)?;
+    ops.linear_fp8_tiled(x, &w.wq_a, wscratch, s.qr, t)?;
     ops.rmsnorm(s.qr, w.q_norm, s.qr, t, Q_LORA, norm_eps)?;
     tap.bf16(ops, "qr", l, s.qr, &[t, Q_LORA])?;
-    ops.linear_fp8(s.qr, &w.wq_b, wscratch, s.q, t)?;
+    ops.linear_fp8_tiled(s.qr, &w.wq_b, wscratch, s.q, t)?;
     ops.rope_tail(s.q, s.pos, rope, t, N_HEADS, HEAD_DIM, false)?;
     tap.bf16(ops, "q", l, s.q, &[t, N_HEADS, HEAD_DIM])?;
 
-    ops.linear_fp8(x, &w.wkv, wscratch, s.kv, t)?;
+    ops.linear_fp8_tiled(x, &w.wkv, wscratch, s.kv, t)?;
     ops.rmsnorm(s.kv, w.kv_norm, s.kv, t, HEAD_DIM, norm_eps)?;
     ops.rope_tail(s.kv, s.pos, rope, t, 1, HEAD_DIM, false)?;
     tap.bf16(ops, "kv_new", l, s.kv, &[t, HEAD_DIM])?;
@@ -228,7 +228,7 @@ pub fn attention(
     let grp_k = HEAD_DIM * N_HEADS / O_GROUPS;
     ops.dequant(&w.wo_a, wscratch)?;
     for g in 0..O_GROUPS {
-        ops.linear_bf16_strided(
+        ops.linear_bf16_tiled(
             s.o.offset(g * grp_k * 2),
             N_HEADS * HEAD_DIM,
             wscratch.offset(g * O_LORA * grp_k * 2),
@@ -239,7 +239,7 @@ pub fn attention(
             grp_k,
         )?;
     }
-    ops.linear_fp8(s.o2, &w.wo_b, wscratch, out, t)
+    ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t)
 }
 
 #[cfg(test)]

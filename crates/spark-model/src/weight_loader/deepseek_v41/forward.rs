@@ -165,7 +165,7 @@ impl V41Forward {
             freqs_w: w.upload(ops.gpu, max_seq + 8)?,
             scratch: PassScratch::new(ops.gpu, &dims, max_chunk.max(WINDOW), largest)?,
             attn_scratch: AttnScratch::new(ops.gpu, max_chunk.max(WINDOW))?,
-            ids_dev: ops.gpu.alloc(max_chunk.max(WINDOW) * 4)?,
+            ids_dev: ops.gpu.alloc(super::ops::tiled_rows(max_chunk.max(WINDOW)) * 4)?,
             blocks,
             attn,
             engram,

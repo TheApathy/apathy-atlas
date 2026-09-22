@@ -13,6 +13,9 @@ use std::ffi::c_void;
 
 use super::*;
 
+/// `CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK` (u32).
+const PREF_REDUCTION_SCHEME_MASK: u32 = 3;
+
 /// Element type of a GEMM operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GemmDtype {
@@ -88,6 +91,21 @@ pub fn gemm_act_weight_t_typed(
                 std::mem::size_of::<usize>(),
             ),
             "PrefWorkspace",
+        )?;
+        // NO split-K. The reference's M=16 torch GEMMs do not split K, and even an fp32
+        // split-K reduction reorders the sum enough to move bf16 outputs: measured by
+        // dsv41-attention on L20's compressor (16x512x5120), the default heuristic took ckv
+        // from 100.00% to 70.7% bit-exact vs runF and changed top-k on 296/512 rows; mask 0
+        // restored 100.00% and 0/1024 rows differing across two chunkings.
+        let no_split_k: u32 = 0;
+        chk(
+            cublasLtMatmulPreferenceSetAttribute(
+                pref,
+                PREF_REDUCTION_SCHEME_MASK,
+                &no_split_k as *const u32 as *const c_void,
+                std::mem::size_of::<u32>(),
+            ),
+            "PrefReductionScheme",
         )?;
         let mut result = [0u8; 128];
         let mut returned: i32 = 0;

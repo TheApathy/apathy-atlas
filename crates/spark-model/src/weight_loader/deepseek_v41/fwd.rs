@@ -79,10 +79,10 @@ impl SharedExpert {
     /// `v41_ref.expert_ffn(y, w1, w2, w3, limit)`: out = w2(bf16(silu(clamp(w1 y)) * clamp(w3 y))).
     pub fn forward(&self, ops: &Ops, y: DevicePtr, out: DevicePtr, t: usize, s: &PassScratch, dims: &V41Dims) -> Result<()> {
         let n = t * dims.moe_inter;
-        ops.linear_fp8(y, &self.w1, s.wscratch, s.gate, t)?;
-        ops.linear_fp8(y, &self.w3, s.wscratch, s.up, t)?;
+        ops.linear_fp8_tiled(y, &self.w1, s.wscratch, s.gate, t)?;
+        ops.linear_fp8_tiled(y, &self.w3, s.wscratch, s.up, t)?;
         ops.swiglu(s.gate, s.up, s.act, n, dims.swiglu_limit)?;
-        ops.linear_fp8(s.act, &self.w2, s.wscratch, out, t)
+        ops.linear_fp8_tiled(s.act, &self.w2, s.wscratch, out, t)
     }
 }
 
@@ -114,7 +114,7 @@ impl EngramProj {
     /// `[t, 24]` or NULL for "no dead heads".
     pub fn forward(&self, ops: &Ops, h: DevicePtr, rows: DevicePtr, dead: DevicePtr, t: usize, s: &PassScratch, dims: &V41Dims) -> Result<()> {
         ops.engram_rows_bf16(rows, dead, s.engram_rows_bf16, t * ENGRAM_ROW_WIDTH)?;
-        ops.linear_fp8(s.engram_rows_bf16, &self.wkv, s.wscratch, s.engram_kv, t)?;
+        ops.linear_fp8_tiled(s.engram_rows_bf16, &self.wkv, s.wscratch, s.engram_kv, t)?;
         ops.engram_gate(h, s.engram_kv, self.weight, t, dims.hc, dims.hidden, dims.norm_eps)
     }
 }
@@ -195,7 +195,8 @@ impl PassScratch {
             Ok(p)
         };
         let (d, hc) = (dims.hidden, dims.hc);
-        let t = max_t;
+        // Every activation buffer holds whole MM_TILE tiles (see ops::tiled_rows).
+        let t = super::ops::tiled_rows(max_t);
         let s = Self {
             max_t,
             h: a(t * hc * d * 2)?,
@@ -373,7 +374,8 @@ impl Tap {
 
 /// `Model.forward`'s tail for the LAST row of the pass: `x = hc_pre(h, pre_mix)`,
 /// `rmsnorm(x, norm)`, `logits = head(x)` — bf16 GEMM with fp32 accumulate and bf16 logits,
-/// exactly `R.head_logits` for a bf16 head. `logits` receives `[vocab]` bf16.
+/// exactly `R.head_logits` for a bf16 head. `logits` must hold `[MM_TILE, vocab]` bf16 (the
+/// GEMM runs as one 16-row tile like `R.mm`); row 0 is the result.
 ///
 /// Rows other than the last are never needed at prefill; computing them would be a
 /// `[T, 129280]` GEMM for nothing.
@@ -394,5 +396,5 @@ pub fn final_logits_last_row(
     let pre_last = s.pre_mix.offset((t - 1) * hc * 4);
     ops.hc_pre(h_last, pre_last, s.x, 1, d)?;
     ops.rmsnorm(s.x, norm, s.x, 1, d, dims.norm_eps)?;
-    ops.linear_bf16(s.x, head, logits, 1, vocab, d)
+    ops.linear_bf16_tiled(s.x, d, head, logits, vocab, 1, vocab, d)
 }

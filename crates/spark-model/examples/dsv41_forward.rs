@@ -246,7 +246,7 @@ fn run_model_path(
         None => Tap::off(),
     };
     let mut seq = V41Seq::new(ops.gpu, &dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?;
-    let logits = ops.gpu.alloc(config.vocab_size * 2)?;
+    let logits = ops.gpu.alloc(spark_model::weight_loader::deepseek_v41::ops::MM_TILE * config.vocab_size * 2)?;
     fwd.prefill(ops, &mut seq, ids, PrefillMode::Replay, &NoHook, &core, moe, &tap, logits)?;
     tap.bf16(ops, "logits_last", 40, logits, &[config.vocab_size])?;
     ops.gpu.synchronize(ops.stream)?;
@@ -472,7 +472,7 @@ fn main() -> Result<()> {
         gpu.copy_h2d(&pb, s.pre_mix)?;
         let norm = bf16_tensor(&store, "norm.weight", &[dims.hidden])?;
         let head = bf16_tensor(&store, "head.weight", &[config.vocab_size, dims.hidden])?;
-        let logits = gpu.alloc(config.vocab_size * 2)?;
+        let logits = gpu.alloc(spark_model::weight_loader::deepseek_v41::ops::MM_TILE * config.vocab_size * 2)?;
         final_logits_last_row(&ops, &dims, &s, t, norm, head, config.vocab_size, logits)?;
         tap.bf16(&ops, "logits_last", 40, logits, &[config.vocab_size])?;
         let mut host = vec![0u8; config.vocab_size * 2];
