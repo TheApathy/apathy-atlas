@@ -146,7 +146,8 @@ __device__ __forceinline__ uint32_t fp8x2_to_bf16x2(uint16_t two, float sc) {
 }
 }  // namespace dsv41_fp8gemm
 
-extern "C" __global__ void __launch_bounds__(dsv41_fp8gemm::THREADS) dsv41_fp8_gemm_nt_v2(
+template <bool CONVERT>
+__device__ __forceinline__ void fp8_gemm_v2_body(
     const __nv_bfloat16* __restrict__ A, int lda,
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, int s_ld,
     __nv_bfloat16* __restrict__ C, int ldc, int M, int N, int K)
@@ -211,8 +212,14 @@ extern "C" __global__ void __launch_bounds__(dsv41_fp8gemm::THREADS) dsv41_fp8_g
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const uint8_t* wr = &wraw[b][nrow[j]][kk + 2 * q];
-                const uint32_t bb[2] = {fp8x2_to_bf16x2(*reinterpret_cast<const uint16_t*>(wr), sc[j]),
-                                        fp8x2_to_bf16x2(*reinterpret_cast<const uint16_t*>(wr + 8), sc[j])};
+                uint32_t bb[2];
+                if (CONVERT) {
+                    bb[0] = fp8x2_to_bf16x2(*reinterpret_cast<const uint16_t*>(wr), sc[j]);
+                    bb[1] = fp8x2_to_bf16x2(*reinterpret_cast<const uint16_t*>(wr + 8), sc[j]);
+                } else {   // TIMING PROBE ONLY: raw bits, wrong values
+                    bb[0] = *reinterpret_cast<const uint16_t*>(wr);
+                    bb[1] = *reinterpret_cast<const uint16_t*>(wr + 8);
+                }
 #pragma unroll
                 for (int i = 0; i < 4; ++i) mma16816(acc[i][j], af[i], bb);
             }
@@ -231,3 +238,22 @@ extern "C" __global__ void __launch_bounds__(dsv41_fp8gemm::THREADS) dsv41_fp8_g
                 *reinterpret_cast<__nv_bfloat162*>(C + (size_t)(m + 8) * ldc + n) = __floats2bfloat162_rn(acc[i][j][2], acc[i][j][3]);
         }
 }
+
+extern "C" __global__ void __launch_bounds__(dsv41_fp8gemm::THREADS) dsv41_fp8_gemm_nt_v2(
+    const __nv_bfloat16* __restrict__ A, int lda,
+    const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, int s_ld,
+    __nv_bfloat16* __restrict__ C, int ldc, int M, int N, int K)
+{
+    fp8_gemm_v2_body<true>(A, lda, W, S, s_ld, C, ldc, M, N, K);
+}
+
+#ifdef DSV41_FP8GEMM_GATE
+// Timing probe: the same kernel with the FP8 -> bf16 conversion removed (wrong values).
+extern "C" __global__ void __launch_bounds__(dsv41_fp8gemm::THREADS) dsv41_fp8_gemm_probe_noconv(
+    const __nv_bfloat16* __restrict__ A, int lda,
+    const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, int s_ld,
+    __nv_bfloat16* __restrict__ C, int ldc, int M, int N, int K)
+{
+    fp8_gemm_v2_body<false>(A, lda, W, S, s_ld, C, ldc, M, N, K);
+}
+#endif

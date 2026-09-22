@@ -22,11 +22,15 @@ def get(name):
 R = Run("runF_faithful")
 acts = {"attn_x": R.load(2, "attn_x", 0, raw=True), "qr": R.load(2, "qr", 0, raw=True)}
 cases = [("wq_b", "layers.2.attn.wq_b", "qr"), ("wo_b", "layers.2.attn.wo_b", None),
-         ("w1", "layers.2.ffn.shared_experts.w1", "attn_x"), ("wq_a", "layers.2.attn.wq_a", "attn_x")]
+         ("w1", "layers.2.ffn.shared_experts.w1", "attn_x"), ("wq_a", "layers.2.attn.wq_a", "attn_x"),
+         ("wkv", "layers.2.attn.wkv", "attn_x"), ("w2", "layers.2.ffn.shared_experts.w2", None),
+         ("wo_a_g0", "layers.2.attn.wo_a", None)]
 os.makedirs(OUT, exist_ok=True)
 for name, p, act in cases:
     w = get(p + ".weight").view(torch.uint8).numpy()
     s = get(p + ".scale").view(torch.uint8).numpy()
+    if name == "wo_a_g0":   # the grouped wo_a: group 0 = rows 0..1023 (x K 4096), as ops issues it
+        w, s = w[:1024], s[:32]
     n, k = w.shape
     if act:
         a = acts[act]

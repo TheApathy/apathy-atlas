@@ -8,6 +8,7 @@
 //! runF_faithful / runG_replay by `examples/dsv41_attn_seam.rs` (SPEC.md 8f-8g). A
 //! `full_attention` fallback for this architecture is a DIFFERENT MODEL, not a slower one.
 
+pub mod fp8_gemm;
 pub mod index;
 pub mod schedule;
 pub mod core;

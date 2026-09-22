@@ -14,6 +14,7 @@
 //   control: every scale +1 (all weights x2) must move rel_l2 to ~1 -- the gate can fail;
 //   speed: reported against dequant+GEMM and GEMM alone at M=512; no speed claim is gated.
 
+#define DSV41_FP8GEMM_GATE
 #include "../cb3/dsv41_fp8_gemm.cu"
 
 #include <cmath>
@@ -130,6 +131,8 @@ int main(int argc, char** argv) {
         const float t_v2 = time_it([&] { fused2(M, Cf); });
         std::printf("           v2 (on-the-fly B, 3 stages): byte-identical to v1: %s, %.3f ms (%.1f TF/s, %.2fx current)\n",
                     v2same ? "yes" : "NO", t_v2, 2.0 * M * N * K / (t_v2 * 1e9), t_cur / t_v2);
+        const float t_nc = time_it([&] { dsv41_fp8_gemm_probe_noconv<<<dim3(N / dsv41_fp8gemm::BN, (M + dsv41_fp8gemm::BM - 1) / dsv41_fp8gemm::BM), dsv41_fp8gemm::THREADS>>>(A, K, W, S, SK, Cf, N, M, N, K); });
+        std::printf("           PROBE v2 without the fp8->bf16 conversion (wrong values, timing only): %.3f ms (%.1f TF/s)\n", t_nc, 2.0 * M * N * K / (t_nc * 1e9));
         const bool ok = same >= 0.99 && rel <= 1e-3 && inv && crel > 0.5 && v2same;
         fails += !ok;
         std::printf("%-10s M=%d N=%5d K=%5d | identical %.4f%% rel %.2e | M=20 rows byte-identical: %s | CTRL scale+1 rel %.2e | "
