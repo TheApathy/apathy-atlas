@@ -31,6 +31,13 @@ pub const KEY_BLOCK: usize = 512;
 const SCORE_KEYS_PER_BLOCK: usize = 128;
 const SCORE_THREADS: u32 = 128;
 const SELECT_THREADS: u32 = 512;
+/// [`IndexOps::gemm_f32`] takes `dsv41_gemv_f32_nt` at M <= this (bit-identical, N/8 CTAs not N/64).
+pub const GEMV_F32_MAX_M: usize = 16;
+const GEMV_F32_KC: usize = 128;
+
+/// A/B switch for the small-M fp32 GEMV (`ATLAS_DSV41_GEMV_F32=0` at core load, or a gate):
+/// `true` forces `dsv41_gemm_f32_nt` at every M.
+pub static GEMV_F32_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Score width for `n_c` visible compressed rows: `max(512, ceil(n_c / 512) * 512)`.
 ///
@@ -55,6 +62,16 @@ pub struct IndexKernels {
     pub iota: KernelHandle,
     pub gemm_f32: KernelHandle,
     pub gemm_bf16_smalln: KernelHandle,
+    pub gemv_f32: KernelHandle,
+    /// Shape-static decode entries: the pass start is read from device memory.
+    pub score_dev: KernelHandle,
+    pub topk_dev: KernelHandle,
+    pub candidates_dev: KernelHandle,
+    pub iota_dev: KernelHandle,
+    pub comp2_pending_in: KernelHandle,
+    pub combine2_dev: KernelHandle,
+    pub comp2_pending_out: KernelHandle,
+    pub publish_rows: KernelHandle,
 }
 
 impl IndexKernels {
@@ -77,6 +94,15 @@ impl IndexKernels {
             iota: k("dsv41_iota_i32")?,
             gemm_f32: k("dsv41_gemm_f32_nt")?,
             gemm_bf16_smalln: k("dsv41_gemm_bf16_smalln")?,
+            gemv_f32: k("dsv41_gemv_f32_nt")?,
+            score_dev: k("dsv41_index_score_dev")?,
+            topk_dev: k("dsv41_index_topk_dev")?,
+            candidates_dev: k("dsv41_select_candidates_dev")?,
+            iota_dev: k("dsv41_iota_dev")?,
+            comp2_pending_in: k("dsv41_comp2_pending_in")?,
+            combine2_dev: k("dsv41_compress_combine2_dev")?,
+            comp2_pending_out: k("dsv41_comp2_pending_out")?,
+            publish_rows: k("dsv41_publish_rows")?,
         })
     }
 }
@@ -206,6 +232,14 @@ impl IndexOps<'_> {
         if m == 0 {
             return Ok(());
         }
+        if m <= GEMV_F32_MAX_M && k % GEMV_F32_KC == 0 && !GEMV_F32_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+            // The same fmaf chain per output, parallel over N only: bit-identical at any M.
+            return KernelLaunch::new(self.gpu, self.k.gemv_f32)
+                .grid([n.div_ceil(8) as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(a).arg_ptr(b).arg_ptr(c).arg_i32(m as i32).arg_i32(n as i32).arg_i32(k as i32)
+                .launch(self.stream);
+        }
         KernelLaunch::new(self.gpu, self.k.gemm_f32)
             .grid([n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1])
             .block([256, 1, 1])
@@ -237,6 +271,93 @@ impl IndexOps<'_> {
             .grid([Self::grid_1d(n)?, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(out).arg_i32(start as i32).arg_i32(stride as i32).arg_i32(n as i32)
+            .launch(self.stream)
+    }
+}
+
+/// Shape-static decode (`ATLAS_DSV41_CORE_STATIC`): the same operations with the pass START read
+/// from `dstart` (one device i32) instead of a launch argument, and FIXED geometry, so a captured
+/// graph replays at any position. `ld` is the static score width; the kernels stop at
+/// `score_width(n_c)` for the position they read. See `sparse_index.cu`.
+impl IndexOps<'_> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn score_dev(&self, q: DevicePtr, ik: DevicePtr, w: DevicePtr, cand: Option<CandidateMask>, out: DevicePtr, t: usize, ld: usize, dstart: DevicePtr, ratio: usize) -> Result<()> {
+        ensure!(ld % KEY_BLOCK == 0 && ratio >= 1 && t > 0, "score_dev: ld {ld}, ratio {ratio}, t {t}");
+        let (cand_ptr, cand_ld) = match cand {
+            Some(c) => (c.mask, c.ld),
+            None => (DevicePtr(0), 0),
+        };
+        KernelLaunch::new(self.gpu, self.k.score_dev)
+            .grid([t as u32, (ld / SCORE_KEYS_PER_BLOCK) as u32, 1])
+            .block([SCORE_THREADS, 1, 1])
+            .arg_ptr(q).arg_ptr(ik).arg_ptr(w).arg_ptr(cand_ptr).arg_ptr(out)
+            .arg_i32(ld as i32).arg_ptr(dstart).arg_i32(ratio as i32).arg_i32(cand_ld as i32)
+            .launch(self.stream)
+    }
+
+    pub fn topk_dev(&self, score: DevicePtr, out: DevicePtr, t: usize, ld: usize, dstart: DevicePtr, ratio: usize) -> Result<()> {
+        KernelLaunch::new(self.gpu, self.k.topk_dev)
+            .grid([t as u32, 1, 1])
+            .block([SELECT_THREADS, 1, 1])
+            .arg_ptr(score).arg_ptr(out).arg_i32(ld as i32).arg_ptr(dstart).arg_i32(ratio as i32)
+            .launch(self.stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_candidates_dev(&self, score: DevicePtr, block_scratch: DevicePtr, cand: DevicePtr, t: usize, ld: usize, dstart: DevicePtr, ratio: usize, topk_blocks: usize, block_size: usize) -> Result<()> {
+        KernelLaunch::new(self.gpu, self.k.candidates_dev)
+            .grid([t as u32, 1, 1])
+            .block([SELECT_THREADS, 1, 1])
+            .arg_ptr(score).arg_ptr(block_scratch).arg_ptr(cand).arg_i32(ld as i32).arg_ptr(dstart)
+            .arg_i32(ratio as i32).arg_i32(topk_blocks as i32).arg_i32(block_size as i32)
+            .launch(self.stream)
+    }
+
+    /// `out[i] = base + i * stride`, base = start, or start & !1 when `even_floor`.
+    pub fn iota_dev(&self, out: DevicePtr, dstart: DevicePtr, even_floor: bool, stride: usize, n: usize) -> Result<()> {
+        KernelLaunch::new(self.gpu, self.k.iota_dev)
+            .grid([Self::grid_1d(n)?, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(out).arg_ptr(dstart).arg_i32(i32::from(even_floor)).arg_i32(stride as i32).arg_i32(n as i32)
+            .launch(self.stream)
+    }
+
+    /// Ratio 2: copy the pending `(kv, sc)` row to slot 0 of `kv`/`sc` when the start is odd.
+    pub fn comp2_pending_in(&self, pending: DevicePtr, kv: DevicePtr, sc: DevicePtr, d: usize, dstart: DevicePtr) -> Result<()> {
+        KernelLaunch::new(self.gpu, self.k.comp2_pending_in)
+            .grid([Self::grid_1d(d)?, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(pending).arg_ptr(kv).arg_ptr(sc).arg_i32(d as i32).arg_ptr(dstart)
+            .launch(self.stream)
+    }
+
+    /// Ratio 2: combine `n_pairs` pairs starting at slot `1 - (start & 1)`.
+    pub fn combine2_dev(&self, kv: DevicePtr, sc: DevicePtr, out: DevicePtr, n_pairs: usize, d: usize, dstart: DevicePtr) -> Result<()> {
+        KernelLaunch::new(self.gpu, self.k.combine2_dev)
+            .grid([Self::grid_1d(n_pairs * d)?, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(kv).arg_ptr(sc).arg_ptr(out).arg_i32(n_pairs as i32).arg_i32(d as i32).arg_ptr(dstart)
+            .launch(self.stream)
+    }
+
+    /// Ratio 2: slot `t` becomes the pending row when `t + (start & 1)` is odd.
+    pub fn comp2_pending_out(&self, kv: DevicePtr, sc: DevicePtr, pending: DevicePtr, d: usize, t: usize, dstart: DevicePtr) -> Result<()> {
+        KernelLaunch::new(self.gpu, self.k.comp2_pending_out)
+            .grid([Self::grid_1d(d)?, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(kv).arg_ptr(sc).arg_ptr(pending).arg_i32(d as i32).arg_i32(t as i32).arg_ptr(dstart)
+            .launch(self.stream)
+    }
+
+    /// Copy the pass's published compressed rows from `src` (row 0..) to `dst` at row `j0`.
+    /// `max_rows` is the grid; the kernel publishes `(t + p) / 2` (ratio 2) or `t` rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_rows(&self, src: DevicePtr, dst: DevicePtr, row_bytes: usize, max_rows: usize, ratio: usize, t: usize, dstart: DevicePtr) -> Result<()> {
+        ensure!(row_bytes % 16 == 0 && (ratio == 1 || ratio == 2), "publish_rows: row {row_bytes} B, ratio {ratio}");
+        KernelLaunch::new(self.gpu, self.k.publish_rows)
+            .grid([max_rows as u32, 1, 1])
+            .block([64, 1, 1])
+            .arg_ptr(src).arg_ptr(dst).arg_i32((row_bytes / 16) as i32).arg_i32(ratio as i32).arg_i32(t as i32).arg_ptr(dstart)
             .launch(self.stream)
     }
 }
