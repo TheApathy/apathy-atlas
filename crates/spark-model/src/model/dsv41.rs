@@ -211,7 +211,13 @@ fn load_vision(
         hidden,
         gpu,
     )?;
-    tracing::info!("DeepSeek-V4.1 vision tower loaded (image input enabled)");
+    // Memory: the tower's weights (~0.97 GB) are already in the store; this is the
+    // encoder scratch arena on top (sized for max_image_tokens, allocated here once).
+    tracing::info!(
+        "DeepSeek-V4.1 vision tower loaded (image input enabled): encoder scratch {:.2} GB \
+         + ~0.97 GB of vision/aligner weights in the store",
+        enc.scratch_bytes()? as f64 / 1e9
+    );
     Ok(Some(crate::weight_loader::deepseek_v41::image_splice::V41ImageSplice::new(enc, hidden)))
 }
 
