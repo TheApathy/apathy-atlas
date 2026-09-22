@@ -36,6 +36,11 @@
 //     K steps ahead, 73.7 KB dynamic smem): bit-identical, but 35.3 vs 28.7 ms at T=2048,
 //     21.7 vs 17.2 at T=512, 16.7 vs 13.0 at T=128 (6 interleaved rounds). Exposed load
 //     latency is not what bounds a step either.
+//   - Shaped tiles for few-row experts (32x256 / 64x128, all 8 warps in the MMA, every
+//     thread decoding): chosen because ncu stall reasons at T=512 put BARRIER first (3.29
+//     cycles/instr gate_up, 5.82 down). Bit-identical and chunk-invariant, but SLOWER at every
+//     T: 19.55 vs 17.13 ms at T=512, 31.08 vs 28.67 at 2048, 9.51 vs 8.21 at 32 (6
+//     interleaved rounds; 254 registers with 4 decode jobs per thread).
 // Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
 
 #include <cstdint>

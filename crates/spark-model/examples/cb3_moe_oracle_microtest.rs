@@ -111,7 +111,7 @@ fn main() -> Result<()> {
             "--layer" => layer = args.next().context("--layer needs a value")?.parse()?,
             "--occurrence" => occurrence = args.next().context("--occurrence needs a value")?.parse()?,
             "--dump" => dump = Some(args.next().context("--dump needs a path")?.into()),
-            // NEGATIVE CONTROL for the ownership check: cycles 2-3 load the arena UNOWNED (the
+            // NEGATIVE CONTROL for the ownership check: cycles 2-6 load the arena UNOWNED (the
             // old never-free behaviour); the check must then FAIL.
             "--leak-control" => leak_control = true,
             "--invariance" => invariance = Some(args.next().context("--invariance needs SPLIT[;SPLIT]")?),
@@ -186,6 +186,39 @@ fn main() -> Result<()> {
     let kernels = Dsv41Kernels::load(gpu)?;
     let pack_dir = PathBuf::from(MODEL_DIR).join("k154-cb3");
     let pack = ExpertPack::parse(&std::fs::read_to_string(pack_dir.join("manifest.json"))?, SERVED_PACKED_KEEP)?;
+    // ONE-TIME STATE, measured by name before the MoE exists: the cuBLASLt handle + its 64 MB
+    // workspace + the library's lazily loaded kernels, created by the first GEMM. The warm-up
+    // uses the router's exact shape and the pinned entry point, so it only pre-pays that cost
+    // (the pinned algorithm is chosen at the reference M, not at this call's M).
+    let one_time_cublas = {
+        let before = gpu.free_memory()? as i64;
+        let a = gpu.alloc(hidden * 4)?;
+        let w = gpu.alloc(ROUTER_EXPERTS * hidden * 4)?;
+        let o = gpu.alloc(ROUTER_EXPERTS * 4)?;
+        gpu.memset_async(a, 0, hidden * 4, gpu.default_stream())?;
+        gpu.memset_async(w, 0, ROUTER_EXPERTS * hidden * 4, gpu.default_stream())?;
+        spark_runtime::cublaslt::gemm_act_weight_t_typed_pinned(
+            a.0, hidden as u32, w.0, o.0, ROUTER_EXPERTS as u32, 1, ROUTER_EXPERTS as u32, hidden as u32,
+            spark_runtime::cublaslt::GemmDtype::F32, spark_runtime::cublaslt::GemmDtype::F32, true,
+            spark_model::weight_loader::deepseek_v41::moe_forward::ROUTER_REF_M, gpu.default_stream(),
+        )?;
+        gpu.synchronize(gpu.default_stream())?;
+        for p in [a, w, o] {
+            gpu.free(p)?;
+        }
+        before - gpu.free_memory()? as i64
+    };
+    println!("  one-time state: cuBLASLt handle + workspace + library load = {:.3} GB (retained by design)", one_time_cublas as f64 / 1e9);
+    // Second named one-time item: the router is read from its shard with std::fs::read, which
+    // leaves the shard in page cache — and free_memory on GB10 is system-wide unified memory.
+    // Pre-read it once here so the cycles below see a warm cache, and report what it cost.
+    let one_time_page_cache = {
+        let before = gpu.free_memory()? as i64;
+        let warm = router_from_checkpoint(layer, hidden, gpu)?;
+        gpu.free(warm.gate_w)?;
+        before - gpu.free_memory()? as i64
+    };
+    println!("  one-time state: router shard read into page cache = {:.3} GB (reclaimable, not device-owned)", one_time_page_cache as f64 / 1e9);
     let free_before = gpu.free_memory()? as i64;
     let arena = Arc::new(Cb3ExpertArena::load_one_layer(&pack_dir, &pack, layer, &shared)?);
     let router = router_from_checkpoint(layer, hidden, gpu)?;
@@ -326,8 +359,10 @@ fn main() -> Result<()> {
         100.0 * returned as f64 / taken.max(1) as f64
     );
     ensure!(taken >= 1_700_000_000, "loading one layer took only {taken} bytes — the check cannot see a leak");
+    // Cycles 2..=6. BAND (set by the lead, not by me after the fact): cycles 3-6 must EACH
+    // return >= 99% of what they took with |drift| <= 0.05 GB — no accumulation after warm-up.
     let mut prev_after = free_after;
-    for cycle in 2..=3 {
+    for cycle in 2..=6 {
         let before = gpu.free_memory()? as i64;
         let arena = Arc::new(if leak_control {
             Cb3ExpertArena::load_one_layer_unowned(&pack_dir, &pack, layer, gpu)?
@@ -342,23 +377,18 @@ fn main() -> Result<()> {
         let loaded = gpu.free_memory()? as i64;
         drop(again);
         let after = gpu.free_memory()? as i64;
-        let (took, gave) = (before - loaded, after - loaded);
+        let (took, gave, drift) = (before - loaded, after - loaded, after - prev_after);
         println!(
             "  ownership cycle {cycle}: took {:.3} GB, returned {:.3} GB ({:.1}%), drift vs previous cycle {:+.3} GB",
             took as f64 / 1e9,
             gave as f64 / 1e9,
             100.0 * gave as f64 / took.max(1) as f64,
-            (after - prev_after) as f64 / 1e9
+            drift as f64 / 1e9
         );
         ensure!(took >= 1_700_000_000, "cycle {cycle} took only {took} bytes — the check cannot see a leak");
-        // Asserted on the LAST cycle only. Measured (dsv41-engine, 11 runs): cycle 2 still
-        // returns only 93-95% (drift ~-0.13 GB) and cycle 3 returns 99.5-101% (drift
-        // -0.014..+0.025 GB), so one-time costs spread over two cycles; the leak control
-        // (--leak-control) returns 4.6% with drift -1.91 GB. The first version of this
-        // check asserted cycle 2 and failed on every production run — recorded, not hidden.
-        if cycle == 3 {
-            ensure!(gave as f64 >= 0.95 * took as f64, "cycle {cycle}: drop returned only {gave} of {took} bytes");
-            ensure!(after - prev_after > -256_000_000, "cycle {cycle}: free memory drifted down by {} bytes", prev_after - after);
+        if cycle >= 3 {
+            ensure!(gave as f64 >= 0.99 * took as f64, "cycle {cycle}: drop returned only {gave} of {took} bytes");
+            ensure!(drift.abs() <= 50_000_000, "cycle {cycle}: free memory drifted by {drift} bytes");
         }
         prev_after = after;
     }
