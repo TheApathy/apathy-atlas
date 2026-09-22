@@ -35,18 +35,32 @@
 //!   --features cuda,gpu-examples -- --keep 6 --control
 //! ```
 //!
-//! ## The throughput number is NOT disk throughput — read this before quoting it
+//! ## The throughput number is NOT disk throughput, and this MEASURES the difference
 //! `Cb3ExpertArena::load` reads the shards through `Mmap` and issues one `copy_h2d` per
-//! plane, SINGLE-THREADED. So the figure printed below is end-to-end (page-cache-or-NVMe
-//! read + H2D copy), not an NVMe measurement, and it is page-cache dependent: a second run
-//! over the same shards reads mostly from RAM.
+//! plane, SINGLE-THREADED. So the figure printed below is end-to-end (read + H2D copy),
+//! not an NVMe measurement, and it is page-cache dependent: a second run over the same
+//! shards reads mostly from RAM.
 //!
-//! The engram lane measured this box's NVMe at **11.53 GB/s** (O_DIRECT, 4 MB blocks, 4
-//! threads; cross-checked against /proc/diskstats). That makes the ceiling a DISCRIMINATOR
-//! rather than just context: if this example reports more than 11.53 GB/s, the read cannot
-//! have come off the device and the page cache served it. The run says so explicitly rather
-//! than leaving a reader to quote a warm number as disk performance — which is exactly the
-//! misattribution that produced a bogus figure elsewhere in this project today.
+//! An earlier version of this file tried to INFER cache-vs-device by comparing the rate
+//! against the engram lane's measured 11.53 GB/s ceiling. That lane pointed out it is the
+//! wrong instrument, and they were right on three counts: 11.53 was their FOUR-thread
+//! figure (single-threaded O_DIRECT was 8.54), so a cache-served 10 GB/s would slip under
+//! the threshold unremarked; 11.53 is "the fastest observed under the configs tried", not a
+//! hardware ceiling, so a deeper queue could exceed it legitimately; and sequential mmap
+//! faults get kernel readahead, which issues concurrent requests, so there is no clean
+//! single-threaded bound to compare against anyway.
+//!
+//! So this reads `/proc/diskstats` around the upload and reports what the DEVICE actually
+//! moved. No threshold, no inference, no dependence on anyone's hardware numbers:
+//!
+//! ```text
+//!   device_bytes ~= arena_bytes  -> genuinely cold, the read came off NVMe
+//!   device_bytes ~= 0            -> page cache served it; not a cold-start number
+//!   in between                   -> partial, and the fraction is reported
+//! ```
+//!
+//! This is the same check that caught that lane's own 132 GB/s phantom: the device counter
+//! would have said ~0.
 //!
 //! Their tuning does NOT transfer here either, in either direction: the expert pack is
 //! ~14.45 MB sequential records (bandwidth-bound, saturates ~4 threads, REGRESSES by 16),
@@ -75,11 +89,23 @@ use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
 const MODEL_DIR: &str = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K";
 const PACK_SUBDIR: &str = "k154-cb3";
 
-/// This box's NVMe ceiling, measured by the engram lane with O_DIRECT at 4 MB blocks and
-/// 4 threads, cross-checked against /proc/diskstats (15.93 GB reported vs 15.9 GB on the
-/// device counter). Used here as a DISCRIMINATOR: a reported rate above this cannot have
-/// come off the device.
-const NVME_CEILING_GB_S: f64 = 11.53;
+/// The block device the model lives on. `/proc/diskstats` field 6 is sectors read, 512 B
+/// each. Whole-device (not a partition) so it captures every read under it.
+const DISK_DEVICE: &str = "nvme0n1";
+
+/// Sectors read from `DISK_DEVICE` since boot, or `None` if the counter is unreadable.
+///
+/// Returning `None` rather than 0 matters: 0 would make "the device moved nothing" and
+/// "I could not tell" the same value, and the whole point of this counter is to separate
+/// a cache hit from an unknown.
+fn device_sectors_read() -> Option<u64> {
+    let stats = std::fs::read_to_string("/proc/diskstats").ok()?;
+    stats.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let name = fields.nth(2)?;
+        (name == DISK_DEVICE).then(|| fields.nth(2)?.parse::<u64>().ok())?
+    })
+}
 
 /// Host MemAvailable in bytes, or 0 if /proc/meminfo cannot be read.
 fn mem_available_bytes() -> u64 {
@@ -132,6 +158,7 @@ fn main() -> Result<()> {
     let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let free_before = gpu.free_memory()?;
     let mem_available_before = mem_available_bytes();
+    let sectors_before = device_sectors_read();
 
     // Sample host MemAvailable while the upload runs. GB10 is unified memory and an
     // over-allocation takes the HOST down, so the low-water mark is the number that says
@@ -153,6 +180,7 @@ fn main() -> Result<()> {
     let started = std::time::Instant::now();
     let arena = Cb3ExpertArena::load(&pack_dir, &pack, &gpu)?;
     let upload_secs = started.elapsed().as_secs_f64();
+    let sectors_after = device_sectors_read();
     sampling.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = sampler.join();
     let free_after = gpu.free_memory()?;
@@ -171,20 +199,48 @@ fn main() -> Result<()> {
         free_after as f64 / 1e9,
         consumed as f64 / 1e9,
     );
-    // Use the measured NVMe ceiling as a discriminator, not as decoration.
-    if throughput > NVME_CEILING_GB_S {
-        println!(
-            "  NOTE: {throughput:.2} GB/s EXCEEDS this box's measured NVMe ceiling of \
-             {NVME_CEILING_GB_S} GB/s (O_DIRECT, 4 MB blocks, 4 threads), so the shards were \
-             served from PAGE CACHE, not the device. This is a warm number. Do NOT quote it \
-             as disk or as cold-start performance."
-        );
-    } else {
-        println!(
-            "  {throughput:.2} GB/s is at or below the {NVME_CEILING_GB_S} GB/s NVMe ceiling, \
-             so this run may have touched the device. Still END-TO-END, not a disk \
-             measurement — it includes the H2D copy and is single-threaded."
-        );
+    // MEASURE cache-vs-device off the block-device counter. No threshold, no inference.
+    match (sectors_before, sectors_after) {
+        (Some(before), Some(after)) => {
+            let device_bytes = after.saturating_sub(before) * 512;
+            let arena_bytes = arena.resident_bytes();
+            let fraction = device_bytes as f64 / arena_bytes.max(1) as f64;
+            println!(
+                "  device read {:.2} GB off {DISK_DEVICE} for a {:.2} GB arena = {:.0}% of it",
+                device_bytes as f64 / 1e9,
+                arena_bytes as f64 / 1e9,
+                fraction * 100.0,
+            );
+            if fraction < 0.10 {
+                println!(
+                    "  -> PAGE CACHE served this read. The rate above is a WARM number and \
+                     must not be quoted as disk or cold-start performance."
+                );
+            } else if fraction > 0.80 {
+                println!(
+                    "  -> COLD: the read genuinely came off the device, so the rate above \
+                     includes real NVMe time (plus the H2D copy, single-threaded)."
+                );
+            } else {
+                println!(
+                    "  -> PARTIAL: {:.0}% off the device, the rest from page cache. Mixed; \
+                     do not quote as either.",
+                    fraction * 100.0
+                );
+            }
+            // Reading MORE than the arena holds is not an error — other processes share
+            // this device — but it makes the fraction an upper bound, so say so.
+            if device_bytes > arena_bytes {
+                println!(
+                    "  NOTE: device reads exceed the arena size; another process was also \
+                     reading. Treat the fraction as an upper bound on what this run caused."
+                );
+            }
+        }
+        _ => println!(
+            "  could not read /proc/diskstats for {DISK_DEVICE}; cache-vs-device is UNKNOWN \
+             for this run (not assumed either way)"
+        ),
     }
     let low = low_water.load(std::sync::atomic::Ordering::Relaxed);
     println!(

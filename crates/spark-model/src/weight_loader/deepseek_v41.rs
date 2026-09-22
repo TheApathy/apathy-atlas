@@ -29,6 +29,7 @@ pub mod indexer;
 pub mod layer;
 mod load_layers;
 pub mod moe;
+pub mod routing;
 pub mod seams;
 
 use anyhow::{Result, bail};

@@ -62,7 +62,8 @@ pub fn load_all_layers(
     let admission = super::indexer::admit_indexer_weights(store, config)?;
 
     // (2) THE PLAN, CHECKED BEFORE IT IS SPENT.
-    let pack_dir = resolve_pack_dir()?;
+    let model_dir = resolve_model_dir()?;
+    let pack_dir = model_dir.join(PACK_SUBDIR);
     let manifest_path = pack_dir.join("manifest.json");
     let manifest = std::fs::read_to_string(&manifest_path).with_context(|| {
         format!(
@@ -163,7 +164,7 @@ pub fn load_all_layers(
         // `None` for the 38 layers without an engram is the CORRECT answer, and the one
         // place in this port where an empty success is not a silent gap.
         let engram: Option<Box<dyn super::seams::Dsv41Engram>> = match engram_loader {
-            Some(loader) => loader.load_engram(i, store, config, gpu)?,
+            Some(loader) => loader.load_engram(i, &model_dir, config, gpu)?,
             None if ENGRAM_LAYERS.contains(&i) => Some(Box::new(MissingEngram { layer: i })),
             None => None,
         };
@@ -196,19 +197,21 @@ pub fn load_all_layers(
     Ok(layers)
 }
 
-/// Locate the `k154-cb3` pack directory.
-fn resolve_pack_dir() -> Result<PathBuf> {
+/// Locate the model directory — the CB3 pack and the engram tables both hang off it.
+///
+/// The engram tables are ~95 GB each and are never loaded into the `WeightStore`, so the
+/// engram seam takes this path rather than a store. See `seams::Dsv41EngramLoader`.
+fn resolve_model_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var(MODEL_DIR_ENV) {
-        return Ok(PathBuf::from(dir).join(PACK_SUBDIR));
+        return Ok(PathBuf::from(dir));
     }
     // The default is the local checkpoint. This is a development default, not a
     // deployment one: a served build should set MODEL_DIR_ENV.
-    let default = PathBuf::from("/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K")
-        .join(PACK_SUBDIR);
+    let default = PathBuf::from("/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K");
     ensure!(
-        default.is_dir(),
+        default.join(PACK_SUBDIR).is_dir(),
         "DeepSeek-V4.1 expert pack not found at {} and {MODEL_DIR_ENV} is unset",
-        default.display()
+        default.join(PACK_SUBDIR).display()
     );
     Ok(default)
 }
