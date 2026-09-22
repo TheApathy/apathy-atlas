@@ -365,3 +365,29 @@ impl Tap {
         self.write(ops, name, layer, ptr, bytes)
     }
 }
+
+/// `Model.forward`'s tail for the LAST row of the pass: `x = hc_pre(h, pre_mix)`,
+/// `rmsnorm(x, norm)`, `logits = head(x)` — bf16 GEMM with fp32 accumulate and bf16 logits,
+/// exactly `R.head_logits` for a bf16 head. `logits` receives `[vocab]` bf16.
+///
+/// Rows other than the last are never needed at prefill; computing them would be a
+/// `[T, 129280]` GEMM for nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn final_logits_last_row(
+    ops: &Ops,
+    dims: &V41Dims,
+    s: &PassScratch,
+    t: usize,
+    norm: DevicePtr,
+    head: DevicePtr,
+    vocab: usize,
+    logits: DevicePtr,
+) -> Result<()> {
+    ensure!(t >= 1 && t <= s.max_t, "final_logits: bad t {t}");
+    let (d, hc) = (dims.hidden, dims.hc);
+    let h_last = s.h.offset((t - 1) * hc * d * 2);
+    let pre_last = s.pre_mix.offset((t - 1) * hc * 4);
+    ops.hc_pre(h_last, pre_last, s.x, 1, d)?;
+    ops.rmsnorm(s.x, norm, s.x, 1, d, dims.norm_eps)?;
+    ops.linear_bf16(s.x, head, logits, 1, vocab, d)
+}

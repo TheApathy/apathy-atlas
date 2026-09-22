@@ -23,8 +23,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atlas_core::config::parse_config;
+use spark_model::layers::deepseek_v41_engram::{EngramGather, EngramHashState, EngramLayout};
 use spark_model::weight_loader::deepseek_v41::fwd::{
     BlockControl, PassScratch, Tap, V41AttentionBlock, V41BlockWeights, V41Dims, V41RoutedMoe, block,
+    final_logits_last_row,
 };
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops, bf16_tensor, bytemuck_u32};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
@@ -33,6 +35,22 @@ use spark_runtime::weights::{SafetensorsLoader, WeightLoader};
 
 const MODEL_DIR: &str = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K";
 const REF_ROOT: &str = "/home/flocka/atlas/DSV41_PORT/oracle/ref";
+/// FIXTURE, not a production source: the engram lane's exported compressed-token map and the
+/// multipliers from its oracle test. Serving needs `EngramHashState::for_checkpoint`.
+const TOKEN_MAP: &str = "/home/flocka/atlas/dsv41-engram/bench/engram/token_map_i32.bin";
+const ENGRAM_MULTIPLIERS: [[i64; 4]; 2] = [
+    [76632096046245, 4839876093313, 35959672319349, 73987337458391],
+    [67716810739261, 51510806800915, 30921347202721, 82619226485591],
+];
+
+fn engram_hash_state() -> Result<EngramHashState> {
+    let layout = EngramLayout::new(&[1, 14], 4, 8, 256, 16_000_000)?;
+    layout.validate_against_config(&[384_006_168, 384_016_682])?;
+    let raw = std::fs::read(TOKEN_MAP).with_context(|| format!("engram fixture {TOKEN_MAP}"))?;
+    let token_map: Vec<i32> = raw.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let mult = ENGRAM_MULTIPLIERS.iter().map(|m| m.to_vec()).collect();
+    EngramHashState::new(layout, token_map, mult, 2, 99_092)
+}
 
 /// Reads a captured tap for (layer, name) in forward order: the n-th call gets occurrence n.
 struct Feeder {
@@ -126,6 +144,8 @@ fn main() -> Result<()> {
     let mut feed: Vec<String> = Vec::new();
     let mut tap_dir: Option<PathBuf> = None;
     let mut control = BlockControl::None;
+    let mut engram_live = false;
+    let mut head_test = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -133,6 +153,14 @@ fn main() -> Result<()> {
             "--layers" => n_layers = args.next().context("--layers")?.parse()?,
             "--feed" => feed = args.next().context("--feed")?.split(',').map(str::to_string).collect(),
             "--tap-dir" => tap_dir = Some(args.next().context("--tap-dir")?.into()),
+            "--engram" => {
+                engram_live = match args.next().context("--engram")?.as_str() {
+                    "live" => true,
+                    "feed" => false,
+                    o => bail!("--engram live|feed, got {o}"),
+                }
+            }
+            "--head-test" => head_test = true,
             "--control" => {
                 control = match args.next().context("--control")?.as_str() {
                     "own-pre" => BlockControl::OwnPre,
@@ -194,15 +222,46 @@ fn main() -> Result<()> {
         None => Tap::off(),
     };
 
+    let mut hash = if engram_live { Some(engram_hash_state()?) } else { None };
+    let gathers: HashMap<usize, EngramGather> = if engram_live {
+        blocks
+            .iter()
+            .filter(|b| b.engram.is_some())
+            .map(|b| Ok((b.layer, EngramGather::open(Path::new(MODEL_DIR), b.layer, 128)?)))
+            .collect::<Result<_>>()?
+    } else {
+        HashMap::new()
+    };
     let d_ids = gpu.alloc(max_t * 4)?;
     for &(start, t) in &chunks {
-        gpu.copy_h2d(bytemuck_u32(&ids[start..start + t]), d_ids)?;
+        let chunk_ids = &ids[start..start + t];
+        let hashes = match hash.as_mut() {
+            Some(h) => Some(h.forward(chunk_ids, start, None)?),
+            None => None,
+        };
+        gpu.copy_h2d(bytemuck_u32(chunk_ids), d_ids)?;
         ops.embed(embed, d_ids, s.x, t, dims.hidden)?;
         ops.hc_expand(s.x, s.h, s.pre_mix, t, dims.hidden)?;
         for w in &blocks {
             if let Some(e) = &w.engram {
-                // Rows come from the capture (POST-mask), so no mask is applied here.
-                feeder.feed_raw("engram_rows", w.layer, s.engram_rows, t * 24 * 256 * 4)?;
+                match (&hashes, gathers.get(&w.layer)) {
+                    (Some(all), Some(g)) => {
+                        // [T][layer][24] -> this layer's [T, 24]. Text-only here, so no dead heads.
+                        let li = if w.layer == 1 { 0 } else { 1 };
+                        let rows: Vec<i64> = (0..t).flat_map(|tok| all[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
+                        let rb: Vec<u8> = rows.iter().flat_map(|r| r.to_le_bytes()).collect();
+                        let tmp = gpu.alloc(rb.len())?;
+                        gpu.copy_h2d(&rb, tmp)?;
+                        tap.bytes(&ops, "engram_hashes", w.layer, tmp, rb.len())?;
+                        gpu.free(tmp)?;
+                        g.gather_rows_gpu(&rows, t, s.engram_rows, gpu.as_ref(), stream)?;
+                        tap.f32(&ops, "engram_rows", w.layer, s.engram_rows, &[t, 24, 256])?;
+                    }
+                    _ => {
+                        // Rows come from the capture (POST-mask), so no mask is applied here.
+                        feeder.feed_raw("engram_rows", w.layer, s.engram_rows, t * 24 * 256 * 4)?;
+                    }
+                }
                 e.forward(&ops, s.h, s.engram_rows, DevicePtr::NULL, t, &s, &dims)?;
                 tap.bf16(&ops, "engram_out", w.layer, s.h, &[t, dims.hc, dims.hidden])?;
             }
@@ -210,6 +269,28 @@ fn main() -> Result<()> {
         }
         gpu.synchronize(stream)?;
         println!("chunk S={start} T={t}: {n_layers} layers done");
+    }
+    if head_test {
+        // Teacher-force the LAST layer's output of the LAST chunk and run the tail.
+        let (_, t) = *chunks.last().context("no chunks")?;
+        let last_layer = config.num_hidden_layers - 1;
+        let occ = chunks.len() - 1;
+        let hb = std::fs::read(ref_dir.join(format!("L{last_layer:02}.h.{occ:03}.bin")))?;
+        let pb = std::fs::read(ref_dir.join(format!("L{last_layer:02}.pre_mix.{occ:03}.bin")))?;
+        ensure!(hb.len() == t * dims.hc * dims.hidden * 2 && pb.len() == t * dims.hc * 4, "head-test: capture shape mismatch");
+        gpu.copy_h2d(&hb, s.h)?;
+        gpu.copy_h2d(&pb, s.pre_mix)?;
+        let norm = bf16_tensor(&store, "norm.weight", &[dims.hidden])?;
+        let head = bf16_tensor(&store, "head.weight", &[config.vocab_size, dims.hidden])?;
+        let logits = gpu.alloc(config.vocab_size * 2)?;
+        final_logits_last_row(&ops, &dims, &s, t, norm, head, config.vocab_size, logits)?;
+        tap.bf16(&ops, "logits_last", 40, logits, &[config.vocab_size])?;
+        let mut host = vec![0u8; config.vocab_size * 2];
+        gpu.synchronize(stream)?;
+        gpu.copy_d2h(logits, &mut host)?;
+        let v: Vec<f32> = host.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect();
+        let (arg, max) = v.iter().enumerate().fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a });
+        println!("head-test: argmax token {arg} (logit {max})");
     }
     println!("DONE dsv41_forward run={run} layers={n_layers} control={control:?}");
     Ok(())
