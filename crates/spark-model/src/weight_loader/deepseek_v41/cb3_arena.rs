@@ -56,6 +56,23 @@ pub const PACKED_KEEP_ENV: &str = "ATLAS_DSV41_PACKED_KEEP";
 /// attention tensors and the KV cache are allocated around the arena, and a check that
 /// ignores them would pass and then take the host down at the next allocation.
 const DEFAULT_ARENA_BUDGET_FRACTION: f64 = 0.80;
+
+/// Absolute device-memory headroom that must remain AFTER the arena, in bytes.
+///
+/// A fraction alone is not enough at full scale. At `packed_keep = 124` the arena is
+/// 71.7 GB; with ~96 GB free the 0.80 fraction yields a 77 GB budget and the plan is
+/// admitted with ~25 GB to spare — before the mmap'd shards (83 GB of file) start filling
+/// page cache, and before the KV cache and activations are allocated. The kernel will evict
+/// page cache under pressure, but "should evict" is not a guarantee, and on GB10 the
+/// failure is not an `OutOfMemory` error: the pool is UNIFIED, so an over-allocation takes
+/// the HOST down and kills every other process on the box. cgroup MemoryMax does not
+/// contain GPU memory, so nothing else catches it either.
+///
+/// So the floor is absolute and checked independently of the fraction. 16 GB is chosen to
+/// cover the KV cache, activations and transient staging with room for page cache the
+/// kernel has not yet reclaimed. Override with [`ARENA_BUDGET_GB_ENV`] only when you have
+/// measured the real headroom for the configuration in front of you.
+const MIN_HEADROOM_BYTES: u64 = 16_000_000_000;
 /// Override for the above, in bytes' worth of GB (e.g. `72.5`).
 pub const ARENA_BUDGET_GB_ENV: &str = "ATLAS_DSV41_ARENA_BUDGET_GB";
 
@@ -142,6 +159,28 @@ impl Cb3ExpertArena {
         // partial upload that dies at layer 31 would already have taken the host with it.
         let budget = arena_budget_bytes(gpu)?;
         pack.check_residency(budget)?;
+
+        // ABSOLUTE HEADROOM FLOOR, independent of the fraction above. See
+        // MIN_HEADROOM_BYTES: on GB10 the memory pool is unified, so over-allocating does
+        // not raise OutOfMemory — it takes the host down with every other process on it.
+        let free = gpu.free_memory().context("CB3 arena: querying free device memory")? as u64;
+        let remaining = free.saturating_sub(need);
+        ensure!(
+            remaining >= MIN_HEADROOM_BYTES,
+            "DeepSeek-V4.1 CB3 arena REFUSED: {:.1} GB resident at packed_keep={} would leave \
+             only {:.1} GB of the {:.1} GB free, below the {:.1} GB floor. GB10 memory is \
+             UNIFIED — an over-allocation takes the HOST down, not just this process, and \
+             cgroup MemoryMax does not contain GPU memory. The mmap'd shards also fill page \
+             cache as they are read. Free memory first, lower packed_keep (currently {}), or \
+             set {} deliberately after measuring.",
+            need as f64 / 1e9,
+            packed_keep,
+            remaining as f64 / 1e9,
+            free as f64 / 1e9,
+            MIN_HEADROOM_BYTES as f64 / 1e9,
+            packed_keep,
+            ARENA_BUDGET_GB_ENV,
+        );
 
         tracing::info!(
             "DeepSeek-V4.1 CB3 arena: packed_keep={} (pack holds {}, router space {}), \
