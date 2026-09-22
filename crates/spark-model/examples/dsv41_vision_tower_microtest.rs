@@ -254,7 +254,9 @@ fn main() -> Result<()> {
         eprintln!(
             "{name:>24} span vs oracle: V4.1 row-major {rel_v41:.3e} | V4 N-layout {rel_v4:.3e}"
         );
-        layout_ok &= rel_v4 > 100.0 * rel_v41;
+        // The tower's own bf16 noise is ~2-3.5% (production vision.py on GPU vs CPU,
+        // measured); a wrong row order is uncorrelated (~0.9). 10x separates them.
+        layout_ok &= rel_v4 > 10.0 * rel_v41;
         report.push(json!({"image": name, "grid": [gh, gw], "stages": stages, "unfold_layout_identical": same,
                            "span_rel_l2_v41_layout": rel_v41, "span_rel_l2_v4_n_layout": rel_v4}));
     }
