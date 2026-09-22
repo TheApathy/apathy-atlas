@@ -121,6 +121,37 @@ pub fn plan_splice(
     Ok(ops)
 }
 
+/// The per-chunk decision `splice` acts on. `None` = nothing to do: no image
+/// was encoded for this request (the text-only path, which must stay
+/// byte-identical, so it issues no GPU work at all). Image tokens without
+/// encoded images are an error, never a silent no-op.
+pub fn chunk_plan(
+    span_lens: &[usize],
+    seen: &mut Vec<u32>,
+    ids: &[u32],
+    start: usize,
+) -> Result<Option<Vec<SpliceOp>>> {
+    if span_lens.is_empty() {
+        ensure!(
+            !ids.iter()
+                .any(|&i| i == IMAGE_SENTINEL_ID || i == IMAGE_PAD_ID),
+            "image tokens in the prompt but no images were encoded"
+        );
+        return Ok(None);
+    }
+    // Record the ids by absolute position (a re-run range must agree).
+    if start == seen.len() {
+        seen.extend_from_slice(ids);
+    } else {
+        ensure!(
+            start + ids.len() <= seen.len() && seen[start..start + ids.len()] == *ids,
+            "splice: ids at [{start}, {}) disagree with the prompt seen so far",
+            start + ids.len()
+        );
+    }
+    plan_splice(seen, span_lens, start, ids.len()).map(Some)
+}
+
 struct Span {
     rows: DevicePtr,
     len: usize,
@@ -163,6 +194,10 @@ impl V41ImageSplice {
     /// (`(bf16-valued patches, vit_h, vit_w)` in prompt order). Empty = text.
     pub fn encode(&self, gpu: &dyn GpuBackend, images: &[(Vec<f32>, usize, usize)]) -> Result<()> {
         let mut req = self.req.lock().expect("image splice lock");
+        if images.is_empty() && req.spans.is_empty() {
+            req.seen.clear();
+            return Ok(()); // text after text: nothing to free, no GPU call at all
+        }
         for s in req.spans.drain(..) {
             gpu.free(s.rows)?;
         }
@@ -215,29 +250,15 @@ impl V41ImageSplice {
         start: usize,
         x: DevicePtr,
     ) -> Result<()> {
-        let mut req = self.req.lock().expect("image splice lock");
-        if req.spans.is_empty() {
-            ensure!(
-                !ids.iter()
-                    .any(|&i| i == IMAGE_SENTINEL_ID || i == IMAGE_PAD_ID),
-                "image tokens in the prompt but no images were encoded"
-            );
-            return Ok(());
-        }
-        // Record the ids by absolute position (a re-run range must agree).
-        if start == req.seen.len() {
-            req.seen.extend_from_slice(ids);
-        } else {
-            ensure!(
-                start + ids.len() <= req.seen.len() && req.seen[start..start + ids.len()] == *ids,
-                "splice: ids at [{start}, {}) disagree with the prompt seen so far",
-                start + ids.len()
-            );
-        }
+        let mut guard = self.req.lock().expect("image splice lock");
+        let req = &mut *guard;
         let lens: Vec<usize> = req.spans.iter().map(|s| s.len).collect();
+        let Some(ops) = chunk_plan(&lens, &mut req.seen, ids, start)? else {
+            return Ok(()); // text request: not one GPU operation
+        };
         let row = self.hidden * 2;
         let sentinel = embed.offset(IMAGE_SENTINEL_ID as usize * row);
-        for op in plan_splice(&req.seen, &lens, start, ids.len())? {
+        for op in ops {
             match op {
                 SpliceOp::Pad { row: r } => {
                     gpu.copy_d2d_async(sentinel, x.offset(r * row), row, stream)?
@@ -357,6 +378,27 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn text_only_chunks_plan_nothing() {
+        let mut seen = Vec::new();
+        for (start, chunk) in [
+            (0usize, vec![0u32, 128803, 42, 128804, 128822]),
+            (5, vec![7, 8]),
+        ] {
+            assert_eq!(chunk_plan(&[], &mut seen, &chunk, start).unwrap(), None);
+        }
+        assert!(seen.is_empty(), "the text path must not even record ids");
+        // control: the same call WITH an encoded image does plan work
+        let (ids, lens) = layout();
+        assert!(
+            chunk_plan(&lens, &mut Vec::new(), &ids, 0)
+                .unwrap()
+                .is_some_and(|ops| !ops.is_empty())
+        );
+        // and image tokens with no encoded image are refused
+        assert!(chunk_plan(&[], &mut Vec::new(), &[5, S], 0).is_err());
     }
 
     /// NEGATIVE CONTROLS: a sentinel count that does not match the images must

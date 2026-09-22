@@ -104,7 +104,8 @@ impl Dsv41Model {
         let stream = gpu.default_stream();
         let ops = Ops { gpu, k: kernels, stream };
         let threads = std::env::var("ATLAS_DSV41_ENGRAM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
-        let fwd = V41Forward::load(store, &ops, dims, config.vocab_size, config.num_hidden_layers, max_chunk, max_seq, model_dir, threads)?;
+        let mut fwd = V41Forward::load(store, &ops, dims, config.vocab_size, config.num_hidden_layers, max_chunk, max_seq, model_dir, threads)?;
+        fwd.vision = load_vision(store, model_dir, dims.hidden, gpu)?;
         let lanes = build_lanes(store, config, gpu, kernels, &fwd, model_dir, max_seq, max_chunk)?;
         let mode = match std::env::var("ATLAS_DSV41_PREFILL").ok().as_deref() {
             None | Some("replay") => PrefillMode::Replay,
@@ -183,7 +184,46 @@ impl Dsv41Model {
     }
 }
 
+/// The V4.1 vision tower, when the checkpoint has one (`vision.*` tensors and a
+/// `vision_config`). None for a text-only checkpoint.
+fn load_vision(
+    store: &WeightStore,
+    model_dir: &std::path::Path,
+    hidden: usize,
+    gpu: &dyn GpuBackend,
+) -> Result<Option<crate::weight_loader::deepseek_v41::image_splice::V41ImageSplice>> {
+    if store.get("vision.patch_embed.proj.weight").is_err() {
+        return Ok(None);
+    }
+    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
+    let v = &raw["vision_config"];
+    let u = |k: &str| v[k].as_u64().map(|x| x as usize).with_context(|| format!("vision_config.{k}"));
+    let enc = crate::layers::deepseek_vision::DeepSeekVisionEncoder::load_v41(
+        store,
+        u("hidden_size")?,
+        u("intermediate_size")?,
+        u("num_attention_heads")?,
+        u("num_hidden_layers")?,
+        u("patch_size")?,
+        u("downsample_ratio")?,
+        v["rope_theta"].as_f64().context("vision_config.rope_theta")?,
+        u("max_image_tokens")?,
+        hidden,
+        gpu,
+    )?;
+    tracing::info!("DeepSeek-V4.1 vision tower loaded (image input enabled)");
+    Ok(Some(crate::weight_loader::deepseek_v41::image_splice::V41ImageSplice::new(enc, hidden)))
+}
+
 impl Model for Dsv41Model {
+    fn prepare_vision_embed(&self, images: &[(Vec<f32>, usize, usize)]) -> Result<()> {
+        match &self.fwd.vision {
+            Some(v) => v.encode(self.gpu, images),
+            None if images.is_empty() => Ok(()),
+            None => bail!("image input, but this DeepSeek-V4.1 model has no vision tower loaded"),
+        }
+    }
+
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
         self.prefill_all(tokens, seq, 0, true)
     }

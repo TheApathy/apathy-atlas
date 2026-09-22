@@ -116,6 +116,8 @@ pub struct V41Forward {
     pub scratch: PassScratch,
     pub attn_scratch: AttnScratch,
     pub engram: Vec<(usize, EngramGather)>,
+    /// V4.1 image input (the tower + prompt-embedding splice); None = text-only.
+    pub vision: Option<super::image_splice::V41ImageSplice>,
     pub ids_dev: DevicePtr,
     pub max_chunk: usize,
     pub max_seq: usize,
@@ -172,6 +174,7 @@ impl V41Forward {
             blocks,
             attn,
             engram,
+            vision: None,
             max_chunk,
             max_seq,
         })
@@ -240,6 +243,13 @@ impl V41Forward {
         ops.gpu.copy_h2d_async(&dead, self.scratch.engram_dead, ops.stream)?;
         ops.gpu.copy_h2d_async(bytemuck_u32(ids), self.ids_dev, ops.stream)?;
         ops.embed(self.embed, self.ids_dev, self.scratch.x, t, self.dims.hidden)?;
+        // Image spans (prefill only; decode ids are never image ids). A no-op, with no
+        // GPU work, unless this request encoded images.
+        if kind != PassKind::Decode
+            && let Some(v) = &self.vision
+        {
+            v.splice(ops.gpu, ops.stream, self.embed, ids, start, self.scratch.x)?;
+        }
         ops.hc_expand(self.scratch.x, self.scratch.h, self.scratch.pre_mix, t, self.dims.hidden)?;
         hook.begin_pass(kind, start, t)?;
         moe.begin_pass(ids)?;
