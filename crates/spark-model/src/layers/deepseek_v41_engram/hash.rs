@@ -158,13 +158,13 @@ fn is_prime(n: u64) -> bool {
         if n == p {
             return true;
         }
-        if n % p == 0 {
+        if n.is_multiple_of(p) {
             return false;
         }
     }
     // Deterministic Miller-Rabin: this witness set is proven for all u64.
     let (mut d, mut r) = (n - 1, 0u32);
-    while d % 2 == 0 {
+    while d.is_multiple_of(2) {
         d /= 2;
         r += 1;
     }
@@ -290,10 +290,11 @@ impl EngramHashState {
             bail!("engram hash state holds {} positions, asked to start at {start_pos}",
                   self.cache.len());
         }
-        if let Some(a) = alive {
-            if a.len() != ids.len() {
-                bail!("alive mask has {} entries, {} tokens", a.len(), ids.len());
+        match alive {
+            Some(a) if a.len() != ids.len() => {
+                bail!("alive mask has {} entries, {} tokens", a.len(), ids.len())
             }
+            _ => {}
         }
         // Absorb this chunk into the history first: an n-gram may look back into
         // it as well as into earlier chunks.

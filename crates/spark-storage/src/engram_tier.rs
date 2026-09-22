@@ -377,3 +377,130 @@ fn exp2i(e: i32) -> f32 {
         f32::INFINITY
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Build a synthetic engram shard: a real safetensors header plus `rows` rows,
+    /// so the header parse, the gather and the dequantizer are all exercised
+    /// without the 95 GB checkpoint.
+    fn synth(dir: &Path, layer: u32, rows: usize) -> PathBuf {
+        let w_bytes = rows * ENGRAM_HEAD_DIM;
+        let s_bytes = rows * (ENGRAM_HEAD_DIM / ENGRAM_SCALE_GROUP);
+        let hdr = format!(
+            r#"{{"layers.{layer}.engram.embed.weight":{{"dtype":"F8_E4M3","shape":[{rows},256],"data_offsets":[0,{w_bytes}]}},"layers.{layer}.engram.embed.scale":{{"dtype":"F8_E8M0","shape":[{rows},8],"data_offsets":[{w_bytes},{}]}}}}"#,
+            w_bytes + s_bytes
+        );
+        let path = dir.join(format!("synth-{layer}.safetensors"));
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&(hdr.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(hdr.as_bytes()).unwrap();
+        // Row r, value j: fp8 byte (r + j) as u8 — arbitrary but row-dependent, so a
+        // gather that returns the wrong row is visible.
+        for r in 0..rows {
+            let w: Vec<u8> = (0..ENGRAM_HEAD_DIM).map(|j| (r + j) as u8).collect();
+            f.write_all(&w).unwrap();
+        }
+        for r in 0..rows {
+            // Scale exponent 127 + (group index), i.e. 2^0, 2^1, ... per group.
+            let s: Vec<u8> = (0..8).map(|g| (127 + g + r % 3) as u8).collect();
+            f.write_all(&s).unwrap();
+        }
+        path
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("engram-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn header_parse_gather_and_dequant_round_trip() {
+        let d = tmpdir("rt");
+        let p = synth(&d, 1, 64);
+        let shard = EngramShard::open(&p, 1).unwrap();
+        assert_eq!(shard.n_rows(), 64);
+
+        let tier = EngramTier::new(vec![shard], 8).unwrap();
+        let ids = [5u64, 0, 63, 5];
+        let raw = tier.gather(0, &ids).unwrap();
+        assert_eq!(raw.len(), 4 * ENGRAM_ROW_BYTES);
+
+        for (k, &r) in ids.iter().enumerate() {
+            let row = &raw[k * ENGRAM_ROW_BYTES..(k + 1) * ENGRAM_ROW_BYTES];
+            for (j, &b) in row[..ENGRAM_HEAD_DIM].iter().enumerate() {
+                assert_eq!(b, (r as usize + j) as u8, "row {r} byte {j}");
+            }
+            let mut out = [0f32; ENGRAM_HEAD_DIM];
+            dequant_row(row, &mut out).unwrap();
+            // Spot-check one value against the format by hand: byte 0x38 is
+            // exponent 7, mantissa 0 -> 1.0, scaled by 2^(scale - 127).
+            let j = (0x38usize).wrapping_sub(r as usize) % ENGRAM_HEAD_DIM;
+            if row[j] == 0x38 {
+                let sc = row[ENGRAM_HEAD_DIM + j / ENGRAM_SCALE_GROUP] as i32 - 127;
+                assert_eq!(out[j], exp2i(sc), "row {r} value {j}");
+            }
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Duplicate ids must collapse to one read and still rebuild in order.
+    #[test]
+    fn dedup_preserves_order() {
+        let d = tmpdir("dedup");
+        let p = synth(&d, 1, 32);
+        let tier = EngramTier::new(vec![EngramShard::open(&p, 1).unwrap()], 4).unwrap();
+        let ids = [7u64, 3, 7, 3, 7, 11];
+        let (rows, inv) = tier.gather_dedup(0, &ids).unwrap();
+        assert_eq!(rows.len() / ENGRAM_ROW_BYTES, 3, "7/3/11 should dedup to three rows");
+        assert_eq!(inv, vec![0, 1, 0, 1, 0, 2]);
+        let plain = tier.gather(0, &ids).unwrap();
+        for (k, &iv) in inv.iter().enumerate() {
+            let a = &rows[iv as usize * ENGRAM_ROW_BYTES..(iv as usize + 1) * ENGRAM_ROW_BYTES];
+            let b = &plain[k * ENGRAM_ROW_BYTES..(k + 1) * ENGRAM_ROW_BYTES];
+            assert_eq!(a, b, "dedup rebuilt entry {k} wrongly");
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// An out-of-range row is refused rather than reading past the tensor into the
+    /// neighbouring scale plane, which would dequantize to plausible garbage.
+    #[test]
+    fn out_of_range_row_is_refused() {
+        let d = tmpdir("oor");
+        let p = synth(&d, 1, 16);
+        let tier = EngramTier::new(vec![EngramShard::open(&p, 1).unwrap()], 2).unwrap();
+        assert!(tier.gather(0, &[16]).is_err(), "row 16 of a 16-row table must be refused");
+        assert!(tier.gather(0, &[15]).is_ok());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The header parse must reject a shard that does not hold the asked-for layer,
+    /// rather than silently returning offsets for whatever it does hold.
+    #[test]
+    fn header_rejects_the_wrong_layer() {
+        let d = tmpdir("wrong");
+        let p = synth(&d, 1, 8);
+        assert!(EngramShard::open(&p, 14).is_err(), "layer 14 is not in a layer-1 shard");
+        assert!(EngramShard::open(&p, 1).is_ok());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// fp8_e4m3fn corner cases, checked against the format by hand.
+    #[test]
+    fn e4m3_table_matches_the_format() {
+        let t = e4m3_table();
+        assert_eq!(t[0x00], 0.0);
+        assert_eq!(t[0x38], 1.0); // exp 7, man 0
+        assert_eq!(t[0x40], 2.0); // exp 8, man 0
+        assert_eq!(t[0xB8], -1.0); // sign set
+        assert_eq!(t[0x3C], 1.5); // exp 7, man 4 -> 1 + 4/8
+        assert_eq!(t[0x7E], 448.0); // largest finite: exp 15, man 6
+        assert!(t[0x7F].is_nan()); // the single NaN encoding
+        assert!(t[0xFF].is_nan());
+        assert_eq!(t[0x01], 2f32.powi(-9)); // smallest subnormal
+    }
+}
