@@ -266,6 +266,9 @@ MASK_STREAMS = {
         block(inv("get_weather", par("city", "a ｜ b"))),          # U+FF5C inside a value: refused
         block(inv("get_weather", par("days", "3", "false"))),      # required `city` missing: refused
         block(inv("get_weather", par("city", "x"), par("units", "kelvin"))),  # enum violation
+        # U+FF0C (fullwidth comma) is legal DSML value text, but xgrammar 0.1.32's UTF-8 range
+        # split loses U+F000..U+FF3F from [\u0000-\uFF5B]: Python REJECTS it. Rust must match.
+        block(inv("get_weather", par("city", "東京，大阪"))),
     ],
     "weather_search": [
         block(inv("web_search", par("query", "q <b>\n{\"x\": 1}"), par("tags", '["a", "b"]', "false"),
@@ -310,6 +313,40 @@ def fnv1a64(data: bytes) -> str:
     return f"{h:016x}"
 
 
+def load_penalties_class():
+    """`Penalties` from engine/v41_engine.py, extracted by AST so the engine's
+    GPU imports never run. The class needs only `os` and `torch`."""
+    import ast
+    import torch
+    src = open(os.path.join(PY_TREE, "engine", "v41_engine.py")).read()
+    node = next(n for n in ast.parse(src).body if isinstance(n, ast.ClassDef) and n.name == "Penalties")
+    ns = {"os": os, "torch": torch}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "v41_engine.py", "exec"), ns)
+    return ns["Penalties"]
+
+
+def repetition_cases():
+    import random
+    Penalties = load_penalties_class()
+    rng = random.Random(41)
+    hists = [[], [5], [7, 7, 7], [7, 7, 7, 7], [1, 2, 1, 2, 1, 2, 1, 2], [9, 1, 2, 1, 2, 1, 2, 1, 2],
+             [3, 1, 2, 3, 1, 2, 3, 1, 2], [3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2], list(range(40)) * 4,
+             list(range(17)) * 4, list(range(16)) * 4, [4, 4, 4, 5, 4, 4, 4, 5, 4, 4, 4, 5, 4, 4, 4, 5]]
+    for _ in range(60):
+        base = [rng.randrange(6) for _ in range(rng.randrange(1, 6))]
+        h = [rng.randrange(6) for _ in range(rng.randrange(0, 8))] + base * rng.randrange(1, 6)
+        hists.append(h)
+    out = []
+    for h in hists:
+        row = {"history": h}
+        for n in (0, 2, 3, 4):
+            p = Penalties(no_repeat_ngram=n, enabled=True)
+            row[f"ngram{n}"] = sorted(p._banned_ngram_tokens(h))
+        row["cycle"] = Penalties(enabled=True)._cycle_token(h)
+        out.append(row)
+    return out
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     render = [render_case(n, b) for n, b in RENDER_CASES]
@@ -320,6 +357,8 @@ def main():
         ebnf = tool_grammar.build_tool_grammar(t)
         grammar.append({"name": n, "tools": t, "ebnf": ebnf,
                         "streams": [mask_trace(ebnf, x) for x in MASK_STREAMS.get(n, [])]})
+    with open(os.path.join(OUT, "repetition.json"), "w") as f:
+        json.dump({"cases": repetition_cases()}, f)
     meta = {"generator": "scripts/dsv41_parity/gen_fixtures.py", "py_tree": PY_TREE, "model_dir": MODEL_DIR}
     for fname, data in (("render.json", render), ("parse.json", parse), ("grammar.json", grammar)):
         with open(os.path.join(OUT, fname), "w") as f:

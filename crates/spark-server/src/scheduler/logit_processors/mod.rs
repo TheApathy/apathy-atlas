@@ -231,6 +231,9 @@ pub fn process_position_logits(
             ctx.tool_call_end_token,
         ),
     );
+    // deepseek_v41: the Python engine's cycle breaker / no-repeat-ngram bans,
+    // after the penalties as there (a no-op for every other model).
+    crate::dsv41::repetition::apply(logits, &seq.output_tokens);
     if kind == PositionKind::Verify {
         crate::scheduler::mtp_timing::record(crate::scheduler::mtp_timing::Phase::Penalties, t_pen);
     }

@@ -926,6 +926,12 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         );
     }
 
+    if config.model_type == "deepseek_v41" {
+        crate::dsv41::repetition::configure(true);
+        if !crate::scheduler::force_disable_watchdogs() {
+            tracing::warn!("deepseek_v41: auto-watchdogs were already resolved ON; outputs will diverge from the Python engine");
+        }
+    }
     let state = Arc::new(AppState {
         tokenizer,
         model_name,
@@ -950,6 +956,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             Some(rotation_tx)
         },
         vision_config: config.vision.clone(),
+        dsv41: config.model_type == "deepseek_v41",
         deepseek_vision_config: config.deepseek_vision.clone(),
         deepseek_vision_vocab: config
             .deepseek_vision

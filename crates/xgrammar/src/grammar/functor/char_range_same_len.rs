@@ -9,6 +9,16 @@ use crate::fsm::FsmWithStartEnd;
 
 /// Decompose `[min, max]` of packed UTF-8 values of the *same byte
 /// length* into byte-range edges from state `from` to state `to`.
+///
+/// The `byte_*[i] -= 1` / `+= 1` steps are `wrapping_*` on purpose: the C++
+/// original works on `uint8_t` and relies on the wrap. A plain `-=` panics
+/// in debug builds (release builds already wrapped, so release behaviour is
+/// unchanged). KNOWN UPSTREAM BUG, reproduced faithfully: the 3-byte
+/// `tmax` recursion passes `0x0080` where `0x8080` is meant (C++ line
+/// ~1159 has the same constant), so a class whose upper bound is a 3-byte
+/// char with a non-0xBF middle byte loses the middle byte range below it,
+/// e.g. `[\u0000-\uFF5B]` does NOT match U+F000..U+FF3F. Python xgrammar
+/// 0.1.32 rejects `<＂>` (U+FF02) against that class too.
 pub fn add_same_length_range(
     fsm: &mut FsmWithStartEnd,
     from: usize,
@@ -51,7 +61,7 @@ pub fn add_same_length_range(
                 .add_edge(from, tmin, byte_min[3] as i16, byte_min[3] as i16);
             add_same_length_range(fsm, tmin, to, min & 0x00FF_FFFF, 0x00BF_BFBF);
         } else {
-            byte_min[3] -= 1;
+            byte_min[3] = byte_min[3].wrapping_sub(1);
         }
         if (max & 0x00FF_FFFF) != 0xBFBFBF {
             let tmax = fsm.add_state();
@@ -59,7 +69,7 @@ pub fn add_same_length_range(
                 .add_edge(from, tmax, byte_max[3] as i16, byte_max[3] as i16);
             add_same_length_range(fsm, tmax, to, 0x0080_8080, max & 0x00FF_FFFF);
         } else {
-            byte_max[3] += 1;
+            byte_max[3] = byte_max[3].wrapping_add(1);
         }
         if byte_max[3] as i16 - byte_min[3] as i16 > 1 {
             let m1 = fsm.add_state();
@@ -90,7 +100,7 @@ pub fn add_same_length_range(
                 .add_edge(from, tmin, byte_min[2] as i16, byte_min[2] as i16);
             add_same_length_range(fsm, tmin, to, min & 0x00FFFF, 0x00BFBF);
         } else {
-            byte_min[2] -= 1;
+            byte_min[2] = byte_min[2].wrapping_sub(1);
         }
         if (max & 0x00FFFF) != 0xBFBF {
             let tmax = fsm.add_state();
@@ -98,7 +108,7 @@ pub fn add_same_length_range(
                 .add_edge(from, tmax, byte_max[2] as i16, byte_max[2] as i16);
             add_same_length_range(fsm, tmax, to, 0x0080, max & 0x00FFFF);
         } else {
-            byte_max[2] += 1;
+            byte_max[2] = byte_max[2].wrapping_add(1);
         }
         if byte_max[2] as i16 - byte_min[2] as i16 > 1 {
             let m1 = fsm.add_state();
@@ -127,7 +137,7 @@ pub fn add_same_length_range(
             .add_edge(from, tmin, byte_min[1] as i16, byte_min[1] as i16);
         add_same_length_range(fsm, tmin, to, min & 0x00FF, 0x00BF);
     } else {
-        byte_min[1] -= 1;
+        byte_min[1] = byte_min[1].wrapping_sub(1);
     }
     if (max & 0x00FF) != 0xBF {
         let tmax = fsm.add_state();
@@ -135,7 +145,7 @@ pub fn add_same_length_range(
             .add_edge(from, tmax, byte_max[1] as i16, byte_max[1] as i16);
         add_same_length_range(fsm, tmax, to, 0x0080, max & 0x00FF);
     } else {
-        byte_max[1] += 1;
+        byte_max[1] = byte_max[1].wrapping_add(1);
     }
     if byte_max[1] as i16 - byte_min[1] as i16 > 1 {
         let m1 = fsm.add_state();

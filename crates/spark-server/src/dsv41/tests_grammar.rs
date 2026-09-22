@@ -3,7 +3,6 @@
 //! The DSML grammar through Atlas's OWN matcher (the pure-Rust xgrammar port
 //! behind `crate::grammar`), step-compared with Python xgrammar.
 
-use serde_json::Value;
 
 use super::tests::{cases, fixture, tokenizer};
 

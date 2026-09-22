@@ -16,6 +16,7 @@ pub mod encoding;
 pub mod grammar;
 pub mod parse;
 pub mod pyjson;
+pub mod repetition;
 pub mod request;
 
 #[cfg(test)]

@@ -203,6 +203,29 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
 
             let num_completion = response.output_tokens.len();
 
+            if state.dsv41 {
+                let mut choice = super::dsv41::blocking_choice(
+                    &state,
+                    &response.output_tokens,
+                    response.finish_reason.as_str(),
+                    enable_thinking,
+                    &req.stop,
+                    choice_idx,
+                );
+                choice.logprobs = build_logprobs(&state, &response);
+                if choice_idx == 0 {
+                    first_ttft = response.time_to_first_token_ms;
+                }
+                last_decode_time_ms = response.decode_time_ms;
+                total_completion_tokens += num_completion;
+                total_reasoning_tokens += response.reasoning_tokens;
+                total_cached_prompt_tokens =
+                    total_cached_prompt_tokens.max(response.cached_prompt_tokens);
+                engine.merge(response.engine);
+                all_choices.push(choice);
+                break;
+            }
+
             let (reasoning_content_i, output_text_i) =
                 decode_response_text(&state, &response, enable_thinking);
             let (output_text_i, matched_stop) =

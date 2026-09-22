@@ -248,6 +248,10 @@ pub(crate) async fn run_chat_stream(
         capture_tool_parser_input,
     );
 
+    if state.dsv41 {
+        return Ok(dsv41_stream(token_rx, ctx, cancel_flag));
+    }
+
     let token_stream = ReceiverStream::new(token_rx).flat_map(move |event| {
         use futures::StreamExt;
         // The handlers emit provider-neutral deltas (`ir::StreamDelta`);
@@ -291,4 +295,57 @@ pub(crate) async fn run_chat_stream(
     });
 
     Ok(Box::pin(token_stream))
+}
+
+/// deepseek_v41: the Python server's stream shape (api/dsv41.rs) on the shared
+/// scheduler events.
+fn dsv41_stream(
+    token_rx: tokio::sync::mpsc::Receiver<StreamEvent>,
+    ctx: StreamCtx,
+    cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> crate::ir::DeltaStream {
+    let mut st = super::dsv41::StreamState::new(
+        &ctx.state,
+        ctx.enable_thinking,
+        ctx.stop_strings.clone(),
+        cancel_flag,
+    );
+    let stream = ReceiverStream::new(token_rx).flat_map(move |event| {
+        use futures::StreamExt;
+        let deltas = match event {
+            StreamEvent::Token(tok) | StreamEvent::TokenWithLogprobs(tok, _) => {
+                st.on_token(&ctx.state, tok)
+            }
+            StreamEvent::PromptLogprobs(_) => Vec::new(),
+            StreamEvent::Done {
+                finish_reason,
+                completion_tokens,
+                time_to_first_token_ms,
+                decode_time_ms,
+                reasoning_tokens,
+                cached_prompt_tokens,
+                engine,
+                ..
+            } => {
+                let tps = if decode_time_ms > 0.0 {
+                    completion_tokens.saturating_sub(1) as f64 / (decode_time_ms / 1000.0)
+                } else {
+                    0.0
+                };
+                let usage = crate::ir::Usage {
+                    prompt_tokens: ctx.prompt_len,
+                    completion_tokens,
+                    cached_prompt_tokens: cached_prompt_tokens as usize,
+                    reasoning_tokens: reasoning_tokens as usize,
+                    time_to_first_token_ms,
+                    response_tokens_per_second: tps,
+                    engine: Some(engine),
+                };
+                st.on_done(&ctx.state, finish_reason, usage)
+            }
+            StreamEvent::Error(msg) => handle_error::handle_error(&ctx, msg),
+        };
+        futures::stream::iter(deltas).boxed()
+    });
+    Box::pin(stream)
 }

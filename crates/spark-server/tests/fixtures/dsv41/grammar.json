@@ -1130,6 +1130,216 @@
       }
      ],
      "terminated": false
+    },
+    {
+     "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">東京，大阪</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+     "ids": [
+      271,
+      30,
+      128825,
+      10699,
+      1018,
+      30,
+      128825,
+      34756,
+      2329,
+      1281,
+      1133,
+      65,
+      50219,
+      3816,
+      30,
+      128825,
+      10767,
+      2329,
+      1281,
+      37399,
+      4,
+      3418,
+      1281,
+      11476,
+      3320,
+      66771,
+      303,
+      85721,
+      1718,
+      128825,
+      10767,
+      1018,
+      1718,
+      128825,
+      34756,
+      1018,
+      1718,
+      128825,
+      10699,
+      32
+     ],
+     "steps": [
+      {
+       "n_allowed": 2,
+       "digest": "050e6d035f75bacc",
+       "token": 271,
+       "accepted": true
+      },
+      {
+       "n_allowed": 1,
+       "digest": "07ff7e07b4c00556",
+       "token": 30,
+       "accepted": true
+      },
+      {
+       "n_allowed": 4,
+       "digest": "f118d935f6d10d9e",
+       "token": 128825,
+       "accepted": true
+      },
+      {
+       "n_allowed": 6,
+       "digest": "565a845247015d8e",
+       "token": 10699,
+       "accepted": true
+      },
+      {
+       "n_allowed": 2,
+       "digest": "91e960a16e26eef4",
+       "token": 1018,
+       "accepted": true
+      },
+      {
+       "n_allowed": 1,
+       "digest": "07ff7e07b4c00556",
+       "token": 30,
+       "accepted": true
+      },
+      {
+       "n_allowed": 4,
+       "digest": "f118d935f6d10d9e",
+       "token": 128825,
+       "accepted": true
+      },
+      {
+       "n_allowed": 6,
+       "digest": "33236acda097b812",
+       "token": 34756,
+       "accepted": true
+      },
+      {
+       "n_allowed": 5,
+       "digest": "3003d63cd5083809",
+       "token": 2329,
+       "accepted": true
+      },
+      {
+       "n_allowed": 2,
+       "digest": "2254462063ecd513",
+       "token": 1281,
+       "accepted": true
+      },
+      {
+       "n_allowed": 3,
+       "digest": "e424cab49dfecd07",
+       "token": 1133,
+       "accepted": true
+      },
+      {
+       "n_allowed": 2,
+       "digest": "7fb2f8ef70c9ca0b",
+       "token": 65,
+       "accepted": true
+      },
+      {
+       "n_allowed": 3,
+       "digest": "bf769f33170cdf26",
+       "token": 50219,
+       "accepted": true
+      },
+      {
+       "n_allowed": 3,
+       "digest": "ff52b3299e3c8913",
+       "token": 3816,
+       "accepted": true
+      },
+      {
+       "n_allowed": 1,
+       "digest": "07ff7e07b4c00556",
+       "token": 30,
+       "accepted": true
+      },
+      {
+       "n_allowed": 4,
+       "digest": "f118d935f6d10d9e",
+       "token": 128825,
+       "accepted": true
+      },
+      {
+       "n_allowed": 8,
+       "digest": "a97a533662a5f200",
+       "token": 10767,
+       "accepted": true
+      },
+      {
+       "n_allowed": 5,
+       "digest": "3003d63cd5083809",
+       "token": 2329,
+       "accepted": true
+      },
+      {
+       "n_allowed": 2,
+       "digest": "2254462063ecd513",
+       "token": 1281,
+       "accepted": true
+      },
+      {
+       "n_allowed": 4,
+       "digest": "04c51d62df8a365e",
+       "token": 37399,
+       "accepted": true
+      },
+      {
+       "n_allowed": 1,
+       "digest": "af63a94c860195e3",
+       "token": 4,
+       "accepted": true
+      },
+      {
+       "n_allowed": 6,
+       "digest": "77d589e5269ed358",
+       "token": 3418,
+       "accepted": true
+      },
+      {
+       "n_allowed": 2,
+       "digest": "2254462063ecd513",
+       "token": 1281,
+       "accepted": true
+      },
+      {
+       "n_allowed": 3,
+       "digest": "ae3ca03917c77bbc",
+       "token": 11476,
+       "accepted": true
+      },
+      {
+       "n_allowed": 9,
+       "digest": "64baaf10eff6fb3c",
+       "token": 3320,
+       "accepted": true
+      },
+      {
+       "n_allowed": 127806,
+       "digest": "6639ff8c7a065526",
+       "token": 66771,
+       "accepted": true
+      },
+      {
+       "n_allowed": 127806,
+       "digest": "6639ff8c7a065526",
+       "token": 303,
+       "accepted": false
+      }
+     ],
+     "terminated": false
     }
    ]
   },
