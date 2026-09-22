@@ -256,6 +256,20 @@ pub const COMBINE_MODULE: &str = "dsv41_moe_combine";
 pub const SWIGLU_WEIGHTED_FN: &str = "dsv41_swiglu_weighted";
 /// `out = bf16(sum_k expert_out[token_to_perm[t,k]])` over fp32, already-weighted rows.
 pub const UNPERMUTE_SUM_FN: &str = "dsv41_unpermute_sum_f32";
+/// Router softplus/sqrt + bias (text or vision per row) + residency mask + top-k + weights.
+pub const ROUTE_TOPK_FN: &str = "dsv41_route_topk";
+
+/// Module of the fused grouped CB3 GEMM (`cb3/cb3_moe_gemm.cu`): weights decoded in shared
+/// memory, never written to DRAM.
+pub const FUSED_GEMM_MODULE: &str = "cb3_moe_gemm";
+/// Gate + up + SwiGLU x route weight -> bf16 h.
+pub const FUSED_GATE_UP_FN: &str = "cb3_moe_gate_up";
+/// Down projection -> fp32 rows.
+pub const FUSED_DOWN_FN: &str = "cb3_moe_down";
+/// Rows per M tile of the fused kernels (`BM` in the .cu). N must divide by
+/// [`FUSED_TILE_N`], K by 32.
+pub const FUSED_TILE_M: usize = 128;
+pub const FUSED_TILE_N: usize = 64;
 
 /// Bytes of bf16 scratch one expert's reconstruct needs, for all three matrices at once.
 pub fn scratch_bytes(config: &ModelConfig) -> Result<usize> {
@@ -779,12 +793,12 @@ mod permutation_tests {
             .join("kernels/gb10/deepseek-v4.1/cb3")
             .join(format!("{COMBINE_MODULE}.cu"));
         let source = std::fs::read_to_string(&cu).expect("combine kernel source");
-        for kernel in [SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN] {
-            assert!(
-                source.contains(&format!("extern \"C\" __global__ void {kernel}(")),
-                "{kernel} must be a C-linkage kernel in {}",
-                cu.display()
-            );
+        for kernel in [SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, ROUTE_TOPK_FN] {
+            // `__launch_bounds__(...)` may sit between `__global__` and the return type.
+            let declared = source.lines().any(|line| {
+                line.starts_with("extern \"C\" __global__") && line.contains(&format!(" {kernel}("))
+            });
+            assert!(declared, "{kernel} must be a C-linkage kernel in {}", cu.display());
         }
     }
 
