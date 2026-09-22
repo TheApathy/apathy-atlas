@@ -250,7 +250,7 @@ fn run_model_path(
     warm_prefill: bool,
     splits: Vec<Vec<usize>>,
 ) -> Result<()> {
-    let gpu_ref: &AtlasCudaBackend = &Arc::clone(&gpu);
+    let shared_dyn: spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu = gpu.clone();
     spark_model::model::dsv41::log_run_identity("driver", ops.stream);
     let max_chunk = splits.iter().flatten().copied().chain(chunks.iter().map(|c| c.1)).max().unwrap_or(1);
     let fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, 8192, Path::new(MODEL_DIR), 128)?;
@@ -258,7 +258,7 @@ fn run_model_path(
     let fed_core = FedCore(&feeder);
     let real_core;
     let (core, hook): (&dyn AttnCore, &dyn PassHook) = if attn_real {
-        real_core = Dsv41SparseCore::load_prefix(gpu_ref, store, config, 8192, max_chunk, fwd.freqs_c, n_layers)?;
+        real_core = Dsv41SparseCore::load_prefix(&shared_dyn, store, config, 8192, max_chunk, fwd.freqs_c, n_layers)?;
         (&real_core, &real_core)
     } else {
         (&fed_core, &NoHook)
@@ -569,7 +569,7 @@ fn main() -> Result<()> {
         let rings = (0..n_layers).map(|_| { let r = gpu.alloc(RING * HEAD_DIM * 2)?; gpu.memset(r, 0, RING * HEAD_DIM * 2)?; Ok(r) }).collect::<Result<Vec<_>>>()?;
         let freqs_c = spec_c.upload(gpu.as_ref(), positions)?;
         real_core = if core_real {
-            Some(Dsv41SparseCore::load_prefix(gpu.as_ref(), &store, &config, 8192, max_t, freqs_c, n_layers)?)
+            Some(Dsv41SparseCore::load_prefix(&(gpu.clone() as spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu), &store, &config, 8192, max_t, freqs_c, n_layers)?)
         } else {
             None
         };

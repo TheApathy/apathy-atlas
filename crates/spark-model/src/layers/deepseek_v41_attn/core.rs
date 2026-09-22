@@ -32,8 +32,9 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::index::{CandidateMask, INDEX_HEAD_DIM, INDEX_HEADS, INDEX_TOPK, IndexKernels, IndexOps, score_width};
 use crate::weight_loader::deepseek_v41::attn_block::{AttnCore, CoreArgs, RING, WINDOW};
+use crate::weight_loader::deepseek_v41::device_allocs::{DeviceAllocs, SharedGpu};
 use crate::weight_loader::deepseek_v41::forward::{PassHook, PassKind};
-use crate::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Fp8Linear, Ops, RopeTable, bf16_tensor};
+use crate::weight_loader::deepseek_v41::ops::{FWD_MODULE, Fp8Linear, Ops, RopeTable, bf16_tensor};
 
 /// Kernel module compiled from `cb3/dsv41_sparse_attn.cu`.
 pub const ATTN_MODULE: &str = "dsv41_sparse_attn";
@@ -238,12 +239,22 @@ pub struct Dsv41SparseCore {
     /// weights_proj as the reference issues them (cuBLASLt, 16-row tiles) instead of the
     /// deterministic `dsv41_gemm_f32_nt` / `dsv41_gemm_bf16_smalln` (A/B arm only).
     comp_cublas_tiled: bool,
+    /// Owns every device allocation above; frees them when the core drops.
+    allocs: DeviceAllocs,
 }
 
-fn dev_f32_copy(gpu: &dyn GpuBackend, fwd: &Dsv41Kernels, bf: DevicePtr, n: usize) -> Result<DevicePtr> {
-    let out = gpu.alloc(n * 4)?;
+/// Widen a bf16 weight to an fp32 copy at load. Launches `dsv41_fwd::dsv41_bf16_to_f32` directly
+/// rather than through `Dsv41Kernels::load`, which also allocates decode scratch this core would
+/// not own (caught by the drop test: 46 live allocations, 45 recorded).
+fn dev_f32_copy(gpu: &dyn GpuBackend, cvt: KernelHandle, bf: DevicePtr, out: DevicePtr, n: usize) -> Result<DevicePtr> {
     let stream = gpu.default_stream();
-    Ops { gpu, k: fwd, stream }.bf16_to_f32(bf, out, n)?;
+    KernelLaunch::new(gpu, cvt)
+        .grid([u32::try_from(n.div_ceil(256))?, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(bf)
+        .arg_ptr(out)
+        .arg_u64(n as u64)
+        .launch(stream)?;
     gpu.synchronize(stream)?;
     Ok(out)
 }
@@ -252,7 +263,7 @@ impl Dsv41SparseCore {
     /// `freqs_c` is the forward's YaRN table (the compressed rows and every indexer query use
     /// it on every layer, SPEC sec 6). `max_seq` sizes the caches; `max_chunk` the scratch.
     pub fn load(
-        gpu: &dyn GpuBackend,
+        gpu: &SharedGpu,
         store: &WeightStore,
         config: &ModelConfig,
         max_seq: usize,
@@ -264,7 +275,7 @@ impl Dsv41SparseCore {
 
     /// Layers `0..n_layers` only — for drivers that load a layer prefix of the checkpoint.
     pub fn load_prefix(
-        gpu: &dyn GpuBackend,
+        shared: &SharedGpu,
         store: &WeightStore,
         config: &ModelConfig,
         max_seq: usize,
@@ -273,10 +284,11 @@ impl Dsv41SparseCore {
         n_layers: usize,
     ) -> Result<Self> {
         ensure!((1..=40).contains(&n_layers), "n_layers {n_layers} outside 1..=40");
+        let gpu: &dyn GpuBackend = shared.as_ref();
         ensure!(config.num_attention_heads == 64, "V4.1 attention is 64 heads, config says {}", config.num_attention_heads);
         ensure!(max_chunk <= RING - WINDOW, "chunk {max_chunk} would overwrite window rows still in use");
         ensure!(freqs_c.positions >= max_seq, "freqs_c covers {} positions, max_seq is {max_seq}", freqs_c.positions);
-        let fwd = Dsv41Kernels::load(gpu)?;
+        let cvt = gpu.kernel(FWD_MODULE, "dsv41_bf16_to_f32").context("dsv41_fwd::dsv41_bf16_to_f32 not in the PTX")?;
         let idx = IndexKernels::load(gpu)?;
         let split_kernel = gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_split").context("dsv41_sparse_attn_split not in the PTX")?;
         let mma_kernel = if std::env::var("ATLAS_DSV41_ATTN_MMA").as_deref() == Ok("0") {
@@ -289,9 +301,12 @@ impl Dsv41SparseCore {
             .kernel(ATTN_MODULE, "dsv41_sparse_attn_w32")
             .with_context(|| format!("{ATTN_MODULE}::dsv41_sparse_attn_w32 is not in the compiled PTX"))?;
         let total = std::cell::Cell::new(0usize);
+        // Every allocation goes through ONE owned guard: freed when the core drops, and freed
+        // with the error if this constructor fails half-way (TUI model swap).
+        let allocs = std::cell::RefCell::new(DeviceAllocs::owned(shared.clone()));
         let alloc = |bytes: usize| -> Result<DevicePtr> {
             total.set(total.get() + bytes);
-            gpu.alloc(bytes.max(256))
+            allocs.borrow_mut().alloc(gpu, bytes.max(256))
         };
 
         let mut layers = Vec::with_capacity(n_layers);
@@ -307,8 +322,10 @@ impl Dsv41SparseCore {
                 let wkv_bf = bf16_tensor(store, &p("compressor.wkv.weight"), &[HEAD_DIM, HIDDEN])?;
                 let (wkv, wgate) = if ratio == 2 {
                     let g = bf16_tensor(store, &p("compressor.wgate.weight"), &[HEAD_DIM, HIDDEN])?;
-                    total.set(total.get() + 2 * HEAD_DIM * HIDDEN * 4);
-                    (dev_f32_copy(gpu, &fwd, wkv_bf, HEAD_DIM * HIDDEN)?, Some(dev_f32_copy(gpu, &fwd, g, HEAD_DIM * HIDDEN)?))
+                    (
+                        dev_f32_copy(gpu, cvt, wkv_bf, alloc(HEAD_DIM * HIDDEN * 4)?, HEAD_DIM * HIDDEN)?,
+                        Some(dev_f32_copy(gpu, cvt, g, alloc(HEAD_DIM * HIDDEN * 4)?, HEAD_DIM * HIDDEN)?),
+                    )
                 } else {
                     (wkv_bf, None)
                 };
@@ -396,9 +413,15 @@ impl Dsv41SparseCore {
             s,
             st: Mutex::new(SeqState { has_pending: vec![false; 40], ..SeqState::default() }),
             prof: Prof::new(),
+            allocs: allocs.into_inner(),
             split_on: std::env::var("ATLAS_DSV41_ATTN_SPLIT").as_deref() != Ok("0"),
             comp_cublas_tiled: std::env::var("ATLAS_DSV41_COMP_CUBLAS").as_deref() == Ok("1"),
         })
+    }
+
+    /// Device allocations this core owns (freed on drop).
+    pub fn allocation_count(&self) -> usize {
+        self.allocs.len()
     }
 
     /// This layer's `(ckv, ik)` caches, if it is a kv-source layer (for gates).
@@ -798,6 +821,83 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Dsv41SparseCore>();
         assert_send_sync::<std::sync::Arc<Dsv41SparseCore>>();
+    }
+
+    use spark_runtime::gpu::mock::MockGpuBackend;
+    use spark_runtime::weights::WeightTensor;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// A store holding exactly the tensors the core looks up for layers `0..n_layers`, at fake
+    /// device addresses (the core never allocates weights, so they do not enter the count).
+    fn fake_store(skip_layer: Option<usize>, n_layers: usize) -> WeightStore {
+        let mut m = HashMap::new();
+        let mut next = 0x7000_0000u64;
+        let mut put = |name: String, dtype: WeightDtype, shape: Vec<usize>| {
+            next += 0x10_0000;
+            m.insert(name, WeightTensor { ptr: DevicePtr(next), shape, dtype });
+        };
+        for l in (0..n_layers).filter(|l| Some(*l) != skip_layer) {
+            let p = |x: &str| format!("layers.{l}.attn.{x}");
+            if KV_SOURCE_LAYERS.contains(&l) {
+                put(p("compressor.wkv.weight"), WeightDtype::BF16, vec![HEAD_DIM, HIDDEN]);
+                if l < 20 {
+                    put(p("compressor.wgate.weight"), WeightDtype::BF16, vec![HEAD_DIM, HIDDEN]);
+                }
+                put(p("compressor.norm.weight"), WeightDtype::BF16, vec![HEAD_DIM]);
+                put(p("indexer.wk.weight"), WeightDtype::BF16, vec![INDEX_HEAD_DIM, HEAD_DIM]);
+                put(p("indexer.k_norm.weight"), WeightDtype::BF16, vec![INDEX_HEAD_DIM]);
+            }
+            if INDEX_SOURCE_LAYERS.contains(&l) {
+                put(p("indexer.wq_b.weight"), WeightDtype::FP8E4M3, vec![INDEX_HEADS * INDEX_HEAD_DIM, Q_LORA]);
+                put(p("indexer.wq_b.scale"), WeightDtype::FP8E8M0, vec![INDEX_HEADS * INDEX_HEAD_DIM / 32, Q_LORA / 32]);
+                put(p("indexer.weights_proj.weight"), WeightDtype::BF16, vec![INDEX_HEADS, HIDDEN]);
+            }
+        }
+        WeightStore::from_map(m)
+    }
+
+    fn v41_config() -> ModelConfig {
+        let mut c = ModelConfig::qwen3_next_80b_nvfp4();
+        c.num_attention_heads = 64;
+        c.rms_norm_eps = 1e-20;
+        c.compress_ratios = [0usize, 0].into_iter().chain(std::iter::repeat(2).take(18)).chain(std::iter::repeat(1).take(20)).collect();
+        c
+    }
+
+    fn rope() -> RopeTable {
+        RopeTable { cos: DevicePtr(0x6000_0000), sin: DevicePtr(0x6800_0000), half: 32, positions: 4096 }
+    }
+
+    /// TUI model swap: every device allocation the core makes is freed when it drops.
+    /// NEGATIVE CONTROL: a core that is leaked (never dropped) keeps its allocations, so the
+    /// count below can fail -- and does, for the leaking arm.
+    #[test]
+    fn the_core_frees_every_allocation_on_drop() {
+        let mock = Arc::new(MockGpuBackend::new());
+        let shared: SharedGpu = mock.clone();
+        let store = fake_store(None, 40);
+        let core = Dsv41SparseCore::load(&shared, &store, &v41_config(), 1024, 64, rope()).unwrap();
+        let n = mock.alloc_count();
+        assert!(n > 20, "the core allocates its caches, tail and scratch ({n})");
+        assert_eq!(core.allocation_count(), n, "every live allocation is recorded by the core's guard");
+        drop(core);
+        assert_eq!(mock.alloc_count(), 0, "dropping the core must free everything it allocated");
+
+        let leaked = Dsv41SparseCore::load(&shared, &store, &v41_config(), 1024, 64, rope()).unwrap();
+        std::mem::forget(leaked); // CONTROL: the leak the swap test must be able to see
+        assert_eq!(mock.alloc_count(), n, "a leaked core keeps all {n} allocations");
+    }
+
+    /// A load that fails half-way (layer 14's tensors missing, after layers 2 and 8 allocated
+    /// their caches) frees what it already took.
+    #[test]
+    fn a_failed_load_frees_its_partial_allocations() {
+        let mock = Arc::new(MockGpuBackend::new());
+        let shared: SharedGpu = mock.clone();
+        let err = Dsv41SparseCore::load(&shared, &fake_store(Some(14), 40), &v41_config(), 1024, 64, rope());
+        assert!(err.is_err(), "layer 14 has no tensors, the load must fail");
+        assert_eq!(mock.alloc_count(), 0, "the half-built core must free layers 2/8's caches");
     }
 
     /// Score scratch sizing: n_pad rounds max_seq up to 512 columns.
