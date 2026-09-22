@@ -23,8 +23,12 @@ echo "$(date -u +%FT%TZ) dsv41-integrate KEEP124 $LABEL window START (lock held)
 end() { echo "$(date -u +%FT%TZ) dsv41-integrate KEEP124 $LABEL window END rc=$1 lowwater_GB=$2 pid=$$" >> "$Q"; flock -u 9; echo "DONE $LABEL rc=$1 lowwater_GB=$2"; exit "$1"; }
 
 # ---- preflight: nothing else resident
-others=$(docker ps --format '{{.Names}}' | grep -Ei 'dsv41|atlas|spark|vllm' || true)
-procs=$(pgrep -af 'spark serve|spark-server|v41_engine|capture_ref|dsv41_forward' | grep -v "$$" | grep -v keep124_window || true)
+# Model-holding things only: a buildkit builder container or a cargo build is not resident on
+# the GPU (a build is reported as a warning: it slows GPU work but cannot OOM the device).
+others=$(docker ps --format '{{.Names}}' | grep -Ei 'dsv41|atlas|spark|vllm' | grep -v buildkit || true)
+procs=$(pgrep -af 'spark serve|bin/spark |v41_engine|capture_ref|examples/dsv41_forward' | grep -v "$$" | grep -v keep124_window | grep -v cargo || true)
+builds=$(pgrep -af 'cargo build|rustc|nvcc' | head -3 || true)
+[ -n "$builds" ] && echo "WARNING: builds running (slow GPU work, not memory-resident): [${builds}]"
 avail=$(memavail)
 echo "preflight: MemAvailable $((avail/1024/1024)) GB; containers: [${others}]; procs: [${procs}]"
 if [ -n "$others" ] || [ -n "$procs" ] || [ "$avail" -lt "$NEED_KB" ]; then
