@@ -794,11 +794,11 @@ mod permutation_tests {
             .join(format!("{COMBINE_MODULE}.cu"));
         let source = std::fs::read_to_string(&cu).expect("combine kernel source");
         for kernel in [SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, ROUTE_TOPK_FN] {
-            assert!(
-                source.contains(&format!("extern \"C\" __global__ void {kernel}(")),
-                "{kernel} must be a C-linkage kernel in {}",
-                cu.display()
-            );
+            // `__launch_bounds__(...)` may sit between `__global__` and the return type.
+            let declared = source.lines().any(|line| {
+                line.starts_with("extern \"C\" __global__") && line.contains(&format!(" void {kernel}("))
+            });
+            assert!(declared, "{kernel} must be a C-linkage kernel in {}", cu.display());
         }
     }
 
