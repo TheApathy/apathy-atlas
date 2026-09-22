@@ -84,6 +84,50 @@ pub(crate) fn prepare(
     })
 }
 
+/// `POST /v1/debug/prompt` (app.py `_debug_prompt`): render a chat request
+/// to the prompt text and ids without generating. deepseek_v41 only.
+pub async fn debug_prompt(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    use axum::response::IntoResponse;
+    if !state.dsv41 {
+        return openai_error_response_with_param(
+            StatusCode::NOT_FOUND,
+            "/v1/debug/prompt is only served for deepseek_v41".into(),
+            None,
+            None,
+        );
+    }
+    let body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return bad_request(format!("request body is not valid JSON: {e}"), None),
+    };
+    let rendered = match request::render_request(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_request(e.message, e.param.as_deref()),
+    };
+    let ids = match state.tokenizer.encode(&rendered.prompt) {
+        Ok(ids) => ids,
+        Err(e) => return bad_request(format!("Tokenization error: {e}"), None),
+    };
+    let grammar = rendered.grammar_tools.as_deref().and_then(|t| {
+        crate::dsv41::grammar::build_tool_grammar(t, crate::dsv41::grammar::DEFAULT_MAX_CALLS)
+    });
+    let mut out = serde_json::json!({
+        "thinking": rendered.thinking,
+        "reasoning_effort": rendered.effort,
+        "prompt": rendered.prompt,
+        "prompt_tokens": ids.len(),
+        "prompt_ids": ids,
+        "images": rendered.images.len(),
+    });
+    if let Some(g) = grammar {
+        out["tool_grammar"] = serde_json::Value::String(g);
+    }
+    axum::Json(out).into_response()
+}
+
 fn to_ir_calls(calls: Vec<ParsedCall>) -> Vec<ir::message::ToolCall> {
     calls
         .into_iter()
