@@ -237,12 +237,13 @@ pub fn attention(
 
     // grouped wo_a: o [T, 8, 4096] -> o2 [T, 8, 1024], group g uses wo_a rows g*1024..
     let grp_k = HEAD_DIM * N_HEADS / O_GROUPS;
-    if t == 1 && ops.k.fp8_gemv_m1.is_some() {
+    let decode = super::ops::decode_pass();
+    if t == 1 && decode && ops.k.fp8_gemv_m1.is_some() {
         // One grouped fp8 GEMV: output row n reads activation group n / 1024.
         ops.fp8_gemv_m1(s.o, &w.wo_a, s.o2, O_LORA, grp_k)?;
         return ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t);
     }
-    if t <= super::ops::GEMV_MAX_M && ops.k.fp8_gemv_m8.is_some() {
+    if t <= super::ops::GEMV_MAX_M && decode && ops.k.fp8_gemv_m8.is_some() {
         ops.fp8_gemv_rows(s.o, N_HEADS * HEAD_DIM, &w.wo_a, s.o2, O_GROUPS * O_LORA, t, O_LORA, grp_k)?;
         return ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t);
     }

@@ -54,6 +54,22 @@ pub mod profile {
 /// with chunking lets cuBLASLt pick a different algorithm per M, and the untiled FP8 path was
 /// measured NOT chunk-invariant ([500,544] vs [512,512,20]: 72,443 of 21.4M h values differ at L00).
 /// Issuing at one fixed M keeps one algorithm for every chunk.
+/// Whether the pass now running is a DECODE-like pass (generated tokens: decode, and later the
+/// speculative verify). The three decode-size paths (M = 1 / small-M fp8 GEMV, split hc_mixes,
+/// the CB3 decode MoE) key on THIS, never on the row count: a 1-row or <= 8-row PREFILL chunk
+/// (e.g. the tail of a 1025-token prompt) must run exactly the prefill kernels, or prefill stops
+/// being chunk-invariant. Set by `V41Forward::pass` and cleared by the replay pass; callers that
+/// drive the ops directly (microtests) set it themselves.
+static DECODE_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_decode_pass(on: bool) {
+    DECODE_PASS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn decode_pass() -> bool {
+    DECODE_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static FP8_FIXED_M: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_fp8_fixed_m(m: usize) {
@@ -289,7 +305,7 @@ impl Ops<'_> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn hc_mixes(&self, h: DevicePtr, hc: &HcParams, pre: DevicePtr, post: DevicePtr, comb: DevicePtr, t: usize, d: usize, iters: u32, eps: f32, hc_eps: f32) -> Result<()> {
-        if let Some((dot, finish, raw)) = self.k.hc_split.filter(|_| t == 1) {
+        if let Some((dot, finish, raw)) = self.k.hc_split.filter(|_| t == 1 && decode_pass()) {
             KernelLaunch::new(self.gpu, dot)
                 .grid([25, 1, 1])
                 .block([BLOCK, 1, 1])
@@ -406,10 +422,10 @@ impl Ops<'_> {
     /// Measured: untiled vs 16-row-tiled gave bit-identical h over all 40 layers at M=512, and
     /// the tiled form re-reads the whole bf16 weight once per 16 rows (32x per 512-row chunk).
     pub fn linear_fp8_tiled(&self, x: DevicePtr, w: &Fp8Linear, scratch: DevicePtr, out: DevicePtr, m: usize) -> Result<()> {
-        if m == 1 && self.k.fp8_gemv_m1.is_some() {
+        if m == 1 && decode_pass() && self.k.fp8_gemv_m1.is_some() {
             return self.fp8_gemv_m1(x, w, out, w.n, 0);
         }
-        if m <= GEMV_MAX_M && self.k.fp8_gemv_m8.is_some() {
+        if m <= GEMV_MAX_M && decode_pass() && self.k.fp8_gemv_m8.is_some() {
             return self.fp8_gemv_rows(x, w.k, w, out, w.n, m, w.n, 0);
         }
         prof(self, "dense/dequant", || self.dequant(w, scratch))?;
