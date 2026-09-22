@@ -19,7 +19,7 @@
 //! the 71.7 GB pack is addressable, the weight names resolve, and the geometry agrees.
 
 use anyhow::Result;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -30,7 +30,7 @@ use crate::weight_map::DenseWeight;
 
 use super::cb3_arena::Cb3ExpertArena;
 use super::moe::{Cb3Matrix, Cb3Reconstruct};
-use super::seams::{Dsv41Attention, Dsv41Engram};
+use super::seams::{Dsv41Attention, Dsv41Engram, SparseShared};
 
 /// The router. V4.1 carries **two** biases, which is not a duplicate.
 ///
@@ -93,6 +93,11 @@ pub struct DeepSeekV41Layer {
     pub reconstruct: Cb3Reconstruct,
     pub expert_matrices: [Cb3Matrix; 3],
     pub attention: Box<dyn Dsv41Attention>,
+    /// Cross-layer sparse state for ONE forward, shared by all 40 layers and RESET BY
+    /// LAYER 0. See [`SparseShared`] for why it lives here rather than on `ForwardContext`,
+    /// and why layer 0 is a sound reset point (it runs once per forward and has
+    /// `compress_ratio == 0`, so it has no sparse work a reset could destroy).
+    pub sparse: Arc<Mutex<SparseShared>>,
     /// Layers 1 and 14 only; `None` elsewhere, which is the correct answer there.
     pub engram: Option<Box<dyn Dsv41Engram>>,
 }

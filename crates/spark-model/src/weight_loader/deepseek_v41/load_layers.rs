@@ -15,7 +15,7 @@
 
 use anyhow::{Context, Result, ensure};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use atlas_core::config::{ExpertPack, ModelConfig};
 use spark_runtime::gpu::GpuBackend;
@@ -30,7 +30,7 @@ use super::layer::{
     DeepSeekV41Layer, V41HcAttn, V41HyperConnections, V41Router, V41SharedExpert,
 };
 use super::moe::{Cb3Reconstruct, expert_matrices};
-use super::seams::{ENGRAM_LAYERS, MissingAttention, MissingEngram};
+use super::seams::{ENGRAM_LAYERS, MissingAttention, MissingEngram, SparseShared};
 
 /// Where the CB3 pack lives, relative to the model directory.
 pub const PACK_SUBDIR: &str = "k154-cb3";
@@ -85,6 +85,9 @@ pub fn load_all_layers(
 
     // (4) LAYERS.
     let reconstruct = Cb3Reconstruct::new(gpu)?;
+    // ONE SparseShared for the whole model, cloned into every layer. Layer 0 resets it at
+    // the top of each forward.
+    let sparse = Arc::new(Mutex::new(SparseShared::default()));
     let matrices = expert_matrices(config)?;
     let attention_loader = super::seams::attention_loader();
     let engram_loader = super::seams::engram_loader();
@@ -176,6 +179,7 @@ pub fn load_all_layers(
             reconstruct,
             expert_matrices: matrices,
             attention,
+            sparse: Arc::clone(&sparse),
             engram,
         }));
     }

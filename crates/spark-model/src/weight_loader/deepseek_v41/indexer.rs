@@ -41,14 +41,10 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 /// would expect `[32, 10]` and reject a correct checkpoint.
 const WEIGHT_BLOCK: usize = 32;
 
-/// Layers that recompute a top-k selection, from the checkpoint's
-/// `text_config.index_source_layer_ids`. The other 32 layers attend with their
-/// predecessor's selection.
-pub const INDEX_SOURCE_LAYERS: [usize; 8] = [2, 8, 14, 20, 24, 28, 32, 36];
-/// Layers that build compressed KV and index KEYS, from `text_config.kv_source_layer_ids`.
-/// Only these carry `indexer.wk` / `indexer.k_norm`; 3-7 reuse 2's, 9-13 reuse 8's,
-/// 21-39 reuse 20's.
-pub const KV_SOURCE_LAYERS: [usize; 4] = [2, 8, 14, 20];
+// The layer sets live in `seams`, which is where the attention lane reads them. Re-exported
+// rather than redeclared: two copies of {2,8,14,20,24,28,32,36} that drift apart is exactly
+// the mis-selection this module exists to prevent.
+pub use super::seams::{INDEX_SOURCE_LAYERS, KV_SOURCE_LAYERS};
 
 /// What admission found, for the attention lane to consume and for startup logging.
 #[derive(Debug, Clone, PartialEq, Eq)]
