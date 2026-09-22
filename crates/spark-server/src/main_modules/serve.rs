@@ -942,7 +942,9 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     if config.model_type == "deepseek_v41" {
         crate::dsv41::repetition::configure(true);
         if !crate::scheduler::force_disable_watchdogs() {
-            tracing::warn!("deepseek_v41: auto-watchdogs were already resolved ON; outputs will diverge from the Python engine");
+            tracing::warn!(
+                "deepseek_v41: auto-watchdogs were already resolved ON; outputs will diverge from the Python engine"
+            );
         }
     }
     let state = Arc::new(AppState {
@@ -1263,5 +1265,97 @@ mod qv1_tests {
     fn incompat_unknown_rejected() {
         assert!(!quant_pair_compatible("nvfp4", "gptq-4bit"));
         assert!(!quant_pair_compatible("fp8", "nvfp4"));
+    }
+}
+
+/// The scheduler thread owns the loaded model (~84 GB on DeepSeek-V4.1). Any
+/// fallible step after it spawns can make `serve` return Err while the
+/// detached thread keeps that memory, and on this unified-memory host the next
+/// load then OOMs. These tests read serve.rs itself and fail if an error
+/// exit (`?`, `bail!`, `ensure!`, `return Err`) appears between the end of the
+/// scheduler spawn and the end of the function.
+#[cfg(test)]
+mod spawn_order_tests {
+    /// Error exits in `src` after the scheduler spawn closes, up to the end of
+    /// the enclosing fn. Comments and string literals are skipped.
+    pub(super) fn error_exits_after_spawn(src: &str) -> Vec<String> {
+        let spawn = src
+            .find("std::thread::spawn(move ||")
+            .expect("scheduler spawn not found");
+        // skip the closure body: balanced braces from its first '{'
+        let open = spawn + src[spawn..].find('{').expect("closure body");
+        let (mut depth, mut i) = (0usize, open);
+        for (k, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        i = open + k + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // the enclosing fn ends at the first "\n}\n" (column-0 brace) after it
+        let end = i + src[i..].find("\n}\n").expect("fn end");
+        let mut hits = Vec::new();
+        for line in src[i..end].lines() {
+            let code = strip_strings_and_comments(line);
+            if code.contains('?')
+                || code.contains("bail!")
+                || code.contains("ensure!")
+                || code.contains("return Err")
+            {
+                hits.push(line.trim().to_string());
+            }
+        }
+        hits
+    }
+
+    fn strip_strings_and_comments(line: &str) -> String {
+        let mut out = String::new();
+        let (mut in_str, mut prev) = (false, ' ');
+        let chars: Vec<char> = line.chars().collect();
+        for (k, &c) in chars.iter().enumerate() {
+            if !in_str && c == '/' && chars.get(k + 1) == Some(&'/') {
+                break;
+            }
+            if c == '"' && prev != '\\' {
+                in_str = !in_str;
+            } else if !in_str {
+                out.push(c);
+            }
+            prev = c;
+        }
+        out
+    }
+
+    #[test]
+    fn no_error_exit_after_the_scheduler_spawn() {
+        let src = include_str!("serve.rs");
+        let hits = error_exits_after_spawn(src);
+        assert!(
+            hits.is_empty(),
+            "error exits after the scheduler spawn: {hits:#?}"
+        );
+    }
+
+    /// NEGATIVE CONTROL: the same scan must catch a `?` put back after the
+    /// spawn (the pre-fix shape), or the test above cannot fail.
+    #[test]
+    fn the_scan_catches_a_question_mark_after_the_spawn() {
+        let src = include_str!("serve.rs");
+        let anchor = "    let state = Arc::new(AppState {";
+        assert!(src.contains(anchor));
+        let broken = src.replacen(
+            anchor,
+            &format!("    let _x = build_auth_config(&args)?;\n{anchor}"),
+            1,
+        );
+        assert_eq!(error_exits_after_spawn(&broken).len(), 1);
+        let broken = src.replacen(anchor, &format!("    anyhow::bail!(\"x\");\n{anchor}"), 1);
+        assert_eq!(error_exits_after_spawn(&broken).len(), 1);
     }
 }
