@@ -181,23 +181,27 @@ pub struct Dsv41Kernels {
     /// `dsv41_decode::dsv41_fp8_gemv_m1`, used at M = 1 when [`DENSE_GEMV_ENV`] is on.
     pub fp8_gemv_m1: Option<KernelHandle>,
     /// `dsv41_fp8_gemv_m8`: the same GEMV for 2..=8 rows, each row bit-identical to the M = 1
-    /// kernel. Used only with [`DENSE_GEMV_SMALL_M_ENV`]`=1` until it is gated end to end.
+    /// kernel (decode-kind passes only; see [`DENSE_GEMV_SMALL_M_ENV`]).
     pub fp8_gemv_m8: Option<KernelHandle>,
     /// The bit-identical split `hc_mixes` for T = 1 ([`HC_SPLIT_ENV`]): (dot, finish, raw scratch).
-    pub hc_split: Option<(KernelHandle, KernelHandle, DevicePtr)>,
+    pub hc_split: Option<(KernelHandle, KernelHandle)>,
 }
 
 /// ON by default (`ATLAS_DSV41_HC_SPLIT=0` turns it off): at T = 1, `hc_mixes` runs as 25 blocks + an epilogue instead of one
 /// block per token. Bit-identical by construction (same per-thread order, same tree).
 pub const HC_SPLIT_ENV: &str = "ATLAS_DSV41_HC_SPLIT";
+/// Bytes of the split hc_mixes' partials: 25 floats (24 mixes + the sum of squares) per token row.
+pub const HC_RAW_BYTES: usize = MM_TILE * 25 * 4;
 
 /// Module compiled from `kernels/gb10/deepseek-v4.1/cb3/dsv41_decode.cu`.
 pub const DECODE_DENSE_MODULE: &str = "dsv41_decode";
 /// ON by default (`ATLAS_DSV41_DENSE_GEMV=0` turns it off): every M = 1 FP8 linear runs as
 /// a direct fp8 GEMV instead of dequant-to-bf16 + a 16-row GEMM.
 pub const DENSE_GEMV_ENV: &str = "ATLAS_DSV41_DENSE_GEMV";
-/// `ATLAS_DSV41_DENSE_GEMV_SMALL_M=1`: FP8 linears with 2..=8 rows also take the GEMV (for
-/// speculative verify). Off by default: it changes prefill tails of <= 8 rows.
+/// FP8 linears with 2..=8 rows of a DECODE-kind pass (the DSpark verify) take the small-M GEMV,
+/// whose rows are bit-identical to the M = 1 GEMV -- which is what makes a verify row equal to
+/// plain decode. ON by default (`ATLAS_DSV41_DENSE_GEMV_SMALL_M=0` turns it off); prefill never
+/// takes it (the dispatch keys on `decode_pass()`).
 pub const DENSE_GEMV_SMALL_M_ENV: &str = "ATLAS_DSV41_DENSE_GEMV_SMALL_M";
 /// Largest row count the small-M GEMV serves.
 pub const GEMV_MAX_M: usize = 8;
@@ -243,15 +247,16 @@ impl Dsv41Kernels {
                 None
             },
             fp8_gemv_m8: if std::env::var(DENSE_GEMV_ENV).as_deref() != Ok("0")
-                && std::env::var(DENSE_GEMV_SMALL_M_ENV).as_deref() == Ok("1")
+                && std::env::var(DENSE_GEMV_SMALL_M_ENV).as_deref() != Ok("0")
             {
                 Some(k2("dsv41_fp8_gemv_m8")?)
             } else {
                 None
             },
             hc_split: if std::env::var(HC_SPLIT_ENV).as_deref() != Ok("0") {
-                let raw = gpu.alloc(MM_TILE * 25 * 4)?;
-                Some((k2("dsv41_hc_mix_dot")?, k2("dsv41_hc_mix_finish")?, raw))
+                // No allocation here: this table is Copy and has no owner to free a buffer.
+                // The partials live in the caller's scratch (`PassScratch::hc_raw`).
+                Some((k2("dsv41_hc_mix_dot")?, k2("dsv41_hc_mix_finish")?))
             } else {
                 None
             },
@@ -304,8 +309,9 @@ impl Ops<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn hc_mixes(&self, h: DevicePtr, hc: &HcParams, pre: DevicePtr, post: DevicePtr, comb: DevicePtr, t: usize, d: usize, iters: u32, eps: f32, hc_eps: f32) -> Result<()> {
-        if let Some((dot, finish, raw)) = self.k.hc_split.filter(|_| t == 1 && decode_pass()) {
+    /// `raw` is the split path's partials buffer ([`HC_RAW_BYTES`], `PassScratch::hc_raw`).
+    pub fn hc_mixes(&self, h: DevicePtr, hc: &HcParams, pre: DevicePtr, post: DevicePtr, comb: DevicePtr, t: usize, d: usize, iters: u32, eps: f32, hc_eps: f32, raw: DevicePtr) -> Result<()> {
+        if let Some((dot, finish)) = self.k.hc_split.filter(|_| t == 1 && decode_pass() && !raw.is_null()) {
             KernelLaunch::new(self.gpu, dot)
                 .grid([25, 1, 1])
                 .block([BLOCK, 1, 1])
@@ -667,6 +673,28 @@ pub fn bytemuck_u32(v: &[u32]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel table is Copy and has no owner that could free a buffer, so building it must
+    /// allocate NOTHING (it once allocated the split hc_mixes scratch on every load: a per-load
+    /// leak, found by attention2's drop test). Loaded twice with every decode path on.
+    #[test]
+    fn loading_the_kernel_table_allocates_nothing() {
+        let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+        // SAFETY-adjacent: test-local env; the defaults are ON anyway, set explicitly for intent.
+        unsafe {
+            std::env::set_var(HC_SPLIT_ENV, "1");
+            std::env::set_var(DENSE_GEMV_ENV, "1");
+        }
+        let before = gpu.alloc_count();
+        let k1 = Dsv41Kernels::load(&gpu).expect("load");
+        let k2 = Dsv41Kernels::load(&gpu).expect("load");
+        assert!(k1.hc_split.is_some() && k2.hc_split.is_some(), "the split path must be loaded for this test to mean anything");
+        assert_eq!(gpu.alloc_count(), before, "Dsv41Kernels::load allocated device memory it can never free");
+        // Control: the counter does see an allocation.
+        let p = gpu.alloc(HC_RAW_BYTES).expect("alloc");
+        assert_eq!(gpu.alloc_count(), before + 1, "the mock's counter is not counting");
+        gpu.free(p).expect("free");
+    }
 
     /// The two tables must differ, and only YaRN may bend the low frequencies.
     ///

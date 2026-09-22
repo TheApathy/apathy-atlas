@@ -187,6 +187,9 @@ pub struct PassScratch {
     /// Transient bf16 copy of one FP8 weight; sized for the largest (engram wkv).
     pub wscratch: DevicePtr,
     pub wscratch_bytes: usize,
+    /// The split hc_mixes' per-token partials (`ops::HC_RAW_BYTES`). Owned HERE, not by the
+    /// Copy kernel table, so it is freed with the rest of the scratch.
+    pub hc_raw: DevicePtr,
     allocations: Vec<DevicePtr>,
 }
 
@@ -228,6 +231,7 @@ impl PassScratch {
             engram_kv: a(t * (hc + 1) * d * 2)?,
             engram_dead: a(t * 24)?,
             wscratch: a(largest_fp8_weight * 2)?,
+            hc_raw: a(super::ops::HC_RAW_BYTES)?,
             wscratch_bytes: largest_fp8_weight * 2,
             allocations: Vec::new(),
         };
@@ -295,7 +299,7 @@ pub fn block(
         BlockControl::OwnPre => s.attn_pre,
     };
     prof(ops, "mhc+norm", || {
-        ops.hc_mixes(s.h, &w.hc_attn, s.attn_pre, s.attn_post, s.attn_comb, t, d, it, eps, hce)?;
+        ops.hc_mixes(s.h, &w.hc_attn, s.attn_pre, s.attn_post, s.attn_comb, t, d, it, eps, hce, s.hc_raw)?;
         ops.hc_pre(s.h, attn_side_pre, s.x, t, d)?;
         ops.rmsnorm(s.x, w.attn_norm, s.x, t, d, eps)
     })?;
@@ -310,7 +314,7 @@ pub fn block(
     };
     prof(ops, "mhc+norm", || {
         ops.hc_post(s.y, s.h, s.attn_post, s.attn_comb, s.h, t, d)?;
-        ops.hc_mixes(s.h, &w.hc_ffn, s.ffn_pre, s.ffn_post, s.ffn_comb, t, d, it, eps, hce)?;
+        ops.hc_mixes(s.h, &w.hc_ffn, s.ffn_pre, s.ffn_post, s.ffn_comb, t, d, it, eps, hce, s.hc_raw)?;
         ops.hc_pre(s.h, ffn_side_pre, s.x, t, d)?;
         ops.rmsnorm(s.x, w.ffn_norm, s.x, t, d, eps)
     })?;
