@@ -30,20 +30,8 @@ use crate::weight_map::DenseWeight;
 
 use super::cb3_arena::Cb3ExpertArena;
 use super::moe::{Cb3Matrix, Cb3Reconstruct};
+use super::moe_forward::RouterF32;
 use super::seams::{Dsv41Attention, Dsv41Engram, SparseShared};
-
-/// The router. V4.1 carries **two** biases, which is not a duplicate.
-///
-/// `gate.bias` is the noaux_tc correction bias applied to the routing scores. `gate.bias_vl`
-/// is a SEPARATE vision-language bias the multimodal path selects instead. Loading one as
-/// the other would shift every routing score by a constant vector — a change that reorders
-/// top-k near ties and shows up as slightly-different text, never as an error. Both are
-/// held, and which one applies is a forward-path decision, not a load-time one.
-pub struct V41Router {
-    pub weight: DenseWeight,
-    pub bias: DenseWeight,
-    pub bias_vl: DenseWeight,
-}
 
 /// The always-on shared expert. **FP8 block-quantised in the main shards, NOT CB3.**
 ///
@@ -85,7 +73,12 @@ pub struct DeepSeekV41Layer {
     pub layer: usize,
     pub input_norm: DenseWeight,
     pub post_attn_norm: DenseWeight,
-    pub router: V41Router,
+    /// The router, in the dtypes the reference computes in: weight widened to fp32 on the
+    /// device, BOTH biases (`gate.bias`, and the image-row `gate.bias_vl` — not a duplicate)
+    /// kept as F32 on the host. They were loaded through `dense_auto`, which narrows F32 to
+    /// bf16: at ~9.8 bf16's step is 0.0625, coarser than the 0.036 spread that decides
+    /// routing. See `routing::tests::a_bf16_router_bias_misroutes`.
+    pub router: RouterF32,
     pub shared_expert: V41SharedExpert,
     pub hyper_connections: V41HyperConnections,
     /// Shared across all 40 layers; each layer addresses its own slice.

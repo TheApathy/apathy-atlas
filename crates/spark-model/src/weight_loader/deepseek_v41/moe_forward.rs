@@ -39,7 +39,7 @@ use super::moe::{
     group_by_expert,
 };
 use super::ops::{Dsv41Kernels, Ops};
-use super::routing::{Routing, VisionBias, image_rows, score_of, select_experts_multimodal};
+use super::routing::{Routing, image_rows, score_of, select_experts_multimodal};
 
 /// `num_experts_per_tok`.
 pub const TOP_K: usize = 6;
@@ -289,14 +289,11 @@ impl<'a> Cb3RoutedMoe<'a> {
         )?;
         ensure!(ids.len() == t, "pass tokens are {} ids for a {t}-token pass", ids.len());
         let image = image_rows(ids);
-        let vision = image.iter().any(|row| *row).then_some(VisionBias {
-            bias: &router.bias_vl,
-            image_rows: &image,
-        });
         select_experts_multimodal(
             scores,
             &router.bias,
-            vision,
+            &router.bias_vl,
+            &image,
             self.arena.routing_mask(layer)?,
             t,
             ROUTER_EXPERTS,
