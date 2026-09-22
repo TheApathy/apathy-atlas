@@ -68,7 +68,11 @@ pub fn fp8_fixed_m() -> usize {
     FP8_FIXED_M.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// How an FP8 dense GEMM with M > 16 is issued (`ATLAS_DSV41_FP8_POLICY`, default `fixedm`).
+/// How an FP8 dense GEMM with M > 16 is issued (`ATLAS_DSV41_FP8_POLICY`, default `pinned`).
+///
+/// Measured (runI prompt as [512,512,20] vs [500,544], 241 tapped tensors incl. logits):
+/// pinned and fixedm are BYTE-IDENTICAL across chunkings; untiled is not. pinned does no
+/// padding, so it is the default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fp8Policy {
     /// One GEMM at the true M, cuBLASLt's per-M algorithm (NOT chunk-invariant, measured).
@@ -90,8 +94,8 @@ pub fn fp8_policy() -> Fp8Policy {
         match std::env::var("ATLAS_DSV41_FP8_POLICY").as_deref() {
             Ok("untiled") => Fp8Policy::Untiled,
             Ok("rowtile") => Fp8Policy::RowTile,
-            Ok("pinned") => Fp8Policy::Pinned,
-            _ => Fp8Policy::FixedM,
+            Ok("fixedm") => Fp8Policy::FixedM,
+            _ => Fp8Policy::Pinned,
         }
     })
 }
