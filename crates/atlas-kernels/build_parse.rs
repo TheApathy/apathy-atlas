@@ -71,6 +71,21 @@ pub(super) fn parse_sampling_presets(
     let toml: toml::Value = toml::from_str(&content)
         .unwrap_or_else(|e| panic!("Bad TOML in {}: {e}", model_toml_path.display()));
 
+    // An unknown `[sampling.<name>]` used to be ignored silently, so a typo'd
+    // section served the built-in defaults with no warning (deepseek-v4-flash
+    // shipped `[sampling.thinking|coding|general]` that way). Fail the build.
+    const SAMPLING_SECTIONS: [&str; 4] = ["thinking_text", "thinking_coding", "non_thinking", "tools"];
+    if let Some(table) = toml.get("sampling").and_then(|s| s.as_table()) {
+        for key in table.keys() {
+            assert!(
+                SAMPLING_SECTIONS.contains(&key.as_str()),
+                "{}: unknown section [sampling.{key}]; the recognised sections are {:?}",
+                model_toml_path.display(),
+                SAMPLING_SECTIONS
+            );
+        }
+    }
+
     let parse_cat = |key: &str| -> SamplingCat {
         let section = toml.get("sampling").and_then(|s| s.get(key));
         match section {
