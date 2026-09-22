@@ -877,6 +877,21 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         );
     }
 
+    // deepseek_v41 image input: the preprocessing geometry from config.json's
+    // vision_config. A checkpoint without one serves text only.
+    let dsv41_vision = if config.model_type == "deepseek_v41" {
+        let raw: serde_json::Value =
+            serde_json::from_str(&config_json).context("config.json is not JSON")?;
+        match raw.get("vision_config") {
+            Some(_) => Some(
+                crate::dsv41::vision::VisionConfig::from_config_json(&raw)
+                    .context("deepseek_v41 vision_config")?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
     let deepseek_vision_vocab = config
         .deepseek_vision
         .as_ref()
@@ -974,6 +989,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         },
         vision_config: config.vision.clone(),
         dsv41: config.model_type == "deepseek_v41",
+        dsv41_vision,
         deepseek_vision_config: config.deepseek_vision.clone(),
         deepseek_vision_vocab,
         initial_prefill_tokens: prefill_budget,

@@ -28,6 +28,7 @@ pub mod attn_block;
 pub mod cb3_arena;
 pub mod forward;
 pub mod fwd;
+pub mod image_splice;
 pub mod indexer;
 pub mod layer;
 mod load_layers;

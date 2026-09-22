@@ -157,7 +157,9 @@ pub(crate) async fn chat_completions_inner(
         .fold(0usize, |n, m| n.saturating_add(m.image_count()));
     if let Err(error) = image_admission::validate(
         image_count,
-        state.vision_config.is_some() || state.deepseek_vision_config.is_some(),
+        state.vision_config.is_some()
+            || state.deepseek_vision_config.is_some()
+            || state.dsv41_vision.is_some(),
         state.max_batch_size,
         state.yarn_context,
     )

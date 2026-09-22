@@ -63,6 +63,9 @@ pub struct AppState {
     /// rendered and outputs parsed by `crate::dsv41` (the production Python
     /// server's semantics) instead of the generic Jinja/tool-parser path.
     pub dsv41: bool,
+    /// deepseek_v41 checkpoints with a `vision_config`: image preprocessing
+    /// parameters for `crate::dsv41::vision`. None = text-only.
+    pub dsv41_vision: Option<crate::dsv41::vision::VisionConfig>,
     /// Dedicated Vision-Exp architecture; never interpreted as Qwen vision.
     pub deepseek_vision_config: Option<atlas_core::config::DeepSeekVisionConfig>,
     /// Physical text embedding vocabulary; virtual image sentinels start here.

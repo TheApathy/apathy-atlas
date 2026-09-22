@@ -50,22 +50,19 @@ pub(crate) fn prepare(
     };
     let rendered = request::render_request(body)
         .map_err(|e| bad_request(e.message.clone(), e.param.as_deref()))?;
-    if !rendered.images.is_empty() {
-        // The V4.1 vision tower and placeholder expansion are not ported yet
-        // (DSV41_PORT/PARITY.md section 4). Refuse rather than feed the model
-        // bare sentinel tokens with no image embedding behind them.
-        return Err(bad_request(
-            "image input for deepseek_v41 is not supported on this engine yet".into(),
-            Some("messages"),
-        ));
-    }
-    let prompt_tokens = state
+    let text_ids = state
         .tokenizer
         .encode(&rendered.prompt)
         .map_err(|e| bad_request(format!("Tokenization error: {e}"), None))?;
+    let (prompt_tokens, image_pixels) = if rendered.images.is_empty() {
+        (text_ids, Vec::new())
+    } else {
+        expand_images(state, &rendered.images, &text_ids)?
+    };
     tracing::info!(
-        "deepseek_v41 prompt: {} tokens, thinking={} effort={} tools={}",
+        "deepseek_v41 prompt: {} tokens ({} image(s)), thinking={} effort={} tools={}",
         prompt_tokens.len(),
+        image_pixels.len(),
         rendered.thinking,
         rendered.effort,
         rendered.grammar_tools.as_ref().map_or(0, Vec::len),
@@ -75,7 +72,7 @@ pub(crate) fn prepare(
         // means a parser is configured and the request carries tools.
         tools_active: state.tool_call_parser.is_some() && rendered.grammar_tools.is_some(),
         cwd_hint: None,
-        image_pixels: Vec::new(),
+        image_pixels,
         prompt_tokens,
         enable_thinking: rendered.thinking,
         // The Python engine has no thinking budget: reasoning may use the
@@ -90,7 +87,7 @@ fn debug_prompt_enabled(env: Option<&str>) -> bool {
 }
 
 /// `POST /v1/debug/prompt` (app.py `_debug_prompt`). Behind the normal
-/// `/v1/` auth gate, and disabled unless `ATLAS_DSV41_DEBUG_PROMPT=1`.: render a chat request
+/// `/v1/` auth gate, and disabled unless `ATLAS_DSV41_DEBUG_PROMPT=1`. Renders a chat request
 /// to the prompt text and ids without generating. deepseek_v41 only.
 pub async fn debug_prompt(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -142,6 +139,38 @@ pub async fn debug_prompt(
         out["tool_grammar"] = serde_json::Value::String(g);
     }
     axum::Json(out).into_response()
+}
+
+/// Images: decode + preprocess (vision.py-exact), then expand each
+/// `<｜deepseek_image｜>` into PAD + sentinel span ids. Returns the expanded ids
+/// and one `(bf16 patches [vit_h*vit_w, 3,14,14], vit_h, vit_w)` per image, in
+/// prompt order, for `Model::prepare_vision_embed`.
+#[allow(clippy::result_large_err, clippy::type_complexity)]
+fn expand_images(
+    state: &Arc<AppState>,
+    records: &[crate::dsv41::encoding::ImageRecord],
+    text_ids: &[u32],
+) -> Result<(Vec<u32>, Vec<(Vec<f32>, usize, usize)>), Response> {
+    use crate::dsv41::vision;
+    let Some(cfg) = state.dsv41_vision.as_ref() else {
+        return Err(bad_request(
+            "this checkpoint has no vision_config; image input is not available".into(),
+            Some("messages"),
+        ));
+    };
+    let mut lens = Vec::with_capacity(records.len());
+    let mut pixels = Vec::with_capacity(records.len());
+    for rec in records {
+        let img = vision::decode_image_record(&serde_json::Value::Object(rec.clone()))
+            .map_err(|e| bad_request(e.to_string(), Some("messages")))?;
+        let prep = vision::preprocess_image(&img, cfg)
+            .map_err(|e| bad_request(e.to_string(), Some("messages")))?;
+        lens.push(prep.types.len());
+        pixels.push((prep.patches, prep.plan.vit_h, prep.plan.vit_w));
+    }
+    let (ids, _spans) = vision::expand_image_placeholders(text_ids, &lens)
+        .map_err(|e| bad_request(e.to_string(), Some("messages")))?;
+    Ok((ids, pixels))
 }
 
 fn to_ir_calls(calls: Vec<ParsedCall>) -> Vec<ir::message::ToolCall> {
