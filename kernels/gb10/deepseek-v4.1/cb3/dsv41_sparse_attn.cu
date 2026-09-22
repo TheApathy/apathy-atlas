@@ -71,7 +71,11 @@ __device__ void sparse_attn_body(
     const IdxT*          __restrict__ CIDX,  // [T, NC]  compressed rows, -1 = none
     const float*         __restrict__ SINK,  // [NH]
     OutT*                __restrict__ O,     // [T, NH, D]
-    int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
+    int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale,
+    // SPLIT-KV (flash-decoding): walk only keys [k_lo, k_hi) of the concatenated
+    // [window (NW) | compressed (NC)] list and, when PART != null, write the unnormalised
+    // partial (m, l, acc[D]) per head to PART[t][h][blockIdx.z] instead of O.
+    int k_lo = 0, int k_hi = 1 << 30, float* __restrict__ PART = nullptr)
 {
     const int t   = blockIdx.x;
     const int hb  = blockIdx.y;
@@ -81,7 +85,7 @@ __device__ void sparse_attn_body(
 
     __shared__ __nv_bfloat16 qs[HB][DMAX];
     __shared__ __nv_bfloat16 ks[BK][DMAX];
-    __shared__ float red[HB][NT / 32];
+    __shared__ float red2[HB][BK][NT / 32];
     __shared__ float sc[HB][BK];
     __shared__ int   vld[BK];
 
@@ -102,17 +106,21 @@ __device__ void sparse_attn_body(
     // seg 0 = window, seg 1 = compressed; CTRL_ORDER swaps the visit order.
     for (int step = 0; step < 2; ++step) {
         const int seg = CTRL_ORDER ? (1 - step) : step;
-        const int n   = seg == 0 ? NW : NC;
+        const int n0  = seg == 0 ? NW : NC;
         if (seg == 1 && CIDX == nullptr) continue;
+        const int base = seg == 0 ? 0 : NW;
+        const int lo = max(0, k_lo - base);
+        const int n  = min(n0, k_hi - base);        // this split's end within the segment
+        if (lo >= n) continue;
 
-        for (int kb = 0; kb < n; kb += BK) {
+        for (int kb = lo; kb < n; kb += BK) {
             // ---- gather BK rows straight out of the ring / compressed cache
             if (tid < BK) {
                 const int c = kb + tid;
                 int row = -1;
                 if (c < n) {
                     if (seg == 0) {
-                        const long long p = WPOS[(size_t)t * NW + c];
+                        const long long p = WPOS[(size_t)t * NW + c];   // NW is the row stride
                         if (p >= 0 && p >= win_lo) row = (int)(p % RING_N);   // ring modulo
                     } else if (CTRL_GATHER) {
                         row = c;                                       // wrong on purpose
@@ -135,29 +143,37 @@ __device__ void sparse_attn_body(
             }
             __syncthreads();
 
-            // ---- scores: sc[h][kk] = dot(q_h, k_kk) * scale, fp32 accumulate
-            for (int kk = 0; kk < BK; ++kk) {
-                float part[HB];
+            // ---- scores: sc[h][kk] = dot(q_h, k_kk) * scale, fp32 accumulate.
+            // All HB x BK dot products of the tile in ONE reduction round (one barrier pair per
+            // tile, not per key). Per product the arithmetic order is unchanged -- per-thread
+            // fmaf over its DPT dims, the same shfl_down tree, then warps summed in order -- so
+            // this is bit-identical to reducing one key at a time.
+            {
+                float part[HB][BK];
 #pragma unroll
-                for (int h = 0; h < HB; ++h) {
-                    float s = 0.f;
-                    for (int i = 0; i < DPT; ++i) {
-                        const int d = tid + i * NT;
-                        s = fmaf(__bfloat162float(qs[h][d]), __bfloat162float(ks[kk][d]), s);
+                for (int h = 0; h < HB; ++h)
+#pragma unroll
+                    for (int kk = 0; kk < BK; ++kk) {
+                        float s = 0.f;
+                        for (int i = 0; i < DPT; ++i) {
+                            const int d = tid + i * NT;
+                            s = fmaf(__bfloat162float(qs[h][d]), __bfloat162float(ks[kk][d]), s);
+                        }
+                        for (int off = 16; off; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+                        part[h][kk] = s;
                     }
-                    part[h] = s;
-                }
+                if (lane == 0) {
 #pragma unroll
-                for (int h = 0; h < HB; ++h) {
-                    float s = part[h];
-                    for (int off = 16; off; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
-                    if (lane == 0) red[h][warp] = s;
+                    for (int h = 0; h < HB; ++h)
+#pragma unroll
+                        for (int kk = 0; kk < BK; ++kk) red2[h][kk][warp] = part[h][kk];
                 }
                 __syncthreads();
-                if (tid < HB) {
+                if (tid < HB * BK) {
+                    const int h = tid / BK, kk = tid % BK;
                     float s = 0.f;
-                    for (int w = 0; w < nwarp; ++w) s += red[tid][w];
-                    sc[tid][kk] = s * scale;
+                    for (int w = 0; w < nwarp; ++w) s += red2[h][kk][w];
+                    sc[h][kk] = s * scale;
                 }
                 __syncthreads();
             }
@@ -191,6 +207,16 @@ __device__ void sparse_attn_body(
         }
     }
 
+    if (PART != nullptr) {
+        const int S = gridDim.z, sidx = blockIdx.z;
+#pragma unroll
+        for (int h = 0; h < HB; ++h) {
+            float* pr = PART + (((size_t)t * NH + (hb * HB + h)) * S + sidx) * (2 + D);
+            if (tid == 0) { pr[0] = m[h]; pr[1] = l[h]; }
+            for (int i = 0; i < DPT; ++i) pr[2 + tid + i * NT] = acc[h][i];
+        }
+        return;
+    }
 #pragma unroll
     for (int h = 0; h < HB; ++h) {
         const float m_safe = (m[h] == -INFINITY) ? 0.f : m[h];
@@ -221,6 +247,45 @@ extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn_w32(
 {
     sparse_attn_body<false, false, long long, __nv_bfloat16, int32_t>(
         Q, RING, WPOS, CKV, CIDX, SINK, O, T, NH, D, NW, NC, RING_N, win_lo, scale);
+}
+
+// DECODE entry (T small): SPLIT-KV. grid (T, NH / 8, S), block 256. Split z walks keys
+// [z*SLICE, (z+1)*SLICE) of [window | compressed]; SLICE is a multiple of BK. The split is by
+// KEY INDEX only, so a row's result does not depend on T or on the step: bit-stable. PART is
+// [T, NH, S, 2 + D] fp32. Follow with dsv41_sparse_attn_combine.
+extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn_split(
+    const __nv_bfloat16* Q, const __nv_bfloat16* RING, const int32_t* WPOS,
+    const __nv_bfloat16* CKV, const long long* CIDX, float* PART,
+    int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale, int SLICE)
+{
+    const int k_lo = blockIdx.z * SLICE;
+    sparse_attn_body<false, false, long long, float, int32_t>(
+        Q, RING, WPOS, CKV, CIDX, nullptr, nullptr, T, NH, D, NW, NC, RING_N, win_lo, scale,
+        k_lo, k_lo + SLICE, PART);
+}
+
+// Merge the S partials of each (t, head) in FIXED split order, add the sink to the
+// denominator ONCE, write bf16. grid (T, NH), block 256 (2 dims per thread).
+extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn_combine(
+    const float* __restrict__ PART, const float* __restrict__ SINK, __nv_bfloat16* __restrict__ O,
+    int NH, int D, int S)
+{
+    const int t = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    const float* pr = PART + ((size_t)t * NH + h) * S * (2 + D);
+    float M = -INFINITY;
+    for (int s = 0; s < S; ++s) M = fmaxf(M, pr[(size_t)s * (2 + D)]);
+    const float m_safe = (M == -INFINITY) ? 0.f : M;
+    float L = 0.f, acc[DPT];
+    for (int i = 0; i < DPT; ++i) acc[i] = 0.f;
+    for (int s = 0; s < S; ++s) {
+        const float* q = pr + (size_t)s * (2 + D);
+        const float w = __expf(q[0] - m_safe);      // -inf partial (all keys masked) -> 0
+        L = L + q[1] * w;
+        for (int i = 0; i < DPT; ++i) acc[i] = acc[i] + q[2 + tid + i * NT] * w;
+    }
+    const float denom = L + __expf(SINK[h] - m_safe);
+    for (int i = 0; i < DPT; ++i)
+        O[((size_t)t * NH + h) * D + tid + i * NT] = __float2bfloat16_rn(acc[i] / denom);
 }
 
 // PRODUCTION entry. grid (T, NH / 8), block 256. CIDX may be null (window-only layers 0/1).
@@ -428,6 +493,82 @@ int main() {
         const size_t bad32 = bits_equal(h_ok);
         std::printf("PRODUCTION entry w32 (i32 wpos, i64 idx, bf16) : %zu/%zu differ from bf16(fp32 kernel)\n", bad32, no);
         prod_ok = prod_ok && bad32 == 0;
+
+        // SPLIT-KV decode entry: S splits of SLICE keys + combine. Only the accumulation
+        // order within a row changes, so against bf16(one-pass fp32) the bf16 outputs must be
+        // (nearly) identical. Pre-registered: >= 99.9% bit-identical, and vs the fp32 reference
+        // within 1e-6. CONTROL: combine over S-1 splits (the last slice dropped) must differ.
+        {
+            const int SLICE = 32, S = (NW + NC + SLICE - 1) / SLICE;
+            float* d_part; CUDA_OK(cudaMalloc(&d_part, (size_t)T * NH * ((NW + NC + 7) / 8) * (2 + D) * 4));
+            dim3 gs(T, NH / HB, S);
+            auto split = [&](int s_combine) {
+                dsv41_sparse_attn_split<<<gs, NT>>>(d_q, d_ring, d_wpos, d_ckv, d_c64, d_part, T, NH, D, NW, NC, RING_N, 0, scale, SLICE);
+                CUDA_OK(cudaGetLastError());
+                // combine reads S partials per (t,h) with stride S; to drop the last slice the
+                // control re-lays nothing -- it combines over the first s_combine of them.
+                dsv41_sparse_attn_combine<<<dim3(T, NH), NT>>>(d_part, d_sink, d_ob, NH, D, S);
+                CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
+                if (s_combine < S) {  // control: zero the last split's partial and recombine
+                    for (int tt = 0; tt < T; ++tt)
+                        for (int hh = 0; hh < NH; ++hh) {
+                            float* pr = d_part + (((size_t)tt * NH + hh) * S + (S - 1)) * (2 + D);
+                            const float mneg = -INFINITY, zero = 0.f;
+                            CUDA_OK(cudaMemcpy(pr, &mneg, 4, cudaMemcpyHostToDevice));
+                            CUDA_OK(cudaMemcpy(pr + 1, &zero, 4, cudaMemcpyHostToDevice));
+                        }
+                    dsv41_sparse_attn_combine<<<dim3(T, NH), NT>>>(d_part, d_sink, d_ob, NH, D, S);
+                    CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
+                }
+                CUDA_OK(cudaMemcpy(ob.data(), d_ob, no*2, cudaMemcpyDeviceToHost));
+            };
+            split(S);
+            const size_t sbad = bits_equal(h_ok);
+            std::vector<float> of(no);
+            for (size_t i = 0; i < no; ++i) of[i] = __bfloat162float(ob[i]);
+            const Err es = compare(of.data(), h_r32, no);
+            split(S - 1);
+            const size_t cbad = bits_equal(h_ok);
+            std::printf("SPLIT-KV decode entry (S=%d x %d keys + combine): %zu/%zu bf16 differ from bf16(one-pass) (%.4f%% identical), "
+                        "vs fp32 ref rel_l2=%.3e | CTRL last split dropped: %zu differ\n",
+                        S, SLICE, sbad, no, 100.0 * (1.0 - (double)sbad / no), es.rel, cbad);
+            prod_ok = prod_ok && (double)sbad / no <= 1e-3 && cbad > sbad;
+
+            // T=1 latency (the decode shape): last row of the fixture, one-pass vs split+combine.
+            {
+                const int tl = T - 1;
+                const __nv_bfloat16* q1 = d_q + (size_t)tl * NH * D;
+                const int32_t* w1 = d_wpos + (size_t)tl * NW;
+                const long long* c1 = d_c64 + (size_t)tl * NC;
+                cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+                auto time_it = [&](auto&& launch) {
+                    for (int i = 0; i < 10; ++i) launch();
+                    CUDA_OK(cudaDeviceSynchronize());
+                    cudaEventRecord(e0);
+                    for (int i = 0; i < 200; ++i) launch();
+                    cudaEventRecord(e1); cudaEventSynchronize(e1);
+                    float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+                    return 1000.0f * ms / 200;
+                };
+                const float one = time_it([&] {
+                    dsv41_sparse_attn_w32<<<dim3(1, NH / HB), NT>>>(q1, d_ring, w1, d_ckv, c1, d_sink, d_ob, 1, NH, D, NW, NC, RING_N, 0, scale); });
+                std::printf("T=1 latency (GPU-lock held, nothing else running): one-pass %.1f us\n", one);
+                for (int sl : {64, 32, 16, 8}) {
+                    const int ss = (NW + NC + sl - 1) / sl;
+                    const float spl = time_it([&] {
+                        dsv41_sparse_attn_split<<<dim3(1, NH / HB, ss), NT>>>(q1, d_ring, w1, d_ckv, c1, d_part, 1, NH, D, NW, NC, RING_N, 0, scale, sl);
+                        dsv41_sparse_attn_combine<<<dim3(1, NH), NT>>>(d_part, d_sink, d_ob, NH, D, ss); });
+                    CUDA_OK(cudaGetLastError());
+                    const float so = time_it([&] {
+                        dsv41_sparse_attn_split<<<dim3(1, NH / HB, ss), NT>>>(q1, d_ring, w1, d_ckv, c1, d_part, 1, NH, D, NW, NC, RING_N, 0, scale, sl); });
+                    const float co = time_it([&] {
+                        dsv41_sparse_attn_combine<<<dim3(1, NH), NT>>>(d_part, d_sink, d_ob, NH, D, ss); });
+                    std::printf("    split SLICE=%2d (S=%2d, %3d CTAs) + combine %.1f us (%.1fx)  [split alone %.1f, combine alone %.1f]\n",
+                                sl, ss, ss * NH / HB, spl, one / spl, so, co);
+                }
+            }
+            cudaFree(d_part);
+        }
         cudaFree(d_w64); cudaFree(d_c64); cudaFree(d_ob);
     }
     const bool all_ok = ok && prod_ok;

@@ -408,7 +408,9 @@ fn main() -> Result<()> {
                 "DECODE L{l:02} ({n} steps, T=1): vs own prefill topk {self_bad} rows differ, attention bit-identical {self_o:.6} \
                  | vs capture topk {cap_bad}/{n} (worst {worst:.4}), attention bit-exact {ce:.4} rel {crl:.2e}"
             );
-            fail += usize::from(self_bad != 0 || self_o < 1.0 || cap_bad > 1 || ce < 0.98);
+            // Decode uses the SPLIT-KV kernel (only the within-row accumulation order differs
+            // from prefill's one-pass): >= 99.9% bit-identical to own prefill, rest 1-ulp.
+            fail += usize::from(self_bad != 0 || self_o < 0.999 || cap_bad > 1 || ce < 0.98);
         }
         // CONTROL: window positions off by one (the query's own row dropped, p-128 added).
         let c = dec(1)?;

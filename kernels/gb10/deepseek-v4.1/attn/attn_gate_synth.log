@@ -22,4 +22,10 @@ NOTE: the gap against the bf16-P reference is this kernel being MORE
 PRODUCTION entry (i64 idx, bf16 out)            : 0/1572864 differ from bf16(fp32 kernel) | CTRL other mode: 1570918 differ
 PRODUCTION entry (i64 idx, bf16 out) window-only: 0/1572864 differ from bf16(fp32 kernel) | CTRL other mode: 1538579 differ
 PRODUCTION entry w32 (i32 wpos, i64 idx, bf16) : 0/1572864 differ from bf16(fp32 kernel)
+SPLIT-KV decode entry (S=20 x 32 keys + combine): 502/1572864 bf16 differ from bf16(one-pass) (99.9681% identical), vs fp32 ref rel_l2=1.664e-03 | CTRL last split dropped: 1527399 differ
+T=1 latency (GPU-lock held, nothing else running): one-pass 527.2 us
+    split SLICE=64 (S=10,  80 CTAs) + combine 86.1 us (6.1x)  [split alone 84.6, combine alone 4.1]
+    split SLICE=32 (S=20, 160 CTAs) + combine 87.8 us (6.0x)  [split alone 82.8, combine alone 5.0]
+    split SLICE=16 (S=40, 320 CTAs) + combine 84.0 us (6.3x)  [split alone 73.8, combine alone 8.9]
+    split SLICE= 8 (S=80, 640 CTAs) + combine 90.3 us (5.8x)  [split alone 77.1, combine alone 10.2]
 PASS one-pass streaming gather (controls separate)
