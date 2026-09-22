@@ -180,6 +180,7 @@ fn main() -> Result<()> {
     let steps = 8;
     let mut worst = (0usize, 1.0f64);
     for arm in [0i64, 1] {
+        core.rollback(gpu.as_ref(), 1044, gpu.default_stream())?; // each arm resumes at the prompt end
         let mut ctrl_exact = Vec::new();
         for st in 0..steps {
             let p = 1044 + st;
