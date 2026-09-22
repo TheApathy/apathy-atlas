@@ -25,9 +25,11 @@
 //! so the seam is here, documented, against a tested shard reader.
 
 pub mod cb3_arena;
+pub mod fwd;
 pub mod indexer;
 pub mod layer;
 mod load_layers;
+pub mod ops;
 pub mod moe;
 pub mod routing;
 pub mod seams;
