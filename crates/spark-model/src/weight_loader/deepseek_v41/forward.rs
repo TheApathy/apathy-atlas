@@ -195,6 +195,13 @@ pub struct V41Forward {
     /// q*k weight products), freed on drop once [`Self::own_allocations`] hands it a backend.
     /// Until then (the driver) it only records them.
     pub allocs: super::device_allocs::DeviceAllocs,
+    /// DSpark seed (`Model.forward`'s `main_hiddens`): bf16 `[rows, 3 * hidden]`, filled with the
+    /// hc-mean of the INPUT stream of L37, L38, L39 on every pass that runs them (replay,
+    /// decode, verify). `None` unless the drafter is loaded (`enable_dspark_seed`).
+    pub dspark_seed: Option<DevicePtr>,
+    /// The DSpark drafter's weights (store-resident), when loaded. Consumed by dsv41-decode's
+    /// draft/verify path.
+    pub dspark: Option<super::mtp::DsparkWeights>,
 }
 
 pub fn rope_specs() -> (RopeSpec, RopeSpec) {
@@ -252,7 +259,19 @@ impl V41Forward {
             max_chunk,
             max_seq,
             allocs: super::device_allocs::DeviceAllocs::unowned(),
+            dspark_seed: None,
+            dspark: None,
         })
+    }
+
+    /// Allocate the DSpark seed buffer (call before [`Self::own_allocations`] so it is owned too).
+    pub fn enable_dspark_seed(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+        let rows = super::ops::tiled_rows(self.max_chunk.max(WINDOW));
+        let cols = super::mtp::DSPARK_TARGET_LAYERS.len() * self.dims.hidden;
+        let p = gpu.alloc(rows * cols * 2)?;
+        self.allocs.adopt(p);
+        self.dspark_seed = Some(p);
+        Ok(())
     }
 
     /// Take ownership of every allocation made in [`Self::load`] so dropping the forward frees
@@ -267,6 +286,9 @@ impl V41Forward {
             a.adopt(t.sin);
         }
         a.adopt(self.ids_dev);
+        if let Some(p) = self.dspark_seed {
+            a.adopt(p);
+        }
         for b in &self.blocks {
             if let Some(e) = &b.engram {
                 a.adopt(e.weight);
@@ -317,6 +339,12 @@ impl V41Forward {
                     tap.bf16(ops, "engram_rows_masked", l, s.engram_rows_bf16, &[t, N_HEAD_COLS, 256])?;
                 }
                 tap.bf16(ops, "engram_out", l, s.h, &[t, self.dims.hc, self.dims.hidden])?;
+            }
+            if let (Some(seed), Some(col)) =
+                (self.dspark_seed, super::mtp::DSPARK_TARGET_LAYERS.iter().position(|&x| x == l))
+            {
+                let d = self.dims.hidden;
+                ops.hc_mean_bf16(s.h, seed, t, d, super::mtp::DSPARK_TARGET_LAYERS.len() * d, col * d)?;
             }
             let adapter = AttnAdapter { fwd: self, ring: seq.rings[l], win_lo, core, tap };
             block(ops, w, &self.dims, s, t, start, &adapter, moe, tap, BlockControl::None)?;

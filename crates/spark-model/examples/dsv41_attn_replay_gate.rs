@@ -73,7 +73,7 @@ fn main() -> Result<()> {
     }));
     let store = loader.load(Path::new(MODEL_DIR), g, 0)?;
     let spec = RopeSpec { dim: 64, original_seq_len: 65536, base: 160000.0, factor: 16.0, beta_fast: 32.0, beta_slow: 1.0 };
-    let core = Dsv41SparseCore::load_prefix(g, &store, &config, MAX_SEQ, 512, spec.upload(g, MAX_SEQ + 8)?, 29)?;
+    let core = Dsv41SparseCore::load_prefix(&(gpu.clone() as spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu), &store, &config, MAX_SEQ, 512, spec.upload(g, MAX_SEQ + 8)?, 29)?;
 
     // Seed L20's cache + the replay tail from L24's taps (they ARE L20's cache and tail).
     let ckv = tap(24, "ckv")?;

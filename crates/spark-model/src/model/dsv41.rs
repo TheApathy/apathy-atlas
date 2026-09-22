@@ -68,7 +68,7 @@ fn build_lanes(
     use crate::layers::deepseek_v41_attn::core::Dsv41SparseCore;
     use crate::weight_loader::deepseek_v41::cb3_arena::{Cb3ExpertArena, resolve_packed_keep};
     use crate::weight_loader::deepseek_v41::moe_forward::{Cb3RoutedMoe, RouterF32};
-    let core = std::sync::Arc::new(Dsv41SparseCore::load(gpu, store, config, max_seq, max_chunk, fwd.freqs_c)?);
+    let core = std::sync::Arc::new(Dsv41SparseCore::load(shared, store, config, max_seq, max_chunk, fwd.freqs_c)?);
     let pack_dir = model_dir.join("k154-cb3");
     let manifest = std::fs::read_to_string(pack_dir.join("manifest.json"))
         .with_context(|| format!("DeepSeek-V4.1 expert pack manifest at {}", pack_dir.display()))?;
@@ -129,6 +129,13 @@ impl Dsv41Model {
         log_run_identity("serve", stream);
         let threads = std::env::var("ATLAS_DSV41_ENGRAM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
         let mut fwd = V41Forward::load(store, &ops, dims, config.vocab_size, config.num_hidden_layers, max_chunk, max_seq, model_dir, threads)?;
+        if crate::weight_loader::deepseek_v41::dspark_enabled() {
+            // DSpark drafter (ATLAS_DSV41_DSPARK=1): its tensors are only in the store then.
+            let bytes = crate::weight_loader::deepseek_v41::mtp::mtp_store_bytes(store);
+            fwd.dspark = Some(crate::weight_loader::deepseek_v41::mtp::DsparkWeights::load(store, &dims, config.vocab_size)?);
+            fwd.enable_dspark_seed(gpu)?;
+            tracing::info!("DeepSeek-V4.1 DSpark drafter loaded: {:.2} GB of mtp.* in the store (+ seed buffer)", bytes as f64 / 1e9);
+        }
         fwd.own_allocations(shared.clone());
         fwd.vision = load_vision(store, model_dir, dims.hidden, &shared)?;
         let lanes = build_lanes(store, config, gpu, kernels, &shared, &fwd, model_dir, max_seq, max_chunk)?;

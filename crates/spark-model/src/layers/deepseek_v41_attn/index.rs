@@ -54,6 +54,7 @@ pub struct IndexKernels {
     pub wts: KernelHandle,
     pub iota: KernelHandle,
     pub gemm_f32: KernelHandle,
+    pub gemm_bf16_smalln: KernelHandle,
 }
 
 impl IndexKernels {
@@ -75,6 +76,7 @@ impl IndexKernels {
             wts: k("dsv41_index_wts")?,
             iota: k("dsv41_iota_i32")?,
             gemm_f32: k("dsv41_gemm_f32_nt")?,
+            gemm_bf16_smalln: k("dsv41_gemm_bf16_smalln")?,
         })
     }
 }
@@ -208,6 +210,19 @@ impl IndexOps<'_> {
             .grid([n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1])
             .block([256, 1, 1])
             .arg_ptr(a).arg_ptr(b).arg_ptr(c).arg_i32(m as i32).arg_i32(n as i32).arg_i32(k as i32)
+            .launch(self.stream)
+    }
+
+    /// `out[m, n] = bf16(x[m, :] . w[n, :])`, fp32 accumulate, one block per row (small N).
+    pub fn gemm_bf16_smalln(&self, x: DevicePtr, w: DevicePtr, out: DevicePtr, m: usize, n: usize, k: usize) -> Result<()> {
+        ensure!(k % 64 == 0, "gemm_bf16_smalln: K {k} not a multiple of 64");
+        if m == 0 {
+            return Ok(());
+        }
+        KernelLaunch::new(self.gpu, self.k.gemm_bf16_smalln)
+            .grid([m as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x).arg_ptr(w).arg_ptr(out).arg_i32(n as i32).arg_i32(k as i32)
             .launch(self.stream)
     }
 

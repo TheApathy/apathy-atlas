@@ -11,6 +11,8 @@ use crate::api::inference_types::RepetitionDetectionParams;
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct CompletionRequest {
+    /// Optional, as on the DeepSeek-V4.1 Python server (which ignores it).
+    #[serde(default)]
     pub model: String,
     /// Legacy completions has no constrained-decoding implementation. Keep
     /// the raw field so the handler can reject it instead of silently

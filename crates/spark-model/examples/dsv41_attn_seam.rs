@@ -180,7 +180,7 @@ fn main() -> Result<()> {
     println!("run {run}; weights: {} tensors, {:.2} GB", store.len(), store.total_bytes() as f64 / 1e9);
     let spec = RopeSpec { dim: 64, original_seq_len: 65536, base: 160000.0, factor: 16.0, beta_fast: 32.0, beta_slow: 1.0 };
     let freqs_c = spec.upload(gpu.as_ref(), MAX_SEQ + 8)?;
-    let core = Dsv41SparseCore::load(gpu.as_ref(), &store, &config, MAX_SEQ, MAX_CHUNK, freqs_c)?;
+    let core = Dsv41SparseCore::load(&(gpu.clone() as spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu), &store, &config, MAX_SEQ, MAX_CHUNK, freqs_c)?;
 
     let ins: Vec<LayerIn> = LAYERS
         .iter()
