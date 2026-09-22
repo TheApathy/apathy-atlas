@@ -165,6 +165,9 @@ struct Request {
 
 /// The V4.1 tower and the current request's encoded spans.
 pub struct V41ImageSplice {
+    /// Frees the current request's span buffers on drop (the encoder frees
+    /// its own arena). None = never frees (non-owning callers).
+    owner: Option<super::device_allocs::SharedGpu>,
     encoder: DeepSeekVisionEncoder,
     hidden: usize,
     /// START, NEWLINE, END rows (bf16, device).
@@ -175,9 +178,14 @@ pub struct V41ImageSplice {
 }
 
 impl V41ImageSplice {
-    pub fn new(encoder: DeepSeekVisionEncoder, hidden: usize) -> Self {
+    pub fn new(
+        encoder: DeepSeekVisionEncoder,
+        hidden: usize,
+        owner: Option<super::device_allocs::SharedGpu>,
+    ) -> Self {
         let sp = encoder.image_special_embeddings();
         Self {
+            owner,
             encoder,
             hidden,
             start_row: sp[0],
@@ -277,6 +285,29 @@ impl V41ImageSplice {
             }
         }
         Ok(())
+    }
+}
+
+/// Free span buffers through `owner`; with no owner, leave them (non-owning).
+fn free_spans(owner: Option<&super::device_allocs::SharedGpu>, spans: &mut Vec<Span>) {
+    let Some(gpu) = owner else { return };
+    if let Err(e) = gpu.bind_to_thread() {
+        tracing::warn!("V41ImageSplice: bind_to_thread failed before freeing spans: {e}");
+    }
+    for s in spans.drain(..) {
+        if let Err(e) = gpu.free(s.rows) {
+            tracing::warn!("V41ImageSplice: freeing span rows failed: {e}");
+        }
+    }
+}
+
+/// Dropping the splice frees the last request's span buffers; the encoder
+/// (dropped with it) frees its own arena through its `DeviceAllocs`.
+impl Drop for V41ImageSplice {
+    fn drop(&mut self) {
+        if let Ok(mut req) = self.req.lock() {
+            free_spans(self.owner.as_ref(), &mut req.spans);
+        }
     }
 }
 
@@ -399,6 +430,34 @@ mod tests {
         );
         // and image tokens with no encoded image are refused
         assert!(chunk_plan(&[], &mut Vec::new(), &[5, S], 0).is_err());
+    }
+
+    /// The drop path frees every span buffer through an owned backend.
+    /// NEGATIVE CONTROL: with no owner nothing is freed (the old leak).
+    #[test]
+    fn span_buffers_are_freed_with_an_owner_and_leak_without() {
+        use spark_runtime::gpu::mock::MockGpuBackend;
+        let mock = std::sync::Arc::new(MockGpuBackend::new());
+        let shared: super::super::device_allocs::SharedGpu = mock.clone();
+        let mk = |n: usize| -> Vec<Span> {
+            (0..n)
+                .map(|_| Span {
+                    rows: shared.alloc(4096).unwrap(),
+                    len: 4,
+                })
+                .collect()
+        };
+        let mut spans = mk(3);
+        assert_eq!(mock.alloc_count(), 3);
+        free_spans(Some(&shared), &mut spans);
+        assert_eq!(mock.alloc_count(), 0, "owned drop must free all span rows");
+        let mut leaky = mk(2);
+        free_spans(None, &mut leaky);
+        assert_eq!(
+            mock.alloc_count(),
+            2,
+            "without an owner the spans are left (and leak)"
+        );
     }
 
     /// NEGATIVE CONTROLS: a sentinel count that does not match the images must

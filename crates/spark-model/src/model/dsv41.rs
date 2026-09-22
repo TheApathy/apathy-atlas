@@ -130,7 +130,7 @@ impl Dsv41Model {
         let threads = std::env::var("ATLAS_DSV41_ENGRAM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
         let mut fwd = V41Forward::load(store, &ops, dims, config.vocab_size, config.num_hidden_layers, max_chunk, max_seq, model_dir, threads)?;
         fwd.own_allocations(shared.clone());
-        fwd.vision = load_vision(store, model_dir, dims.hidden, gpu)?;
+        fwd.vision = load_vision(store, model_dir, dims.hidden, &shared)?;
         let lanes = build_lanes(store, config, gpu, kernels, &shared, &fwd, model_dir, max_seq, max_chunk)?;
         let mode = match std::env::var("ATLAS_DSV41_PREFILL").ok().as_deref() {
             None | Some("replay") => PrefillMode::Replay,
@@ -217,8 +217,9 @@ fn load_vision(
     store: &WeightStore,
     model_dir: &std::path::Path,
     hidden: usize,
-    gpu: &dyn GpuBackend,
+    shared: &SharedGpu,
 ) -> Result<Option<crate::weight_loader::deepseek_v41::image_splice::V41ImageSplice>> {
+    let gpu = shared.as_ref();
     if store.get("vision.patch_embed.proj.weight").is_err() {
         return Ok(None);
     }
@@ -237,6 +238,7 @@ fn load_vision(
         u("max_image_tokens")?,
         hidden,
         gpu,
+        Some(shared.clone()),
     )?;
     // Memory: the tower's weights (~0.97 GB) are already in the store; this is the
     // encoder scratch arena on top (sized for max_image_tokens, allocated here once).
@@ -245,7 +247,7 @@ fn load_vision(
          + ~0.97 GB of vision/aligner weights in the store",
         enc.scratch_bytes()? as f64 / 1e9
     );
-    Ok(Some(crate::weight_loader::deepseek_v41::image_splice::V41ImageSplice::new(enc, hidden)))
+    Ok(Some(crate::weight_loader::deepseek_v41::image_splice::V41ImageSplice::new(enc, hidden, Some(shared.clone()))))
 }
 
 impl Drop for Dsv41Model {
