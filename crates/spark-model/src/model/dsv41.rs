@@ -429,12 +429,15 @@ impl Model for Dsv41Model {
         bail!("dsv41: speculative verify not supported yet (MTP is unported)")
     }
 
+    // Refused, not no-ops: a generic speculation caller must never silently skip the restore of
+    // the rings, compressor pending state and engram hash. DSpark rolls back through
+    // `V41Forward::rollback` directly.
     fn checkpoint_ssm_states(&self, _seq: &mut SequenceState) -> Result<()> {
-        Ok(())
+        anyhow::bail!("dsv41: speculation state rollback goes through V41Forward::rollback (DSpark), not the generic SSM hooks")
     }
 
     fn rollback_ssm_states(&self, _seq: &mut SequenceState, _n: usize) -> Result<()> {
-        Ok(())
+        anyhow::bail!("dsv41: speculation state rollback goes through V41Forward::rollback (DSpark), not the generic SSM hooks")
     }
 
     fn generate_speculative(
