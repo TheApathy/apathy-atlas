@@ -177,6 +177,24 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> Response {
         // n>1 we only charge once (same prompt reused).
         total_cached_prompt_tokens = total_cached_prompt_tokens.max(response.cached_prompt_tokens);
 
+        if state.dsv41 {
+            // deepseek_v41: app.py's output routing and DSML parsing (api/dsv41.rs).
+            let (message, finish_reason) = super::dsv41::blocking_choice(
+                &state.tokenizer,
+                &response.output_tokens,
+                response.finish_reason.as_str(),
+                enable_thinking,
+                &req.stop,
+            );
+            all_choices.push(crate::openai::ChatChoice {
+                index: choice_idx,
+                message,
+                finish_reason,
+                logprobs: build_logprobs(&state, &response),
+            });
+            continue;
+        }
+
         let (reasoning_content_i, output_text_i) =
             decode_response_text(&state, &response, enable_thinking);
         let output_text_i = strip_stop_sequences(output_text_i, &req.stop);

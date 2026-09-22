@@ -53,7 +53,7 @@ pub async fn chat_completions(
     // handler path and the `--dump` raw-capture path without
     // cloning the struct or cascading `Serialize` through every
     // request type.
-    let req: ChatCompletionRequest = match serde_json::from_slice(&body) {
+    let mut req: ChatCompletionRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
             return openai_error_response(
@@ -75,7 +75,24 @@ pub async fn chat_completions(
         }
     });
 
+    if state.dsv41 {
+        // deepseek_v41 renders from the wire body (api/dsv41.rs); the body
+        // already parsed as a ChatCompletionRequest, so it is valid JSON.
+        req.raw_body = serde_json::from_slice(&body).ok().map(Arc::new);
+    }
+
     chat_completions_inner(state, req_ctx, req, dump_seq).await
+}
+
+/// The prompt-affecting phases' result: what the sampling and dispatch
+/// phases need, whichever renderer produced it.
+pub(crate) struct PreparedChat {
+    pub(crate) tools_active: bool,
+    pub(crate) cwd_hint: Option<String>,
+    pub(crate) image_pixels: Vec<(Vec<f32>, usize, usize)>,
+    pub(crate) prompt_tokens: Vec<u32>,
+    pub(crate) enable_thinking: bool,
+    pub(crate) thinking_budget: Option<u32>,
 }
 
 /// Internal entry for the parsed-request path. Called by
@@ -108,11 +125,25 @@ pub(crate) async fn chat_completions_inner(
     });
     if let Err(error) = image_admission::validate(
         image_count,
-        state.vision_config.is_some(),
+        state.vision_config.is_some() || state.dsv41_vision.is_some(),
         state.max_batch_size,
         state.yarn_context,
     ) {
         return openai_error_response(StatusCode::BAD_REQUEST, error.into());
+    }
+    if state.dsv41 {
+        // deepseek_v41: the production Python server's prompt (api/dsv41.rs).
+        // None of the generic request rewriting below (failure guards, tool
+        // system prompt, observation masking, loop detection) exists there.
+        let prepared = match super::dsv41::prepare(&state, &req) {
+            Ok((p, max_tokens_cap)) => {
+                // app.py clamps max_tokens to the context left over.
+                req.max_tokens = req.max_tokens.min(max_tokens_cap);
+                p
+            }
+            Err(resp) => return resp,
+        };
+        return sample_and_dispatch(state, req_ctx, req, dump_seq, active, prepared, false, 0).await;
     }
     let f23_metrics = super::chat_phases::apply_failure_guards(&mut req);
     let _ = f23_metrics; // kept available for downstream consumers
@@ -231,6 +262,48 @@ pub(crate) async fn chat_completions_inner(
         Err(resp) => return resp,
     };
 
+    let prepared = PreparedChat {
+        tools_active,
+        cwd_hint,
+        image_pixels,
+        prompt_tokens,
+        enable_thinking,
+        thinking_budget,
+    };
+    sample_and_dispatch(
+        state,
+        req_ctx,
+        req,
+        dump_seq,
+        active,
+        prepared,
+        suppress_tool_call,
+        tool_call_repeat_count,
+    )
+    .await
+}
+
+/// Phases 6-7, shared by every renderer: context check, sampling preset /
+/// stop / grammar / timeout, then the streaming or blocking dispatch.
+#[allow(clippy::too_many_arguments)]
+async fn sample_and_dispatch(
+    state: Arc<AppState>,
+    req_ctx: Option<axum::extract::Extension<crate::rate_limiter::RequestContext>>,
+    req: ChatCompletionRequest,
+    dump_seq: Option<u64>,
+    active: crate::metrics::ActiveRequestGuard,
+    prepared: PreparedChat,
+    suppress_tool_call: bool,
+    tool_call_repeat_count: usize,
+) -> Response {
+    let PreparedChat {
+        tools_active,
+        cwd_hint,
+        image_pixels,
+        prompt_tokens,
+        enable_thinking,
+        thinking_budget,
+    } = prepared;
     let session_hash = crate::session_manager::compute_session_hash(&prompt_tokens);
     let tools_count = req.tools.as_ref().map_or(0, |t| t.len());
     tracing::info!(

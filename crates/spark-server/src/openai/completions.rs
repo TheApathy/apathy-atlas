@@ -10,6 +10,8 @@ use super::*;
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct CompletionRequest {
+    /// Optional, as on the DeepSeek-V4.1 Python server (which ignores it).
+    #[serde(default)]
     pub model: String,
     #[serde(default, deserialize_with = "deserialize_prompt")]
     pub prompt: String,

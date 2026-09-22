@@ -188,6 +188,13 @@ pub async fn tokenize(
         }
     };
 
+    if state.dsv41 && req.messages.is_some() {
+        // The generic chat template path would render ChatML for this model.
+        return openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "deepseek_v41: render chat messages with POST /v1/debug/prompt".into(),
+        );
+    }
     if req.messages.as_ref().is_some_and(|messages| {
         messages
             .iter()

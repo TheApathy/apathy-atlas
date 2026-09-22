@@ -168,6 +168,27 @@ fn validate_completion_input(req: &CompletionRequest) -> Result<(), Response> {
     Ok(())
 }
 
+/// Prepend `bos` unless the ids already start with it (app.py `add_bos`).
+fn with_bos(ids: Vec<u32>, bos: Option<u32>) -> Vec<u32> {
+    match bos {
+        Some(bos) if ids.first() != Some(&bos) => std::iter::once(bos).chain(ids).collect(),
+        _ => ids,
+    }
+}
+
+#[cfg(test)]
+mod dsv41_bos_tests {
+    use super::with_bos;
+
+    #[test]
+    fn bos_is_prepended_once() {
+        assert_eq!(with_bos(vec![5, 6], Some(0)), vec![0, 5, 6]);
+        assert_eq!(with_bos(vec![0, 5], Some(0)), vec![0, 5]);
+        assert_eq!(with_bos(vec![5], None), vec![5]);
+        assert_eq!(with_bos(Vec::new(), Some(0)), vec![0]);
+    }
+}
+
 pub async fn completions(
     CurrentModel(state): CurrentModel,
     req: Result<Json<CompletionRequest>, JsonRejection>,
@@ -201,6 +222,18 @@ pub async fn completions(
             );
         }
         ids.clone()
+    } else if state.dsv41 {
+        // deepseek_v41: the Python server tokenizes the text as given (no
+        // think prefix) and prepends BOS unless the prompt already starts with it.
+        match state.tokenizer.encode(&req.prompt) {
+            Ok(t) => with_bos(t, state.tokenizer.inner().token_to_id(crate::dsv41::encoding::BOS)),
+            Err(e) => {
+                return openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Tokenization error: {e}"),
+                );
+            }
+        }
     } else {
         let raw_prompt = if state.tokenizer.supports_thinking() && !req.prompt.contains("</think>")
         {

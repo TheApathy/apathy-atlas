@@ -84,11 +84,23 @@ pub(super) fn build_sampling(
     };
     let temperature =
         temp_override.unwrap_or_else(|| req_temperature.unwrap_or(preset.temperature));
-    let top_k = req_top_k.unwrap_or(preset.top_k);
+    // deepseek_v41: the Python server samples with temperature, top_p and the
+    // presence/frequency penalties only; it ignores top_k, top_n_sigma, min_p
+    // and repetition_penalty, so they are neutral here whatever the client sends.
+    let dsv41 = state.dsv41;
+    let top_k = if dsv41 { 0 } else { req_top_k.unwrap_or(preset.top_k) };
     let top_p = req_top_p.unwrap_or(preset.top_p);
-    let top_n_sigma = req.top_n_sigma.unwrap_or(state.default_top_n_sigma);
-    let min_p = req.min_p.unwrap_or(state.default_min_p);
-    let repetition_penalty = req.repetition_penalty.unwrap_or(preset.repetition_penalty);
+    let top_n_sigma = if dsv41 {
+        0.0
+    } else {
+        req.top_n_sigma.unwrap_or(state.default_top_n_sigma)
+    };
+    let min_p = if dsv41 { 0.0 } else { req.min_p.unwrap_or(state.default_min_p) };
+    let repetition_penalty = if dsv41 {
+        1.0
+    } else {
+        req.repetition_penalty.unwrap_or(preset.repetition_penalty)
+    };
     let presence_penalty = req.presence_penalty.unwrap_or(preset.presence_penalty);
     let frequency_penalty = req.frequency_penalty.unwrap_or(preset.frequency_penalty);
     let dry_multiplier = preset.dry_multiplier;
@@ -136,8 +148,12 @@ pub(super) fn build_sampling(
     // Same effective ceiling consumed by thinking resolution. Keep the cap in
     // one helper so tool turns cannot budget reasoning against the raw client
     // max and only later shrink the actual generation allowance.
-    let max_tokens =
-        super::thinking::generation_max_tokens(req.max_tokens, tools_active, state.tool_max_tokens);
+    // deepseek_v41: the Python server has no tool-turn cap.
+    let max_tokens = if dsv41 {
+        req.max_tokens
+    } else {
+        super::thinking::generation_max_tokens(req.max_tokens, tools_active, state.tool_max_tokens)
+    };
     if tools_active && max_tokens < req.max_tokens {
         tracing::info!(
             "Tool max_tokens cap: {} → {} (tool_max_tokens={})",
@@ -234,7 +250,11 @@ pub(super) fn build_sampling(
     };
 
     // Timeout deadline.
-    let timeout_secs = req.timeout.unwrap_or(state.request_timeout as f32);
+    // deepseek_v41: the Python server has no server-side deadline; only an
+    // explicit request `timeout` sets one.
+    let timeout_secs = req
+        .timeout
+        .unwrap_or(if dsv41 { 0.0 } else { state.request_timeout as f32 });
     let timeout_at = if timeout_secs > 0.0 {
         Some(std::time::Instant::now() + std::time::Duration::from_secs_f32(timeout_secs))
     } else {

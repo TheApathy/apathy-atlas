@@ -49,6 +49,7 @@ mod auth;
 mod citation;
 mod cli;
 mod conversation_store;
+pub mod dsv41;
 mod error_hints;
 pub mod grammar;
 mod halluc_probe;

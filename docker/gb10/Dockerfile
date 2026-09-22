@@ -64,7 +64,11 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends --allow-change-held-packages \
       libnccl2 libibverbs1 librdmacm1 ibverbs-providers \
-      libnl-3-200 libnl-route-3-200 && \
+      libnl-3-200 libnl-route-3-200 \
+      # DeepSeek-V4.1 JPEG input: libjpeg-turbo decodes bit-identically to the
+      # Python engine's Pillow (crates/spark-server/src/dsv41/turbojpeg.rs,
+      # dlopen'd at runtime; without it JPEGs fall back to zune-jpeg).
+      libturbojpeg && \
     rm -rf /var/lib/apt/lists/* && \
     # Sanity-check the linked NCCL is ≥ 2.28 — fail-fast if a future repo
     # change downgrades the available version below the symmetric-memory floor.

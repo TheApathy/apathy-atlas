@@ -8,6 +8,10 @@ use super::*;
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct ChatCompletionRequest {
+    /// Optional: the DeepSeek-V4.1 Python server ignores `model` and accepts a
+    /// request without it; an absent model is the base model (responses echo
+    /// the served name either way).
+    #[serde(default)]
     pub model: String,
     pub messages: Vec<IncomingMessage>,
     #[serde(default = "default_max_tokens", alias = "max_completion_tokens")]
@@ -67,7 +71,9 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub thinking_token_budget: Option<u32>,
     /// OpenAI-style reasoning effort: `{"reasoning": {"effort": "low"}}`
-    #[serde(default)]
+    /// A non-object `reasoning` is ignored (as the DeepSeek-V4.1 Python server
+    /// does), not a parse error.
+    #[serde(default, deserialize_with = "reasoning_object_or_ignore")]
     pub reasoning: Option<ReasoningConfig>,
     /// vLLM-style chat template kwargs: `{"chat_template_kwargs": {"enable_thinking": true}}`
     #[serde(default)]
@@ -180,8 +186,45 @@ pub struct ChatCompletionRequest {
     /// 2026 SDKs send this as a top-level field on gpt-5.x chat models;
     /// Atlas maps it to the existing `reasoning.effort` knob when the
     /// model's reasoning parser supports it.
-    #[serde(default)]
+    ///
+    /// DeepSeek-V4.1's production server also takes an integer 1..100 here, so
+    /// the typed parse must not reject it before the model's own resolver sees
+    /// the raw body. Integers are carried here as their decimal string.
+    #[serde(default, deserialize_with = "effort_string_or_int")]
     pub reasoning_effort: Option<String>,
+    /// The request body as received, kept only when the served model renders
+    /// from the wire format itself (deepseek_v41, `api/dsv41.rs`). Never part
+    /// of the wire schema.
+    #[serde(skip)]
+    pub raw_body: Option<std::sync::Arc<serde_json::Value>>,
+}
+
+fn reasoning_object_or_ignore<'de, D>(d: D) -> Result<Option<ReasoningConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    match Option::<serde_json::Value>::deserialize(d)? {
+        Some(v @ serde_json::Value::Object(_)) => serde_json::from_value(v).map(Some).map_err(D::Error::custom),
+        _ => Ok(None),
+    }
+}
+
+/// `reasoning_effort` / `reasoning.effort`: a string, or an integer kept as its
+/// decimal string. Anything else (bool, float, object) is a 400, as before.
+fn effort_string_or_int<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => Ok(Some(n.to_string())),
+        Some(other) => Err(D::Error::custom(format!(
+            "reasoning effort must be a string or an integer, got {other}"
+        ))),
+    }
 }
 
 /// Stream options (OpenAI-compatible).
@@ -244,7 +287,8 @@ pub struct ThinkingConfig {
 /// OpenAI-style reasoning configuration.
 #[derive(Debug, Deserialize)]
 pub struct ReasoningConfig {
-    /// Qualitative effort level.
+    /// Qualitative effort level (or a DeepSeek-V4.1 integer, as a string).
+    #[serde(default, deserialize_with = "effort_string_or_int")]
     pub effort: Option<String>,
 }
 
