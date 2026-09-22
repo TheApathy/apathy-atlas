@@ -329,3 +329,27 @@ groups of the production engine. Selection sensitivity to that residue, fp64 dot
 GEMMs, expect top-k to match the engine on ~99.5% of rows, NOT 100%: the kernel is exact on
 the engine's inputs, and the remaining flips are upstream ulps meeting near-ties. A per-layer
 bisect must compare selection as set overlap from here on, not identity.
+
+## 8f. The seam implementation (layers/deepseek_v41_attn/seam.rs) vs runF_faithful
+
+Kernels now live in the target: `cb3/dsv41_sparse_attn.cu` and `cb3/dsv41_sparse_index.cu`,
+modules = file stems. The (gb10, deepseek-v4.1, cb3) build compiles 179 kernels (177 without
+them), and every entry is present in the example binary's PTX. Both kernel gates were re-run
+from the moved files under the target's --fmad=false with identical results.
+
+`examples/dsv41_attn_seam.rs` is teacher-forced at attn_x/qr; everything the lane owns is
+computed. Log: `seam_gate.log`. PASS **with no split-K** (see below):
+    compress   ckv/ik bit-exact  L2 .9999/.9992  L8 .9998/.9983  L14 .9998/.9986  L20 1.0000/.9999
+    index      topk rows differ  0/512 on every chunk and layer, except L20 chunk 1: 1/512 (overlap .998)
+    candidates 0/524288 differ;  replay tail == L20's last 128 rows, incl. across 3 chunks
+    attention  on the lane's OWN ckv + topk: L2 .9977, L20 .9993 bf16-exact vs the fp32 reference
+    chunk invariance: [0,511,1000,1023,1024] vs 2x512 -> 0/1024 rows differ, all 4 layers
+    CONTROLS  cleared ckv -> .0013/.0021;  dropped pending -> REFUSED (row count no longer adds up)
+
+Two numerics facts this measured, both now contracts:
+1. **MM_TILE = 16.** The reference runs every activation GEMM on 16-row tiles. With M = chunk
+   length, re-chunking the same prompt changed 19/128 replay-tail rows at L20.
+2. **No split-K.** At M=16, cuBLASLt's top-1 heuristic splits K. On L20's bf16 compressor that
+   gave ckv 70.7% bit-exact and top-k 296/512 rows wrong. With an fp32 split-K reduction (mask 2)
+   it was still 97.75% and 53/512. With REDUCTION_SCHEME_MASK = 0 it is 100.00% and 1/512. The fix
+   belongs in `cublaslt/typed.rs` (owned by dsv41-integrate), not here.
