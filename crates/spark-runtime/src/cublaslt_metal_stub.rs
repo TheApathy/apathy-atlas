@@ -91,3 +91,26 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
 ) -> Result<()> {
     unreachable!("cublaslt::fp8_gemm_act_weight_t_blkscaled is cuda-only (not built for metal)")
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmDtype {
+    Bf16,
+    F32,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_act_weight_t_typed(
+    _act: u64,
+    _lda: u32,
+    _weight: u64,
+    _out: u64,
+    _ldc: u32,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _in_dtype: GemmDtype,
+    _out_dtype: GemmDtype,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::gemm_act_weight_t_typed is cuda-only (not built for metal)")
+}
