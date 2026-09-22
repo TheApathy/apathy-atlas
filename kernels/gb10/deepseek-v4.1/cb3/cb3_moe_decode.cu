@@ -69,6 +69,52 @@ __device__ __forceinline__ void dec_load8(const __nv_bfloat16* p, float* f) {
     }
 }
 
+// The row's 8-entry codebook as bf16 (fp4 value, UNscaled: exact), split into a low-byte and a
+// high-byte table so `prmt` can select four weights at once (engine2's cb3_moe_gemm.cu trick,
+// ece90b487). Selected values are exactly kDecFp4[code] -- the same floats the previous
+// shared-memory lookup produced -- so every product and sum below is unchanged.
+struct DecCb {
+    uint32_t lx, ly, hx, hy;
+};
+
+__device__ __forceinline__ uint32_t dec_prmt(uint32_t a, uint32_t b, uint32_t sel) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+    return r;
+}
+
+__device__ __forceinline__ DecCb dec_cb_tables(const uint8_t* __restrict__ cb_row) {
+    const uint2 c = __ldg(reinterpret_cast<const uint2*>(cb_row));
+    uint32_t e[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t w = i < 4 ? c.x : c.y;
+        e[i] = __float_as_uint(kDecFp4[(w >> (8 * (i % 4))) & 0xfu]) >> 16;  // fp4 is exact in bf16
+    }
+    DecCb t;
+    t.lx = (e[0] & 0xffu) | ((e[1] & 0xffu) << 8) | ((e[2] & 0xffu) << 16) | ((e[3] & 0xffu) << 24);
+    t.ly = (e[4] & 0xffu) | ((e[5] & 0xffu) << 8) | ((e[6] & 0xffu) << 16) | ((e[7] & 0xffu) << 24);
+    t.hx = (e[0] >> 8) | ((e[1] >> 8) << 8) | ((e[2] >> 8) << 16) | ((e[3] >> 8) << 24);
+    t.hy = (e[4] >> 8) | ((e[5] >> 8) << 8) | ((e[6] >> 8) << 16) | ((e[7] >> 8) << 24);
+    return t;
+}
+
+// Four weights (bytes j = 0..3 of lo/hi) for one (g parity, r): their fp32 values in w[0..3].
+// lo bits at shift SH = 4*godd + 2r, hi bit at HB = nib + 2*godd + r.
+__device__ __forceinline__ void dec_pick4(uint32_t lo, uint32_t hi, int sh, int hb, const DecCb& t, float* w) {
+    const uint32_t a = (lo >> sh) & 0x03030303u;
+    const uint32_t b = ((hi >> hb) & 0x01010101u) << 2;
+    const uint32_t ie = a | b;                 // one index 0..7 per byte
+    const uint32_t u = ie | (ie >> 4);
+    const uint32_t sel = (u & 0xffu) | ((u >> 8) & 0xff00u);
+    const uint32_t lb = dec_prmt(t.lx, t.ly, sel), hb4 = dec_prmt(t.hx, t.hy, sel);
+    const uint32_t p01 = dec_prmt(lb, hb4, 0x5140), p23 = dec_prmt(lb, hb4, 0x7362);
+    w[0] = __uint_as_float(p01 << 16);
+    w[1] = __uint_as_float(p01 & 0xffff0000u);
+    w[2] = __uint_as_float(p23 << 16);
+    w[3] = __uint_as_float(p23 & 0xffff0000u);
+}
+
 // One lane's 16 weights of one 512-wide K block (see CB3_FORMAT.md):
 //   lane L reads lo u32 at block*128 + 4L  -> lo bytes (gg = L/4, lane0 = 4*(L%4) .. +3)
 //   hi u32 at block*64 + (L/8)*16 + 4*(L%4), nibble gg%2
@@ -77,22 +123,20 @@ __device__ __forceinline__ void dec_load8(const __nv_bfloat16* p, float* f) {
 // (even g) and xe + 32 (odd g). Adds sum(w*x) for each row into acc[r].
 template <int R>
 __device__ __forceinline__ void dec_cb3_chunk(uint32_t lo, uint32_t hi, uint32_t sc16, int gg,
-                                              const float* __restrict__ cbv,
+                                              const DecCb& cbt,
                                               const __nv_bfloat16* const* xr, int xe, int nr,
                                               float* acc) {
-    const uint32_t nib = (uint32_t)(gg & 1) * 4u;
-    float we[8], wo[8];
+    const int nib = (gg & 1) * 4;
+    // we/wo[2j + r] = weight of byte j, sub-position r, even/odd scale group (same order as before).
+    float we[8], wo[8], t4[4];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const uint32_t lb = (lo >> (8 * j)) & 0xffu;
-        const uint32_t hb = (hi >> (8 * j + nib)) & 0xfu;
+    for (int r = 0; r < 2; ++r) {
+        dec_pick4(lo, hi, 2 * r, nib + r, cbt, t4);
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            const uint32_t ie = ((lb >> (2 * r)) & 3u) | (((hb >> r) & 1u) << 2);
-            const uint32_t io = ((lb >> (4 + 2 * r)) & 3u) | (((hb >> (2 + r)) & 1u) << 2);
-            we[2 * j + r] = cbv[ie];
-            wo[2 * j + r] = cbv[io];
-        }
+        for (int j = 0; j < 4; ++j) we[2 * j + r] = t4[j];
+        dec_pick4(lo, hi, 4 + 2 * r, nib + 2 + r, cbt, t4);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) wo[2 * j + r] = t4[j];
     }
     const float se = dec_pow2(sc16 & 0xffu);
     const float so = dec_pow2((sc16 >> 8) & 0xffu);
@@ -118,7 +162,7 @@ template <int R, int NB, bool TAIL>
 __device__ __forceinline__ void dec_cb3_row(const uint8_t* __restrict__ lo_row,
                                             const uint8_t* __restrict__ hi_row,
                                             const uint8_t* __restrict__ sc_row,
-                                            const float* __restrict__ cbv,
+                                            const DecCb& cbt,
                                             const __nv_bfloat16* const* xr, int nr, float* acc) {
     const int L = threadIdx.x & 31;
     const int gg = L >> 2;
@@ -135,7 +179,7 @@ __device__ __forceinline__ void dec_cb3_row(const uint8_t* __restrict__ lo_row,
 #pragma unroll
     for (int b = 0; b < NT; ++b) {
         if (b < NB || L < 16)
-            dec_cb3_chunk<R>(lo[b], hi[b], sc[b], gg, cbv, xr, b * 512 + 64 * gg + 8 * (L & 3), nr, acc);
+            dec_cb3_chunk<R>(lo[b], hi[b], sc[b], gg, cbt, xr, b * 512 + 64 * gg + 8 * (L & 3), nr, acc);
     }
 }
 
@@ -254,7 +298,6 @@ __device__ __forceinline__ void dec_gateup(
     const __nv_bfloat16* __restrict__ y, const int* __restrict__ groups,
     const float* __restrict__ row_w, __nv_bfloat16* __restrict__ h, float limit) {
     constexpr int K = 5120, N = 2304;
-    __shared__ float s_cb[DEC_WARPS][2][8];
     const int g = blockIdx.y;
     if (g >= groups[0]) return;
     const int warp = threadIdx.x >> 5, L = threadIdx.x & 31;
@@ -264,9 +307,8 @@ __device__ __forceinline__ void dec_gateup(
     const unsigned long long slot = (unsigned long long)G[0];
     const int nr = min(G[1], R);
     const unsigned long long rw = (unsigned long long)n;
-    if (L < 8) s_cb[warp][0][L] = kDecFp4[__ldg(w1cb + slot * cb_stride + rw * 8 + L) & 0xf];
-    else if (L < 16) s_cb[warp][1][L - 8] = kDecFp4[__ldg(w3cb + slot * cb_stride + rw * 8 + (L - 8)) & 0xf];
-    __syncwarp();
+    const DecCb cb1 = dec_cb_tables(w1cb + slot * cb_stride + rw * 8);
+    const DecCb cb3 = dec_cb_tables(w3cb + slot * cb_stride + rw * 8);
     const __nv_bfloat16* xr[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) xr[r] = y + (size_t)(G[2 + (r < nr ? r : 0)] / DEC_TOPK) * K;
@@ -274,9 +316,9 @@ __device__ __forceinline__ void dec_gateup(
 #pragma unroll
     for (int r = 0; r < R; ++r) ag[r] = au[r] = 0.0f;
     dec_cb3_row<R, 10, false>(w1lo + slot * lo_stride + rw * (K / 4), w1hi + slot * hi_stride + rw * (K / 8),
-                              s1 + slot * sc_stride + rw * (K / 32), s_cb[warp][0], xr, nr, ag);
+                              s1 + slot * sc_stride + rw * (K / 32), cb1, xr, nr, ag);
     dec_cb3_row<R, 10, false>(w3lo + slot * lo_stride + rw * (K / 4), w3hi + slot * hi_stride + rw * (K / 8),
-                              s3 + slot * sc_stride + rw * (K / 32), s_cb[warp][1], xr, nr, au);
+                              s3 + slot * sc_stride + rw * (K / 32), cb3, xr, nr, au);
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         if (r >= nr) break;
@@ -315,7 +357,6 @@ __device__ __forceinline__ void dec_down(
     unsigned long long cb_stride, unsigned long long sc_stride,
     const __nv_bfloat16* __restrict__ h, const int* __restrict__ groups, float* __restrict__ down) {
     constexpr int K = 2304, N = 5120;
-    __shared__ float s_cb[DEC_WARPS][8];
     const int g = blockIdx.y;
     if (g >= groups[0]) return;
     const int warp = threadIdx.x >> 5, L = threadIdx.x & 31;
@@ -325,8 +366,7 @@ __device__ __forceinline__ void dec_down(
     const unsigned long long slot = (unsigned long long)G[0];
     const int nr = min(G[1], R);
     const unsigned long long rw = (unsigned long long)n;
-    if (L < 8) s_cb[warp][L] = kDecFp4[__ldg(cb + slot * cb_stride + rw * 8 + L) & 0xf];
-    __syncwarp();
+    const DecCb cbt = dec_cb_tables(cb + slot * cb_stride + rw * 8);
     const __nv_bfloat16* xr[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) xr[r] = h + (size_t)G[2 + (r < nr ? r : 0)] * K;
@@ -334,7 +374,7 @@ __device__ __forceinline__ void dec_down(
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
     dec_cb3_row<R, 4, true>(lo + slot * lo_stride + rw * (K / 4), hi + slot * hi_stride + rw * (K / 8),
-                            s2 + slot * sc_stride + rw * (K / 32), s_cb[warp], xr, nr, acc);
+                            s2 + slot * sc_stride + rw * (K / 32), cbt, xr, nr, acc);
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         if (r >= nr) break;
