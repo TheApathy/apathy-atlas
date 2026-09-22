@@ -717,7 +717,12 @@ impl V41Forward {
         let dead: Vec<u8> = engram_dead_heads(ids).into_iter().map(u8::from).collect();
         gpu.copy_h2d_async(&dead, self.scratch.engram_dead, stream)?;
         gpu.copy_h2d_async(bytemuck_u32(ids), self.ids_dev, stream)?;
-        gpu.memset_u32_async(g.dstart, start as u32, 1, stream)?;
+        // NEGATIVE CONTROL ONLY: ATLAS_DSV41_CONTROL_FREEZE_GRAPH_START=1 never advances the
+        // device start after the first pass, as a graph that baked in its position would.
+        let freeze = std::env::var("ATLAS_DSV41_CONTROL_FREEZE_GRAPH_START").as_deref() == Ok("1");
+        if !(freeze && !g.graphs.lock().expect("graph cache poisoned").is_empty()) {
+            gpu.memset_u32_async(g.dstart, start as u32, 1, stream)?;
+        }
         super::ops::set_decode_pass(true);
         moe.begin_pass(ids)?;
         // ---- the graph: capture once per (kind, t, sequence), then replay
