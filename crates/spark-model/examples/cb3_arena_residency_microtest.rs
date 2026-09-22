@@ -35,6 +35,31 @@
 //!   --features cuda,gpu-examples -- --keep 6 --control
 //! ```
 //!
+//! ## The throughput number is NOT disk throughput — read this before quoting it
+//! `Cb3ExpertArena::load` reads the shards through `Mmap` and issues one `copy_h2d` per
+//! plane, SINGLE-THREADED. So the figure printed below is end-to-end (page-cache-or-NVMe
+//! read + H2D copy), not an NVMe measurement, and it is page-cache dependent: a second run
+//! over the same shards reads mostly from RAM.
+//!
+//! The engram lane measured this box's NVMe at **11.53 GB/s** (O_DIRECT, 4 MB blocks, 4
+//! threads; cross-checked against /proc/diskstats). That makes the ceiling a DISCRIMINATOR
+//! rather than just context: if this example reports more than 11.53 GB/s, the read cannot
+//! have come off the device and the page cache served it. The run says so explicitly rather
+//! than leaving a reader to quote a warm number as disk performance — which is exactly the
+//! misattribution that produced a bogus figure elsewhere in this project today.
+//!
+//! Their tuning does NOT transfer here either, in either direction: the expert pack is
+//! ~14.45 MB sequential records (bandwidth-bound, saturates ~4 threads, REGRESSES by 16),
+//! while engram is 264 B random reads (latency-bound, wants ~128). This loader is currently
+//! 1 thread and makes no O_DIRECT claim, so it has none of the alignment traps that come
+//! with sharding — and if it is ever threaded, 4 is the starting point, not 128.
+//!
+//! ## Host memory
+//! GB10 is unified: a GPU over-allocation takes the HOST down, not just this process, and
+//! cgroup MemoryMax does not contain GPU memory. At `--keep 124` the arena is 71.7 GB of
+//! device memory while the mmap'd shards also populate page cache, so the run samples
+//! MemAvailable throughout and reports the low-water mark.
+//!
 //! Take the GPU lock first: append to `/home/flocka/atlas/.gb10-queue`, then `flock` on
 //! `/home/flocka/atlas/.gb10.lock`.
 
@@ -49,6 +74,27 @@ use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
 
 const MODEL_DIR: &str = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K";
 const PACK_SUBDIR: &str = "k154-cb3";
+
+/// This box's NVMe ceiling, measured by the engram lane with O_DIRECT at 4 MB blocks and
+/// 4 threads, cross-checked against /proc/diskstats (15.93 GB reported vs 15.9 GB on the
+/// device counter). Used here as a DISCRIMINATOR: a reported rate above this cannot have
+/// come off the device.
+const NVME_CEILING_GB_S: f64 = 11.53;
+
+/// Host MemAvailable in bytes, or 0 if /proc/meminfo cannot be read.
+fn mem_available_bytes() -> u64 {
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
+    };
+    meminfo
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("MemAvailable:")?;
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            Some(kb * 1024)
+        })
+        .unwrap_or(0)
+}
 
 fn main() -> Result<()> {
     let mut keep = 6usize;
@@ -85,25 +131,73 @@ fn main() -> Result<()> {
 
     let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let free_before = gpu.free_memory()?;
+    let mem_available_before = mem_available_bytes();
+
+    // Sample host MemAvailable while the upload runs. GB10 is unified memory and an
+    // over-allocation takes the HOST down, so the low-water mark is the number that says
+    // whether --keep 124 is safe, and it cannot be recovered after the fact.
+    let low_water = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampler = {
+        let low_water = std::sync::Arc::clone(&low_water);
+        let sampling = std::sync::Arc::clone(&sampling);
+        std::thread::spawn(move || {
+            while sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = mem_available_bytes();
+                low_water.fetch_min(now, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+    };
 
     let started = std::time::Instant::now();
     let arena = Cb3ExpertArena::load(&pack_dir, &pack, &gpu)?;
     let upload_secs = started.elapsed().as_secs_f64();
+    sampling.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = sampler.join();
     let free_after = gpu.free_memory()?;
 
     // Device memory must ACTUALLY have moved. An arena that allocated nothing would sail
     // through a readback of its own empty expectations.
     let consumed = free_before.saturating_sub(free_after) as u64;
+    let throughput = arena.resident_bytes() as f64 / 1e9 / upload_secs.max(1e-9);
     println!(
-        "uploaded {:.2} GB in {:.1}s ({:.2} GB/s); device free {:.1} -> {:.1} GB \
-         (consumed {:.2} GB)",
+        "uploaded {:.2} GB in {:.1}s = {:.2} GB/s END-TO-END (mmap read + H2D, 1 thread); \
+         device free {:.1} -> {:.1} GB (consumed {:.2} GB)",
         arena.resident_bytes() as f64 / 1e9,
         upload_secs,
-        arena.resident_bytes() as f64 / 1e9 / upload_secs.max(1e-9),
+        throughput,
         free_before as f64 / 1e9,
         free_after as f64 / 1e9,
         consumed as f64 / 1e9,
     );
+    // Use the measured NVMe ceiling as a discriminator, not as decoration.
+    if throughput > NVME_CEILING_GB_S {
+        println!(
+            "  NOTE: {throughput:.2} GB/s EXCEEDS this box's measured NVMe ceiling of \
+             {NVME_CEILING_GB_S} GB/s (O_DIRECT, 4 MB blocks, 4 threads), so the shards were \
+             served from PAGE CACHE, not the device. This is a warm number. Do NOT quote it \
+             as disk or as cold-start performance."
+        );
+    } else {
+        println!(
+            "  {throughput:.2} GB/s is at or below the {NVME_CEILING_GB_S} GB/s NVMe ceiling, \
+             so this run may have touched the device. Still END-TO-END, not a disk \
+             measurement — it includes the H2D copy and is single-threaded."
+        );
+    }
+    let low = low_water.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "  host MemAvailable {:.1} GB before -> {:.1} GB low-water during upload",
+        mem_available_before as f64 / 1e9,
+        low as f64 / 1e9,
+    );
+    if low < 10_000_000_000 {
+        println!(
+            "  WARNING: host MemAvailable fell below 10 GB. On GB10 an over-allocation takes \
+             the HOST down, not just this process. Do not scale this run up without headroom."
+        );
+    }
     if consumed < arena.resident_bytes() / 2 {
         bail!(
             "device free memory fell by only {:.2} GB for a {:.2} GB arena — the allocation \
