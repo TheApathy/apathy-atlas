@@ -112,6 +112,8 @@ pub struct Dsv41Model {
     dspark: Option<Mutex<Dspark>>,
     /// Per-sequence DSpark counters (steps, accepted drafts), logged when the sequence is freed.
     spec_stats: Mutex<(usize, usize)>,
+    /// The input token and drafts of an uncommitted `spec_verify`.
+    spec_pending: Mutex<Option<(u32, Vec<u32>)>>,
 }
 
 // SAFETY-adjacent: every field is either immutable after construction, behind a Mutex, or a
@@ -189,6 +191,7 @@ impl Dsv41Model {
             tap,
             dspark,
             spec_stats: Mutex::new((0, 0)),
+            spec_pending: Mutex::new(None),
         })
     }
 
@@ -345,30 +348,44 @@ impl Model for Dsv41Model {
         self.dspark.is_some()
     }
 
-    fn decode_multi(&self, token: u32, seq: &mut SequenceState, stop_ids: &[u32], stream: u64) -> Result<(Vec<u32>, DevicePtr)> {
-        let ds = self.dspark.as_ref().context("dsv41 decode_multi: DSpark is not loaded")?;
-        let near_end = self.with_seq(seq.slot_idx, |s| Ok(s.len + T_VERIFY > self.fwd.max_seq))?;
-        if near_end {
-            // The verify pass writes T_VERIFY positions: finish the last few plainly.
-            return Ok((Vec::new(), self.decode(token, seq, stream)?));
-        }
+    fn spec_verify(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
+        let ds = self.dspark.as_ref().context("dsv41 spec_verify: DSpark is not loaded")?;
         let ops = self.ops();
         let l = &self.lanes;
-        let out = self.with_seq(seq.slot_idx, |s| {
+        let r = self.with_seq(seq.slot_idx, |s| {
+            ensure!(s.len == seq.seq_len, "dsv41 spec_verify: model holds {} positions, sequence {}", s.len, seq.seq_len);
+            if s.len + T_VERIFY > self.fwd.max_seq {
+                // The verify pass writes T_VERIFY positions.
+                return Ok(None);
+            }
             let ds = ds.lock().expect("dspark poisoned");
-            ds.step_with_stop(&ops, &self.fwd, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits, false, stop_ids)
+            let (drafts, _a, am) = ds.propose_verify(&ops, &self.fwd, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits)?;
+            Ok(Some((drafts, am)))
+        })?;
+        if let Some((drafts, _)) = &r {
+            *self.spec_pending.lock().expect("dsv41 spec pending poisoned") = Some((token, drafts.clone()));
+        }
+        Ok(r)
+    }
+
+    fn spec_commit(&self, seq: &mut SequenceState, accepted: usize, _stream: u64) -> Result<()> {
+        let ds = self.dspark.as_ref().context("dsv41 spec_commit: DSpark is not loaded")?;
+        let (token, drafts) = self.spec_pending.lock().expect("dsv41 spec pending poisoned").take().context("dsv41 spec_commit without spec_verify")?;
+        ensure!(accepted <= drafts.len(), "dsv41 spec_commit: {accepted} > {} drafts", drafts.len());
+        let ops = self.ops();
+        let pos = seq.seq_len;
+        self.with_seq(seq.slot_idx, |s| {
+            ds.lock().expect("dspark poisoned").commit(&ops, &self.fwd, s, pos, accepted, self.lanes.hook.as_ref())
         })?;
         {
             let mut st = self.spec_stats.lock().expect("dsv41 spec stats poisoned");
             st.0 += 1;
-            st.1 += out.accepted;
+            st.1 += accepted;
         }
-        let accepted = out.emitted[..out.accepted].to_vec();
         seq.tokens.push(token);
-        seq.tokens.extend_from_slice(&accepted);
-        seq.seq_len += out.accepted + 1;
-        // Verify row `accepted` holds the logits of the next position (its argmax is the bonus).
-        Ok((accepted, self.logits.offset(out.accepted * self.vocab * 2)))
+        seq.tokens.extend_from_slice(&drafts[..accepted]);
+        seq.seq_len += accepted + 1;
+        Ok(())
     }
 
     fn decode_batch(&self, tokens: &[u32], seqs: &mut [&mut SequenceState], stream: u64) -> Result<DevicePtr> {

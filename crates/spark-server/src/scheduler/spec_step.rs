@@ -11,30 +11,30 @@ use super::*;
 /// each verify position runs through the full 8-stage pre-sample
 /// pipeline instead of falling through unmasked. See
 /// `verify_pipeline_helper` for the rationale.
-/// Whether a lone sequence's next step may run the model's internal speculation: exactly the
-/// conditions under which `process_decode_logits` takes its raw GPU-argmax fast path (greedy, no
-/// grammar, no logprobs, not inside/after thinking, bf16 logits), so every speculated token is
-/// the token plain decode would have picked. Any other request decodes plainly.
+/// Whether a lone sequence's next step may run the model's internal speculation (DeepSeek-V4.1
+/// DSpark). Greedy only (sampled speculation is not wired yet), no logprobs (spec emits none),
+/// bf16 logits. Thinking and grammar ARE allowed: every draft is accepted only if it equals the
+/// full per-position pipeline pick (`verify_pick_all_with_pipeline`, the MTP verify basis), and
+/// the next token is picked by the normal decode path.
 pub fn internal_spec_eligible(a: &ActiveSeq, model: &dyn Model) -> bool {
-    a.temperature == 0.0
-        && a.grammar_state.is_none()
+    (a.temperature == 0.0 || crate::scheduler::decode_logits_seq::force_temp_zero_enabled())
         && a.top_logprobs.is_none()
-        && !a.inside_thinking
-        && !a.think_ended
         && !a.suppress_tool_call
         && !a.disable_mtp
         && !model.decode_logits_fp32()
 }
 
-/// One step of a model's internal speculation (`Model::decode_multi`, e.g. DeepSeek-V4.1
-/// DSpark): the accepted drafts are emitted like MTP-accepted tokens, then the next token is
-/// picked from the returned logits row by the normal decode path, so the tokens the stateful
-/// bookkeeping keys on (think / tool-call / EOS / hard-stop ids, which never come back as
-/// accepted drafts) always go through `process_decode_logits`.
+/// One step of a model's internal speculation: `spec_verify` (draft + one verify pass), then
+/// accept the leading drafts that equal the pipeline pick at their position and are not a
+/// structural id (EOS / think / tool-call / hard stop, which always go through the normal
+/// per-token handler), `spec_commit` them, emit them like MTP-accepted tokens, and pick the
+/// next token from the verify row that follows them through `process_decode_logits`, exactly
+/// as after a plain decode.
 #[allow(clippy::too_many_arguments)]
 pub fn step_internal_spec(
     model: &dyn Model,
     active: &mut Vec<ActiveSeq>,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
     code_fence_token: Option<u32>,
@@ -44,37 +44,58 @@ pub fn step_internal_spec(
 ) {
     let t0 = std::time::Instant::now();
     let a = &mut active[0];
-    let stop: Vec<u32> = a
-        .eos_tokens
-        .iter()
-        .copied()
-        .chain([think_end_token, think_start_token, tool_call_start_token, tool_call_end_token, tool_response_hard_stop()].into_iter().flatten())
-        .collect();
     if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
         tracing::error!("EP broadcast internal-spec token: {e:#}");
         a.finished = true;
         return;
     }
-    let (accepted, logits) = match model.decode_multi(a.last_token, &mut a.seq, &stop, 0) {
-        Ok(r) => r,
+    let (drafts, argmax) = match model.spec_verify(a.last_token, &mut a.seq, 0) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            step_decode_only(
+                model,
+                active,
+                think_end_token,
+                think_start_token,
+                code_fence_token,
+                tool_call_start_token,
+                tool_call_end_token,
+                adaptive_sampling,
+            );
+            return;
+        }
         Err(e) => {
-            tracing::error!("internal speculation step: {e:#}");
+            tracing::error!("internal speculation verify: {e:#}");
             let mut a = active.remove(0);
             send_error(model, &mut a, &format!("{e:#}"));
             return;
         }
     };
-    for tok in accepted {
+    let picks = crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(model, &argmax, a, verify_ctx);
+    let structural = |t: u32| {
+        a.eos_tokens.contains(&t)
+            || [think_end_token, think_start_token, tool_call_start_token, tool_call_end_token, tool_response_hard_stop()]
+                .contains(&Some(t))
+    };
+    let accepted = drafts.iter().zip(&picks).take_while(|(d, p)| d == p && !structural(**d)).count();
+    if let Err(e) = model.spec_commit(&mut a.seq, accepted, 0) {
+        tracing::error!("internal speculation commit: {e:#}");
+        let mut a = active.remove(0);
+        send_error(model, &mut a, &format!("{e:#}"));
+        return;
+    }
+    for &tok in &drafts[..accepted] {
         emit_token(a, tok, None);
         if a.finished {
             return;
         }
         a.last_token = tok;
     }
+    let row = model.logits_buffer_ptr().offset(accepted * model.vocab_size() * 2);
     process_decode_logits(
         model,
         active,
-        logits,
+        row,
         t0,
         think_end_token,
         think_start_token,

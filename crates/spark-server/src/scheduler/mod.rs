@@ -236,7 +236,7 @@ pub fn run(
     let use_mtp = use_speculative && model.has_proposer();
     let use_internal_spec = model.has_internal_spec();
     if use_internal_spec {
-        tracing::info!("model speculates internally: eligible greedy steps run Model::decode_multi");
+        tracing::info!("model speculates internally: eligible greedy steps run Model::spec_verify/spec_commit");
     }
     let num_drafts = if use_mtp || use_self_speculative || use_ngram_speculative {
         num_drafts.max(1)
@@ -570,6 +570,7 @@ pub fn run(
                 step_internal_spec(
                     &*model,
                     &mut active,
+                    &verify_ctx,
                     think_end_token,
                     think_start_token,
                     code_fence_token,
