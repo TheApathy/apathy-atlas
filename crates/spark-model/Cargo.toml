@@ -127,6 +127,14 @@ required-features = ["cuda", "gpu-examples"]
 name = "dsv41_attn_seam"
 required-features = ["cuda", "gpu-examples"]
 
+[[example]]
+name = "dsv41_attn_replay_gate"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "dsv41_attn_runj_gate"
+required-features = ["cuda", "gpu-examples"]
+
 # The first comparison of an actual MoE OUTPUT against the serving engine:
 # feeds the oracle's moe_in through CB3 reconstruct + cuBLASLt and checks
 # moe_routed. `--control` reverses the routing weights and must FAIL.
