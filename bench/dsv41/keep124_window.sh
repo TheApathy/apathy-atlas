@@ -5,7 +5,8 @@
 #  - a watchdog samples MemAvailable every 100 ms and SIGKILLs the driver (by its own PID)
 #    below 6 GB; the low-water mark is logged
 #  - the lock is held for the whole window; START only once held; END always with rc
-# Usage: keep124_window.sh <label> <driver args...>
+# Usage: keep124_window.sh <label> <driver args...> [ ::: <driver args...> ... ]
+# Several driver runs separated by ':::' share ONE lock acquisition (one window).
 set -uo pipefail
 LABEL="$1"; shift
 Q=/home/flocka/atlas/.gb10-queue; LOCK=/home/flocka/atlas/.gb10.lock
@@ -44,18 +45,30 @@ memory plan (GB):
   headroom after load                               ~$(( avail/1024/1024 - 84 ))  (floor 16; auto-abort below 6)
 ARITH
 
-"$BIN" "$@" &
-child=$!
 low=$(memavail)
-while kill -0 "$child" 2>/dev/null; do
-  m=$(memavail)
-  [ "$m" -lt "$low" ] && low=$m
-  if [ "$m" -lt "$ABORT_KB" ]; then
-    echo "WATCHDOG: MemAvailable $((m/1024)) MB < 6 GB -> SIGKILL pid $child"
-    kill -9 "$child"
-  fi
-  sleep 0.1
+rc=0
+run_one() {
+  echo "=== run: $*"
+  "$BIN" "$@" &
+  child=$!
+  while kill -0 "$child" 2>/dev/null; do
+    m=$(memavail)
+    [ "$m" -lt "$low" ] && low=$m
+    if [ "$m" -lt "$ABORT_KB" ]; then
+      echo "WATCHDOG: MemAvailable $((m/1024)) MB < 6 GB -> SIGKILL pid $child"
+      kill -9 "$child"
+    fi
+    sleep 0.1
+  done
+  wait "$child"; local r=$?
+  echo "=== run rc=$r, low-water so far $((low/1024/1024)) GB"
+  [ "$r" -ne 0 ] && rc=$r
+  return 0
+}
+cur=()
+for a in "$@"; do
+  if [ "$a" = ":::" ]; then run_one "${cur[@]}"; cur=(); else cur+=("$a"); fi
 done
-wait "$child"; rc=$?
+[ ${#cur[@]} -gt 0 ] && run_one "${cur[@]}"
 echo "low-water MemAvailable: $((low/1024/1024)) GB ($((low/1024)) MB)"
 end "$rc" "$((low/1024/1024))"
