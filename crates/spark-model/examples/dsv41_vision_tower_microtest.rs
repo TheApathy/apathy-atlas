@@ -151,6 +151,21 @@ fn main() -> Result<()> {
         gpu,
     )?;
     let r = u("downsample_ratio")?;
+    // START / NEWLINE / END rows (V4.1 has no learned pad row).
+    let specials: Vec<Vec<f32>> = {
+        let sp = encoder.image_special_embeddings();
+        [sp[0], sp[3], sp[4]]
+            .into_iter()
+            .map(|p| -> Result<Vec<f32>> {
+                let mut raw = vec![0u8; text_hidden * 2];
+                gpu.copy_d2h(p, &mut raw)?;
+                Ok(raw
+                    .chunks_exact(2)
+                    .map(|b| bf16(u16::from_le_bytes([b[0], b[1]])))
+                    .collect())
+            })
+            .collect::<Result<_>>()?
+    };
     let hidden = u("hidden_size")?;
 
     let mut report = Vec::new();
@@ -210,7 +225,40 @@ fn main() -> Result<()> {
             "{name:>24} unfold layout (Atlas vs host F.unfold of Atlas final-norm): {}",
             if same { "IDENTICAL" } else { "DIFFERS" }
         );
-        report.push(json!({"image": name, "grid": [gh, gw], "stages": stages, "unfold_layout_identical": same}));
+        // Span layout: V4.1 is START, then per aligner row (w IMAGE slots, NEWLINE),
+        // then END. V4-Flash-Vision's N-layout interleaves row pairs. Assemble the
+        // span from the Atlas aligner output both ways; V4.1 must track the
+        // oracle's `span` tap and the V4 N-layout must NOT.
+        let (lh, lw) = (gh.div_ceil(r), gw.div_ceil(r));
+        let aligner = &taps["aligner-output"];
+        let row = |i: usize| &aligner[i * text_hidden..(i + 1) * text_hidden];
+        let assemble = |order: &[usize]| -> Vec<f32> {
+            let mut span = Vec::with_capacity((lh * (lw + 1) + 2) * text_hidden);
+            span.extend_from_slice(&specials[0]);
+            let mut it = order.iter();
+            for _ in 0..lh {
+                for _ in 0..lw {
+                    span.extend_from_slice(row(*it.next().expect("order covers the grid")));
+                }
+                span.extend_from_slice(&specials[1]);
+            }
+            span.extend_from_slice(&specials[2]);
+            span
+        };
+        let want_span = read_bf16(&oracle.join(format!("{name}.span.bin")))?;
+        let v41: Vec<usize> = (0..lh * lw).collect();
+        let v4 =
+            atlas_core::config::build_deepseek_image_block(lh, lw, 0, 129_280)?.aligner_permutation;
+        let (rel_v41, _, _) = metrics(&assemble(&v41), &want_span);
+        let (rel_v4, _, _) = metrics(&assemble(&v4), &want_span);
+        eprintln!(
+            "{name:>24} span vs oracle: V4.1 row-major {rel_v41:.3e} | V4 N-layout {rel_v4:.3e}"
+        );
+        // The tower's own bf16 noise is ~2-3.5% (production vision.py on GPU vs CPU,
+        // measured); a wrong row order is uncorrelated (~0.9). 10x separates them.
+        layout_ok &= rel_v4 > 10.0 * rel_v41;
+        report.push(json!({"image": name, "grid": [gh, gw], "stages": stages, "unfold_layout_identical": same,
+                           "span_rel_l2_v41_layout": rel_v41, "span_rel_l2_v4_n_layout": rel_v4}));
     }
     println!(
         "{}",
@@ -218,7 +266,10 @@ fn main() -> Result<()> {
             &json!({"control": control, "text_hidden": text_hidden, "results": report})
         )?
     );
-    ensure!(layout_ok, "unfold layout differs from torch F.unfold");
+    ensure!(
+        layout_ok,
+        "unfold layout differs from torch F.unfold, or the span layout test did not separate"
+    );
     println!("DONE control={control}");
     Ok(())
 }

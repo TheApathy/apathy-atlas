@@ -38,6 +38,8 @@ path = "src/main.rs"
 libc = "0.2"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# Runtime dlopen of libturbojpeg (DeepSeek-V4.1 JPEG parity with Pillow; optional at runtime).
+libloading = "0.8"
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
 # `default-features = false` on path-deps so the metal feature actually

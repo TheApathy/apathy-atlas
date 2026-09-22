@@ -13,12 +13,11 @@ use crate::fsm::FsmWithStartEnd;
 /// The `byte_*[i] -= 1` / `+= 1` steps are `wrapping_*` on purpose: the C++
 /// original works on `uint8_t` and relies on the wrap. A plain `-=` panics
 /// in debug builds (release builds already wrapped, so release behaviour is
-/// unchanged). KNOWN UPSTREAM BUG, reproduced faithfully: the 3-byte
-/// `tmax` recursion passes `0x0080` where `0x8080` is meant (C++ line
-/// ~1159 has the same constant), so a class whose upper bound is a 3-byte
-/// char with a non-0xBF middle byte loses the middle byte range below it,
-/// e.g. `[\u0000-\uFF5B]` does NOT match U+F000..U+FF3F. Python xgrammar
-/// 0.1.32 rejects `<＂>` (U+FF02) against that class too.
+/// unchanged). FIXED UPSTREAM BUG: the 3-byte `tmax` recursion passed
+/// `0x0080` where the two continuation bytes `0x8080` are meant (upstream C++
+/// xgrammar has the same constant), so `[\u0000-\uFF5B]` lost U+F000..U+FF3F.
+/// `char_range_tests::codepoint_ranges_are_exact_across_utf8_lengths` checks
+/// every BMP codepoint.
 pub fn add_same_length_range(
     fsm: &mut FsmWithStartEnd,
     from: usize,
@@ -106,7 +105,7 @@ pub fn add_same_length_range(
             let tmax = fsm.add_state();
             fsm.fsm_mut()
                 .add_edge(from, tmax, byte_max[2] as i16, byte_max[2] as i16);
-            add_same_length_range(fsm, tmax, to, 0x0080, max & 0x00FFFF);
+            add_same_length_range(fsm, tmax, to, 0x8080, max & 0x00FFFF);
         } else {
             byte_max[2] = byte_max[2].wrapping_add(1);
         }

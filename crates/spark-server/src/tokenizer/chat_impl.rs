@@ -70,7 +70,17 @@ impl ChatTokenizer {
             {
                 config_tmpl
             } else {
-                tracing::warn!("No chat template found — using default ChatML");
+                if model_type == "deepseek_v41" {
+                    // Not used: deepseek_v41 prompts are rendered by crate::dsv41
+                    // (the checkpoint's encoding.py port), which is why the
+                    // checkpoint has no template. Kept only as an inert fallback.
+                    tracing::info!(
+                        "deepseek_v41: chat prompts are rendered by the encoding.py port \
+                         (crate::dsv41); the generic Jinja template is unused"
+                    );
+                } else {
+                    tracing::warn!("No chat template found — using default ChatML");
+                }
                 super::jinja_helpers::default_chatml_template(supports_thinking)
             };
             let env = super::jinja_helpers::build_jinja_env(&tmpl)?;

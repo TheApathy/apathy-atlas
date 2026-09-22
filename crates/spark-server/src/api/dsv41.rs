@@ -84,13 +84,29 @@ pub(crate) fn prepare(
     })
 }
 
-/// `POST /v1/debug/prompt` (app.py `_debug_prompt`): render a chat request
+/// Opt-in switch for `/v1/debug/prompt`: only an explicit `1`/`true` enables it.
+fn debug_prompt_enabled(env: Option<&str>) -> bool {
+    matches!(env.map(str::trim), Some("1") | Some("true"))
+}
+
+/// `POST /v1/debug/prompt` (app.py `_debug_prompt`). Behind the normal
+/// `/v1/` auth gate, and disabled unless `ATLAS_DSV41_DEBUG_PROMPT=1`.: render a chat request
 /// to the prompt text and ids without generating. deepseek_v41 only.
 pub async fn debug_prompt(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> Response {
     use axum::response::IntoResponse;
+    if !debug_prompt_enabled(std::env::var("ATLAS_DSV41_DEBUG_PROMPT").ok().as_deref()) {
+        // It echoes the rendered prompt, system prompt and tool schemas
+        // included: off unless the operator opts in.
+        return openai_error_response_with_param(
+            StatusCode::NOT_FOUND,
+            "/v1/debug/prompt is disabled; set ATLAS_DSV41_DEBUG_PROMPT=1 to enable".into(),
+            None,
+            None,
+        );
+    }
     if !state.dsv41 {
         return openai_error_response_with_param(
             StatusCode::NOT_FOUND,
@@ -493,6 +509,16 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 15);
+    }
+
+    #[test]
+    fn debug_prompt_is_disabled_by_default() {
+        assert!(!debug_prompt_enabled(None));
+        assert!(!debug_prompt_enabled(Some("")));
+        assert!(!debug_prompt_enabled(Some("0")));
+        assert!(!debug_prompt_enabled(Some("yes")));
+        assert!(debug_prompt_enabled(Some("1")));
+        assert!(debug_prompt_enabled(Some("true")));
     }
 
     /// NEGATIVE CONTROL: the terminal EOS must be cut before decoding. EOS is

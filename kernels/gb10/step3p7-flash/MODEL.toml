@@ -62,10 +62,8 @@ mtp_type = "full_attention"
 
 vision = true
 
-[sampling.default]
-temperature = 0.7
-top_p = 0.95
-top_k = 20
+# (A `[sampling.default]` section with the built-in defaults 0.7/0.95/20 was
+# here; build_parse.rs never read that name. Removed: no behaviour change.)
 
 [behavior]
 thinking_default = true

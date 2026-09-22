@@ -102,336 +102,447 @@
      "steps": [
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "050e6d035f75bacc",
        "digest": "050e6d035f75bacc",
        "token": 271,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "565a845247015d8e",
        "digest": "565a845247015d8e",
        "token": 10699,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "e424cab49dfecd07",
        "digest": "e424cab49dfecd07",
        "token": 1133,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "7fb2f8ef70c9ca0b",
        "digest": "7fb2f8ef70c9ca0b",
        "token": 65,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "bf769f33170cdf26",
        "digest": "bf769f33170cdf26",
        "token": 50219,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ff52b3299e3c8913",
        "digest": "ff52b3299e3c8913",
        "token": 3816,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "04c51d62df8a365e",
        "digest": "04c51d62df8a365e",
        "token": 37399,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63a94c860195e3",
        "digest": "af63a94c860195e3",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ae3ca03917c77bbc",
        "digest": "ae3ca03917c77bbc",
        "token": 11476,
        "accepted": true
       },
       {
        "n_allowed": 9,
+       "n_allowed_nohole": 9,
+       "digest_nohole": "64baaf10eff6fb3c",
        "digest": "64baaf10eff6fb3c",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 51119,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 127808,
+       "n_allowed_nohole": 127806,
+       "digest_nohole": "5079bf23ca49811d",
        "digest": "1d76c360dae3cdac",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "ca6f879bee8ebf98",
        "digest": "ebb44b687d49d208",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 9,
+       "n_allowed_nohole": 9,
+       "digest_nohole": "9ba5aa76f3c4bc93",
        "digest": "9ba5aa76f3c4bc93",
        "token": 28026,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63a94c860195e3",
        "digest": "af63a94c860195e3",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "8598b101cc9f1dd5",
        "digest": "8598b101cc9f1dd5",
        "token": 19836,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "d6c2ed26db6818e1",
        "digest": "d6c2ed26db6818e1",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 1001,
+       "n_allowed_nohole": 1001,
+       "digest_nohole": "1c1692edbfe7110c",
        "digest": "1c1692edbfe7110c",
        "token": 21,
        "accepted": true
       },
       {
        "n_allowed": 1112,
+       "n_allowed_nohole": 1112,
+       "digest_nohole": "1086e3d232d6faea",
        "digest": "1086e3d232d6faea",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "565a845247015d8e",
        "digest": "565a845247015d8e",
        "token": 10699,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7c07b4c001f0",
        "digest": "07ff7c07b4c001f0",
        "token": 32,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63ac4c86019afc",
        "digest": "af63ac4c86019afc",
        "token": 1,
        "accepted": true
       }
      ],
-     "terminated": true
+     "terminated": true,
+     "hole_in_text": false
     },
     {
      "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">a ｜ b</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
@@ -481,174 +592,231 @@
      "steps": [
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "050e6d035f75bacc",
        "digest": "050e6d035f75bacc",
        "token": 271,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "565a845247015d8e",
        "digest": "565a845247015d8e",
        "token": 10699,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "e424cab49dfecd07",
        "digest": "e424cab49dfecd07",
        "token": 1133,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "7fb2f8ef70c9ca0b",
        "digest": "7fb2f8ef70c9ca0b",
        "token": 65,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "bf769f33170cdf26",
        "digest": "bf769f33170cdf26",
        "token": 50219,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ff52b3299e3c8913",
        "digest": "ff52b3299e3c8913",
        "token": 3816,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "04c51d62df8a365e",
        "digest": "04c51d62df8a365e",
        "token": 37399,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63a94c860195e3",
        "digest": "af63a94c860195e3",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ae3ca03917c77bbc",
        "digest": "ae3ca03917c77bbc",
        "token": 11476,
        "accepted": true
       },
       {
        "n_allowed": 9,
+       "n_allowed_nohole": 9,
+       "digest_nohole": "64baaf10eff6fb3c",
        "digest": "64baaf10eff6fb3c",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 67,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 223,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 28217,
        "accepted": false
       }
      ],
-     "terminated": false
+     "terminated": false,
+     "hole_in_text": false
     },
     {
      "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
@@ -695,126 +863,167 @@
      "steps": [
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "050e6d035f75bacc",
        "digest": "050e6d035f75bacc",
        "token": 271,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "565a845247015d8e",
        "digest": "565a845247015d8e",
        "token": 10699,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "e424cab49dfecd07",
        "digest": "e424cab49dfecd07",
        "token": 1133,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "7fb2f8ef70c9ca0b",
        "digest": "7fb2f8ef70c9ca0b",
        "token": 65,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "bf769f33170cdf26",
        "digest": "bf769f33170cdf26",
        "token": 50219,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ff52b3299e3c8913",
        "digest": "ff52b3299e3c8913",
        "token": 3816,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "04c51d62df8a365e",
        "digest": "04c51d62df8a365e",
        "token": 28026,
        "accepted": false
       }
      ],
-     "terminated": false
+     "terminated": false,
+     "hole_in_text": false
     },
     {
      "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">x</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"units\" string=\"true\">kelvin</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
@@ -878,258 +1087,343 @@
      "steps": [
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "050e6d035f75bacc",
        "digest": "050e6d035f75bacc",
        "token": 271,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "565a845247015d8e",
        "digest": "565a845247015d8e",
        "token": 10699,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "e424cab49dfecd07",
        "digest": "e424cab49dfecd07",
        "token": 1133,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "7fb2f8ef70c9ca0b",
        "digest": "7fb2f8ef70c9ca0b",
        "token": 65,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "bf769f33170cdf26",
        "digest": "bf769f33170cdf26",
        "token": 50219,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ff52b3299e3c8913",
        "digest": "ff52b3299e3c8913",
        "token": 3816,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "04c51d62df8a365e",
        "digest": "04c51d62df8a365e",
        "token": 37399,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63a94c860195e3",
        "digest": "af63a94c860195e3",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ae3ca03917c77bbc",
        "digest": "ae3ca03917c77bbc",
        "token": 11476,
        "accepted": true
       },
       {
        "n_allowed": 9,
+       "n_allowed_nohole": 9,
+       "digest_nohole": "64baaf10eff6fb3c",
        "digest": "64baaf10eff6fb3c",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 90,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 127808,
+       "n_allowed_nohole": 127806,
+       "digest_nohole": "5079bf23ca49811d",
        "digest": "1d76c360dae3cdac",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "ca6f879bee8ebf98",
        "digest": "ebb44b687d49d208",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 9,
+       "n_allowed_nohole": 9,
+       "digest_nohole": "9ba5aa76f3c4bc93",
        "digest": "9ba5aa76f3c4bc93",
        "token": 45850,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63a94c860195e3",
        "digest": "af63a94c860195e3",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ae3ca03917c77bbc",
        "digest": "ae3ca03917c77bbc",
        "token": 11476,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "d6c2ed26db6818e1",
        "digest": "d6c2ed26db6818e1",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "2d60fef4837a8566",
        "digest": "2d60fef4837a8566",
        "token": 25674,
        "accepted": false
       }
      ],
-     "terminated": false
+     "terminated": false,
+     "hole_in_text": false
     },
     {
      "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">東京，大阪</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
@@ -1178,168 +1472,223 @@
      "steps": [
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "050e6d035f75bacc",
        "digest": "050e6d035f75bacc",
        "token": 271,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "565a845247015d8e",
        "digest": "565a845247015d8e",
        "token": 10699,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "e424cab49dfecd07",
        "digest": "e424cab49dfecd07",
        "token": 1133,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "7fb2f8ef70c9ca0b",
        "digest": "7fb2f8ef70c9ca0b",
        "token": 65,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "bf769f33170cdf26",
        "digest": "bf769f33170cdf26",
        "token": 50219,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ff52b3299e3c8913",
        "digest": "ff52b3299e3c8913",
        "token": 3816,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "04c51d62df8a365e",
        "digest": "04c51d62df8a365e",
        "token": 37399,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63a94c860195e3",
        "digest": "af63a94c860195e3",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ae3ca03917c77bbc",
        "digest": "ae3ca03917c77bbc",
        "token": 11476,
        "accepted": true
       },
       {
        "n_allowed": 9,
+       "n_allowed_nohole": 9,
+       "digest_nohole": "64baaf10eff6fb3c",
        "digest": "64baaf10eff6fb3c",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 66771,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 303,
        "accepted": false
       }
      ],
-     "terminated": false
+     "terminated": false,
+     "hole_in_text": true
     }
    ]
   },
@@ -1509,504 +1858,671 @@
      "steps": [
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "050e6d035f75bacc",
        "digest": "050e6d035f75bacc",
        "token": 271,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "565a845247015d8e",
        "digest": "565a845247015d8e",
        "token": 10699,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "39853f65efcb5b72",
        "digest": "39853f65efcb5b72",
        "token": 11375,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "61fb25b4d980514e",
        "digest": "61fb25b4d980514e",
        "token": 63742,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ff52b3299e3c8913",
        "digest": "ff52b3299e3c8913",
        "token": 3816,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "20e6c0de50bfb205",
        "digest": "20e6c0de50bfb205",
        "token": 12066,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63a94c860195e3",
        "digest": "af63a94c860195e3",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ae3ca03917c77bbc",
        "digest": "ae3ca03917c77bbc",
        "token": 11476,
        "accepted": true
       },
       {
        "n_allowed": 9,
+       "n_allowed_nohole": 9,
+       "digest_nohole": "64baaf10eff6fb3c",
        "digest": "64baaf10eff6fb3c",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 83,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 818,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 68,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 24313,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 90,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 3362,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 223,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 19,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 24568,
        "accepted": true
       },
       {
        "n_allowed": 127808,
+       "n_allowed_nohole": 127806,
+       "digest_nohole": "5079bf23ca49811d",
        "digest": "1d76c360dae3cdac",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 16,
+       "n_allowed_nohole": 16,
+       "digest_nohole": "56b3cd9976671ec1",
        "digest": "56b3cd9976671ec1",
        "token": 44175,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63a94c860195e3",
        "digest": "af63a94c860195e3",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "8598b101cc9f1dd5",
        "digest": "8598b101cc9f1dd5",
        "token": 19836,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "d6c2ed26db6818e1",
        "digest": "d6c2ed26db6818e1",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "f5258164b4bad96d",
        "digest": "f5258164b4bad96d",
        "token": 10931,
        "accepted": true
       },
       {
        "n_allowed": 126442,
+       "n_allowed_nohole": 126440,
+       "digest_nohole": "0728d2a923049921",
        "digest": "d9399eee766ae404",
        "token": 67,
        "accepted": true
       },
       {
        "n_allowed": 126442,
+       "n_allowed_nohole": 126440,
+       "digest_nohole": "0728d2a923049921",
        "digest": "d9399eee766ae404",
        "token": 1760,
        "accepted": true
       },
       {
        "n_allowed": 168,
+       "n_allowed_nohole": 168,
+       "digest_nohole": "b92609a800ddb06d",
        "digest": "b92609a800ddb06d",
        "token": 582,
        "accepted": true
       },
       {
        "n_allowed": 126442,
+       "n_allowed_nohole": 126440,
+       "digest_nohole": "0728d2a923049921",
        "digest": "d9399eee766ae404",
        "token": 68,
        "accepted": true
       },
       {
        "n_allowed": 126442,
+       "n_allowed_nohole": 126440,
+       "digest_nohole": "0728d2a923049921",
        "digest": "d9399eee766ae404",
        "token": 13747,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "ba0a3a3a2103eef0",
        "digest": "ba0a3a3a2103eef0",
        "token": 25002,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63a94c860195e3",
        "digest": "af63a94c860195e3",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "8598b101cc9f1dd5",
        "digest": "8598b101cc9f1dd5",
        "token": 19836,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "d6c2ed26db6818e1",
        "digest": "d6c2ed26db6818e1",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 7,
+       "n_allowed_nohole": 7,
+       "digest_nohole": "8fecf86afcb94422",
        "digest": "8fecf86afcb94422",
        "token": 19836,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "565a845247015d8e",
        "digest": "565a845247015d8e",
        "token": 10699,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7c07b4c001f0",
        "digest": "07ff7c07b4c001f0",
        "token": 32,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63ac4c86019afc",
        "digest": "af63ac4c86019afc",
        "token": 1,
        "accepted": true
       }
      ],
-     "terminated": true
+     "terminated": true,
+     "hole_in_text": false
     },
     {
      "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"web_search\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">q</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"flag\" string=\"false\">maybe</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
@@ -2068,252 +2584,335 @@
      "steps": [
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "050e6d035f75bacc",
        "digest": "050e6d035f75bacc",
        "token": 271,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "565a845247015d8e",
        "digest": "565a845247015d8e",
        "token": 10699,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "39853f65efcb5b72",
        "digest": "39853f65efcb5b72",
        "token": 11375,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "61fb25b4d980514e",
        "digest": "61fb25b4d980514e",
        "token": 63742,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ff52b3299e3c8913",
        "digest": "ff52b3299e3c8913",
        "token": 3816,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "20e6c0de50bfb205",
        "digest": "20e6c0de50bfb205",
        "token": 12066,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63a94c860195e3",
        "digest": "af63a94c860195e3",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ae3ca03917c77bbc",
        "digest": "ae3ca03917c77bbc",
        "token": 11476,
        "accepted": true
       },
       {
        "n_allowed": 9,
+       "n_allowed_nohole": 9,
+       "digest_nohole": "64baaf10eff6fb3c",
        "digest": "64baaf10eff6fb3c",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 83,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 127808,
+       "n_allowed_nohole": 127806,
+       "digest_nohole": "5079bf23ca49811d",
        "digest": "1d76c360dae3cdac",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 16,
+       "n_allowed_nohole": 16,
+       "digest_nohole": "56b3cd9976671ec1",
        "digest": "56b3cd9976671ec1",
        "token": 25002,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63a94c860195e3",
        "digest": "af63a94c860195e3",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "8598b101cc9f1dd5",
        "digest": "8598b101cc9f1dd5",
        "token": 19836,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "d6c2ed26db6818e1",
        "digest": "d6c2ed26db6818e1",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 7,
+       "n_allowed_nohole": 7,
+       "digest_nohole": "8fecf86afcb94422",
        "digest": "8fecf86afcb94422",
        "token": 72335,
        "accepted": false
       }
      ],
-     "terminated": false
+     "terminated": false,
+     "hole_in_text": false
     }
    ]
   },
@@ -2415,396 +3014,527 @@
      "steps": [
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "050e6d035f75bacc",
        "digest": "050e6d035f75bacc",
        "token": 271,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "565a845247015d8e",
        "digest": "565a845247015d8e",
        "token": 10699,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7e07b4c00556",
        "digest": "07ff7e07b4c00556",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 7,
+       "n_allowed_nohole": 7,
+       "digest_nohole": "da524306551a7596",
        "digest": "da524306551a7596",
        "token": 22153,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ff52b3299e3c8913",
        "digest": "ff52b3299e3c8913",
        "token": 3816,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "ca6f879bee8ebf98",
        "digest": "ebb44b687d49d208",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 16,
+       "n_allowed_nohole": 16,
+       "digest_nohole": "d1477737ce0a8367",
        "digest": "d1477737ce0a8367",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 126631,
+       "n_allowed_nohole": 126629,
+       "digest_nohole": "9dba7576b5dd0540",
        "digest": "8c4d20cbfd10cf83",
        "token": 111153,
        "accepted": true
       },
       {
        "n_allowed": 126631,
+       "n_allowed_nohole": 126629,
+       "digest_nohole": "9dba7576b5dd0540",
        "digest": "8c4d20cbfd10cf83",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 7,
+       "n_allowed_nohole": 7,
+       "digest_nohole": "8fecf86afcb94422",
        "digest": "8fecf86afcb94422",
        "token": 11476,
        "accepted": true
       },
       {
        "n_allowed": 9,
+       "n_allowed_nohole": 9,
+       "digest_nohole": "64baaf10eff6fb3c",
        "digest": "64baaf10eff6fb3c",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 2710,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 273,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 127808,
+       "n_allowed_nohole": 127806,
+       "digest_nohole": "5079bf23ca49811d",
        "digest": "1d76c360dae3cdac",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "ca6f879bee8ebf98",
        "digest": "ebb44b687d49d208",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 16,
+       "n_allowed_nohole": 16,
+       "digest_nohole": "d1477737ce0a8367",
        "digest": "d1477737ce0a8367",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 126631,
+       "n_allowed_nohole": 126629,
+       "digest_nohole": "9dba7576b5dd0540",
        "digest": "8c4d20cbfd10cf83",
        "token": 80,
        "accepted": true
       },
       {
        "n_allowed": 126631,
+       "n_allowed_nohole": 126629,
+       "digest_nohole": "9dba7576b5dd0540",
        "digest": "8c4d20cbfd10cf83",
        "token": 4,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "77d589e5269ed358",
        "digest": "77d589e5269ed358",
        "token": 3418,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 7,
+       "n_allowed_nohole": 7,
+       "digest_nohole": "8fecf86afcb94422",
        "digest": "8fecf86afcb94422",
        "token": 19836,
        "accepted": true
       },
       {
        "n_allowed": 9,
+       "n_allowed_nohole": 9,
+       "digest_nohole": "64baaf10eff6fb3c",
        "digest": "64baaf10eff6fb3c",
        "token": 3320,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 19,
        "accepted": true
       },
       {
        "n_allowed": 127806,
+       "n_allowed_nohole": 127804,
+       "digest_nohole": "7b7482cb19a5664d",
        "digest": "6639ff8c7a065526",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 127808,
+       "n_allowed_nohole": 127806,
+       "digest_nohole": "5079bf23ca49811d",
        "digest": "1d76c360dae3cdac",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 8,
+       "n_allowed_nohole": 8,
+       "digest_nohole": "a97a533662a5f200",
        "digest": "a97a533662a5f200",
        "token": 10767,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 30,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 4,
+       "digest_nohole": "ca6f879bee8ebf98",
        "digest": "ebb44b687d49d208",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 5,
+       "n_allowed_nohole": 5,
+       "digest_nohole": "3003d63cd5083809",
        "digest": "3003d63cd5083809",
        "token": 2329,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "2254462063ecd513",
        "digest": "2254462063ecd513",
        "token": 1281,
        "accepted": true
       },
       {
        "n_allowed": 7,
+       "n_allowed_nohole": 7,
+       "digest_nohole": "da524306551a7596",
        "digest": "da524306551a7596",
        "token": 949,
        "accepted": true
       },
       {
        "n_allowed": 3,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "ff52b3299e3c8913",
        "digest": "ff52b3299e3c8913",
        "token": 3816,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "33236acda097b812",
        "digest": "33236acda097b812",
        "token": 34756,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "91e960a16e26eef4",
        "digest": "91e960a16e26eef4",
        "token": 1018,
        "accepted": true
       },
       {
        "n_allowed": 2,
+       "n_allowed_nohole": 2,
+       "digest_nohole": "0c53c65e08cb3ccf",
        "digest": "0c53c65e08cb3ccf",
        "token": 1718,
        "accepted": true
       },
       {
        "n_allowed": 4,
+       "n_allowed_nohole": 3,
+       "digest_nohole": "aec5578fc1d4e512",
        "digest": "f118d935f6d10d9e",
        "token": 128825,
        "accepted": true
       },
       {
        "n_allowed": 6,
+       "n_allowed_nohole": 6,
+       "digest_nohole": "565a845247015d8e",
        "digest": "565a845247015d8e",
        "token": 10699,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "07ff7c07b4c001f0",
        "digest": "07ff7c07b4c001f0",
        "token": 32,
        "accepted": true
       },
       {
        "n_allowed": 1,
+       "n_allowed_nohole": 1,
+       "digest_nohole": "af63ac4c86019afc",
        "digest": "af63ac4c86019afc",
        "token": 1,
        "accepted": true
       }
      ],
-     "terminated": true
+     "terminated": true,
+     "hole_in_text": false
     }
    ]
   },
