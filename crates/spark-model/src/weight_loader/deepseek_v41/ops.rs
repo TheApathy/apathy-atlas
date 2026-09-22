@@ -115,13 +115,13 @@ pub struct Dsv41Kernels {
     pub hc_split: Option<(KernelHandle, KernelHandle, DevicePtr)>,
 }
 
-/// `ATLAS_DSV41_HC_SPLIT=1`: at T = 1, `hc_mixes` runs as 25 blocks + an epilogue instead of one
+/// ON by default (`ATLAS_DSV41_HC_SPLIT=0` turns it off): at T = 1, `hc_mixes` runs as 25 blocks + an epilogue instead of one
 /// block per token. Bit-identical by construction (same per-thread order, same tree).
 pub const HC_SPLIT_ENV: &str = "ATLAS_DSV41_HC_SPLIT";
 
 /// Module compiled from `kernels/gb10/deepseek-v4.1/cb3/dsv41_decode.cu`.
 pub const DECODE_DENSE_MODULE: &str = "dsv41_decode";
-/// Opt-in until gated end to end: `ATLAS_DSV41_DENSE_GEMV=1` runs every M = 1 FP8 linear as
+/// ON by default (`ATLAS_DSV41_DENSE_GEMV=0` turns it off): every M = 1 FP8 linear runs as
 /// a direct fp8 GEMV instead of dequant-to-bf16 + a 16-row GEMM.
 pub const DENSE_GEMV_ENV: &str = "ATLAS_DSV41_DENSE_GEMV";
 const GEMV_WARPS: u32 = 8;
@@ -157,14 +157,14 @@ impl Dsv41Kernels {
             engram_rows_bf16: k("dsv41_engram_rows_bf16")?,
             engram_gate: k("dsv41_engram_gate")?,
             mul_bf16_to_f32: k("dsv41_mul_bf16_to_f32")?,
-            fp8_gemv_m1: if std::env::var(DENSE_GEMV_ENV).as_deref() == Ok("1") {
+            fp8_gemv_m1: if std::env::var(DENSE_GEMV_ENV).as_deref() != Ok("0") {
                 Some(gpu.kernel(DECODE_DENSE_MODULE, "dsv41_fp8_gemv_m1").with_context(|| {
                     format!("{DENSE_GEMV_ENV}=1 but {DECODE_DENSE_MODULE}::dsv41_fp8_gemv_m1 is not in the PTX")
                 })?)
             } else {
                 None
             },
-            hc_split: if std::env::var(HC_SPLIT_ENV).as_deref() == Ok("1") {
+            hc_split: if std::env::var(HC_SPLIT_ENV).as_deref() != Ok("0") {
                 let raw = gpu.alloc(MM_TILE * 25 * 4)?;
                 Some((k2("dsv41_hc_mix_dot")?, k2("dsv41_hc_mix_finish")?, raw))
             } else {

@@ -408,22 +408,30 @@ extern "C" __global__ void dsv41_moe_sum_decode(const float* __restrict__ down,
 }
 
 // ── router logits ────────────────────────────────────────────────────────────
-// logits[t, e] = sum_k f32(y[t, k]) * gate_w[e, k], fp32 (bf16 -> fp32 is exact).
+// logits[t, e] = sum_k f32(y[t, k]) * f32(gate_w[e, k]), fp32. The weight is read either as
+// the widened fp32 copy or as the ORIGINAL bf16 (W_BF16): bf16 -> fp32 is exact and the lane ->
+// element mapping and summation order are the same, so both variants are bit-identical.
 // Grid (384 / DEC_WARPS, T), Block (32 * DEC_WARPS). Warp -> one (t, e).
-extern "C" __global__ void __launch_bounds__(32 * DEC_WARPS) dsv41_router_logits_decode(
-    const __nv_bfloat16* __restrict__ y, const float* __restrict__ gate_w,
-    float* __restrict__ logits) {
+template <bool W_BF16>
+__device__ __forceinline__ void dec_router(const __nv_bfloat16* __restrict__ y, const void* __restrict__ gate_w,
+                                           float* __restrict__ logits) {
     constexpr int K = 5120;
     const int t = blockIdx.y;
     const int warp = threadIdx.x >> 5, L = threadIdx.x & 31;
     const int e = blockIdx.x * DEC_WARPS + warp;
     if (e >= DEC_EXPERTS) return;
-    const float4* w = reinterpret_cast<const float4*>(gate_w + (size_t)e * K);
     const uint2* x = reinterpret_cast<const uint2*>(y + (size_t)t * K);
     float acc = 0.0f;
 #pragma unroll 8
     for (int i = L; i < K / 4; i += 32) {
-        const float4 wv = __ldg(w + i);
+        float4 wv;
+        if (W_BF16) {
+            const uint2 wb = __ldg(reinterpret_cast<const uint2*>(static_cast<const __nv_bfloat16*>(gate_w) + (size_t)e * K) + i);
+            wv = make_float4(__uint_as_float(wb.x << 16), __uint_as_float(wb.x & 0xffff0000u),
+                             __uint_as_float(wb.y << 16), __uint_as_float(wb.y & 0xffff0000u));
+        } else {
+            wv = __ldg(reinterpret_cast<const float4*>(static_cast<const float*>(gate_w) + (size_t)e * K) + i);
+        }
         const uint2 xv = __ldg(x + i);
         acc = __fadd_rn(acc, __fmul_rn(wv.x, __uint_as_float(xv.x << 16)));
         acc = __fadd_rn(acc, __fmul_rn(wv.y, __uint_as_float(xv.x & 0xffff0000u)));
@@ -432,4 +440,14 @@ extern "C" __global__ void __launch_bounds__(32 * DEC_WARPS) dsv41_router_logits
     }
     acc = dec_warp_sum(acc);
     if (L == 0) logits[t * DEC_EXPERTS + e] = acc;
+}
+
+extern "C" __global__ void __launch_bounds__(32 * DEC_WARPS) dsv41_router_logits_decode(
+    const __nv_bfloat16* __restrict__ y, const float* __restrict__ gate_w, float* __restrict__ logits) {
+    dec_router<false>(y, gate_w, logits);
+}
+
+extern "C" __global__ void __launch_bounds__(32 * DEC_WARPS) dsv41_router_logits_decode_bf16w(
+    const __nv_bfloat16* __restrict__ y, const __nv_bfloat16* __restrict__ gate_w, float* __restrict__ logits) {
+    dec_router<true>(y, gate_w, logits);
 }

@@ -137,7 +137,10 @@ extern "C" __global__ void __launch_bounds__(HCD_BLOCK) dsv41_hc_mix_dot(
     if (threadIdx.x == 0) raw[t * (HCD_NMIX + 1) + m] = r;
 }
 
-// Grid (T), Block 32 (thread 0 works, as in the original epilogue).
+// Grid (T), Block 32. Lane (i, j) = (lane / 4, lane % 4) owns comb[i][j] for lanes 0..15; every
+// row / column sum gathers the four values by shuffle and adds them in the ORIGINAL sequential
+// order (0.f + v0 + v1 + v2 + v3), and every division is the same division, so each value is
+// bit-identical to the original single-thread epilogue -- just not serialised over 16 entries.
 extern "C" __global__ void dsv41_hc_mix_finish(const float* __restrict__ raw,
                                                const float* __restrict__ scale,
                                                const float* __restrict__ base,
@@ -145,49 +148,45 @@ extern "C" __global__ void dsv41_hc_mix_finish(const float* __restrict__ raw,
                                                float* __restrict__ comb, const unsigned D,
                                                const unsigned iters, const float eps,
                                                const float hc_eps) {
-    if (threadIdx.x != 0) return;
-    const unsigned t = blockIdx.x;
+    const unsigned t = blockIdx.x, lane = threadIdx.x & 31;
     const unsigned R = HCD_HC * D;
+    const unsigned HC = HCD_HC;
     const float* rw = raw + t * (HCD_NMIX + 1);
     const float rs = rsqrtf(rw[HCD_NMIX] / (float)R + eps);
-    float mix[HCD_NMIX];
-    for (int m = 0; m < HCD_NMIX; ++m) mix[m] = rw[m] * rs;
-    const unsigned HC = HCD_HC;
-    for (unsigned i = 0; i < HC; ++i) {
-        const float vp = mix[i] * scale[0] + base[i];
-        pre[t * HC + i] = 1.f / (1.f + expf(-vp)) + hc_eps;
-        const float vq = mix[HC + i] * scale[1] + base[HC + i];
+    if (lane < HC) {
+        const float vp = (rw[lane] * rs) * scale[0] + base[lane];
+        pre[t * HC + lane] = 1.f / (1.f + expf(-vp)) + hc_eps;
+    } else if (lane < 2 * HC) {
+        const unsigned i = lane - HC;
+        const float vq = (rw[HC + i] * rs) * scale[1] + base[HC + i];
         post[t * HC + i] = 2.f * (1.f / (1.f + expf(-vq)));
     }
-    float c[HCD_HC * HCD_HC];
-    for (unsigned i = 0; i < HC; ++i) {
-        float mx = -INFINITY;
-        for (unsigned j = 0; j < HC; ++j) {
-            c[i * HC + j] = mix[2 * HC + i * HC + j] * scale[2] + base[2 * HC + i * HC + j];
-            mx = fmaxf(mx, c[i * HC + j]);
-        }
-        float z = 0.f;
-        for (unsigned j = 0; j < HC; ++j) {
-            c[i * HC + j] = expf(c[i * HC + j] - mx);
-            z += c[i * HC + j];
-        }
-        for (unsigned j = 0; j < HC; ++j) c[i * HC + j] = c[i * HC + j] / z + hc_eps;
-    }
+    const unsigned i = (lane >> 2) & 3u, j = lane & 3u;  // lanes 16..31 mirror 0..15, unused
+    const unsigned m = 2 * HC + i * HC + j;
+    float c = (rw[m] * rs) * scale[2] + base[m];
+    auto row = [&](float v, unsigned q) { return __shfl_sync(0xffffffffu, v, (lane & ~3u) + q); };
+    auto col = [&](float v, unsigned q) { return __shfl_sync(0xffffffffu, v, (lane & 16u) + q * 4 + j); };
+    float mx = -INFINITY;
+#pragma unroll
+    for (unsigned q = 0; q < 4; ++q) mx = fmaxf(mx, row(c, q));
+    c = expf(c - mx);
+    float z = 0.f;
+#pragma unroll
+    for (unsigned q = 0; q < 4; ++q) z += row(c, q);
+    c = c / z + hc_eps;
     for (unsigned it = 0; it < iters; ++it) {
         if (it > 0) {
-            for (unsigned i = 0; i < HC; ++i) {
-                float z = 0.f;
-                for (unsigned j = 0; j < HC; ++j) z += c[i * HC + j];
-                z += hc_eps;
-                for (unsigned j = 0; j < HC; ++j) c[i * HC + j] /= z;
-            }
+            float zr = 0.f;
+#pragma unroll
+            for (unsigned q = 0; q < 4; ++q) zr += row(c, q);
+            zr += hc_eps;
+            c /= zr;
         }
-        for (unsigned j = 0; j < HC; ++j) {
-            float z = 0.f;
-            for (unsigned i = 0; i < HC; ++i) z += c[i * HC + j];
-            z += hc_eps;
-            for (unsigned i = 0; i < HC; ++i) c[i * HC + j] /= z;
-        }
+        float zc = 0.f;
+#pragma unroll
+        for (unsigned q = 0; q < 4; ++q) zc += col(c, q);
+        zc += hc_eps;
+        c /= zc;
     }
-    for (unsigned q = 0; q < HC * HC; ++q) comb[t * HC * HC + q] = c[q];
+    if (lane < 16) comb[t * HC * HC + i * HC + j] = c;
 }

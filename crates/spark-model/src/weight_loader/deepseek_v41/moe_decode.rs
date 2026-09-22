@@ -30,7 +30,8 @@ use super::routing::Routing;
 pub const DECODE_MODULE: &str = "cb3_moe_decode";
 /// Largest pass the decode path serves (the kernels' MAXR / MAXT).
 pub const MAX_DECODE_T: usize = 8;
-/// Opt-in until the path is gated end to end: `ATLAS_DSV41_MOE_DECODE=1`.
+/// ON by default (gated end to end at keep=124: 48/48 greedy tokens identical to the prefill
+/// path's base arm). `ATLAS_DSV41_MOE_DECODE=0` turns it off.
 pub const MOE_DECODE_ENV: &str = "ATLAS_DSV41_MOE_DECODE";
 const WARPS: u32 = 8;
 const GROUP_INTS: usize = 2 + MAX_DECODE_T;
@@ -39,12 +40,13 @@ const HIDDEN: usize = 5120;
 const INTER: usize = 2304;
 
 pub fn enabled() -> bool {
-    std::env::var(MOE_DECODE_ENV).as_deref() == Ok("1")
+    std::env::var(MOE_DECODE_ENV).as_deref() != Ok("0")
 }
 
 #[derive(Clone, Copy)]
 struct Kernels {
     router: KernelHandle,
+    router_bf16w: KernelHandle,
     route: KernelHandle,
     gateup_r1: KernelHandle,
     gateup_r8: KernelHandle,
@@ -92,6 +94,7 @@ impl MoeDecode {
         };
         let k = Kernels {
             router: k("dsv41_router_logits_decode")?,
+            router_bf16w: k("dsv41_router_logits_decode_bf16w")?,
             route: k("dsv41_route_decode")?,
             gateup_r1: k("dsv41_cb3_gateup_decode_r1")?,
             gateup_r8: k("dsv41_cb3_gateup_decode_r8")?,
@@ -154,11 +157,17 @@ impl MoeDecode {
     pub fn route(&self, gpu: &dyn GpuBackend, layer: usize, router: &RouterF32, y: DevicePtr, t: usize, route_scale: f32, stream: u64) -> Result<()> {
         ensure!(t >= 1 && t <= MAX_DECODE_T, "decode MoE: t = {t}");
         let tb = self.table(layer)?;
-        KernelLaunch::new(gpu, self.k.router)
+        // The original bf16 weight when we have it (half the bytes, bit-identical logits);
+        // `ATLAS_DSV41_ROUTER_BF16=0` forces the widened fp32 copy (A/B only).
+        let (kernel, w) = match router.gate_w_bf16 {
+            Some(b) if std::env::var("ATLAS_DSV41_ROUTER_BF16").as_deref() != Ok("0") => (self.k.router_bf16w, b),
+            _ => (self.k.router, router.gate_w),
+        };
+        KernelLaunch::new(gpu, kernel)
             .grid([(ROUTED_EXPERTS as u32).div_ceil(WARPS), t as u32, 1])
             .block([32 * WARPS, 1, 1])
             .arg_ptr(y)
-            .arg_ptr(router.gate_w)
+            .arg_ptr(w)
             .arg_ptr(self.logits)
             .launch(stream)?;
         KernelLaunch::new(gpu, self.k.route)

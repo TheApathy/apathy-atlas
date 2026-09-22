@@ -56,6 +56,10 @@ const BLOCK: u32 = 256;
 /// kept on the host: top-k runs there.
 pub struct RouterF32 {
     pub gate_w: DevicePtr,
+    /// The ORIGINAL bf16 `gate.weight` (store-owned, never freed here), when loaded from the
+    /// store. The decode router reads this instead of the widened copy: bf16 -> fp32 is exact,
+    /// so the logits are bit-identical at half the bytes (moe_decode.rs).
+    pub gate_w_bf16: Option<DevicePtr>,
     pub bias: Vec<f32>,
     pub bias_vl: Vec<f32>,
 }
@@ -95,6 +99,7 @@ impl RouterF32 {
         };
         Ok(Self {
             gate_w,
+            gate_w_bf16: Some(w.ptr),
             bias: host_f32(&format!("{p}.bias"))?,
             bias_vl: host_f32(&format!("{p}.bias_vl"))?,
         })
@@ -117,7 +122,7 @@ impl RouterF32 {
             .collect();
         let gate_w = gpu.alloc(wide.len())?;
         gpu.copy_h2d(&wide, gate_w)?;
-        Ok(Self { gate_w, bias, bias_vl })
+        Ok(Self { gate_w, gate_w_bf16: None, bias, bias_vl })
     }
 }
 
@@ -200,7 +205,7 @@ pub struct Cb3RoutedMoe<'a> {
     pass_tokens: Mutex<Option<Vec<i64>>>,
     control: Mutex<MoeControl>,
     work: Mutex<ExpertWork>,
-    /// The decode-size path (t <= 8): GPU routing + CB3 GEMV. `ATLAS_DSV41_MOE_DECODE=1`.
+    /// The decode-size path (t <= 8): GPU routing + CB3 GEMV. On unless `ATLAS_DSV41_MOE_DECODE=0`.
     decode: Option<MoeDecode>,
     kernel: Mutex<ExpertKernel>,
     /// Per layer: (layer, bias, bias_vl, resident u8 mask), all [384] on the device.
