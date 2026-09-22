@@ -307,6 +307,15 @@ fn main() -> Result<()> {
         fail += usize::from(bad > 2 || e < 0.98 || c > 0.9);
     }
 
+    // ---- 4. the reset rule: Decode continues the sequence; only a new prompt resets.
+    run_encoder(&dev, &ops, &core, &ins, &[0, CHUNK, N_TOK], None)?;
+    core.begin_pass(PassKind::Decode, N_TOK, 1)?;
+    let kept = core.replay_tail().3;
+    core.begin_pass(PassKind::EncoderChunk, 0, 1)?; // CONTROL: a new prompt MUST reset
+    let reset = core.replay_tail().3;
+    println!("RESET RULE: after Decode(pos {N_TOK}) the tail still holds {kept} rows; after a new prompt {reset}");
+    fail += usize::from(kept != REPLAY_ROWS || reset != 0);
+
     ensure!(fail == 0, "CORE GATE FAIL ({fail} checks)");
     println!("CORE GATE PASS");
     Ok(())

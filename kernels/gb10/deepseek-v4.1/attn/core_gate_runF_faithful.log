@@ -21,4 +21,5 @@ L14 chunk invariance [0, 511, 1000, 1023, 1024] vs 2x512: topk 0/1024 rows diffe
 L20 chunk invariance [0, 511, 1000, 1023, 1024] vs 2x512: topk 0/1024 rows differ (worst 1.0000), attention bit-identical 1.000000
 odd splits: replay tail 128 rows spanning 3 chunks, == own last 128 rows: true
 CTRL dropped pending at 511: REFUSED loudly (layer 2: 500 compressed rows visible, 499 published)
+RESET RULE: after Decode(pos 1024) the tail still holds 128 rows; after a new prompt 0
 CORE GATE PASS

@@ -515,8 +515,9 @@ impl PassHook for Dsv41SparseCore {
     fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
         ensure!(t <= self.max_chunk, "pass of {t} rows exceeds max_chunk {}", self.max_chunk);
         let mut st = self.st.lock().expect("core state poisoned");
-        if start == 0 && kind != PassKind::Replay {
-            // A new sequence: nothing is carried.
+        if start == 0 && matches!(kind, PassKind::EncoderChunk | PassKind::FullChunk) {
+            // A new prompt: nothing is carried. NEVER on Decode or Replay, which continue the
+            // sequence -- a reset there would wipe ckv's pending row and the replay tail.
             st.has_pending = vec![false; 40];
             st.published = None;
             st.tail = TailState::default();
