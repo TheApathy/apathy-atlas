@@ -15,6 +15,7 @@ use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed_ex, gemm_act_we
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use spark_runtime::weights::{WeightDtype, WeightStore};
+use crate::layers::deepseek_v41_attn::fp8_gemm::{Fp8Gemm, fused_wins};
 
 /// Opt-in wall-clock profiler (`ATLAS_DSV41_PROF=1`): each [`prof`] scope SYNCHRONIZES the
 /// stream before and after, so the numbers are exclusive GPU+host wall time per scope and the
@@ -185,7 +186,14 @@ pub struct Dsv41Kernels {
     pub fp8_gemv_m8: Option<KernelHandle>,
     /// The bit-identical split `hc_mixes` for T = 1 ([`HC_SPLIT_ENV`]): (dot, finish, raw scratch).
     pub hc_split: Option<(KernelHandle, KernelHandle)>,
+    /// attention2's fused FP8-weight GEMM (no bf16 dequant copy), used for prefill M > MM_TILE
+    /// on the shapes where it measured faster ([`fused_wins`]). [`FP8_FUSED_ENV`]`=1` only,
+    /// until the end-to-end byte test passes.
+    pub fp8_fused: Option<Fp8Gemm>,
 }
+
+/// `ATLAS_DSV41_FP8_FUSED=1`: prefill FP8 linears on the winning shapes skip the bf16 dequant.
+pub const FP8_FUSED_ENV: &str = "ATLAS_DSV41_FP8_FUSED";
 
 /// ON by default (`ATLAS_DSV41_HC_SPLIT=0` turns it off): at T = 1, `hc_mixes` runs as 25 blocks + an epilogue instead of one
 /// block per token. Bit-identical by construction (same per-thread order, same tree).
@@ -258,6 +266,7 @@ impl Dsv41Kernels {
             } else {
                 None
             },
+            fp8_fused: if std::env::var(FP8_FUSED_ENV).as_deref() == Ok("1") { Some(Fp8Gemm::load(gpu)?) } else { None },
         })
     }
 }
@@ -431,6 +440,14 @@ impl Ops<'_> {
         }
         if m <= GEMV_MAX_M && decode_pass() && self.k.fp8_gemv_m8.is_some() {
             return self.fp8_gemv_rows(x, w.k, w, out, w.n, m, w.n, 0);
+        }
+        if let Some(f) = self.k.fp8_fused
+            && m > MM_TILE
+            && !fp8_force_rowtile()
+            && fp8_policy() == Fp8Policy::Pinned
+            && fused_wins(m, w.n, w.k)
+        {
+            return prof(self, "dense/fused", || f.linear(self.gpu, x, w.k, w, out, w.n, m, self.stream));
         }
         prof(self, "dense/dequant", || self.dequant(w, scratch))?;
         prof(self, "dense/gemm", || {
