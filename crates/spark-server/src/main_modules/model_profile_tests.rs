@@ -70,6 +70,11 @@ fn qwen3_5_checkpoints_get_their_own_profile_by_directory() {
     let q38 = profile_for(Some("/home/flocka/atlas/qwen38/optimized-qwen"), "qwen3_5").unwrap();
     assert_eq!(q38.recipe_id, "qwen3.8/qwen3.8-27b-optimized-local");
     assert!(q38.env.contains_key("ATLAS_ATTN_PROJ_CUBLASLT"));
+    // The TC verify switches ship only together with decode parity, which keeps
+    // speculation byte-identical to plain decode.
+    for tc in ["ATLAS_FFN_TC", "ATLAS_SSM_PROJ_TC", "ATLAS_LM_HEAD_TC", "ATLAS_DECODE_TC_PARITY"] {
+        assert_eq!(q38.env.get(tc).map(String::as_str), Some("1"), "{tc}");
+    }
     let aeon = profile_for(Some("/m/AEON-Q36-27B-Full/"), "qwen3_5").unwrap();
     assert_eq!(aeon.recipe_id, "qwen3.6/aeon-q36-27b-full-local");
     assert!(profile_for(Some("/m/Some-Other-27B"), "qwen3_5").is_none());

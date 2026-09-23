@@ -190,7 +190,7 @@ fn sample_host_logits(
         }
     }
     if !needs_sampler(params, history) {
-        // Greedy argmax over FP32
+        // Greedy argmax over FP32, first id of a tie (the device rule).
         return spark_runtime::sampler::first_max_index(f32_logits);
     }
     // SAFETY: an f32 slice viewed as its bytes; same length in bytes, no alignment demand.
@@ -237,56 +237,17 @@ pub fn sample_token_with_grammar(
 
     // ── Greedy fused fast path (temperature == 0) ──
     //
-    // Earlier implementation made THREE sequential passes over `vocab_size`:
-    // (1) BF16→f32 conversion, (2) apply_bitmask_to_logits, (3) max_by scan
-    // with f32 partial_cmp — about 5 ms wall on the 248k-vocab aeon-ultimate
-    // model. We fuse them into ONE pass, comparing BF16 values directly as
-    // signed i16 (which preserves the natural ordering of finite BF16
-    // values) so no f32 scratch buffer is needed. Plus we apply suppress_ids
-    // post-hoc since they're typically a handful of token IDs.
+    // One pass over the BF16 row: the grammar bitmask and suppress_ids are
+    // folded into the admit filter of the shared greedy pick, so no f32
+    // scratch buffer is needed. A fully-masked row falls back to token 0.
     if !needs_sampler(params, history) {
-        let bytes: &[u8] = &bf16_buf;
-        let mut best_tok: u32 = 0;
-        let mut best_val: i16 = i16::MIN;
-        for tok in 0..vocab_size {
-            let word = tok / 32;
-            let bit = tok % 32;
-            if word >= bitmask.len() || (bitmask[word] & (1i32 << bit)) == 0 {
-                continue;
-            }
-            // Reinterpret BF16 bit pattern as signed i16 for total ordering
-            // over finite values. Suppress-ids are filtered post-loop.
-            let hi = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]);
-            let signed = hi as i16;
-            if signed > best_val {
-                best_val = signed;
-                best_tok = tok as u32;
-            }
-        }
-        // Suppress-id post-filter: rare hit path, recompute argmax only when
-        // a suppressed token was chosen. Cheaper than per-token suppress
-        // check inside the hot loop above.
-        if suppress_ids.contains(&best_tok) {
-            best_val = i16::MIN;
-            best_tok = 0;
-            for tok in 0..vocab_size {
-                if suppress_ids.contains(&(tok as u32)) {
-                    continue;
-                }
-                let word = tok / 32;
-                let bit = tok % 32;
-                if word >= bitmask.len() || (bitmask[word] & (1i32 << bit)) == 0 {
-                    continue;
-                }
-                let hi = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]);
-                let signed = hi as i16;
-                if signed > best_val {
-                    best_val = signed;
-                    best_tok = tok as u32;
-                }
-            }
-        }
-        return Ok(best_tok);
+        let allowed = |tok: u32| {
+            let (word, bit) = ((tok / 32) as usize, tok % 32);
+            word < bitmask.len()
+                && (bitmask[word] & (1i32 << bit)) != 0
+                && !suppress_ids.contains(&tok)
+        };
+        return Ok(spark_runtime::sampler::argmax_bf16_first_wins(&bf16_buf, allowed).unwrap_or(0));
     }
 
     // Stochastic sampling path: needs f32 logits for the sampler. Keep the

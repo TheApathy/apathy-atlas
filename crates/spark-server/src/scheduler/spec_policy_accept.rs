@@ -146,29 +146,16 @@ fn accept_fast_argmax_enabled() -> bool {
     std::env::var("ATLAS_ACCEPT_FAST_ARGMAX").as_deref() != Ok("0")
 }
 
-/// Argmax over a host-copied BF16 logits row with **last-wins** tie
-/// semantics, skipping a set of token indices.
+/// Greedy pick over a host-copied BF16 logits row, skipping `skip_toks`.
 ///
-/// The full walk's greedy branch is `raw_logits.iter().enumerate().max_by(
-/// |a, b| a.1.partial_cmp(b.1).unwrap_or(Equal))`, which returns the LAST
-/// maximal element on ties. A strict `>` scan would return the first, so a
-/// byte-identical fast path must use `>=` to match `max_by`. BF16-as-i16
-/// ordering is valid for all finite values (same trick as
-/// `argmax_bf16_skip_tokens` in `verify_dflash_step.rs`).
-fn argmax_bf16_skip_last_wins(bytes: &[u8], skip_toks: &[u32], vocab: usize) -> Option<u32> {
-    let mut best_tok: Option<u32> = None;
-    let mut best_val = i16::MIN;
-    for tok in 0..vocab {
-        if skip_toks.contains(&(tok as u32)) {
-            continue;
-        }
-        let signed = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]) as i16;
-        if best_tok.is_none() || signed >= best_val {
-            best_val = signed;
-            best_tok = Some(tok as u32);
-        }
-    }
-    best_tok
+/// Must commit exactly what the full walk's greedy branch would: both go
+/// through the shared first-wins rule
+/// ([`spark_runtime::sampler::argmax_bf16_first_wins`]), which is also the
+/// device argmax's rule.
+fn argmax_bf16_skip(bytes: &[u8], skip_toks: &[u32], vocab: usize) -> Option<u32> {
+    spark_runtime::sampler::argmax_bf16_first_wins(&bytes[..2 * vocab], |tok| {
+        !skip_toks.contains(&tok)
+    })
 }
 
 /// Per-row gate for the raw-BF16 accept fast path.
@@ -187,7 +174,7 @@ fn argmax_bf16_skip_last_wins(bytes: &[u8], skip_toks: &[u32], vocab: usize) -> 
 /// - `!suppress_tool_call` / `!require_tool_call`: the −12 tool bias and
 ///   the one-shot pin-to-tool-call-start would re-order the argmax.
 /// - no grammar: the grammar bitmask would re-order logits.
-/// - BF16 rows only: the FP32 path needs an f32 scan, not the i16 trick.
+/// - BF16 rows only: the FP32 path needs an f32 row, not a BF16 one.
 ///
 /// The `</think>`/`<think>` masks applied by the full walk when
 /// `think_ended` are reproduced here as a skip list; masking to −inf and
@@ -223,7 +210,7 @@ fn accept_row_fast_path_ok(
 /// the champion (13 rows × 248,320 vocab). The result is byte-identical by
 /// construction: BF16→FP32 is a monotone injection, all interventions that
 /// could re-order the argmax are gated out, and the masks become a skip
-/// list with matching last-wins tie semantics.
+/// list with the same first-wins tie rule.
 pub(super) fn dflash_content_accept(
     a: &mut ActiveSeq,
     drafts: &[u32],
@@ -275,7 +262,7 @@ pub(super) fn dflash_content_accept(
                     skip.push(t);
                 }
             }
-            let tok = argmax_bf16_skip_last_wins(&row_buf, &skip, vocab).unwrap_or(0);
+            let tok = argmax_bf16_skip(&row_buf, &skip, vocab).unwrap_or(0);
             (tok, None)
         } else {
             process_seq_logits(
@@ -406,7 +393,7 @@ pub(super) fn run_dflash_content_accept(
 
 #[cfg(test)]
 mod fast_argmax_tests {
-    use super::argmax_bf16_skip_last_wins;
+    use super::argmax_bf16_skip;
 
     fn bf16(f: f32) -> u16 {
         // Round-to-nearest-even BF16 conversion: keep the top 16 bits and
@@ -418,7 +405,7 @@ mod fast_argmax_tests {
     }
 
     /// Reference: exactly what `process_seq_logits`'s greedy branch does —
-    /// expand BF16→FP32, apply −inf masks, `max_by` (last-wins ties).
+    /// expand BF16→FP32, apply −inf masks, first-wins argmax.
     fn ref_walk(row: &[u8], skip: &[u32], vocab: usize) -> u32 {
         let f32s: Vec<f32> = (0..vocab)
             .map(|j| {
@@ -433,23 +420,34 @@ mod fast_argmax_tests {
                 }
             })
             .collect();
-        f32s.iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0)
+        spark_runtime::sampler::argmax_first_wins_f32(&f32s)
     }
 
     #[test]
-    fn last_wins_tie_semantics_match_max_by() {
-        // Two distinct tokens with identical BF16 max values: `max_by`
-        // returns the LAST; a strict `>` scan would return the first.
+    fn exact_tie_keeps_the_first_id_like_the_device_argmax() {
         let mut row = vec![0u8; 6 * 2];
         for (i, v) in [1.0f32, -2.0, 3.0, 3.0, 0.5, -1.0].iter().enumerate() {
             row[2 * i..2 * i + 2].copy_from_slice(&bf16(*v).to_le_bytes());
         }
-        assert_eq!(argmax_bf16_skip_last_wins(&row, &[], 6), Some(3));
-        assert_eq!(ref_walk(&row, &[], 6), 3);
+        assert_eq!(argmax_bf16_skip(&row, &[], 6), Some(2));
+    }
+
+    #[test]
+    fn all_negative_row_orders_numerically() {
+        let mut row = vec![0u8; 4 * 2];
+        for (i, v) in [-8.0f32, -1.0, -2.0, -8.0].iter().enumerate() {
+            row[2 * i..2 * i + 2].copy_from_slice(&bf16(*v).to_le_bytes());
+        }
+        assert_eq!(argmax_bf16_skip(&row, &[], 4), Some(1));
+    }
+
+    #[test]
+    fn signed_zeros_tie_and_the_first_wins() {
+        let mut row = vec![0u8; 4 * 2];
+        for (i, v) in [-8.0f32, -0.0, 0.0, -8.0].iter().enumerate() {
+            row[2 * i..2 * i + 2].copy_from_slice(&bf16(*v).to_le_bytes());
+        }
+        assert_eq!(argmax_bf16_skip(&row, &[], 4), Some(1));
     }
 
     #[test]
@@ -460,7 +458,7 @@ mod fast_argmax_tests {
         for (i, v) in [0.0f32, -100.0, 5.5, -0.25, 1e3, -1e3].iter().enumerate() {
             row[2 * i..2 * i + 2].copy_from_slice(&bf16(*v).to_le_bytes());
         }
-        assert_eq!(argmax_bf16_skip_last_wins(&row, &[], 6), Some(4));
+        assert_eq!(argmax_bf16_skip(&row, &[], 6), Some(4));
         assert_eq!(ref_walk(&row, &[], 6), 4);
     }
 
@@ -472,19 +470,19 @@ mod fast_argmax_tests {
         for (i, v) in [1.0f32, 2.0, 9.0, 3.0, 0.5, 4.0].iter().enumerate() {
             row[2 * i..2 * i + 2].copy_from_slice(&bf16(*v).to_le_bytes());
         }
-        assert_eq!(argmax_bf16_skip_last_wins(&row, &[2], 6), Some(5));
+        assert_eq!(argmax_bf16_skip(&row, &[2], 6), Some(5));
         assert_eq!(ref_walk(&row, &[2], 6), 5);
     }
 
     #[test]
-    fn masked_tie_breaks_toward_last_unmasked() {
+    fn masked_tie_breaks_toward_first_unmasked() {
         let mut row = vec![0u8; 6 * 2];
         for (i, v) in [7.0f32, 7.0, 7.0, 1.0, 2.0, 3.0].iter().enumerate() {
             row[2 * i..2 * i + 2].copy_from_slice(&bf16(*v).to_le_bytes());
         }
-        // Mask the first two 7.0s: last 7.0 (index 2) wins in both paths.
-        assert_eq!(argmax_bf16_skip_last_wins(&row, &[0, 1], 6), Some(2));
-        assert_eq!(ref_walk(&row, &[0, 1], 6), 2);
+        // Mask the first 7.0: the next 7.0 (index 1) wins in both paths.
+        assert_eq!(argmax_bf16_skip(&row, &[0], 6), Some(1));
+        assert_eq!(ref_walk(&row, &[0], 6), 1);
     }
 
     #[test]
@@ -493,7 +491,7 @@ mod fast_argmax_tests {
         for (i, v) in [1.0f32, 2.0, 3.0].iter().enumerate() {
             row[2 * i..2 * i + 2].copy_from_slice(&bf16(*v).to_le_bytes());
         }
-        assert_eq!(argmax_bf16_skip_last_wins(&row, &[0, 1, 2], 3), None);
+        assert_eq!(argmax_bf16_skip(&row, &[0, 1, 2], 3), None);
     }
 
     #[test]
@@ -520,7 +518,7 @@ mod fast_argmax_tests {
                 .filter(|_| next() < 0.1)
                 .map(|j| j as u32)
                 .collect();
-            let fast = argmax_bf16_skip_last_wins(&row, &skip, vocab);
+            let fast = argmax_bf16_skip(&row, &skip, vocab);
             let reference = ref_walk(&row, &skip, vocab);
             if skip.len() == vocab {
                 assert_eq!(fast, None, "trial {trial}: all-skipped must be None");

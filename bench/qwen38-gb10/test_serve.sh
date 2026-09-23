@@ -41,6 +41,7 @@ legacy="$({ invoke DRAFT=/draft "$SERVE"; } 2>&1)"
 explicit="$(invoke RUNTIME_MODE=dflash-v3 DRAFT=/draft "$SERVE")"
 [[ "$explicit" == *$'arg=--dflash\n'* ]]
 [[ "$explicit" == *$'ATLAS_DFLASH_ECHO=0\n'* ]]
+[[ "$explicit" == *$'ATLAS_DECODE_TC_PARITY=1\n'* ]]
 
 inherited_echo="$(invoke RUNTIME_MODE=dflash-v3 DRAFT=/draft ATLAS_DFLASH_ECHO=1 "$SERVE")"
 [[ "$inherited_echo" == *$'ATLAS_DFLASH_ECHO=0\n'* ]]

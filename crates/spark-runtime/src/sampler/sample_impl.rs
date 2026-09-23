@@ -122,6 +122,11 @@ pub fn sample_with_params_seeded(
     // monotonic transforms, neither of which can re-order the maximum. Only
     // penalties + logit_bias actually re-order logits, so as long as those
     // ran first, this argmax is correct AND respects caller config.
+    //
+    // Ties keep the FIRST maximal id, like the device argmax and the verify
+    // path (`argmax_first_wins_f32` is the SSOT); `Iterator::max_by` would
+    // keep the LAST and fork plain decode from speculative verify on exact
+    // BF16 ties.
     if params.temperature <= 0.0 {
         return first_max_index(&raw_logits);
     }
