@@ -15,6 +15,7 @@
 //!   - `gemma4`: Gemma-4 (pure attention, GeGLU, sliding + full attention)
 
 mod dflash_admission;
+pub mod deepseek_v41;
 pub mod dflash_loader;
 mod dflash_validation;
 pub mod dspark_confidence;
@@ -250,7 +251,10 @@ pub trait ModelWeightLoader {
         crate::precision_schedule::PrecisionSchedule::default()
     }
 
-    fn load_embedding(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight>;
+    /// `gpu` is passed so model-specific loaders can do on-device weight
+    /// transforms at load time, matching `load_final_norm`/`load_lm_head`
+    /// below (DeepSeek-V4.1 delegates all three to the same dense helpers).
+    fn load_embedding(&self, store: &WeightStore, config: &ModelConfig, gpu: &dyn GpuBackend) -> Result<DenseWeight>;
     /// Load the final RMSNorm weight used before the LM head.
     ///
     /// `gpu` is passed so model-specific loaders can do on-device weight
