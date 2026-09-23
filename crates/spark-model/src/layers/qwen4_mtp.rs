@@ -151,6 +151,7 @@ impl Qwen4MtpHead {
         ctx: &ForwardContext,
         stream: u64,
         grammar_bitmask: Option<&[i32]>,
+        emit_draft: bool,
     ) -> Result<u32> {
         let h = ctx.config.hidden_size;
         let r = ctx.config.residual_width();
@@ -278,6 +279,14 @@ impl Qwen4MtpHead {
             stream,
         )?;
 
+        // Prompt replay only fills the MTP KV cache. It must not run the head:
+        // `buffers.logits()` still holds the target's prefill logits, which the
+        // scheduler samples the first output token from after this returns.
+        if !emit_draft {
+            state.seq_len += 1;
+            return Ok(0);
+        }
+
         let (sample_hidden, inject) = self.final_mixer.prepare_decode(
             hidden,
             ctx.buffers.residual(),
@@ -373,6 +382,7 @@ impl DraftProposer for Qwen4MtpHead {
                 ctx,
                 stream,
                 grammar_bitmask,
+                true,
             )?;
             drafts.push(token);
             hidden = ctx.buffers.hidden_states();
@@ -428,6 +438,7 @@ impl DraftProposer for Qwen4MtpHead {
                 ctx,
                 stream,
                 None,
+                false,
             )?;
         }
         state.last_num_drafted = 0;
