@@ -2,6 +2,17 @@
 //
 // Grouped CB3 expert GEMM with the weights decoded IN SHARED MEMORY, never in DRAM.
 //
+// CLOSING NOTE (2026-09-23, dsv41-engine; MoE kernel work stopped here by the lead's ruling).
+//   Where it is: one layer of runC_2048 L02, production forward, T=2048 26.78 ms (from
+//   30.78 at 7049910c2), T=128 11.46 ms (from 13.31); all byte-identical to the original.
+//   Bound: LATENCY at low occupancy. ncu (T=2048 gate_up): tensor pipe 42%, IPC ~1, 7.5
+//   warps/SM; T=128: issue utilisation 16-23%, 0.2-0.3 eligible warps per scheduler, DRAM
+//   and L2 < 40%. Each warp's dependent decode chain plus plane-load latency sets the pace.
+//   Floors: DRAM ~5.8 ms at T=128 (1.45 GB of packed experts), MMA ~7 ms at T=2048.
+//   Rule the data gave, 12 times: shrinking shared memory or plane-load traffic wins; every
+//   variant that grew smem, forced occupancy, or moved a named ncu stall lost or was flat.
+//   The wins and the rejections, with numbers, are listed below in the order measured.
+//
 // Replaces reconstruct-to-bf16-scratch + cuBLASLt for the DeepSeek-V4.1 routed experts.
 // Measured on one layer at T=2048 (dsv41_moe_bench): the scratch path wrote 70.8 MB of
 // bf16 per expert and read it back — 129 of 147 ms per layer — against a floor of reading

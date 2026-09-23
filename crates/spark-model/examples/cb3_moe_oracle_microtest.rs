@@ -308,6 +308,10 @@ fn main() -> Result<()> {
         println!("  candidate dumped to {} (float32, [{tokens}, {hidden}])", path.display());
     }
     // CHUNK INVARIANCE: the same rows split into different chunks must give the SAME BYTES.
+    // NECESSARY, NOT SUFFICIENT: it compares chunkings with each other, so a kernel that is
+    // wrong the same way in every chunking passes (a broken 2x4 down_m32 at rel_l2 0.70 did).
+    // Always pair it with the oracle rel_l2 gate above and a byte-cmp of --dump against the
+    // previous kernel.
     // Each split is a list of chunk sizes summing to T, e.g. "512,512,512,512;1000,1048".
     if let Some(spec) = &invariance {
         ensure!(ours, "--invariance runs the production forward: use --routing ours");
