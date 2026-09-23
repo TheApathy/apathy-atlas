@@ -28,7 +28,9 @@ pub struct GgufDeviceTensor {
     ///
     /// SETTING THIS IN A TEST FIXTURE: derive it, never write a literal --
     ///
-    ///     alloc_bytes: mmq_tensor_alloc_bytes(kind, dims, byte_len)?
+    /// ```text
+    /// alloc_bytes: mmq_tensor_alloc_bytes(kind, dims, byte_len)?
+    /// ```
     ///
     /// A fixture that hardcodes `byte_len` (or a number that happens to match
     /// today) silently stops modelling the allocation the loader really makes,

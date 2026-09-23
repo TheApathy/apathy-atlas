@@ -27,8 +27,11 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 
+mod bounce_copy;
 mod direct_io;
 mod header;
+
+use bounce_copy::PinnedBounceCopier;
 
 use header::{parse_header, resolve_shards};
 
@@ -418,6 +421,14 @@ fn load_shard_fast(
     });
 
     // Copier: drains the channel, does gpu alloc + copy_h2d, inserts into the map.
+    //
+    // The H2D leg uses a pinned bounce buffer, not the plain pageable
+    // `gpu.copy_h2d`: that call is a blocking, timeout-free driver
+    // synchronize that has been observed to stall indefinitely on an
+    // ordinary few-MB tensor with tens of GB of GPU memory free. The bounce
+    // copier stages through page-locked memory and waits on a polled,
+    // bounded timeout instead — see `bounce_copy` for why.
+    let mut bounce = PinnedBounceCopier::new(gpu)?;
     for result in rx {
         let (idx, buf, slice_start) = result?;
         let meta = &tensors[idx];
@@ -428,13 +439,7 @@ fn load_shard_fast(
         let ptr = match gpu.alloc(meta.len) {
             Ok(p) => {
                 load_trace!("copier: #{idx} alloc done ({:?}), h2d start", t_tensor.elapsed());
-                if load_trace_enabled() {
-                    // Split copy_h2d's two driver calls apart when tracing: its
-                    // leading cuStreamSynchronize and the cuMemcpyHtoD itself.
-                    gpu.synchronize(gpu.default_stream())?;
-                    load_trace!("copier: #{idx} stream sync done ({:?}), memcpy start", t_tensor.elapsed());
-                }
-                gpu.copy_h2d(src, p)?;
+                bounce.copy(gpu, src, p)?;
                 load_trace!("copier: #{idx} h2d done ({:?})", t_tensor.elapsed());
                 p
             }
@@ -465,6 +470,7 @@ fn load_shard_fast(
         );
     }
 
+    bounce.drain(gpu)?;
     load_trace!("shard: copier drained ({:?}), joining reader", t_shard.elapsed());
     reader_handle
         .join()

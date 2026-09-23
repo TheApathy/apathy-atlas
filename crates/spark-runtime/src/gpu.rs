@@ -502,6 +502,19 @@ pub trait GpuBackend: Send + Sync {
         Ok(())
     }
 
+    /// Poll whether an event has completed, without blocking.
+    ///
+    /// `Ok(true)` once the work recorded on the event has finished, `Ok(false)`
+    /// while it is still pending. Callers that need a bounded wait poll this
+    /// on a wall-clock deadline instead of calling a blocking driver
+    /// synchronize — see [`GpuBackend::copy_h2d`] for why a blocking call on
+    /// pageable memory can, on rare hardware/driver states, never return.
+    /// Default: always ready (matches the other event stubs' no-op mock
+    /// semantics — nothing was actually recorded).
+    fn poll_event(&self, _event: u64) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Destroy an event.
     fn destroy_event(&self, _event: u64) -> Result<()> {
         Ok(())

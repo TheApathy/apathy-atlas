@@ -26,12 +26,12 @@ defaults:
   max_prefill_tokens: 8192
   max_batch_size: 1
   max_num_seqs: 1
-  mtp_vocab: 248320
+  mtp_vocab: 96000
   max_thinking_budget: 2048
   enable_prefix_caching: false
   dflash: true
-  draft_model: /home/flocka/models/z-lab-Qwen3.8-27B-DFlash2
-  dflash_gamma: 7
+  draft_model: /home/flocka/atlas/qwen38/drafter-qwen38-v3-final
+  dflash_gamma: 8
   dflash_quantization: nvfp4
   dflash_method: flat
 atlas:

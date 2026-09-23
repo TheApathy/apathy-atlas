@@ -608,6 +608,16 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(())
     }
 
+    fn poll_event(&self, event: u64) -> Result<bool> {
+        const CUDA_ERROR_NOT_READY: i32 = 600;
+        let status = unsafe { super::cuEventQuery(event) };
+        match status {
+            0 => Ok(true),
+            CUDA_ERROR_NOT_READY => Ok(false),
+            other => bail!("cuEventQuery failed: status {other}"),
+        }
+    }
+
     fn alloc_host_pinned(&self, bytes: usize) -> Result<PinnedHostBuffer> {
         if bytes == 0 {
             bail!("pinned host allocation must be non-empty");

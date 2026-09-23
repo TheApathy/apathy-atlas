@@ -72,6 +72,11 @@ unsafe extern "C" {
     pub(super) fn cuEventRecord(hEvent: u64, hStream: u64) -> i32;
     pub(super) fn cuStreamWaitEvent(hStream: u64, hEvent: u64, flags: u32) -> i32;
     pub(super) fn cuEventDestroy_v2(hEvent: u64) -> i32;
+    // CUDA_ERROR_NOT_READY (600) on a still-pending event; CUDA_SUCCESS (0) once
+    // it has completed. Never blocks — the polling counterpart to
+    // cuEventSynchronize, used so a stalled H2D copy can be bounded by a
+    // wall-clock timeout instead of hanging inside the driver indefinitely.
+    pub(super) fn cuEventQuery(hEvent: u64) -> i32;
 }
 
 /// Production GPU backend wrapping AtlasRegistry + raw CUDA driver API.
