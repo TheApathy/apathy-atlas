@@ -41,6 +41,9 @@ pub enum WeightDtype {
     BF16,
     FP32,
     FP8E4M3,
+    /// NVFP4 block-scale exponent (1 byte, E8M0). DeepSeek-V4.1's MTP head
+    /// ships its expert scales in this format.
+    FP8E8M0,
     UInt8,
     Int64,
 }
@@ -51,6 +54,7 @@ impl WeightDtype {
             Self::BF16 => 2,
             Self::FP32 => 4,
             Self::FP8E4M3 => 1,
+            Self::FP8E8M0 => 1,
             Self::UInt8 => 1,
             Self::Int64 => 8,
         }
@@ -63,6 +67,7 @@ impl WeightDtype {
             safetensors::Dtype::U8 => Ok(Self::UInt8),
             safetensors::Dtype::I64 => Ok(Self::Int64),
             safetensors::Dtype::F8_E4M3 => Ok(Self::FP8E4M3),
+            safetensors::Dtype::F8_E8M0 => Ok(Self::FP8E8M0),
             other => bail!("Unsupported safetensors dtype: {other:?}"),
         }
     }
@@ -351,7 +356,20 @@ pub struct SafetensorsLoader {
     /// used for small compatibility sidecars sourced from a full checkpoint
     /// (for example a DFlash donor embedding + LM head).
     pub tensor_allowlist: Option<HashSet<String>>,
+    /// Extra "don't load this tensor" predicate, ORed with the EP rule and the allowlist.
+    ///
+    /// Unlike EP sharding this is unconditional — it applies at `ep_world_size == 1` and to
+    /// `mtp.*` — because its user is DeepSeek-V4.1's engram table (~95 GB per layer, must never
+    /// be loaded into the WeightStore; `deepseek_v41_engram::EngramGather` reads it directly
+    /// from the checkpoint file instead). Skipped tensors are excluded from the pre-flight OOM
+    /// estimate too, since the same predicate feeds `estimate_load_bytes`. Ported from
+    /// dsv41/integration.
+    pub extra_skip: Option<TensorSkipFn>,
 }
+
+/// A "don't load this tensor" predicate, shareable across the loader's pre-flight estimate and
+/// its per-shard passes.
+pub type TensorSkipFn = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 impl Default for SafetensorsLoader {
     fn default() -> Self {
@@ -369,6 +387,7 @@ impl SafetensorsLoader {
             peak_memory_multiplier: None,
             construction_overhead_bytes: 0,
             tensor_allowlist: None,
+            extra_skip: None,
         }
     }
 
@@ -381,13 +400,20 @@ impl SafetensorsLoader {
             peak_memory_multiplier: None,
             construction_overhead_bytes: 0,
             tensor_allowlist: None,
+            extra_skip: None,
         }
     }
 
-    /// Check if a tensor should be skipped under EP.
+    /// Check if a tensor should be skipped under EP, the allowlist, or [`Self::extra_skip`].
     /// Skips `*.experts.{E}.*` tensors where E is not in local range.
-    /// MTP head experts are never skipped (small, fully replicated).
+    /// MTP head experts are never skipped by the EP rule (small, fully replicated) — only
+    /// `extra_skip` can drop them.
     fn should_skip_tensor(&self, name: &str) -> bool {
+        if let Some(ref extra) = self.extra_skip
+            && extra(name)
+        {
+            return true;
+        }
         if self
             .tensor_allowlist
             .as_ref()
@@ -429,6 +455,7 @@ pub(crate) fn parse_expert_index(name: &str) -> Option<usize> {
     None
 }
 
+pub mod deepseek_v41_pack;
 pub mod gguf;
 mod loader;
 pub mod mlx_int8;
