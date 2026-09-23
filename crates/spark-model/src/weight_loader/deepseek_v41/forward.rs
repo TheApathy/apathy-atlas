@@ -37,6 +37,11 @@ use crate::layers::deepseek_v41_engram::{
 /// every run.
 pub const ENGRAM_DEBUG_ENV: &str = "ATLAS_DSV41_ENGRAM_DEBUG";
 
+/// Prompts at least this long prefill in `max_chunk` pieces; shorter ones in [`SHORT_CHUNK`].
+pub const LONG_PROMPT: usize = 6144;
+/// The chunk for prompts under [`LONG_PROMPT`] tokens (window8: faster than 3968 at 4096 tokens).
+pub const SHORT_CHUNK: usize = 2048;
+
 fn engram_debug() -> bool {
     std::env::var(ENGRAM_DEBUG_ENV).is_ok()
 }
@@ -126,10 +131,24 @@ pub trait PassHook {
     fn rollback(&self, _ops: &Ops, n: usize) -> Result<()> {
         anyhow::bail!("this attention core cannot roll back (to {n} positions)")
     }
+    /// CUDA-graph decode: switch the core to shape-static Decode/Verify passes reading their
+    /// start from the device i32 `dstart`. Refuses by default (a core that is not shape-static
+    /// would replay a stale shape silently).
+    fn enable_graph(&self, _dstart: DevicePtr) -> Result<()> {
+        anyhow::bail!("this attention core is not shape-static; decode graphs need one")
+    }
+    /// CUDA-graph decode: the host bookkeeping of a pass that was REPLAYED (its launches came
+    /// from a graph, `run` was not called).
+    fn replay_step(&self, kind: PassKind, start: usize, _t: usize) -> Result<()> {
+        anyhow::bail!("this attention core cannot account for a replayed {kind:?} pass at {start}")
+    }
 }
 
 /// Per-sequence state this module owns. (ckv / ik / pending belong to the attention lane.)
 pub struct V41Seq {
+    /// Unique per allocation (process-wide): CUDA graphs bake this sequence's buffers in and
+    /// are keyed by it, so a new sequence never replays a graph captured on a freed one.
+    pub id: u64,
     /// One window ring per layer, `[RING, 512]` bf16, slot = pos % RING.
     pub rings: Vec<DevicePtr>,
     pub hash: EngramHashState,
@@ -149,6 +168,25 @@ pub struct V41Seq {
     /// `engine/model.py:747`'s local fallback, which only applies to decode/text
     /// (dsv41-parity, 2026-09-22).
     pub dead_carry: Vec<u32>,
+    /// Prefetched engram hashes, keyed by chunk `start_pos`. Populated by
+    /// [`V41Forward::plan_engram_prefetch`] before the chunk loop runs; `pass()` consumes
+    /// (removes) an entry here instead of calling `hash.forward()` again when one exists, since
+    /// the hash state is append-only and can only be advanced once per position.
+    pub engram_hash_cache: std::collections::HashMap<usize, Vec<i64>>,
+    /// Prefetched, dequantized (host, PRE-mask) engram rows, keyed by `(start_pos, layer)`.
+    /// `run_layers` checks here first and uploads straight from it, skipping the synchronous
+    /// NVMe gather, whenever an entry exists (either already received off
+    /// `engram_prefetch_rx`, or inserted directly by a caller that isn't using the channel).
+    pub engram_row_cache: std::collections::HashMap<(usize, usize), Vec<f32>>,
+    /// Set for the duration of a prefetching `prefill()` call: the channel a background thread
+    /// is sending `((start_pos, layer), rows)` down, in job order (chunk-major, then this
+    /// model's engram layers in order). `run_layers`'s engram branch blocks on this -- not on a
+    /// per-chunk wait in `prefill`'s loop -- so the wait happens exactly when that SPECIFIC
+    /// layer's rows are needed, overlapping with every layer before it in the SAME chunk (the
+    /// embedding step plus layers 0..L-1), not only with earlier chunks. A single-chunk prompt
+    /// (chunk >= prompt length) has no chunk-level overlap to exploit at all; per-layer overlap
+    /// is what makes prefetch pay off there (dsv41-lead, 2026-09-22).
+    pub engram_prefetch_rx: Option<std::sync::mpsc::Receiver<((usize, usize), Result<Vec<f32>>)>>,
 }
 
 impl V41Seq {
@@ -160,7 +198,9 @@ impl V41Seq {
                 Ok(r)
             })
             .collect::<Result<Vec<_>>>()?;
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             rings,
             hash,
             len: 0,
@@ -169,6 +209,9 @@ impl V41Seq {
             tail_rows: 0,
             tail_ids: Vec::new(),
             dead_carry: Vec::new(),
+            engram_hash_cache: std::collections::HashMap::new(),
+            engram_row_cache: std::collections::HashMap::new(),
+            engram_prefetch_rx: None,
         })
     }
 
@@ -211,7 +254,42 @@ pub struct V41Forward {
     /// The DSpark drafter's weights (store-resident), when loaded. Consumed by dsv41-decode's
     /// draft/verify path.
     pub dspark: Option<super::mtp::DsparkWeights>,
+    /// Whole-step CUDA graphs for Decode/Verify passes (`enable_graphs`); None = eager.
+    pub graph: Option<GraphState>,
 }
+
+/// CUDA-graph state: the device start scalar, the engram rows gathered BEFORE the graph (the
+/// NVMe gather is host work and cannot be captured), and one instantiated graph per
+/// (pass kind, rows, sequence) -- the rings baked into a graph belong to one sequence, so the
+/// first pass of a new sequence destroys every graph of the previous one.
+pub struct GraphState {
+    pub dstart: DevicePtr,
+    /// (engram layer, rows buffer `[MAX_T, 24, 256]` f32).
+    pub pre_rows: Vec<(usize, DevicePtr)>,
+    graphs: std::sync::Mutex<std::collections::HashMap<(u8, usize, u64), spark_runtime::gpu::GraphHandle>>,
+    /// Graphs captured so far (a replay never adds one).
+    pub captures: std::sync::atomic::AtomicUsize,
+    /// The `V41Seq::id` the cached graphs were captured on.
+    seq_id: std::sync::Mutex<Option<u64>>,
+    /// Destroys every instantiated graph on drop (TUI model swap), when the forward owns its
+    /// allocations (served model); the driver leaves this None.
+    owner: Option<super::device_allocs::SharedGpu>,
+}
+
+impl Drop for GraphState {
+    fn drop(&mut self) {
+        let Some(gpu) = &self.owner else { return };
+        let _ = gpu.bind_to_thread();
+        for (_, h) in self.graphs.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default() {
+            if let Err(e) = gpu.destroy_graph(h) {
+                tracing::warn!("GraphState drop: destroying a decode graph failed: {e}");
+            }
+        }
+    }
+}
+
+/// Rows a graphed pass may carry (Decode = 1, Verify = 1 + drafts).
+pub const GRAPH_MAX_T: usize = 8;
 
 pub fn rope_specs() -> (RopeSpec, RopeSpec) {
     let w = RopeSpec { dim: 64, original_seq_len: 0, base: 10000.0, factor: 16.0, beta_fast: 32.0, beta_slow: 1.0 };
@@ -270,10 +348,34 @@ impl V41Forward {
             allocs: super::device_allocs::DeviceAllocs::unowned(),
             dspark_seed: None,
             dspark: None,
+            graph: None,
         })
     }
 
     /// Allocate the DSpark seed buffer (call before [`Self::own_allocations`] so it is owned too).
+    /// Turn on whole-step CUDA graphs for Decode/Verify passes. `hook` is switched to its
+    /// shape-static mode reading the same device start.
+    pub fn enable_graphs(&mut self, gpu: &dyn GpuBackend, hook: &dyn PassHook) -> Result<()> {
+        let dstart = gpu.alloc(256)?;
+        self.allocs.adopt(dstart);
+        let mut pre_rows = Vec::new();
+        for (layer, _) in &self.engram {
+            let p = gpu.alloc(GRAPH_MAX_T * N_HEAD_COLS * 256 * 4)?;
+            self.allocs.adopt(p);
+            pre_rows.push((*layer, p));
+        }
+        hook.enable_graph(dstart)?;
+        self.graph = Some(GraphState {
+            dstart,
+            pre_rows,
+            graphs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            captures: std::sync::atomic::AtomicUsize::new(0),
+            seq_id: std::sync::Mutex::new(None),
+            owner: self.allocs.owner(),
+        });
+        Ok(())
+    }
+
     pub fn enable_dspark_seed(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
         let rows = super::ops::tiled_rows(self.max_chunk.max(WINDOW));
         let cols = super::mtp::DSPARK_TARGET_LAYERS.len() * self.dims.hidden;
@@ -325,15 +427,69 @@ impl V41Forward {
         moe: &dyn V41RoutedMoe,
         tap: &Tap,
     ) -> Result<()> {
+        self.run_layers_pre(ops, seq, layers, t, start, win_lo, hashes, None, core, moe, tap)
+    }
+
+    /// [`Self::run_layers`] with the engram rows optionally PRE-GATHERED per layer (graph mode:
+    /// the NVMe gather ran before the capture/replay).
+    #[allow(clippy::too_many_arguments)]
+    fn run_layers_pre(
+        &self,
+        ops: &Ops,
+        seq: &mut V41Seq,
+        layers: std::ops::Range<usize>,
+        t: usize,
+        start: usize,
+        win_lo: usize,
+        hashes: Option<&[i64]>,
+        pre: Option<&[(usize, DevicePtr)]>,
+        core: &dyn AttnCore,
+        moe: &dyn V41RoutedMoe,
+        tap: &Tap,
+    ) -> Result<()> {
         let s = &self.scratch;
         for l in layers {
             let w = &self.blocks[l];
-            if let Some(e) = &w.engram {
+            if let (Some(e), Some(pre)) = (&w.engram, pre) {
+                let rows = pre.iter().find(|(pl, _)| *pl == l).context("no pre-gathered engram rows")?.1;
+                e.forward(ops, s.h, rows, s.engram_dead, t, s, &self.dims)?;
+            } else if let Some(e) = &w.engram {
                 let all = hashes.context("engram layer reached without hashes")?;
                 let li = if l == 1 { 0 } else { 1 };
                 let rows: Vec<i64> = (0..t).flat_map(|tok| all[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
                 let g = &self.engram.iter().find(|(el, _)| *el == l).context("no engram gather")?.1;
-                prof(ops, "engram.gather", || g.gather_rows_gpu(&rows, t, s.engram_rows, ops.gpu, ops.stream))?;
+                // A prefetch thread may already have this chunk's rows staged in host memory
+                // (see `V41Forward::prefill`/`engram_prefetch_rx`); if so, skip the synchronous
+                // NVMe gather and just upload. Falls back to the live gather otherwise (decode,
+                // or prefill without prefetch) -- correctness never depends on prefetch having
+                // run. Blocking on the CHANNEL here, not on a cache check alone, is what gives
+                // per-LAYER overlap: this wait only happens when THIS layer's rows are actually
+                // needed, so it overlaps with every layer before it in the same chunk (the
+                // embed step and layers 0..L-1), not only with earlier chunks -- the thing that
+                // makes prefetch pay off even on a single-chunk prompt.
+                if !seq.engram_row_cache.contains_key(&(start, l)) {
+                    if let Some(rx) = &seq.engram_prefetch_rx {
+                        loop {
+                            let (key, host) =
+                                rx.recv().context("engram prefetch thread ended before sending this layer's rows")?;
+                            let found = key == (start, l);
+                            seq.engram_row_cache.insert(key, host?);
+                            if found {
+                                break;
+                            }
+                        }
+                    }
+                }
+                match seq.engram_row_cache.remove(&(start, l)) {
+                    Some(host) => {
+                        prof(ops, "engram.upload_prefetched", || {
+                            EngramGather::upload_rows(&host, s.engram_rows, ops.gpu, ops.stream, l)
+                        })?;
+                    }
+                    None => {
+                        prof(ops, "engram.gather", || g.gather_rows_gpu(&rows, t, s.engram_rows, ops.gpu, ops.stream))?;
+                    }
+                }
                 let debug = engram_debug();
                 if debug {
                     tap.bf16(ops, "engram_in", l, s.h, &[t, self.dims.hc, self.dims.hidden])?;
@@ -379,7 +535,13 @@ impl V41Forward {
         let t = ids.len();
         ensure!(seq.len == start, "sequence holds {} positions, pass starts at {start}", seq.len);
         ensure!(start + t <= self.max_seq, "position {} exceeds max_seq {}", start + t, self.max_seq);
-        let hashes = seq.hash.forward(ids, start, None)?;
+        // `prefetch_engram` may have already computed this chunk's hashes (and advanced
+        // `seq.hash`'s append-only state) up front; reuse them instead of calling forward()
+        // again, which would either panic (position mismatch) or double-count.
+        let hashes = match seq.engram_hash_cache.remove(&start) {
+            Some(h) => h,
+            None => seq.hash.forward(ids, start, None)?,
+        };
         // PREFILL (`engine/v41_engine.py:755`) hashes the WHOLE image-expanded prompt once and
         // slices per chunk -- carrying the trailing MAX_LOOKBACK raw ids across chunks is the
         // exact equivalent (see deepseek_v41_engram::dead_heads's module doc). DECODE does NOT
@@ -426,6 +588,7 @@ impl V41Forward {
         ops.hc_expand(self.scratch.x, self.scratch.h, self.scratch.pre_mix, t, self.dims.hidden)?;
         // Decode-size kernels key on the PASS KIND (never on t): see ops::set_decode_pass.
         super::ops::set_decode_pass(matches!(kind, PassKind::Decode | PassKind::Verify));
+        super::ops::set_replay_pass(matches!(kind, PassKind::Replay));
         hook.begin_pass(kind, start, t)?;
         moe.begin_pass(ids)?;
         self.run_layers(ops, seq, layers, t, start, 0, Some(&hashes), core, moe, tap)?;
@@ -526,10 +689,13 @@ impl V41Forward {
             ops.gpu.copy_d2d_async(seq.tail_h, self.scratch.h, t * hrow, ops.stream)?;
             ops.gpu.copy_d2d_async(seq.tail_pre, self.scratch.pre_mix, t * prow, ops.stream)?;
             super::ops::set_decode_pass(false);
+            super::ops::set_replay_pass(true);
             hook.begin_pass(PassKind::Replay, start, t)?;
             ensure!(seq.tail_ids.len() == t, "replay tail holds {} ids for {t} rows", seq.tail_ids.len());
             moe.begin_pass(&seq.tail_ids)?;
-            self.run_layers(ops, seq, (ENCODER_LAST + 1)..n, t, start, start, None, core, moe, tap)?;
+            let r = self.run_layers(ops, seq, (ENCODER_LAST + 1)..n, t, start, start, None, core, moe, tap);
+            super::ops::set_replay_pass(false);
+            r?;
         }
         prof(ops, "head", || super::fwd::final_logits_last_row(ops, &self.dims, &self.scratch, t, self.norm, self.head, self.vocab, logits))
     }
@@ -549,9 +715,62 @@ impl V41Forward {
         logits: DevicePtr,
     ) -> Result<()> {
         ensure!(!ids.is_empty(), "empty prompt");
-        for chunk in ids.chunks(self.max_chunk) {
-            self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
+        let chunk_len = self.prefill_chunk_len(ids.len());
+        let prefetch = !self.engram.is_empty() && std::env::var("ATLAS_DSV41_ENGRAM_PREFETCH").as_deref() != Ok("0");
+        if !prefetch {
+            for chunk in ids.chunks(chunk_len) {
+                self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
+            }
+            return self.finish_prefill(ops, seq, mode, hook, core, moe, tap, logits);
         }
+
+        // Real overlap requires the chunk loop (this thread's GPU work) to run INSIDE the same
+        // scope as the background gather thread, not after it -- joining before this thread
+        // reaches the loop (the original version of this code did exactly that bug: it moved
+        // the ~73 ms/chunk NVMe cost earlier without ever overlapping it, still fully serial;
+        // caught before it was ever GPU-measured). `receiver.recv()` below blocks only on THIS
+        // chunk's own (start, layer) result, so a chunk whose gather finished early costs
+        // nothing extra, and a chunk that hasn't finished yet blocks no more than the
+        // synchronous path already would have.
+        let (hashes_by_start, jobs) = self.plan_engram_prefetch(seq, ids)?;
+        for (start, hashes) in hashes_by_start {
+            seq.engram_hash_cache.insert(start, hashes);
+        }
+        // Staging memory bound (team-lead's ask): each row is ENGRAM_HEAD_DIM=256 f32 = 1024 B,
+        // 24 rows/token/layer -- 24 KiB/token/layer, 48 KiB/token across both engram layers.
+        // Bounded by max_seq (8192 in this driver's V41Forward::load call): 8192 * 48 KiB ~=
+        // 384 MiB worst case, well under this box's ~25 GB floor. Logged, not capped -- capping
+        // would reintroduce exactly the "this chunk's gather sits on its own critical path"
+        // cost for whichever chunk falls outside the cap, for no memory-pressure benefit here.
+        let staging_bytes: usize = jobs.iter().map(|(_, _, ids)| (ids.len() / 24) * 256 * 4).sum();
+        tracing::debug!("engram prefetch: {} jobs, {:.1} MiB staged", jobs.len(), staging_bytes as f64 / (1024.0 * 1024.0));
+        let (tx, rx) = std::sync::mpsc::channel::<((usize, usize), Result<Vec<f32>>)>();
+        std::thread::scope(|scope| -> Result<()> {
+            scope.spawn(move || {
+                for (start, l, row_ids) in jobs {
+                    let g = &self.engram.iter().find(|(el, _)| *el == l).expect("layer just read from self.engram").1;
+                    let t = row_ids.len() / 24;
+                    // A closed receiver (main thread returned early on an earlier error, or
+                    // dropped the receiver at the end of prefill) just stops the sends -- not an
+                    // error on this side.
+                    if tx.send(((start, l), g.gather_rows_host(&row_ids, t))).is_err() {
+                        return;
+                    }
+                }
+            });
+            // NOT waited on here: `run_layers`'s engram branch blocks on `seq.engram_prefetch_rx`
+            // itself, exactly when it reaches a given (start, layer), so the wait overlaps with
+            // every layer before it in the SAME chunk -- not just with earlier chunks. A single-
+            // chunk prompt has no chunk-level overlap to exploit; this is what makes prefetch
+            // pay off there at all.
+            seq.engram_prefetch_rx = Some(rx);
+            for chunk in ids.chunks(chunk_len) {
+                self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
+            }
+            seq.engram_prefetch_rx = None; // drop -> closes our end; the sender thread (already
+            // finished, since the scope can't exit until it's joined) is unaffected either way
+            Ok(())
+        })?;
         self.finish_prefill(ops, seq, mode, hook, core, moe, tap, logits)
     }
 
@@ -572,6 +791,9 @@ impl V41Forward {
         logits: DevicePtr,
     ) -> Result<()> {
         ensure!(!ids.is_empty() && ids.len() <= super::ops::GEMV_MAX_M, "verify block of {} ids", ids.len());
+        if self.graph.is_some() {
+            return self.step_graphed(ops, seq, ids, PassKind::Verify, hook, core, moe, logits);
+        }
         let start = seq.len;
         self.pass(ops, seq, ids, start, 0..self.blocks.len(), PassKind::Verify, hook, core, moe, tap)?;
         prof(ops, "head", || super::fwd::final_logits_rows(ops, &self.dims, &self.scratch, ids.len(), self.norm, self.head, self.vocab, logits))
@@ -591,6 +813,37 @@ impl V41Forward {
         Ok(())
     }
 
+    /// The chunk a whole-prompt prefill of `n` tokens uses (window10, 8192-token prompt: chunk 3968
+    /// 1791 vs chunk 2048 1712 tok/s, logits byte-identical; on a 2048-4096 prompt 3968 lost to
+    /// 2048): `max_chunk` for prompts of at least [`LONG_PROMPT`] tokens, else at most
+    /// [`SHORT_CHUNK`]. Output does not depend on it (chunk invariance).
+    pub fn prefill_chunk_len(&self, n: usize) -> usize {
+        if n >= LONG_PROMPT { self.max_chunk } else { self.max_chunk.min(SHORT_CHUNK) }
+    }
+
+    /// Compute every chunk's engram hashes up front (cheap, CPU-only, must be sequential --
+    /// the hash cache is append-only) and the row-gather job list, WITHOUT touching NVMe.
+    /// Split out of `prefill` so the hash-forward calls (which need `&mut seq`) happen before
+    /// `prefill`'s `std::thread::scope` borrows `seq` for the chunk loop.
+    fn plan_engram_prefetch(&self, seq: &mut V41Seq, ids: &[u32]) -> Result<(Vec<(usize, Vec<i64>)>, Vec<(usize, usize, Vec<i64>)>)> {
+        let mut start = seq.len;
+        let mut hashes_by_start = Vec::new();
+        let mut jobs: Vec<(usize, usize, Vec<i64>)> = Vec::new();
+        for chunk in ids.chunks(self.prefill_chunk_len(ids.len())) {
+            let t = chunk.len();
+            let hashes = seq.hash.forward(chunk, start, None)?;
+            for &(l, _) in &self.engram {
+                let li = if l == 1 { 0 } else { 1 };
+                let rows: Vec<i64> =
+                    (0..t).flat_map(|tok| hashes[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
+                jobs.push((start, l, rows));
+            }
+            hashes_by_start.push((start, hashes));
+            start += t;
+        }
+        Ok((hashes_by_start, jobs))
+    }
+
     /// One decode step at position `seq.len`; bf16 logits `[vocab]`.
     #[allow(clippy::too_many_arguments)]
     pub fn decode(
@@ -604,9 +857,168 @@ impl V41Forward {
         tap: &Tap,
         logits: DevicePtr,
     ) -> Result<()> {
+        if self.graph.is_some() {
+            return self.step_graphed(ops, seq, &[token], PassKind::Decode, hook, core, moe, logits);
+        }
         let start = seq.len;
         self.pass(ops, seq, &[token], start, 0..self.blocks.len(), PassKind::Decode, hook, core, moe, tap)?;
         prof(ops, "head", || super::fwd::final_logits_last_row(ops, &self.dims, &self.scratch, 1, self.norm, self.head, self.vocab, logits))
+    }
+
+    /// One Decode (t = 1) or Verify (t <= 8) pass as a CUDA GRAPH. Host work that cannot be
+    /// captured runs first: the engram hashing and both layers' NVMe row gathers, the dead-head
+    /// mask and ids uploads, the MoE's id upload, and the device start. The first step of each
+    /// (kind, t, sequence) captures the graph (the core runs and keeps its host bookkeeping);
+    /// every later one replays it (the core accounts via `replay_step`). Logits land in `logits`
+    /// exactly as the eager paths leave them (last row for Decode, all rows for Verify).
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_graphed(
+        &self,
+        ops: &Ops,
+        seq: &mut V41Seq,
+        ids: &[u32],
+        kind: PassKind,
+        hook: &dyn PassHook,
+        core: &dyn AttnCore,
+        moe: &dyn V41RoutedMoe,
+        logits: DevicePtr,
+    ) -> Result<()> {
+        let g = self.graph.as_ref().context("step_graphed without enable_graphs")?;
+        ensure!(matches!(kind, PassKind::Decode | PassKind::Verify), "only Decode/Verify passes are graphed, not {kind:?}");
+        let t = ids.len();
+        ensure!(t >= 1 && t <= GRAPH_MAX_T, "graphed pass of {t} rows");
+        let start = seq.len;
+        ensure!(start + t <= self.max_seq, "position {} exceeds max_seq {}", start + t, self.max_seq);
+        let (gpu, stream) = (ops.gpu, ops.stream);
+        // ---- host work, outside the graph
+        let hashes = seq.hash.forward(ids, start, None)?;
+        let dead: Vec<u8> = engram_dead_heads(ids).into_iter().map(u8::from).collect();
+        gpu.copy_h2d_async(&dead, self.scratch.engram_dead, stream)?;
+        gpu.copy_h2d_async(bytemuck_u32(ids), self.ids_dev, stream)?;
+        // NEGATIVE CONTROL ONLY: ATLAS_DSV41_CONTROL_FREEZE_GRAPH_START=1 never advances the
+        // device start after the first pass, as a graph that baked in its position would.
+        let freeze = std::env::var("ATLAS_DSV41_CONTROL_FREEZE_GRAPH_START").as_deref() == Ok("1");
+        if !(freeze && !g.graphs.lock().expect("graph cache poisoned").is_empty()) {
+            gpu.memset_u32_async(g.dstart, start as u32, 1, stream)?;
+        }
+        super::ops::set_decode_pass(true);
+        moe.begin_pass(ids)?;
+        // Segments. SEGMENTED (default): one graph per span between engram
+        // layers, each engram layer's NVMe gather issued right before ITS segment, so the host
+        // reads while the GPU runs the previous segment (eager's overlap). Otherwise one graph
+        // for the whole pass with both gathers in front of it.
+        let n = self.blocks.len();
+        // Default ON (measured full model: -3.21 ms/step vs eager; one whole-pass graph only -0.8,
+        // its NVMe gathers serialised). `ATLAS_DSV41_GRAPH_SEGMENTED=0` = one graph (A/B only).
+        let segmented = std::env::var("ATLAS_DSV41_GRAPH_SEGMENTED").as_deref() != Ok("0");
+        let mut bounds: Vec<usize> = vec![0];
+        if segmented {
+            bounds.extend(g.pre_rows.iter().map(|(l, _)| *l).filter(|&l| l > 0 && l < n));
+            bounds.sort_unstable();
+            bounds.dedup();
+        }
+        bounds.push(n);
+        let gather = |layer: usize, buf: DevicePtr| -> Result<()> {
+            let li = if layer == 1 { 0 } else { 1 };
+            let rows: Vec<i64> = (0..t).flat_map(|tok| hashes[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
+            let gth = &self.engram.iter().find(|(el, _)| *el == layer).context("no engram gather")?.1;
+            gth.gather_rows_gpu(&rows, t, buf, gpu, stream)
+        };
+        if !segmented {
+            for (layer, buf) in &g.pre_rows {
+                gather(*layer, *buf)?;
+            }
+        }
+        // A new sequence: its rings/tails are different buffers (or the SAME addresses reused by
+        // the allocator for different roles), so no graph of the previous one may be replayed.
+        // NEGATIVE CONTROL ONLY: ATLAS_DSV41_CONTROL_GRAPH_KEEP_STALE=1 keeps and replays them.
+        let keep_stale = std::env::var("ATLAS_DSV41_CONTROL_GRAPH_KEEP_STALE").as_deref() == Ok("1");
+        {
+            let mut cur = g.seq_id.lock().expect("graph seq poisoned");
+            if *cur != Some(seq.id) {
+                if !keep_stale {
+                    let old = std::mem::take(&mut *g.graphs.lock().expect("graph cache poisoned"));
+                    if !old.is_empty() {
+                        gpu.synchronize(stream)?;
+                        for (_, h) in old {
+                            gpu.destroy_graph(h)?;
+                        }
+                    }
+                }
+                *cur = Some(seq.id);
+            }
+        }
+        let base_key = (kind as u8, t, if keep_stale { 0 } else { seq.id });
+        let replay = g.graphs.lock().expect("graph cache poisoned").contains_key(&(base_key.0, base_key.1, base_key.2 ^ ((bounds.len() as u64) << 56)));
+        super::ops::set_graph_start(Some(g.dstart));
+        let r = (|| -> Result<()> {
+            if replay {
+                hook.replay_step(kind, start, t)?;
+            } else {
+                hook.begin_pass(kind, start, t)?;
+            }
+            for (si, w) in bounds.windows(2).enumerate() {
+                let (lo, hi) = (w[0], w[1]);
+                if segmented {
+                    if let Some((_, buf)) = g.pre_rows.iter().find(|(l, _)| *l == lo) {
+                        gather(lo, *buf)?;
+                    }
+                }
+                // Keys: segment 0 of a (kind, t, sequence) carries the segment COUNT in the top
+                // byte, so a segmented and an unsegmented capture never alias.
+                let key = (base_key.0, base_key.1, base_key.2 ^ (((bounds.len() as u64) << 56) | ((si as u64) << 48)));
+                let h = if replay {
+                    g.graphs.lock().expect("graph cache poisoned").get(&key).copied().context("graph segment missing")?
+                } else {
+                    gpu.begin_capture(stream)?;
+                    let body = self.graph_segment(ops, seq, t, start, kind, lo..hi, &g.pre_rows, core, moe, logits);
+                    let graph = gpu.end_capture(stream);
+                    body?;
+                    let h = graph?;
+                    g.graphs.lock().expect("graph cache poisoned").insert(key, h);
+                    g.captures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    h
+                };
+                gpu.launch_graph(h, stream)?;
+            }
+            Ok(())
+        })();
+        super::ops::set_graph_start(None);
+        r?;
+        seq.len = start + t;
+        Ok(())
+    }
+
+    /// Layers `layers` of a graphed Decode/Verify pass, in eager order: the embed before layer 0
+    /// and the head after the last layer.
+    #[allow(clippy::too_many_arguments)]
+    fn graph_segment(
+        &self,
+        ops: &Ops,
+        seq: &mut V41Seq,
+        t: usize,
+        start: usize,
+        kind: PassKind,
+        layers: std::ops::Range<usize>,
+        pre: &[(usize, DevicePtr)],
+        core: &dyn AttnCore,
+        moe: &dyn V41RoutedMoe,
+        logits: DevicePtr,
+    ) -> Result<()> {
+        let s = &self.scratch;
+        let last = layers.end == self.blocks.len();
+        if layers.start == 0 {
+            ops.embed(self.embed, self.ids_dev, s.x, t, self.dims.hidden)?;
+            ops.hc_expand(s.x, s.h, s.pre_mix, t, self.dims.hidden)?;
+        }
+        self.run_layers_pre(ops, seq, layers, t, start, 0, None, Some(pre), core, moe, &Tap::off())?;
+        if !last {
+            return Ok(());
+        }
+        match kind {
+            PassKind::Decode => super::fwd::final_logits_last_row(ops, &self.dims, s, t, self.norm, self.head, self.vocab, logits),
+            _ => super::fwd::final_logits_rows(ops, &self.dims, s, t, self.norm, self.head, self.vocab, logits),
+        }
     }
 }
 

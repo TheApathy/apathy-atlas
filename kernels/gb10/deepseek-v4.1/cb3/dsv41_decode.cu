@@ -224,3 +224,31 @@ extern "C" __global__ void dsv41_hc_mix_finish(const float* __restrict__ raw,
     }
     if (lane < 16) comb[t * HC * HC + i * HC + j] = c;
 }
+
+// ── CUDA-graph decode: per-pass positions from ONE device scalar ─────────────────────────────
+// A captured decode/verify step may not read a host value that changes per step, so the RoPE
+// positions, the window positions and the window-ring slot come from `start` (the position of row
+// 0 of the pass), written before the graph launches. Values equal the host path's exactly:
+// pos[i] = start + i; wpos[i, j] = start + i - (W - 1) + j, or -1 below 0 (window_positions()).
+// Grid (T), Block 128.
+extern "C" __global__ void dsv41_decode_positions(const int* __restrict__ start, int* __restrict__ pos,
+                                                  int* __restrict__ wpos, const int window) {
+    const int i = blockIdx.x;
+    const int p = *start + i;
+    if (threadIdx.x == 0) pos[i] = p;
+    for (int j = threadIdx.x; j < window; j += blockDim.x) {
+        const int q = p - (window - 1) + j;
+        wpos[i * window + j] = q >= 0 ? q : -1;
+    }
+}
+
+// ring[(start + i) % ring_n] = kv[i] for each of the pass's T rows (row = `row_elems` bf16).
+// Grid (T), Block 256.
+extern "C" __global__ void dsv41_ring_write(const __nv_bfloat16* __restrict__ kv, __nv_bfloat16* __restrict__ ring,
+                                            const int* __restrict__ start, const int ring_n, const int row_elems) {
+    const int i = blockIdx.x;
+    const long long slot = (long long)((*start + i) % ring_n);
+    const uint4* src = reinterpret_cast<const uint4*>(kv + (size_t)i * row_elems);
+    uint4* dst = reinterpret_cast<uint4*>(ring + slot * row_elems);
+    for (int k = threadIdx.x; k < row_elems / 8; k += blockDim.x) dst[k] = src[k];
+}

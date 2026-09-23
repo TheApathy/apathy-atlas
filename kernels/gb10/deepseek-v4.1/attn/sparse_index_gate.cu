@@ -47,9 +47,33 @@ template <typename T> static T* up(const std::vector<char>& h) {
     return (T*)d;
 }
 
+// The device candidate mask is one BIT per 8-column block ([rows, ld/256] u32); captures hold a
+// byte per column. A block that is not uniform cannot be represented: stop, loudly.
+static std::vector<char> pack_bits(const std::vector<char>& cols, int rows, int ld) {
+    std::vector<uint32_t> w((size_t)rows * ld / 256, 0u);
+    for (int r = 0; r < rows; ++r)
+        for (int b = 0; b < ld / 8; ++b) {
+            const char* blk = &cols[(size_t)r * ld + b * 8];
+            for (int i = 1; i < 8; ++i)
+                if ((blk[i] != 0) != (blk[0] != 0)) { std::fprintf(stderr, "mask row %d block %d not block-uniform\n", r, b); std::exit(2); }
+            if (blk[0]) w[(size_t)r * ld / 256 + b / 32] |= 1u << (b % 32);
+        }
+    std::vector<char> out(w.size() * 4);
+    std::memcpy(out.data(), w.data(), out.size());
+    return out;
+}
+static std::vector<uint8_t> unpack_bits(const std::vector<uint32_t>& w, int rows, int ld) {
+    std::vector<uint8_t> out((size_t)rows * ld);
+    for (size_t i = 0; i < out.size(); ++i) {
+        const size_t r = i / ld, c = i % ld;
+        out[i] = (w[r * ld / 256 + c / 256] >> ((c / 8) % 32)) & 1u;
+    }
+    return out;
+}
+
 struct Case {
     int T, n_keys, n_pad, ratio, cand_ld, is_src, n_c; long long pos0;
-    __nv_bfloat16 *q, *ik; float* w; uint8_t* cand;
+    __nv_bfloat16 *q, *ik; float* w; uint32_t* cand;
     std::vector<float> ref_score; std::vector<long long> ref_topk; std::vector<uint8_t> ref_cand;
 };
 
@@ -57,7 +81,7 @@ static int g_fail = 0;
 static const int SMALL_BLOCKS = 96;   // make_index_fixture.py
 #define SMALL_S "96"
 
-static void score(const Case& c, int variant, const uint8_t* cand, long long pos0, float* d_out) {
+static void score(const Case& c, int variant, const uint32_t* cand, long long pos0, float* d_out) {
     dim3 grid(c.T, c.n_pad / BN);
     dsv41_index_score_probe<<<grid, SCORE_THREADS>>>(c.q, c.ik, c.w, cand, d_out, c.n_keys, c.n_pad,
                                                       pos0, c.ratio, cand ? c.cand_ld : 0, variant);
@@ -108,7 +132,7 @@ static void run_case(const std::string& dir) {
     c.q = up<__nv_bfloat16>(slurp(dir + "/q.bin", (size_t)c.T * H * DH * 2));
     c.ik = up<__nv_bfloat16>(slurp(dir + "/ik.bin", (size_t)c.n_keys * DH * 2));
     c.w = up<float>(slurp(dir + "/wts.bin", (size_t)c.T * H * 4));
-    c.cand = c.cand_ld ? up<uint8_t>(slurp(dir + "/cand_in.bin", (size_t)c.T * c.cand_ld)) : nullptr;
+    c.cand = c.cand_ld ? up<uint32_t>(pack_bits(slurp(dir + "/cand_in.bin", (size_t)c.T * c.cand_ld), c.T, c.cand_ld)) : nullptr;
     { auto v = slurp(dir + "/ref_score.bin", TS * 4); c.ref_score.assign((float*)v.data(), (float*)v.data() + TS); }
     { auto v = slurp(dir + "/ref_topk.bin", (size_t)c.T * TOPK * 8);
       c.ref_topk.assign((long long*)v.data(), (long long*)v.data() + (size_t)c.T * TOPK); }
@@ -139,13 +163,14 @@ static void run_case(const std::string& dir) {
     //   force-keep of the block holding compress_lens-1 -- control: force-keep shifted.
     if (c.is_src) {
         const int nb = c.n_pad / 8;
-        float* d_b; uint8_t* d_c;
+        float* d_b; uint32_t* d_c;
         CUDA_OK(cudaMalloc(&d_b, (size_t)c.T * nb * 4)); CUDA_OK(cudaMalloc(&d_c, TS));
-        std::vector<uint8_t> h(TS);
+        std::vector<uint32_t> hw(TS / 256);
         auto cand_diff = [&](long long pos0, int blocks, int bs, const std::vector<uint8_t>& ref) {
             dsv41_select_candidates<<<c.T, SEL_THREADS>>>(d_ref, d_b, d_c, c.n_pad, pos0, c.ratio, blocks, bs);
             CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
-            CUDA_OK(cudaMemcpy(h.data(), d_c, TS, cudaMemcpyDeviceToHost));
+            CUDA_OK(cudaMemcpy(hw.data(), d_c, hw.size() * 4, cudaMemcpyDeviceToHost));
+            const std::vector<uint8_t> h = unpack_bits(hw, c.T, c.n_pad);
             size_t bad = 0; for (size_t i = 0; i < TS; ++i) bad += h[i] != ref[i];
             return bad;
         };
@@ -175,7 +200,7 @@ static void run_case(const std::string& dir) {
             Case p = c;
             p.ref_topk.assign((long long*)r.data(), (long long*)r.data() + (size_t)c.T * TOPK);
             p.cand_ld = c.n_pad;
-            uint8_t* d_m = up<uint8_t>(m);
+            uint32_t* d_m = up<uint32_t>(pack_bits(m, c.T, c.n_pad));
             score(p, HEAD_SUM_ORDER, d_m, c.pos0, d_s);
             const int bad = rows_differ(p, topk(p, d_s));
             score(p, HEAD_SUM_ORDER, c.cand, c.pos0, d_s);            // CONTROL: pool dropped

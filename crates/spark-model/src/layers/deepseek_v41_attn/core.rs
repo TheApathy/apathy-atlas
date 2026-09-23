@@ -30,10 +30,11 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
-use super::index::{CandidateMask, INDEX_HEAD_DIM, INDEX_HEADS, INDEX_TOPK, IndexKernels, IndexOps, score_width};
+use super::index::{CandidateMask, INDEX_HEAD_DIM, INDEX_HEADS, INDEX_TOPK, IndexKernels, IndexOps, cand_row_bytes, score_rows_per_block, score_width};
 use crate::weight_loader::deepseek_v41::attn_block::{AttnCore, CoreArgs, RING, WINDOW};
 use crate::weight_loader::deepseek_v41::device_allocs::{DeviceAllocs, SharedGpu};
 use crate::weight_loader::deepseek_v41::forward::{PassHook, PassKind};
+use crate::weight_loader::deepseek_v41::fwd::Tap;
 use crate::weight_loader::deepseek_v41::ops::{FWD_MODULE, Fp8Linear, Ops, RopeTable, bf16_tensor};
 
 /// Kernel module compiled from `cb3/dsv41_sparse_attn.cu`.
@@ -64,11 +65,19 @@ const CANDIDATE_BLOCK_SIZE: usize = 8;
 /// rows (`v41_ref.mm`), because cuBLAS picks its algorithm from M. Measured: with M = chunk
 /// length, re-chunking the same prompt changed L20's replay-tail top-k on 19 of 128 rows.
 const MM_TILE: usize = 16;
+/// A prefill pass (the projection kernels are keyed on this, never on M).
+fn is_prefill(st: &SeqState) -> bool {
+    !matches!(st.kind, Some(PassKind::Decode | PassKind::Verify))
+}
 
-/// Bytes of the ONE fp32 score scratch all index layers share: `[max_chunk, n_pad(max_seq)]`.
-/// Layers >= 20 run at ratio 1, so `n_c` reaches `max_seq`.
+/// `index_score_rows` tap: every this-many-th row of a pass (check_topk_overlap.py SAMPLE).
+const TAP_ROW_STRIDE: usize = 64;
+
+/// Bytes of the ONE fp32 score scratch all index layers share: `[rows, n_pad(max_seq)]`, rows =
+/// [`score_rows_per_block`] (the whole chunk up to ~200K context; 224 rows at 1M). Layers >= 20 run
+/// at ratio 1, so `n_c` reaches `max_seq`.
 pub fn score_scratch_bytes(max_chunk: usize, max_seq: usize) -> usize {
-    max_chunk * score_width(max_seq) * 4
+    score_rows_per_block(max_chunk, max_seq) * score_width(max_seq) * 4
 }
 
 /// Run `gemm(x_tile, out_tile)` over `m` rows in MM_TILE-row tiles; the tail tile is zero-padded
@@ -183,10 +192,18 @@ struct Scratch {
     wts: DevicePtr,
     score: DevicePtr,
     score_bytes: usize,
+    /// Rows the score/block scratch holds: the indexer walks a chunk in blocks of this many.
+    score_rows: usize,
     cand: DevicePtr,
     blocks: DevicePtr,
     pad_in: DevicePtr,
     pad_out: DevicePtr,
+    /// Static decode: the pass's index-key rows before they are published `[DECODE_MAX_T, 128]`.
+    iks: DevicePtr,
+    /// TAPS: every TAP_ROW_STRIDE-th score row of the pass `[ceil(max_chunk / 64), n_pad]` fp32
+    /// (`ATLAS_DSV41_TAP_INDEX_SCORE=1` at load, else NULL), and a small host-value buffer.
+    tap_rows: DevicePtr,
+    tap_val: DevicePtr,
 }
 
 /// Mutable per-sequence / per-pass state.
@@ -208,6 +225,13 @@ struct SeqState {
     pass_start: usize,
     pass_t: usize,
     tail: TailState,
+    /// Static decode: where the pass start lives on the device when the caller owns it (graph
+    /// replay), and whether the core has written its own copy for the current pass otherwise.
+    dstart_ext: Option<DevicePtr>,
+    dstart_written: bool,
+    /// TAPS: the last indexer's score width and n_c (what `taps` dumps for that layer).
+    tap_ld: usize,
+    tap_n_c: usize,
 }
 
 #[derive(Default)]
@@ -238,6 +262,9 @@ pub struct Dsv41SparseCore {
     combine_kernel: KernelHandle,
     /// `[DECODE_MAX_T, 64, S, 2 + 512]` fp32 split partials.
     part: DevicePtr,
+    /// `ATLAS_DSV41_ATTN_LB=1`: `dsv41_sparse_attn_split_lb` (the combine fused by last-block-done,
+    /// byte-identical to split + combine) and its `[DECODE_MAX_T, 64 / 8]` u32 tickets (zeroed).
+    split_lb: Option<(KernelHandle, DevicePtr)>,
     idx: IndexKernels,
     rope_c: RopeTable,
     tail: Tail,
@@ -250,6 +277,17 @@ pub struct Dsv41SparseCore {
     /// weights_proj as the reference issues them (cuBLASLt, 16-row tiles) instead of the
     /// deterministic `dsv41_gemm_f32_nt` / `dsv41_gemm_bf16_smalln` (A/B arm only).
     comp_cublas_tiled: bool,
+    /// `ATLAS_DSV41_CORE_STATIC=1` (or [`Self::set_static_decode`]): Decode/Verify passes with
+    /// T <= DECODE_MAX_T run shape-static -- no launch reads a host value that changes per step.
+    static_on: std::sync::atomic::AtomicBool,
+    /// The core's own device copy of the pass start, used when no caller pointer is set.
+    own_dstart: DevicePtr,
+    /// Static decode score width: `score_width(max_seq)`, the widest any pass can need.
+    static_ld: usize,
+    /// Prefill projections as ONE launch (`ATLAS_DSV41_CORE_TILED=1` restores the 16-row tile
+    /// loops, A/B only): index q via the fused FP8 GEMM, ik / L20 wkv via the pinned bf16 GEMM at
+    /// M > 16 (one 16-row tile at M <= 16, ops' FP8 dense rule). Gate: runJ DIGEST unchanged.
+    fp8: Option<super::fp8_gemm::Fp8Gemm>,
     /// Owns every device allocation above; frees them when the core drops.
     allocs: DeviceAllocs,
 }
@@ -309,11 +347,16 @@ impl Dsv41SparseCore {
         let mma_kernel = if std::env::var("ATLAS_DSV41_ATTN_MMA").as_deref() == Ok("0") {
             None
         } else {
-            let name = match hpc {
-                16 => "dsv41_sparse_attn_mma",
-                32 => "dsv41_sparse_attn_mma32h",
-                64 => "dsv41_sparse_attn_mma64",
-                o => anyhow::bail!("ATLAS_DSV41_ATTN_HPC={o}: use 16, 32 or 64"),
+            // ATLAS_DSV41_ATTN_FA=1: the FA2-style restructure (softmax in registers, 2 syncs per
+            // tile), byte-identical to the mma entries by construction (attn gate). 16/32 only.
+            let fa = std::env::var("ATLAS_DSV41_ATTN_FA").as_deref() == Ok("1");
+            let name = match (hpc, fa) {
+                (16, false) => "dsv41_sparse_attn_mma",
+                (32, false) => "dsv41_sparse_attn_mma32h",
+                (64, false) => "dsv41_sparse_attn_mma64",
+                (16, true) => "dsv41_sparse_attn_fa16h",
+                (32, true) => "dsv41_sparse_attn_fa32h",
+                (o, _) => anyhow::bail!("ATLAS_DSV41_ATTN_HPC={o}: use 16, 32 or 64 (16 or 32 with ATLAS_DSV41_ATTN_FA=1)"),
             };
             Some((gpu.kernel(ATTN_MODULE, name).with_context(|| format!("{name} not in the PTX"))?, hpc))
         };
@@ -391,6 +434,13 @@ impl Dsv41SparseCore {
 
         let n_pad_max = score_width(max_seq);
         let score_bytes = score_scratch_bytes(max_chunk, max_seq);
+        // ATLAS_DSV41_SCORE_ROWS: GATE ONLY -- force smaller row blocks to prove blocking changes no
+        // byte (runJ digest A/B). Never larger than the budget allows.
+        let score_rows = match std::env::var("ATLAS_DSV41_SCORE_ROWS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(r) => r.clamp(DECODE_MAX_T, score_rows_per_block(max_chunk, max_seq)),
+            None => score_rows_per_block(max_chunk, max_seq),
+        };
+        ensure!(score_rows >= DECODE_MAX_T, "score blocks of {score_rows} rows cannot hold a decode pass");
         let row = HEAD_DIM * 4;
         let s = Scratch {
             xf: alloc(max_chunk * HIDDEN * 4)?,
@@ -404,23 +454,48 @@ impl Dsv41SparseCore {
             wts: alloc(max_chunk * INDEX_HEADS * 4)?,
             score: alloc(score_bytes)?,
             score_bytes,
-            cand: alloc(max_chunk * n_pad_max)?,
-            blocks: alloc(max_chunk * n_pad_max.div_ceil(CANDIDATE_BLOCK_SIZE) * 4)?,
+            score_rows,
+            cand: alloc(max_chunk * cand_row_bytes(n_pad_max))?,
+            blocks: alloc(score_rows * n_pad_max.div_ceil(CANDIDATE_BLOCK_SIZE) * 4)?,
             pad_in: alloc(MM_TILE * HIDDEN * 4)?,
             pad_out: alloc(MM_TILE * INDEX_HEADS * INDEX_HEAD_DIM * 4)?,
+            iks: alloc(DECODE_MAX_T * INDEX_HEAD_DIM * 2)?,
+            tap_rows: if std::env::var("ATLAS_DSV41_TAP_INDEX_SCORE").as_deref() == Ok("1") {
+                alloc(max_chunk.div_ceil(TAP_ROW_STRIDE) * n_pad_max * 4)?
+            } else {
+                DevicePtr::NULL
+            },
+            tap_val: alloc(16)?,
         };
+        let own_dstart = alloc(4)?;
         let part = alloc(DECODE_MAX_T * 64 * (WINDOW + INDEX_TOPK).div_ceil(DECODE_SLICE) * (2 + HEAD_DIM) * 4)?;
+        let split_lb = if std::env::var("ATLAS_DSV41_ATTN_LB").as_deref() == Ok("1") {
+            let k = gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_split_lb").context("dsv41_sparse_attn_split_lb not in the PTX")?;
+            let tickets = alloc(DECODE_MAX_T * (64 / HEADS_PER_BLOCK) * 4)?;
+            gpu.memset(tickets, 0, DECODE_MAX_T * (64 / HEADS_PER_BLOCK) * 4)?;
+            Some((k, tickets))
+        } else {
+            None
+        };
         let tail = Tail {
             topk: [alloc(REPLAY_ROWS * INDEX_TOPK * 8)?, alloc(REPLAY_ROWS * INDEX_TOPK * 8)?],
-            cand: [alloc(REPLAY_ROWS * n_pad_max)?, alloc(REPLAY_ROWS * n_pad_max)?],
+            cand: [alloc(REPLAY_ROWS * cand_row_bytes(n_pad_max))?, alloc(REPLAY_ROWS * cand_row_bytes(n_pad_max))?],
             cand_cap: n_pad_max,
         };
         tracing::info!(
-            "dsv41 sparse core: {:.2} GB device (score scratch {:.1} MB = [{max_chunk}, {n_pad_max}] fp32; \
+            "dsv41 sparse core: {:.2} GB device (score scratch {:.1} MB = [{score_rows}, {n_pad_max}] fp32; \
              ckv/ik for max_seq {max_seq})",
             total.get() as f64 / 1e9,
             score_bytes as f64 / 1e6
         );
+        if std::env::var("ATLAS_DSV41_GEMM_F32_V1").as_deref() == Ok("1") {
+            // A/B arm only: the compressor's prefill projections back on the 64x64 GEMM.
+            super::index::GEMM_F32_V1.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if std::env::var("ATLAS_DSV41_GEMV_F32").as_deref() == Ok("0") {
+            // A/B arm only: the ratio-2 compressor's small-M projections back on the 64x64 GEMM.
+            super::index::GEMV_F32_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(Self {
             layers,
             eps: config.rms_norm_eps as f32,
@@ -431,6 +506,7 @@ impl Dsv41SparseCore {
             mma_kernel,
             combine_kernel,
             part,
+            split_lb,
             idx,
             rope_c: freqs_c,
             tail,
@@ -440,6 +516,10 @@ impl Dsv41SparseCore {
             allocs: allocs.into_inner(),
             split_on: std::env::var("ATLAS_DSV41_ATTN_SPLIT").as_deref() != Ok("0"),
             comp_cublas_tiled: std::env::var("ATLAS_DSV41_COMP_CUBLAS").as_deref() == Ok("1"),
+            static_on: std::sync::atomic::AtomicBool::new(std::env::var("ATLAS_DSV41_CORE_STATIC").as_deref() == Ok("1")),
+            own_dstart,
+            static_ld: n_pad_max,
+            fp8: if std::env::var("ATLAS_DSV41_CORE_TILED").as_deref() == Ok("1") { None } else { Some(super::fp8_gemm::Fp8Gemm::load(gpu)?) },
         })
     }
 
@@ -557,7 +637,7 @@ impl Dsv41SparseCore {
         gpu.copy_d2d(ik, c.ik, rows * INDEX_HEAD_DIM * 2)?;
         let mut st = self.st.lock().expect("core state poisoned");
         let cur = st.tail.cur;
-        gpu.copy_d2d(cand, self.tail.cand[cur], tail_rows * cand_ld)?;
+        gpu.copy_d2d(cand, self.tail.cand[cur], tail_rows * cand_row_bytes(cand_ld))?;
         gpu.memset(self.tail.topk[cur], 0xFF, REPLAY_ROWS * INDEX_TOPK * 8)?;
         st.tail = TailState { cur, rows: tail_rows, ld: cand_ld };
         st.published = Some((c.ckv, c.ik, rows, c.ratio));
@@ -611,9 +691,7 @@ impl Dsv41SparseCore {
             self.prof.mark(ops, "compress.combine")?;
             ((start - pend) / 2, n / 2)
         } else {
-            tiled(gpu, s.pad_in, s.pad_out, a.x, s.latent, t, HIDDEN * 2, HEAD_DIM * 2, stream, |x, o| {
-                ops.linear_bf16(x, c.wkv, o, MM_TILE, HEAD_DIM, HIDDEN)
-            })?;
+            self.lin_bf16(ops, is_prefill(st), a.x, c.wkv, s.latent, t, HEAD_DIM, HIDDEN)?;
             self.prof.mark(ops, "compress.gemm_bf16")?;
             (start, t)
         };
@@ -630,9 +708,7 @@ impl Dsv41SparseCore {
             self.prof.mark(ops, "compress.norm")?;
             // The index key from the PRE-RoPE latent, straight into the cache.
             let ik = c.ik.offset(j0 * INDEX_HEAD_DIM * 2);
-            tiled(gpu, s.pad_in, s.pad_out, s.latent, ik, nj, HEAD_DIM * 2, INDEX_HEAD_DIM * 2, stream, |x, o| {
-                ops.linear_bf16(x, c.wk, o, MM_TILE, INDEX_HEAD_DIM, HEAD_DIM)
-            })?;
+            self.lin_bf16(ops, is_prefill(st), s.latent, c.wk, ik, nj, INDEX_HEAD_DIM, HEAD_DIM)?;
             self.prof.mark(ops, "compress.ik_gemm")?;
             ops.rmsnorm(ik, c.k_norm, ik, nj, INDEX_HEAD_DIM, self.eps)?;
             ops.rope_tail(ik, s.pos, &self.rope_c, nj, 1, INDEX_HEAD_DIM, false)?;
@@ -645,7 +721,152 @@ impl Dsv41SparseCore {
         Ok(())
     }
 
-    fn index(&self, ops: &Ops, a: &CoreArgs, st: &mut SeqState) -> Result<()> {
+    /// Shape-static form of [`Self::compress`] for Decode/Verify (`ATLAS_DSV41_CORE_STATIC`): the
+    /// same kernels on FIXED shapes, the parity, row offsets and row counts read on the device
+    /// from `dstart`. The projections always land at slots 1..=t, a pending row at slot 0, and
+    /// the pairs start at slot 1 - p; up to `ceil(t / 2)` rows are normalised and RoPE'd, and only
+    /// the pass's `(t + p) / 2` are published. Host bookkeeping is the dynamic path's.
+    fn compress_static(&self, ops: &Ops, a: &CoreArgs, st: &mut SeqState, dstart: DevicePtr) -> Result<()> {
+        let (layer, t, start, stream) = (a.layer, a.t, a.start, ops.stream);
+        let c = self.layers[layer].kv.as_ref().expect("kv-source");
+        let gpu = ops.gpu;
+        let iops = IndexOps { gpu, k: &self.idx, stream };
+        let s = &self.s;
+        let r = c.ratio;
+        let row = HEAD_DIM * 4;
+        // The unpublished rows are RoPE'd too: their positions must stay inside the table.
+        ensure!(start + t <= self.rope_c.positions, "static compress at {start}+{t} past freqs_c ({})", self.rope_c.positions);
+        let nmax = if r == 2 {
+            // Every pass is contiguous from 0 (begin_pass), so the pending row exists exactly when
+            // start is odd -- the device's p. Derived, not asserted: the skip-restore rollback
+            // CONTROL leaves has_pending stale on purpose and must diverge, not stop.
+            let pend = start % 2 == 1;
+            gpu.copy_d2d_async(c.pending, c.before, 2 * row, stream)?; // for rollback (read only if pend)
+            st.last[layer] = Some((start, t, pend));
+            ops.bf16_to_f32(a.x, s.xf, t * HIDDEN)?;
+            iops.comp2_pending_in(c.pending, s.kvl, s.sc, HEAD_DIM, dstart)?;
+            let wgate = c.wgate.expect("ratio-2 has a gate");
+            let (kv1, sc1) = (s.kvl.offset(row), s.sc.offset(row));
+            if self.comp_cublas_tiled {
+                tiled(gpu, s.pad_in, s.pad_out, s.xf, kv1, t, HIDDEN * 4, row, stream, |x, o| {
+                    ops.linear_f32(x, c.wkv, o, MM_TILE, HEAD_DIM, HIDDEN)
+                })?;
+                tiled(gpu, s.pad_in, s.pad_out, s.xf, sc1, t, HIDDEN * 4, row, stream, |x, o| {
+                    ops.linear_f32(x, wgate, o, MM_TILE, HEAD_DIM, HIDDEN)
+                })?;
+            } else {
+                iops.gemm_f32(s.xf, c.wkv, kv1, t, HEAD_DIM, HIDDEN)?;
+                iops.gemm_f32(s.xf, wgate, sc1, t, HEAD_DIM, HIDDEN)?;
+            }
+            gpu.copy_d2d_async(kv1, c.save_kv, t * row, stream)?; // for rollback
+            gpu.copy_d2d_async(sc1, c.save_sc, t * row, stream)?;
+            iops.comp2_pending_out(s.kvl, s.sc, c.pending, HEAD_DIM, t, dstart)?;
+            st.has_pending[layer] = (t + usize::from(pend)) % 2 == 1;
+            iops.combine2_dev(s.kvl, s.sc, s.latent, t.div_ceil(2), HEAD_DIM, dstart)?;
+            t.div_ceil(2)
+        } else {
+            self.lin_bf16(ops, is_prefill(st), a.x, c.wkv, s.latent, t, HEAD_DIM, HIDDEN)?;
+            t
+        };
+        let (j0, nj) = if r == 2 { ((start - start % 2) / 2, (t + start % 2) / 2) } else { (start, t) };
+        ensure!(j0 + nj <= c.rows_cap, "layer {layer}: compressed row {} past the cache ({} rows)", j0 + nj, c.rows_cap);
+        ops.rmsnorm(s.latent, c.norm, s.latent, nmax, HEAD_DIM, self.eps)?;
+        iops.iota_dev(s.pos, dstart, r == 2, r, nmax)?;
+        self.lin_bf16(ops, is_prefill(st), s.latent, c.wk, s.iks, nmax, INDEX_HEAD_DIM, HEAD_DIM)?;
+        ops.rmsnorm(s.iks, c.k_norm, s.iks, nmax, INDEX_HEAD_DIM, self.eps)?;
+        ops.rope_tail(s.iks, s.pos, &self.rope_c, nmax, 1, INDEX_HEAD_DIM, false)?;
+        iops.publish_rows(s.iks, c.ik, INDEX_HEAD_DIM * 2, nmax, r, t, dstart)?;
+        ops.rope_tail(s.latent, s.pos, &self.rope_c, nmax, 1, HEAD_DIM, false)?;
+        iops.publish_rows(s.latent, c.ckv, HEAD_DIM * 2, nmax, r, t, dstart)?;
+        st.published = Some((c.ckv, c.ik, j0 + nj, r));
+        Ok(())
+    }
+
+    /// The device pass start when this pass runs shape-static, else `None`. Without a caller
+    /// pointer the core writes its own copy once per pass (fine ungraphed; a graph must use
+    /// [`Self::set_device_start`], or the write would be captured with a frozen value).
+    fn static_start(&self, ops: &Ops, st: &mut SeqState) -> Result<Option<DevicePtr>> {
+        let on = self.static_on.load(std::sync::atomic::Ordering::Relaxed)
+            && matches!(st.kind, Some(PassKind::Decode | PassKind::Verify))
+            && st.pass_t <= DECODE_MAX_T;
+        if !on {
+            return Ok(None);
+        }
+        if let Some(d) = st.dstart_ext {
+            return Ok(Some(d));
+        }
+        if !st.dstart_written {
+            let v = u32::try_from(st.pass_start).context("start overflows the device i32")?;
+            ops.gpu.memset_u32_async(self.own_dstart, v, 1, ops.stream)?;
+            st.dstart_written = true;
+        }
+        Ok(Some(self.own_dstart))
+    }
+
+    /// Turn shape-static Decode/Verify passes on or off (gates A/B both arms on one core).
+    pub fn set_static_decode(&self, on: bool) {
+        self.static_on.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// GRAPH REPLAY: the device i32 holding each pass's start (the position of row 0), written by
+    /// the caller BEFORE the core's first launch of the pass and not changed until its last. The
+    /// POINTER may be changed between passes (any call; a graph bakes in the one it captured
+    /// with), never within a pass. One scalar can serve Decode and Verify alike. `None` = the
+    /// core's own copy, written by the core itself (ungraphed runs only).
+    pub fn set_device_start(&self, ptr: Option<DevicePtr>) {
+        self.st.lock().expect("core state poisoned").dstart_ext = ptr;
+    }
+
+    /// GRAPH REPLAY: the host bookkeeping of a static Decode/Verify pass that was REPLAYED rather
+    /// than run (the core's `run` is not called): `begin_pass` plus each ratio-2 layer's pending
+    /// and rollback record, exactly as `compress_static` leaves them. Launches nothing.
+    pub fn replay_step(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
+        ensure!(
+            self.static_on.load(std::sync::atomic::Ordering::Relaxed) && matches!(kind, PassKind::Decode | PassKind::Verify) && t <= DECODE_MAX_T,
+            "replay_step({kind:?}, {start}, {t}) is not a static pass"
+        );
+        PassHook::begin_pass(self, kind, start, t)?;
+        let mut st = self.st.lock().expect("core state poisoned");
+        ensure!(st.dstart_ext.is_some(), "replay_step without a caller-owned device start");
+        for (layer, lw) in self.layers.iter().enumerate() {
+            // Only layers the forward actually drives (every ratio-2 layer in the model; a gate
+            // driving a subset must not gain rollback records for layers it never ran).
+            if lw.kv.as_ref().is_some_and(|c| c.ratio == 2) && st.last[layer].is_some() {
+                let pend = start % 2 == 1; // as compress_static
+                st.last[layer] = Some((start, t, pend));
+                st.has_pending[layer] = (t + usize::from(pend)) % 2 == 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// TAPS: keep rows r0..r0+r's sampled score rows (every TAP_ROW_STRIDE-th of the pass) before
+    /// the next row block or layer overwrites the scratch. No-op unless enabled at load.
+    fn tap_score_rows(&self, gpu: &dyn GpuBackend, r0: usize, r: usize, n_pad: usize, stream: u64) -> Result<()> {
+        if self.s.tap_rows == DevicePtr::NULL {
+            return Ok(());
+        }
+        for row in (r0.div_ceil(TAP_ROW_STRIDE) * TAP_ROW_STRIDE..r0 + r).step_by(TAP_ROW_STRIDE) {
+            let src = self.s.score.offset((row - r0) * n_pad * 4);
+            gpu.copy_d2d_async(src, self.s.tap_rows.offset(row / TAP_ROW_STRIDE * n_pad * 4), n_pad * 4, stream)?;
+        }
+        Ok(())
+    }
+
+    /// `out[m, n] = x[m, k] @ w[n, k]^T` bf16. The kernel is keyed on the PASS KIND, never on M
+    /// (an M switch would put a <= 16-row prefill tail on a different kernel than the same rows in
+    /// a big chunk): every prefill pass (encoder / full chunk / replay) takes ONE pinned launch at
+    /// any M; Decode/Verify keep the 16-row tile, so their rows are unchanged and T=1 == T=6. With
+    /// ATLAS_DSV41_CORE_TILED=1 (`fp8` = None) every pass takes the original tile loop.
+    #[allow(clippy::too_many_arguments)]
+    fn lin_bf16(&self, ops: &Ops, prefill: bool, x: DevicePtr, w: DevicePtr, out: DevicePtr, m: usize, n: usize, k: usize) -> Result<()> {
+        if self.fp8.is_some() && prefill {
+            return ops.linear_bf16_policy(x, k, w, out, n, m, n, k);
+        }
+        tiled(ops.gpu, self.s.pad_in, self.s.pad_out, x, out, m, k * 2, n * 2, ops.stream, |xx, o| ops.linear_bf16(xx, w, o, MM_TILE, n, k))
+    }
+
+    fn index(&self, ops: &Ops, a: &CoreArgs, st: &mut SeqState, dstart: Option<DevicePtr>) -> Result<()> {
         let (layer, t, start, stream) = (a.layer, a.t, a.start, ops.stream);
         let lw = &self.layers[layer];
         let w = lw.idx.as_ref().expect("index-source");
@@ -657,24 +878,33 @@ impl Dsv41SparseCore {
         let s = &self.s;
         let n_c = (start + t) / ratio;
         ensure!(n_c <= rows, "layer {layer}: {n_c} compressed rows visible, {rows} published");
-        if n_c == 0 {
+        if n_c == 0 && dstart.is_none() {
             gpu.memset_async(w.topk, 0xFF, t * INDEX_TOPK * 8, stream)?; // all -1
             st.topk = Some(w.topk);
             return Ok(());
         }
-        let n_pad = score_width(n_c);
-        ensure!(t * n_pad * 4 <= s.score_bytes, "score [{t}, {n_pad}] exceeds the scratch");
+        // Static: one fixed width; the kernels stop at score_width(n_c) for the start they read.
+        let n_pad = if dstart.is_some() { self.static_ld } else { score_width(n_c) };
+        ensure!(t.min(s.score_rows) * n_pad * 4 <= s.score_bytes, "score [{}, {n_pad}] exceeds the scratch", t.min(s.score_rows));
 
         // q_i = rope_c(bf16(qr @ dequant(wq_b)^T)); wts = bf16(x @ weights_proj^T) * 1/64
         self.prof.begin(ops)?;
-        ops.dequant(&w.wq_b, s.deq)?;
-        self.prof.mark(ops, "index.dequant_wq_b")?;
         let qrow = INDEX_HEADS * INDEX_HEAD_DIM * 2;
-        tiled(gpu, s.pad_in, s.pad_out, a.qr, s.qi, t, Q_LORA * 2, qrow, stream, |x, o| {
-            ops.linear_bf16(x, s.deq, o, MM_TILE, w.wq_b.n, w.wq_b.k)
-        })?;
+        if let Some(f) = &self.fp8 {
+            // The FP8 weight read directly, one launch, row-invariant at every M.
+            f.linear(gpu, a.qr, Q_LORA, &w.wq_b, s.qi, INDEX_HEADS * INDEX_HEAD_DIM, t, stream)?;
+        } else {
+            ops.dequant(&w.wq_b, s.deq)?;
+            self.prof.mark(ops, "index.dequant_wq_b")?;
+            tiled(gpu, s.pad_in, s.pad_out, a.qr, s.qi, t, Q_LORA * 2, qrow, stream, |x, o| {
+                ops.linear_bf16(x, s.deq, o, MM_TILE, w.wq_b.n, w.wq_b.k)
+            })?;
+        }
         self.prof.mark(ops, "index.q_gemm")?;
-        iops.iota(s.pos, start, 1, t)?;
+        match dstart {
+            Some(d) => iops.iota_dev(s.pos, d, false, 1, t)?,
+            None => iops.iota(s.pos, start, 1, t)?,
+        }
         ops.rope_tail(s.qi, s.pos, &self.rope_c, t, INDEX_HEADS, INDEX_HEAD_DIM, false)?;
         if self.comp_cublas_tiled {
             tiled(gpu, s.pad_in, s.pad_out, a.x, s.wraw, t, HIDDEN * 2, INDEX_HEADS * 2, stream, |x, o| {
@@ -691,14 +921,43 @@ impl Dsv41SparseCore {
             Some((mask, ld)) if layer > CANDIDATE_SOURCE_LAYER => Some(CandidateMask { mask, ld }),
             _ => None,
         };
-        iops.score(s.qi, ik, s.wts, cand_in, s.score, t, rows, n_pad, start, ratio)?;
-        self.prof.mark(ops, "index.score")?;
-        if layer == CANDIDATE_SOURCE_LAYER {
-            iops.select_candidates(s.score, s.blocks, s.cand, t, n_pad, start, ratio, CANDIDATE_TOPK_BLOCKS, CANDIDATE_BLOCK_SIZE)?;
-            st.cand = Some((s.cand, n_pad));
-            self.prof.mark(ops, "index.candidates")?;
+        let is_src = layer == CANDIDATE_SOURCE_LAYER;
+        if let Some(d) = dstart {
+            // Static decode/verify: t <= DECODE_MAX_T <= score_rows, one block.
+            iops.score_dev(s.qi, ik, s.wts, cand_in, s.score, t, n_pad, d, ratio)?;
+            self.tap_score_rows(gpu, 0, t, n_pad, stream)?;
+            self.prof.mark(ops, "index.score")?;
+            if is_src {
+                iops.select_candidates_dev(s.score, s.blocks, s.cand, t, n_pad, d, ratio, CANDIDATE_TOPK_BLOCKS, CANDIDATE_BLOCK_SIZE)?;
+                self.prof.mark(ops, "index.candidates")?;
+            }
+            iops.topk_dev(s.score, w.topk, t, n_pad, d, ratio)?;
+        } else {
+            // Row blocks of score_rows: score, candidates and top-k are all per row (row r's
+            // compress_lens comes from its absolute position start + r0 + r), so blocking changes
+            // no byte; it bounds the scratch at long context.
+            for r0 in (0..t).step_by(s.score_rows) {
+                let r = s.score_rows.min(t - r0);
+                let cand_b = cand_in.map(|c| CandidateMask { mask: c.mask.offset(r0 * cand_row_bytes(c.ld)), ld: c.ld });
+                iops.score(s.qi.offset(r0 * qrow), ik, s.wts.offset(r0 * INDEX_HEADS * 4), cand_b, s.score, r, rows, n_pad, start + r0, ratio)?;
+                self.tap_score_rows(gpu, r0, r, n_pad, stream)?;
+                self.prof.mark(ops, "index.score")?;
+                if is_src {
+                    let cand_out = s.cand.offset(r0 * cand_row_bytes(n_pad));
+                    iops.select_candidates(s.score, s.blocks, cand_out, r, n_pad, start + r0, ratio, CANDIDATE_TOPK_BLOCKS, CANDIDATE_BLOCK_SIZE)?;
+                    self.prof.mark(ops, "index.candidates")?;
+                }
+                iops.topk(s.score, w.topk.offset(r0 * INDEX_TOPK * 8), r, n_pad, n_c)?;
+                if r0 + r < t {
+                    self.prof.mark(ops, "index.topk")?;
+                }
+            }
         }
-        iops.topk(s.score, w.topk, t, n_pad, n_c)?;
+        if is_src {
+            st.cand = Some((s.cand, n_pad));
+        }
+        st.tap_ld = n_pad;
+        st.tap_n_c = n_c;
         st.topk = Some(w.topk);
         self.prof.mark(ops, "index.topk")?;
         if layer == CANDIDATE_SOURCE_LAYER && st.kind == Some(PassKind::EncoderChunk) {
@@ -723,15 +982,18 @@ impl Dsv41SparseCore {
         let (src, dst) = (tl.cur, 1 - tl.cur);
         let (tk, cd) = (&self.tail.topk, &self.tail.cand);
         // Older rows were scored against fewer columns: pad with 0, as _rep_tail pads False.
-        gpu.memset_async(cd[dst], 0, REPLAY_ROWS * n_pad, stream)?;
+        // Bit rows (cand_row_bytes): a narrower older row's bits are its leading blocks, and the
+        // zeroed rest reads as "not a candidate", exactly as the byte form padded False.
+        let (old_rb, new_rb) = (cand_row_bytes(tl.ld), cand_row_bytes(n_pad));
+        gpu.memset_async(cd[dst], 0, REPLAY_ROWS * new_rb, stream)?;
         if keep > 0 {
             let from = tl.rows - keep;
             gpu.copy_d2d_async(tk[src].offset(from * INDEX_TOPK * 8), tk[dst], keep * INDEX_TOPK * 8, stream)?;
-            gpu.copy_d2d_2d_async(cd[src].offset(from * tl.ld), tl.ld, cd[dst], n_pad, tl.ld, keep, stream)?;
+            gpu.copy_d2d_2d_async(cd[src].offset(from * old_rb), old_rb, cd[dst], new_rb, old_rb, keep, stream)?;
         }
         let from = t - take;
         gpu.copy_d2d_async(topk.offset(from * INDEX_TOPK * 8), tk[dst].offset(keep * INDEX_TOPK * 8), take * INDEX_TOPK * 8, stream)?;
-        gpu.copy_d2d_2d_async(self.s.cand.offset(from * n_pad), n_pad, cd[dst].offset(keep * n_pad), n_pad, n_pad, take, stream)?;
+        gpu.copy_d2d_2d_async(self.s.cand.offset(from * new_rb), new_rb, cd[dst].offset(keep * new_rb), new_rb, new_rb, take, stream)?;
         *tl = TailState { cur: dst, rows: keep + take, ld: n_pad };
         Ok(())
     }
@@ -753,6 +1015,30 @@ impl Dsv41SparseCore {
         if matches!(st.kind, Some(PassKind::Decode | PassKind::Verify)) && a.t <= DECODE_MAX_T && self.split_on {
             let keys = WINDOW + if ratio == 0 { 0 } else { INDEX_TOPK };
             let splits = keys.div_ceil(DECODE_SLICE);
+            if let Some((k, tickets)) = self.split_lb {
+                return KernelLaunch::new(ops.gpu, k)
+                    .grid([a.t as u32, (64 / HEADS_PER_BLOCK) as u32, splits as u32])
+                    .block([ATTN_THREADS, 1, 1])
+                    .arg_ptr(a.q)
+                    .arg_ptr(a.ring)
+                    .arg_ptr(a.wpos)
+                    .arg_ptr(ckv)
+                    .arg_ptr(cidx)
+                    .arg_ptr(self.part)
+                    .arg_ptr(a.sink)
+                    .arg_ptr(a.out)
+                    .arg_ptr(tickets)
+                    .arg_i32(a.t as i32)
+                    .arg_i32(64)
+                    .arg_i32(HEAD_DIM as i32)
+                    .arg_i32(WINDOW as i32)
+                    .arg_i32(INDEX_TOPK as i32)
+                    .arg_i32(RING as i32)
+                    .arg_i32(a.win_lo as i32)
+                    .arg_f32(scale)
+                    .arg_i32(DECODE_SLICE as i32)
+                    .launch(ops.stream);
+            }
             KernelLaunch::new(ops.gpu, self.split_kernel)
                 .grid([a.t as u32, (64 / HEADS_PER_BLOCK) as u32, splits as u32])
                 .block([ATTN_THREADS, 1, 1])
@@ -818,6 +1104,16 @@ impl PassHook for Dsv41SparseCore {
         self.rollback_inner(ops.gpu, n, restore, ops.stream)
     }
 
+    fn enable_graph(&self, dstart: DevicePtr) -> Result<()> {
+        self.set_static_decode(true);
+        self.set_device_start(Some(dstart));
+        Ok(())
+    }
+
+    fn replay_step(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
+        Dsv41SparseCore::replay_step(self, kind, start, t)
+    }
+
     fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
         ensure!(t <= self.max_chunk, "pass of {t} rows exceeds max_chunk {}", self.max_chunk);
         let mut st = self.st.lock().expect("core state poisoned");
@@ -850,6 +1146,7 @@ impl PassHook for Dsv41SparseCore {
         st.kind = Some(kind);
         st.pass_start = start;
         st.pass_t = t;
+        st.dstart_written = false;
         match kind {
             PassKind::Replay => {
                 // Layers 21..23 attend with L20's tail selection; 24..36 score inside its
@@ -868,6 +1165,25 @@ impl PassHook for Dsv41SparseCore {
 }
 
 impl AttnCore for Dsv41SparseCore {
+    /// On index-source layers, in the oracle's names: `topk` `[t, 512]` i64 (the selection this
+    /// layer's attention used), `n_c` `[1]` i64, and with ATLAS_DSV41_TAP_INDEX_SCORE=1
+    /// `index_score_rows` `[ceil(t / 64), n_pad]` fp32 (check_topk_overlap.py's miss triage).
+    fn taps(&self, ops: &Ops, tap: &Tap, layer: usize, t: usize) -> Result<()> {
+        if self.layers.get(layer).is_none_or(|l| l.idx.is_none()) {
+            return Ok(());
+        }
+        let st = self.st.lock().expect("core state poisoned");
+        let topk = st.topk.context("tap: no top-k after an index layer")?;
+        tap.bytes(ops, "topk", layer, topk, t * INDEX_TOPK * 8)?;
+        ops.gpu.synchronize(ops.stream)?;
+        ops.gpu.copy_h2d(&(st.tap_n_c as i64).to_le_bytes(), self.s.tap_val)?;
+        tap.bytes(ops, "n_c", layer, self.s.tap_val, 8)?;
+        if self.s.tap_rows != DevicePtr::NULL {
+            tap.bytes(ops, "index_score_rows", layer, self.s.tap_rows, t.div_ceil(TAP_ROW_STRIDE) * st.tap_ld * 4)?;
+        }
+        Ok(())
+    }
+
     fn run(&self, ops: &Ops, a: &CoreArgs) -> Result<()> {
         ensure!(a.layer < self.layers.len(), "layer {} out of range", a.layer);
         let mut st = self.st.lock().expect("core state poisoned");
@@ -881,11 +1197,15 @@ impl AttnCore for Dsv41SparseCore {
             st.pass_t
         );
         let lw = &self.layers[a.layer];
+        let dstart = self.static_start(ops, &mut st)?;
         if lw.kv.is_some() {
-            self.compress(ops, a, &mut st)?;
+            match dstart {
+                Some(d) => self.compress_static(ops, a, &mut st, d)?,
+                None => self.compress(ops, a, &mut st)?,
+            }
         }
         if lw.idx.is_some() {
-            self.index(ops, a, &mut st)?;
+            self.index(ops, a, &mut st, dstart)?;
         }
         self.prof.begin(ops)?;
         self.attend(ops, a, &st)?;
@@ -911,11 +1231,21 @@ impl PassHook for std::sync::Arc<Dsv41SparseCore> {
     fn rollback(&self, ops: &Ops, n: usize) -> Result<()> {
         PassHook::rollback(self.as_ref(), ops, n)
     }
+    fn enable_graph(&self, dstart: DevicePtr) -> Result<()> {
+        PassHook::enable_graph(self.as_ref(), dstart)
+    }
+    fn replay_step(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
+        PassHook::replay_step(self.as_ref(), kind, start, t)
+    }
 }
 
 impl AttnCore for std::sync::Arc<Dsv41SparseCore> {
     fn run(&self, ops: &Ops, a: &CoreArgs) -> Result<()> {
         self.as_ref().run(ops, a)
+    }
+
+    fn taps(&self, ops: &Ops, tap: &Tap, layer: usize, t: usize) -> Result<()> {
+        self.as_ref().taps(ops, tap, layer, t)
     }
 }
 
@@ -1013,5 +1343,7 @@ mod tests {
     fn score_scratch_is_one_chunk_by_the_widest_row() {
         assert_eq!(score_scratch_bytes(512, 8192), 512 * 8192 * 4);
         assert_eq!(score_scratch_bytes(512, 8193), 512 * 8704 * 4);
+        // 1M context: row blocks, not the chunk -- under the 1 GiB budget at any chunk.
+        assert_eq!(score_scratch_bytes(3968, 1 << 20), 224 * (1 << 20) * 4);
     }
 }

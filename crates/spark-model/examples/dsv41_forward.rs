@@ -178,6 +178,11 @@ impl V41RoutedMoe for Refuse {
     }
 }
 
+/// DSV41_DRIVER_SEQ_RUNS: spacer allocations after each freed sequence, sized like one ring
+/// (`[128, 512]` bf16) so the allocator hands the freed rings' memory to them.
+const N_SPACERS: usize = 48;
+const SPACER_BYTES: usize = 128 * 512 * 2;
+
 fn manifest_ids(dir: &Path) -> Result<Vec<u32>> {
     let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)?;
     m["token_ids"]
@@ -192,7 +197,11 @@ fn manifest_ids(dir: &Path) -> Result<Vec<u32>> {
 /// computed pass line up occurrence for occurrence.
 fn manifest_chunks(dir: &Path, n: usize) -> Result<Vec<(usize, usize)>> {
     let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)?;
-    let chunk = m["model_globals"]["MAX_CHUNK"].as_u64().context("no MAX_CHUNK")? as usize;
+    // DSV41_DRIVER_CHUNK overrides the capture's chunk (e.g. 2048, the serving default).
+    let chunk = match std::env::var("DSV41_DRIVER_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(c) => c,
+        None => m["model_globals"]["MAX_CHUNK"].as_u64().context("no MAX_CHUNK")? as usize,
+    };
     Ok((0..n).step_by(chunk).map(|s| (s, chunk.min(n - s))).collect())
 }
 
@@ -253,7 +262,11 @@ fn run_model_path(
     let shared_dyn: spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu = gpu.clone();
     spark_model::model::dsv41::log_run_identity("driver", ops.stream);
     let max_chunk = splits.iter().flatten().copied().chain(chunks.iter().map(|c| c.1)).max().unwrap_or(1);
-    let mut fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, 8192, Path::new(MODEL_DIR), 128)?;
+    // --max-seq N (default 8192): sizes the compressed caches, rope tables and score scratch.
+    let max_seq: usize = std::env::var("DSV41_DRIVER_MAX_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
+    ensure!(ids.len() <= max_seq, "prompt of {} tokens exceeds --max-seq {max_seq}", ids.len());
+    println!("max_seq {max_seq}");
+    let mut fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, max_seq, Path::new(MODEL_DIR), 128)?;
     // DSpark (DSV41_DRIVER_DSPARK=1): the drafter's weights and the L37-39 seed buffer.
     let dspark_on = std::env::var("DSV41_DRIVER_DSPARK").as_deref() == Ok("1");
     let dspark_force = std::env::var("DSV41_DRIVER_DSPARK_FORCE_ACCEPT").as_deref() == Ok("1");
@@ -261,7 +274,7 @@ fn run_model_path(
         fwd.dspark = Some(spark_model::weight_loader::deepseek_v41::mtp::DsparkWeights::load(store, &dims, config.vocab_size)?);
         fwd.enable_dspark_seed(ops.gpu)?;
     }
-    let fwd = fwd;
+    let mut fwd = fwd;
     let ds = if dspark_on {
         Some(spark_model::weight_loader::deepseek_v41::dspark::Dspark::new(&shared_dyn, &fwd, 10.0, 1.5)?)
     } else {
@@ -271,11 +284,17 @@ fn run_model_path(
     let fed_core = FedCore(&feeder);
     let real_core;
     let (core, hook): (&dyn AttnCore, &dyn PassHook) = if attn_real {
-        real_core = Dsv41SparseCore::load_prefix(&shared_dyn, store, config, 8192, max_chunk, fwd.freqs_c, n_layers)?;
+        real_core = Dsv41SparseCore::load_prefix(&shared_dyn, store, config, max_seq, max_chunk, fwd.freqs_c, n_layers)?;
         (&real_core, &real_core)
     } else {
         (&fed_core, &NoHook)
     };
+    // Whole-step CUDA graphs for Decode/Verify passes (DSV41_DRIVER_GRAPH=1): shape-static core.
+    if std::env::var("DSV41_DRIVER_GRAPH").as_deref() == Ok("1") {
+        fwd.enable_graphs(ops.gpu, hook)?;
+        println!("decode: CUDA graphs ON (Decode/Verify passes captured once, replayed)");
+    }
+    let fwd = fwd;
     let fed_moe = FedMoe(&feeder, dims.hidden);
     let real;
     let moe: &dyn V41RoutedMoe = if moe_real {
@@ -358,21 +377,25 @@ fn run_model_path(
             let rows = seq.tail_rows;
             ds.seed(ops, &fwd, rows, seq.len - rows)?;
             let t1 = std::time::Instant::now();
-            let (mut steps, mut acc_hist) = (0usize, [0usize; 6]);
+            let (mut steps, mut acc_hist, mut k_hist) = (0usize, [0usize; 6], [0usize; 6]);
+            let mut policy = spark_model::weight_loader::deepseek_v41::dspark_adapt::AdaptiveK::from_env()?;
             let mut step_ms = Vec::new();
             while got.len() < decode_n {
                 let tok = *got.last().unwrap();
                 let ts = std::time::Instant::now();
-                let out = ds.step(ops, &fwd, &mut seq, tok, hook, core, moe, &Tap::off(), logits, dspark_force)?;
+                let k = policy.choose();
+                let out = ds.step(ops, &fwd, &mut seq, tok, hook, core, moe, &Tap::off(), logits, k, dspark_force)?;
                 step_ms.push(ts.elapsed().as_secs_f64() * 1e3);
                 acc_hist[out.accepted] += 1;
+                k_hist[k] += 1;
+                policy.observe(k, out.accepted);
                 if std::env::var("DSV41_DRIVER_DSPARK_VERBOSE").as_deref() == Ok("1") {
                     // FNV of verify row 0's logits = the plain-decode logits of the same position:
                     // compare with the plain arm's "decode logits fnv per step".
                     ops.gpu.synchronize(ops.stream)?;
                     ops.gpu.copy_d2h(logits, &mut host)?;
                     let h = host.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
-                    println!("spec step {steps:2}: pos {} tok {tok} accepted {} emitted {:?} row0 fnv {h:x}", seq.len - out.emitted.len(), out.accepted, out.emitted);
+                    println!("spec step {steps:2}: pos {} tok {tok} k {k} accepted {} emitted {:?} row0 fnv {h:x}", seq.len - out.emitted.len(), out.accepted, out.emitted);
                 }
                 steps += 1;
                 got.extend_from_slice(&out.emitted);
@@ -384,7 +407,7 @@ fn run_model_path(
             let mut w = step_ms.clone();
             w.sort_by(f64::total_cmp);
             println!(
-                "dspark{}: {} tokens in {steps} steps, {dt:.2}s ({:.2} tok/s); accepted/step mean {mean_a:.2} hist {acc_hist:?}; step ms median {:.2}",
+                "dspark{}: {} tokens in {steps} steps, {dt:.2}s ({:.2} tok/s); accepted/step mean {mean_a:.2} hist {acc_hist:?}; k hist {k_hist:?}; step ms median {:.2}",
                 if dspark_force { " [CONTROL force-accept]" } else { "" },
                 got.len() - 1,
                 (got.len() - 1) as f64 / dt,
@@ -393,6 +416,14 @@ fn run_model_path(
             println!("decode ours:   {got:?}");
             println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
             println!("decode: first {agree} identical");
+            let ph = ds.phase_ms.lock().expect("phase").clone();
+            if ph.len() > 2 {
+                let med = |k: usize| { let mut v: Vec<f64> = ph[1..].iter().map(|p| p[k]).collect(); v.sort_by(f64::total_cmp); v[v.len() / 2] };
+                println!("dspark phases ms (median, warm): draft {:.2}  verify+accept {:.2}  commit(rollback+seed) {:.2}", med(0), med(1), med(2));
+            }
+            if let Some(g) = &fwd.graph {
+                println!("graph captures: {}", g.captures.load(std::sync::atomic::Ordering::Relaxed));
+            }
             println!("DONE dsv41_forward path=model dspark");
             return Ok(());
         }
@@ -426,11 +457,56 @@ fn run_model_path(
                 w.len(), w[w.len() / 2], w[0], w[w.len() - 1], steps_ms[0]
             );
         }
+        if let Some(g) = &fwd.graph {
+            println!("graph captures: {} over {} decode steps", g.captures.load(std::sync::atomic::Ordering::Relaxed), got.len() - 1);
+        }
         println!("decode ours:   {got:?}");
         println!("decode logits fnv: {:016x}", hashes.iter().fold(0u64, |a, h| a.rotate_left(7) ^ h));
         println!("decode logits fnv per step: {:x?}", hashes);
         println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
         println!("decode: first {agree} identical; top-1 agreement {matches}/{}", got.len().min(want.len()));
+        // DSV41_DRIVER_SEQ_RUNS=dirB,dirA: more sequences in this process, as serve runs them: a
+        // new V41Seq per prompt, the previous one freed and its memory re-used by a garbage-filled
+        // spacer, then prefill + greedy decode of decode_n tokens. A graph replaying a previous
+        // sequence's buffers reads that garbage (the ATLAS_DSV41_CONTROL_GRAPH_KEEP_STALE=1 control).
+        if let Ok(runs) = std::env::var("DSV41_DRIVER_SEQ_RUNS") {
+            let argmax = |h: &[u8]| -> u32 {
+                let v = to_f32(h);
+                // lowest id on a tie, as the device argmax
+                v.iter().enumerate().fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0 as u32
+            };
+            let mut spacers = Vec::new();
+            for (i, dir) in runs.split(',').filter(|d| !d.is_empty()).enumerate() {
+                let ids_i = manifest_ids(Path::new(dir))?;
+                let old = std::mem::replace(&mut seq, V41Seq::new(ops.gpu, &dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?);
+                ops.gpu.synchronize(ops.stream)?;
+                old.free(ops.gpu)?;
+                for _ in 0..N_SPACERS {
+                    let sp = ops.gpu.alloc(SPACER_BYTES)?;
+                    ops.gpu.memset(sp, 0x7f, SPACER_BYTES)?;
+                    spacers.push(sp);
+                }
+                fwd.prefill(ops, &mut seq, &ids_i, PrefillMode::Replay, hook, core, moe, &Tap::off(), logits)?;
+                ops.gpu.synchronize(ops.stream)?;
+                ops.gpu.copy_d2h(logits, &mut host)?;
+                let mut toks = vec![argmax(&host)];
+                let ts = std::time::Instant::now();
+                while toks.len() < decode_n {
+                    fwd.decode(ops, &mut seq, *toks.last().unwrap(), hook, core, moe, &Tap::off(), logits)?;
+                    ops.gpu.synchronize(ops.stream)?;
+                    ops.gpu.copy_d2h(logits, &mut host)?;
+                    toks.push(argmax(&host));
+                }
+                let dt = ts.elapsed().as_secs_f64();
+                println!("seq {} ({dir}, {} prompt tokens, seq id {}): {:.2} tok/s tokens {toks:?}", i + 1, ids_i.len(), seq.id, (toks.len() - 1) as f64 / dt);
+            }
+            for sp in spacers {
+                ops.gpu.free(sp)?;
+            }
+            if let Some(g) = &fwd.graph {
+                println!("graph captures after all sequences: {}", g.captures.load(std::sync::atomic::Ordering::Relaxed));
+            }
+        }
     }
     if warm_prefill {
         // Second prefill of the same prompt in the same process: weights, arena, kernels and
@@ -513,6 +589,12 @@ fn main() -> Result<()> {
             "--chunk" => chunk_override = Some(args.next().context("--chunk")?.parse()?),
             // --tile-prompt K: the capture's prompt repeated K times (speed/memory/identity only:
             // there is no oracle for the longer prompt).
+            // --max-seq N: the model path's max_seq (caches, rope tables, score scratch).
+            "--max-seq" => {
+                let v = args.next().context("--max-seq")?;
+                // SAFETY: single-threaded at argument parsing; nothing has read the env yet.
+                unsafe { std::env::set_var("DSV41_DRIVER_MAX_SEQ", v) }
+            }
             "--tile-prompt" => tile_prompt = args.next().context("--tile-prompt")?.parse()?,
             // Per-run switches for the env-gated ops (read once, so set before any GPU work).
             // SAFETY: single-threaded at argument parsing; nothing has read the environment yet.
@@ -566,7 +648,9 @@ fn main() -> Result<()> {
             o => bail!("unknown argument {o}"),
         }
     }
-    let ref_dir = PathBuf::from(REF_ROOT).join(&run);
+    // `--run` is a capture under REF_ROOT, or (containing '/') any directory with a manifest.json
+    // holding `token_ids` (+ optional `greedy_continuation`, `model_globals.MAX_CHUNK`): real prompts.
+    let ref_dir = if run.contains('/') { PathBuf::from(&run) } else { PathBuf::from(REF_ROOT).join(&run) };
     ensure!(ref_dir.join("manifest.json").is_file(), "{} has no manifest", ref_dir.display());
     let ids = manifest_ids(&ref_dir)?.repeat(tile_prompt);
     let chunks = match chunk_override {
