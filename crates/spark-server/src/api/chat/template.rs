@@ -216,14 +216,38 @@ pub(super) fn render_template(
         }
     }
 
+    // The image pad the model's vision path consumes: the checkpoint's
+    // `image_pad_token_id` when its vision config declares one (GLM-5.3 uses
+    // <|image|>, not Qwen's <|image_pad|>), else the tokenizer's Qwen marker.
+    let image_pad_id = state
+        .vision_config
+        .as_ref()
+        .map(|vision| vision.image_pad_token_id)
+        .filter(|&token| token != 0)
+        .or_else(|| state.tokenizer.image_pad_token_id());
     // Refuse templates that omit/duplicate images, before expansion can hide the mismatch.
     if has_images {
-        let pad = state.tokenizer.image_pad_token_id().ok_or_else(|| {
+        let pad = image_pad_id.ok_or_else(|| {
             openai_error_response(
                 StatusCode::BAD_REQUEST,
                 "Tokenizer lacks an image marker token".into(),
             )
         })?;
+        // GLM-5.3's published template is text-only: for each image it renders
+        // a fixed "unable to process this image" reminder. The checkpoint is
+        // multimodal, so that exact tokenized span is replaced by the native
+        // <|begin_of_image|><|image|><|end_of_image|> triplet. A template that
+        // already emits pads is left alone.
+        if prompt_tokens.iter().all(|&id| id != pad) {
+            prompt_tokens =
+                materialize_glm_image_placeholders(&state.tokenizer, prompt_tokens, image_count, pad)
+                    .map_err(|e| {
+                        openai_error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!("Image template error: {e:#}"),
+                        )
+                    })?;
+        }
         if prompt_tokens.iter().filter(|&&id| id == pad).count() != image_count {
             return Err(openai_error_response(
                 StatusCode::BAD_REQUEST,
@@ -232,12 +256,11 @@ pub(super) fn render_template(
         }
     }
     // Expand image pads when needed.
-    let prompt_tokens = if image_pad_counts.iter().any(|&c| c > 1) {
-        state
-            .tokenizer
-            .expand_image_pads(prompt_tokens, image_pad_counts)
-    } else {
-        prompt_tokens
+    let prompt_tokens = match image_pad_id {
+        Some(pad) if image_pad_counts.iter().any(|&c| c > 1) => {
+            expand_image_pads_with_id(prompt_tokens, pad, image_pad_counts)
+        }
+        _ => prompt_tokens,
     };
 
     // Template-forced thinking detection.
@@ -268,4 +291,87 @@ pub(super) fn render_template(
         enable_thinking,
         thinking_budget,
     })
+}
+
+/// GLM-5.3 image placeholders (ported from perf/glm-5.3-flash-prefill-20260920).
+fn materialize_glm_image_placeholders(
+    tokenizer: &crate::tokenizer::ChatTokenizer,
+    tokens: Vec<u32>,
+    image_count: usize,
+    pad_id: u32,
+) -> anyhow::Result<Vec<u32>> {
+    let existing = tokens.iter().filter(|&&token| token == pad_id).count();
+    if existing == image_count {
+        return Ok(tokens);
+    }
+    anyhow::ensure!(
+        existing == 0,
+        "rendered prompt has {existing} image pads for {image_count} images"
+    );
+    let reminder = tokenizer.encode(
+        "<reminder>You are unable to process this image because you don't have multi-modal input ability. Try different methods.</reminder>",
+    )?;
+    anyhow::ensure!(!reminder.is_empty(), "GLM image reminder encoded empty");
+    let singleton = |text: &str| -> anyhow::Result<u32> {
+        let encoded = tokenizer.encode(text)?;
+        anyhow::ensure!(
+            encoded.len() == 1,
+            "GLM media marker {text} must encode to one token"
+        );
+        Ok(encoded[0])
+    };
+    let replacement = [
+        singleton("<|begin_of_image|>")?,
+        pad_id,
+        singleton("<|end_of_image|>")?,
+    ];
+    replace_exact_spans(tokens, &reminder, &replacement, image_count)
+}
+
+fn expand_image_pads_with_id(tokens: Vec<u32>, pad_id: u32, counts: &[usize]) -> Vec<u32> {
+    let extra: usize = counts.iter().map(|count| count.saturating_sub(1)).sum();
+    let mut output = Vec::with_capacity(tokens.len() + extra);
+    let mut image = 0usize;
+    for token in tokens {
+        if token == pad_id {
+            output.extend(std::iter::repeat_n(
+                pad_id,
+                counts.get(image).copied().unwrap_or(1).max(1),
+            ));
+            image += 1;
+        } else {
+            output.push(token);
+        }
+    }
+    output
+}
+
+fn replace_exact_spans(
+    tokens: Vec<u32>,
+    needle: &[u32],
+    replacement: &[u32],
+    expected: usize,
+) -> anyhow::Result<Vec<u32>> {
+    anyhow::ensure!(
+        !needle.is_empty(),
+        "image placeholder needle must not be empty"
+    );
+    let mut output = Vec::with_capacity(tokens.len());
+    let mut cursor = 0usize;
+    let mut replaced = 0usize;
+    while cursor < tokens.len() {
+        if tokens[cursor..].starts_with(needle) {
+            output.extend_from_slice(replacement);
+            cursor += needle.len();
+            replaced += 1;
+        } else {
+            output.push(tokens[cursor]);
+            cursor += 1;
+        }
+    }
+    anyhow::ensure!(
+        replaced == expected,
+        "rendered prompt contained {replaced} GLM image reminders for {expected} images"
+    );
+    Ok(output)
 }
