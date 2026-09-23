@@ -8,6 +8,10 @@
 //                            -inf where n >= compress_lens[t] or (cand given and !cand[t,n])
 //   dsv41_select_candidates  layer 20 only: amax over blocks of 8 columns, force-keep the
 //                            block holding compress_lens-1, keep the top 2048 finite blocks
+//
+// CANDIDATE MASK = ONE BIT PER 8-COLUMN BLOCK: [T, cand_ld / 256] u32, bit (n >> 3) of row t.
+// The selection keeps whole blocks, so a per-column byte mask carried the same information 64x
+// larger (2.1 GB at max_seq 1M x chunk 2048; 33 MB as bits).
 //   dsv41_index_topk         the top min(512, n_c) finite columns per row, ASCENDING, padded
 //                            to EXACTLY 512 with -1
 //
@@ -98,7 +102,7 @@ __device__ void index_score_body(
     const __nv_bfloat16* __restrict__ Q,     // [T, H, DH]
     const __nv_bfloat16* __restrict__ IK,    // [n_keys, DH]
     const float* __restrict__ W,             // [T, H]
-    const uint8_t* __restrict__ CAND,        // [T, cand_ld] or nullptr
+    const uint32_t* __restrict__ CAND,       // [T, cand_ld / 256] block bits, or nullptr
     float* __restrict__ OUT,                 // [T, n_pad]
     int n_keys, int n_pad, long long pos0, int ratio, int cand_ld,
     __nv_bfloat16* sq,                       // smem [H * DH]            8 KB
@@ -155,7 +159,8 @@ __device__ void index_score_body(
     if (n >= n_pad) return;
     const long long lens = (pos0 + t + 1) / ratio;       // compress_lens, ABSOLUTE position
     bool valid = n < lens;
-    if (CAND != nullptr) valid = valid && n < cand_ld && CAND[(size_t)t * cand_ld + n] != 0;
+    if (CAND != nullptr)
+        valid = valid && n < cand_ld && ((CAND[(size_t)t * (cand_ld / 256) + (n >> 8)] >> ((n >> 3) & 31)) & 1u);
     float v[H];
 #pragma unroll
     for (int h = 0; h < H; ++h) {
@@ -271,7 +276,7 @@ using namespace dsv41_index;
 
 extern "C" __global__ void __launch_bounds__(SCORE_THREADS)
 dsv41_index_score(const __nv_bfloat16* Q, const __nv_bfloat16* IK, const float* W,
-                  const uint8_t* CAND, float* OUT, int n_keys, int n_pad, long long pos0,
+                  const uint32_t* CAND, float* OUT, int n_keys, int n_pad, long long pos0,
                   int ratio, int cand_ld)
 {
     DSV41_INDEX_SCORE_SMEM
@@ -288,7 +293,7 @@ __device__ void topk_row(const float* row, long long* out, int n, int kmax, int*
 }
 
 // One row's candidate mask over score columns [0, n). brow holds ceil(n / block_size) floats.
-__device__ void candidates_row(const float* row, float* brow, uint8_t* crow, int n, long long lens,
+__device__ void candidates_row(const float* row, float* brow, uint32_t* crow, int n, long long lens,
                                int topk_blocks, int block_size, int* hist, int* scratch)
 {
     const int nb = (n + block_size - 1) / block_size;
@@ -301,15 +306,13 @@ __device__ void candidates_row(const float* row, float* brow, uint8_t* crow, int
         }
         brow[b] = b == last ? INFINITY : m;
     }
-    for (int c = threadIdx.x; c < n; c += SEL_THREADS) crow[c] = 0;
+    for (int w = threadIdx.x; w < n / 256; w += SEL_THREADS) crow[w] = 0u;
     __syncthreads();
     const Threshold th = radix_threshold(brow, nb, topk_blocks, hist, scratch);
     __syncthreads();
     emit_selected(brow, nb, th, scratch, [&](int b, int) {
-        for (int i = 0; i < block_size; ++i) {
-            const int c = b * block_size + i;
-            if (c < n) crow[c] = 1;
-        }
+        for (int c = b * block_size; c < min(n, (b + 1) * block_size); c += 8)   // its 8-col bits
+            atomicOr(&crow[c >> 8], 1u << ((c >> 3) & 31));
     });
 }
 
@@ -323,16 +326,17 @@ dsv41_index_topk(const float* SCORE, long long* OUT_IDX, int n_pad, int kmax)
     topk_row(SCORE + (size_t)blockIdx.x * n_pad, OUT_IDX + (size_t)blockIdx.x * TOPK, n_pad, kmax, hist, scratch);
 }
 
-// Layer 20 only. BLOCK_SCORE: [T, n_pad/8] fp32 scratch. CAND: [T, n_pad] uint8.
+// Layer 20 only. BLOCK_SCORE: [T, n_pad/block_size] fp32 scratch. CAND: [T, n_pad/256] u32 bits.
+// block_size must be a multiple of 8 (the bit granularity).
 extern "C" __global__ void __launch_bounds__(SEL_THREADS)
-dsv41_select_candidates(const float* SCORE, float* BLOCK_SCORE, uint8_t* CAND, int n_pad,
+dsv41_select_candidates(const float* SCORE, float* BLOCK_SCORE, uint32_t* CAND, int n_pad,
                         long long pos0, int ratio, int topk_blocks, int block_size)
 {
     __shared__ int hist[256];
     __shared__ int scratch[SEL_THREADS / 32];
     const int t = blockIdx.x;
     const int nb = (n_pad + block_size - 1) / block_size;
-    candidates_row(SCORE + (size_t)t * n_pad, BLOCK_SCORE + (size_t)t * nb, CAND + (size_t)t * n_pad, n_pad,
+    candidates_row(SCORE + (size_t)t * n_pad, BLOCK_SCORE + (size_t)t * nb, CAND + (size_t)t * (n_pad / 256), n_pad,
                    (pos0 + t + 1) / ratio, topk_blocks, block_size, hist, scratch);
 }
 
@@ -340,7 +344,7 @@ dsv41_select_candidates(const float* SCORE, float* BLOCK_SCORE, uint8_t* CAND, i
 // Negative-control and order-probe entry points. NOT for production.
 extern "C" __global__ void __launch_bounds__(SCORE_THREADS)
 dsv41_index_score_probe(const __nv_bfloat16* Q, const __nv_bfloat16* IK, const float* W,
-                        const uint8_t* CAND, float* OUT, int n_keys, int n_pad, long long pos0,
+                        const uint32_t* CAND, float* OUT, int n_keys, int n_pad, long long pos0,
                         int ratio, int cand_ld, int variant)
 {
     DSV41_INDEX_SCORE_SMEM
@@ -460,6 +464,78 @@ extern "C" __global__ void __launch_bounds__(256) dsv41_gemm_bf16_smalln(
     }
 }
 
+// Prefill-M form of dsv41_gemm_f32_nt, BIT-IDENTICAL to it by construction: every output is the
+// SAME single fmaf(a, b, acc) chain over k = 0..K-1 from 0.f; only the tiling changes. 128x64
+// tile, 256 threads x (8 m x 4 n) outputs, float4 smem reads (3 per 32 FMAs vs 8 per 16),
+// global loads for tile k+1 held in registers while tile k computes. K % 16 == 0, K % 4 == 0.
+namespace dsv41_gemm2 {
+constexpr int G_BM = 128, G_BN = 64, G_BK = 16, G_PAD = 4;
+}
+extern "C" __global__ void __launch_bounds__(256) dsv41_gemm_f32_nt_v2(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K)
+{
+    using dsv41_gemm2::G_BM; using dsv41_gemm2::G_BN; using dsv41_gemm2::G_BK; using dsv41_gemm2::G_PAD;
+    __shared__ __align__(16) float as[2][G_BK][G_BM + G_PAD];
+    __shared__ __align__(16) float bs[2][G_BK][G_BN + G_PAD];
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.y * G_BM, n0 = blockIdx.x * G_BN;
+    const int tm = (tid / 16) * 8, tn = (tid % 16) * 4;
+    // Loaders: A 128 x 16 = 512 float4 (2 per thread), B 64 x 16 = 256 float4 (1 per thread).
+    float4 ra[2], rb;
+    auto fetch = [&](int k0) {
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int i = tid + u * 256, r = i / 4, c = (i % 4) * 4;
+            ra[u] = m0 + r < M ? *reinterpret_cast<const float4*>(A + (size_t)(m0 + r) * K + k0 + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        const int r = tid / 4, c = (tid % 4) * 4;
+        rb = n0 + r < N ? *reinterpret_cast<const float4*>(B + (size_t)(n0 + r) * K + k0 + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+    };
+    auto stash = [&](int buf) {
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int i = tid + u * 256, r = i / 4, c = (i % 4) * 4;
+            as[buf][c][r] = ra[u].x; as[buf][c + 1][r] = ra[u].y; as[buf][c + 2][r] = ra[u].z; as[buf][c + 3][r] = ra[u].w;
+        }
+        const int r = tid / 4, c = (tid % 4) * 4;
+        bs[buf][c][r] = rb.x; bs[buf][c + 1][r] = rb.y; bs[buf][c + 2][r] = rb.z; bs[buf][c + 3][r] = rb.w;
+    };
+    float acc[8][4] = {};
+    fetch(0);
+    stash(0);
+    __syncthreads();
+    const int nk = K / G_BK;
+    for (int kt = 0; kt < nk; ++kt) {
+        const int buf = kt & 1;
+        if (kt + 1 < nk) fetch((kt + 1) * G_BK);
+#pragma unroll
+        for (int k = 0; k < G_BK; ++k) {
+            const float4 a0 = *reinterpret_cast<const float4*>(&as[buf][k][tm]);
+            const float4 a1 = *reinterpret_cast<const float4*>(&as[buf][k][tm + 4]);
+            const float4 b4 = *reinterpret_cast<const float4*>(&bs[buf][k][tn]);
+            const float a[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
+            const float b[4] = { b4.x, b4.y, b4.z, b4.w };
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+        if (kt + 1 < nk) stash(buf ^ 1);   // its readers finished before the previous sync
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int m = m0 + tm + i;
+        if (m >= M) continue;
+        if (n0 + tn + 3 < N) {
+            *reinterpret_cast<float4*>(C + (size_t)m * N + n0 + tn) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+        } else {
+            for (int j = 0; j < 4; ++j)
+                if (n0 + tn + j < N) C[(size_t)m * N + n0 + tn + j] = acc[i][j];
+        }
+    }
+}
+
 // Small-M (<= 16) form of dsv41_gemm_f32_nt, BIT-IDENTICAL to it by construction: every output is
 // the SAME single fmaf(a, b, acc) chain over k = 0..K-1 from 0.f. dsv41_gemm_f32_nt tiles N by 64,
 // so at decode/verify M its grid is N/64 = 8 CTAs streaming a 10.5 MB fp32 weight (~800 us per
@@ -525,7 +601,7 @@ __device__ __forceinline__ int score_width_of(long long n_c) {
 
 extern "C" __global__ void __launch_bounds__(SCORE_THREADS)
 dsv41_index_score_dev(const __nv_bfloat16* Q, const __nv_bfloat16* IK, const float* W,
-                      const uint8_t* CAND, float* OUT, int ld, const int* DSTART, int ratio, int cand_ld)
+                      const uint32_t* CAND, float* OUT, int ld, const int* DSTART, int ratio, int cand_ld)
 {
     const long long start = DSTART[0];
     const int T = gridDim.x;
@@ -547,7 +623,7 @@ dsv41_index_topk_dev(const float* SCORE, long long* OUT_IDX, int ld, const int* 
 }
 
 extern "C" __global__ void __launch_bounds__(SEL_THREADS)
-dsv41_select_candidates_dev(const float* SCORE, float* BLOCK_SCORE, uint8_t* CAND, int ld,
+dsv41_select_candidates_dev(const float* SCORE, float* BLOCK_SCORE, uint32_t* CAND, int ld,
                             const int* DSTART, int ratio, int topk_blocks, int block_size)
 {
     __shared__ int hist[256];
@@ -556,7 +632,7 @@ dsv41_select_candidates_dev(const float* SCORE, float* BLOCK_SCORE, uint8_t* CAN
     const long long start = DSTART[0];
     const int n = score_width_of((start + (long long)gridDim.x) / ratio);
     const int nb_ld = (ld + block_size - 1) / block_size;
-    candidates_row(SCORE + (size_t)t * ld, BLOCK_SCORE + (size_t)t * nb_ld, CAND + (size_t)t * ld, n,
+    candidates_row(SCORE + (size_t)t * ld, BLOCK_SCORE + (size_t)t * nb_ld, CAND + (size_t)t * (ld / 256), n,
                    (start + t + 1) / ratio, topk_blocks, block_size, hist, scratch);
 }
 

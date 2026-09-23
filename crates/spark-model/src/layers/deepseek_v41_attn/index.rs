@@ -38,6 +38,9 @@ const GEMV_F32_KC: usize = 128;
 /// A/B switch for the small-M fp32 GEMV (`ATLAS_DSV41_GEMV_F32=0` at core load, or a gate):
 /// `true` forces `dsv41_gemm_f32_nt` at every M.
 pub static GEMV_F32_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A/B switch for the prefill-M fp32 GEMM (`ATLAS_DSV41_GEMM_F32_V1=1` at core load, or a gate):
+/// `true` forces the original 64x64 `dsv41_gemm_f32_nt` above the GEMV's M.
+pub static GEMM_F32_V1: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Score width for `n_c` visible compressed rows: `max(512, ceil(n_c / 512) * 512)`.
 ///
@@ -63,6 +66,7 @@ pub struct IndexKernels {
     pub gemm_f32: KernelHandle,
     pub gemm_bf16_smalln: KernelHandle,
     pub gemv_f32: KernelHandle,
+    pub gemm_f32_v2: KernelHandle,
     /// Shape-static decode entries: the pass start is read from device memory.
     pub score_dev: KernelHandle,
     pub topk_dev: KernelHandle,
@@ -95,6 +99,7 @@ impl IndexKernels {
             gemm_f32: k("dsv41_gemm_f32_nt")?,
             gemm_bf16_smalln: k("dsv41_gemm_bf16_smalln")?,
             gemv_f32: k("dsv41_gemv_f32_nt")?,
+            gemm_f32_v2: k("dsv41_gemm_f32_nt_v2")?,
             score_dev: k("dsv41_index_score_dev")?,
             topk_dev: k("dsv41_index_topk_dev")?,
             candidates_dev: k("dsv41_select_candidates_dev")?,
@@ -107,7 +112,54 @@ impl IndexKernels {
     }
 }
 
-/// Candidate mask from layer 20: `[num_tokens, ld]` u8, 1 = keep.
+/// Bytes of one candidate-mask row of `ld` score columns: one BIT per 8-column block (the
+/// selection keeps whole blocks), packed in u32 words: `[rows, ld / 256]` u32.
+pub fn cand_row_bytes(ld: usize) -> usize {
+    debug_assert!(ld % 256 == 0, "candidate width {ld} not a multiple of 256");
+    ld / 64
+}
+
+/// Host: a per-column u8 mask `[rows, ld]` (a capture's `cand_in` / `cand_out`) -> the device bit
+/// layout. Errors if a block is not uniform (then the bit form could not represent it).
+pub fn pack_cand(cols: &[u8], rows: usize, ld: usize) -> Result<Vec<u8>> {
+    ensure!(cols.len() == rows * ld && ld % 256 == 0, "pack_cand: {} bytes for [{rows}, {ld}]", cols.len());
+    let mut words = vec![0u32; rows * ld / 256];
+    for r in 0..rows {
+        for b in 0..ld / 8 {
+            let blk = &cols[r * ld + b * 8..r * ld + b * 8 + 8];
+            ensure!(blk.iter().all(|&v| (v != 0) == (blk[0] != 0)), "row {r} block {b}: mask not block-uniform");
+            if blk[0] != 0 {
+                words[r * ld / 256 + b / 32] |= 1 << (b % 32);
+            }
+        }
+    }
+    Ok(words.iter().flat_map(|w| w.to_le_bytes()).collect())
+}
+
+/// Host: the device bit layout `[rows, ld / 256]` u32 -> a per-column u8 mask `[rows, ld]`.
+pub fn unpack_cand(bits: &[u8], rows: usize, ld: usize) -> Vec<u8> {
+    (0..rows * ld)
+        .map(|i| {
+            let (r, c) = (i / ld, i % ld);
+            let w = r * ld / 256 + c / 256;
+            let word = u32::from_le_bytes(bits[w * 4..w * 4 + 4].try_into().unwrap());
+            u8::from((word >> ((c / 8) % 32)) & 1 == 1)
+        })
+        .collect()
+}
+
+/// Rows the index scratch (fp32 score + candidate block scores) holds at once: the largest
+/// multiple of 16 whose scratch fits [`SCORE_BUDGET`] at `max_seq`, within [16, max_chunk]. The
+/// indexer walks a chunk in blocks of this many rows (per-row score, candidates and top-k, so
+/// the result is the same bytes). 1M context: 224 rows; <= ~200K: the whole chunk.
+pub const SCORE_BUDGET: usize = 1 << 30;
+pub fn score_rows_per_block(max_chunk: usize, max_seq: usize) -> usize {
+    let w = score_width(max_seq);
+    let per_row = w * 4 + w.div_ceil(8) * 4;
+    (SCORE_BUDGET / per_row / 16 * 16).clamp(16, max_chunk.max(16))
+}
+
+/// Candidate mask from layer 20: [`cand_row_bytes`]`(ld)` bytes per token row, bit = keep block.
 #[derive(Clone, Copy, Debug)]
 pub struct CandidateMask {
     pub mask: DevicePtr,
@@ -236,6 +288,14 @@ impl IndexOps<'_> {
             // The same fmaf chain per output, parallel over N only: bit-identical at any M.
             return KernelLaunch::new(self.gpu, self.k.gemv_f32)
                 .grid([n.div_ceil(8) as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(a).arg_ptr(b).arg_ptr(c).arg_i32(m as i32).arg_i32(n as i32).arg_i32(k as i32)
+                .launch(self.stream);
+        }
+        if !GEMM_F32_V1.load(std::sync::atomic::Ordering::Relaxed) {
+            // 128x64 register-blocked tile, the same chain per output: bit-identical.
+            return KernelLaunch::new(self.gpu, self.k.gemm_f32_v2)
+                .grid([n.div_ceil(64) as u32, m.div_ceil(128) as u32, 1])
                 .block([256, 1, 1])
                 .arg_ptr(a).arg_ptr(b).arg_ptr(c).arg_i32(m as i32).arg_i32(n as i32).arg_i32(k as i32)
                 .launch(self.stream);
@@ -386,6 +446,34 @@ mod tests {
     /// The selection contract's precondition (see sparse_index.cu): selecting only FINITE
     /// columns equals the reference's `where(idx < compress_lens)` only while the candidate
     /// pool can never be smaller than the top-k. Pinned so a config change trips it.
+    /// Long context: the scratch plan stays inside the budget at 1M and every kernel's i32
+    /// argument fits; short context keeps the whole chunk in one block.
+    #[test]
+    fn score_blocks_fit_the_budget_at_1m() {
+        let (chunk, seq) = (3968usize, 1usize << 20);
+        let r = score_rows_per_block(chunk, seq);
+        assert_eq!(r, 224);
+        let w = score_width(seq);
+        assert!(r * (w * 4 + w / 8 * 4) <= SCORE_BUDGET);
+        assert!(w <= i32::MAX as usize && (w / 128) <= 65535, "score grid.y {} over the limit", w / 128);
+        assert_eq!(score_rows_per_block(2048, 8192), 2048);
+        assert_eq!(score_rows_per_block(2048, 65536), 2048);
+        assert!(score_rows_per_block(8, 1 << 20) >= 8, "decode T must fit one block");
+        assert_eq!(cand_row_bytes(w), 16384);
+    }
+
+    #[test]
+    fn candidate_bits_round_trip_and_reject_ragged_blocks() {
+        let (rows, ld) = (3usize, 512usize);
+        let cols: Vec<u8> = (0..rows * ld).map(|i| u8::from(((i % ld) / 8 + i / ld) % 3 == 0)).collect();
+        let bits = pack_cand(&cols, rows, ld).unwrap();
+        assert_eq!(bits.len(), rows * cand_row_bytes(ld));
+        assert_eq!(unpack_cand(&bits, rows, ld), cols);
+        let mut ragged = cols.clone();
+        ragged[3] ^= 1;
+        assert!(pack_cand(&ragged, rows, ld).is_err());
+    }
+
     #[test]
     fn candidate_pool_covers_the_topk() {
         let (blocks, block_size) = (2048usize, 8usize);

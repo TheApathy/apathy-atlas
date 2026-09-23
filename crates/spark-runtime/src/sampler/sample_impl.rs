@@ -16,12 +16,59 @@ pub fn sample_with_params_history(
 
 /// Core sampling pipeline with explicit seed control.
 /// `seed` overrides the RNG for deterministic sampling. None = thread_rng.
+/// What the sampling pipeline leaves before the draw: a deterministic pick (greedy, or the
+/// all-filtered fallback) or the unnormalized filtered weights in the order the draw walks them.
+enum SampleDist {
+    Pick(u32),
+    Weights(Vec<(u32, f32)>),
+}
+
 pub fn sample_with_params_seeded(
     data: &[u8],
     params: &SamplingParams,
     token_history: &[u32],
     seed: Option<u64>,
 ) -> u32 {
+    let probs = match sampling_weights(data, params, token_history) {
+        SampleDist::Pick(t) => return t,
+        SampleDist::Weights(w) => w,
+    };
+    // Multinomial sample from the filtered distribution.
+    let sum: f32 = probs.iter().map(|p| p.1).sum();
+    let random_val: f32 = if let Some(s) = seed {
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(s);
+        rng.r#gen::<f32>()
+    } else {
+        rand::random::<f32>()
+    };
+    let threshold = random_val * sum;
+    let mut cumsum = 0.0f32;
+    for &(idx, prob) in &probs {
+        cumsum += prob;
+        if cumsum >= threshold {
+            return idx;
+        }
+    }
+    probs.last().map_or(0, |p| p.0)
+}
+
+/// The distribution [`sample_with_params_seeded`] draws from, normalized: `(token, p)` over the
+/// tokens that survive penalties/bias, top-n-sigma, temperature, top-k, min-p and top-p. A
+/// deterministic pick (greedy, or everything filtered) is `[(token, 1.0)]`. For speculative
+/// acceptance, which needs p(token) rather than a draw.
+pub fn sampling_distribution(data: &[u8], params: &SamplingParams, token_history: &[u32]) -> Vec<(u32, f32)> {
+    match sampling_weights(data, params, token_history) {
+        SampleDist::Pick(t) => vec![(t, 1.0)],
+        SampleDist::Weights(w) => {
+            let sum: f32 = w.iter().map(|p| p.1).sum();
+            w.into_iter().map(|(t, p)| (t, p / sum)).collect()
+        }
+    }
+}
+
+fn sampling_weights(data: &[u8], params: &SamplingParams, token_history: &[u32]) -> SampleDist {
     let n = data.len() / 4;
     let top_k = params.top_k as usize;
     let top_p = params.top_p;
@@ -57,7 +104,7 @@ pub fn sample_with_params_seeded(
     // penalties + logit_bias actually re-order logits, so as long as those
     // ran first, this argmax is correct AND respects caller config.
     if params.temperature <= 0.0 {
-        return first_max_index(&raw_logits);
+        return SampleDist::Pick(first_max_index(&raw_logits));
     }
     let temperature = params.temperature;
 
@@ -88,7 +135,7 @@ pub fn sample_with_params_seeded(
 
     if logits.is_empty() {
         // Fallback: if top-n-sigma filtered everything, use argmax of original
-        return first_max_index(&raw_logits);
+        return SampleDist::Pick(first_max_index(&raw_logits));
     }
 
     // ── 3. Rank-dependent filtering (top-k / min-p / top-p) ──
@@ -170,26 +217,7 @@ pub fn sample_with_params_seeded(
         }
         probs.truncate(cutoff);
     }
-
-    // Multinomial sample from the filtered distribution.
-    let sum: f32 = probs.iter().map(|p| p.1).sum();
-    let random_val: f32 = if let Some(s) = seed {
-        use rand::Rng;
-        use rand::SeedableRng;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(s);
-        rng.r#gen::<f32>()
-    } else {
-        rand::random::<f32>()
-    };
-    let threshold = random_val * sum;
-    let mut cumsum = 0.0f32;
-    for &(idx, prob) in &probs {
-        cumsum += prob;
-        if cumsum >= threshold {
-            return idx;
-        }
-    }
-    probs.last().map_or(0, |p| p.0)
+    SampleDist::Weights(probs)
 }
 
 /// Greedy argmax with torch/vLLM tie-breaking: the LOWEST index among equal maxima.

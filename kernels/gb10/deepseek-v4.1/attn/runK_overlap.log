@@ -1,0 +1,104 @@
+  L02 occ   0 t= 2048 valid/row=384: overlap mean 0.99877 min 0.9883 | rows<0.99 1 | exact 1275/2048 | sampled-row misses: tie 0 near 0 real 16 (outside our pool 0)
+  L02 occ   1 t= 2048 valid/row=512: overlap mean 0.99547 min 0.9844 | rows<0.99 26 | exact 73/2048 | sampled-row misses: tie 0 near 2 real 77 (outside our pool 0)
+  L02 occ   2 t= 2048 valid/row=512: overlap mean 0.99476 min 0.9824 | rows<0.99 58 | exact 33/2048 | sampled-row misses: tie 0 near 0 real 95 (outside our pool 0)
+  L02 occ   3 t= 2048 valid/row=512: overlap mean 0.99433 min 0.9746 | rows<0.99 64 | exact 20/2048 | sampled-row misses: tie 0 near 1 real 101 (outside our pool 0)
+  L02 occ   4 t= 2048 valid/row=512: overlap mean 0.99393 min 0.9805 | rows<0.99 111 | exact 19/2048 | sampled-row misses: tie 0 near 1 real 87 (outside our pool 0)
+  L02 occ   5 t= 2048 valid/row=512: overlap mean 0.99379 min 0.9727 | rows<0.99 123 | exact 12/2048 | sampled-row misses: tie 0 near 0 real 106 (outside our pool 0)
+  L02 occ   6 t= 2048 valid/row=512: overlap mean 0.99341 min 0.9746 | rows<0.99 158 | exact 13/2048 | sampled-row misses: tie 0 near 1 real 113 (outside our pool 0)
+  L02 occ   7 t= 2048 valid/row=512: overlap mean 0.99314 min 0.9766 | rows<0.99 193 | exact 11/2048 | sampled-row misses: tie 0 near 1 real 101 (outside our pool 0)
+  L02 occ   8 t= 2048 valid/row=512: overlap mean 0.99319 min 0.9512 | rows<0.99 178 | exact 12/2048 | sampled-row misses: tie 0 near 3 real 112 (outside our pool 0)
+  L02 occ   9 t= 2048 valid/row=512: overlap mean 0.99255 min 0.9727 | rows<0.99 295 | exact 2/2048 | sampled-row misses: tie 0 near 1 real 111 (outside our pool 0)
+  L02 occ  10 t= 2048 valid/row=512: overlap mean 0.99244 min 0.9590 | rows<0.99 290 | exact 10/2048 | sampled-row misses: tie 0 near 2 real 142 (outside our pool 0)
+  L02 occ  11 t= 2048 valid/row=512: overlap mean 0.99227 min 0.9688 | rows<0.99 328 | exact 2/2048 | sampled-row misses: tie 0 near 0 real 112 (outside our pool 0)
+  L02 occ  12 t= 2048 valid/row=512: overlap mean 0.99169 min 0.9707 | rows<0.99 405 | exact 3/2048 | sampled-row misses: tie 0 near 0 real 142 (outside our pool 0)
+  L02 occ  13 t= 2048 valid/row=512: overlap mean 0.99216 min 0.9668 | rows<0.99 315 | exact 5/2048 | sampled-row misses: tie 0 near 2 real 129 (outside our pool 0)
+  L02 occ  14 t= 2048 valid/row=512: overlap mean 0.99137 min 0.9668 | rows<0.99 496 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 134 (outside our pool 0)
+  L02 occ  15 t= 2048 valid/row=512: overlap mean 0.99132 min 0.9707 | rows<0.99 514 | exact 1/2048 | sampled-row misses: tie 0 near 0 real 143 (outside our pool 0)
+L02 TOTAL 32768 rows: overlap mean 0.99341 min 0.9512 rows<0.99 3555 | misses tie 0 near 14 real 1721
+    real miss: occ 0 row 1344: our rank 512 (512 kept), margin 1.421e-03
+    real miss: occ 0 row 1408: our rank 524 (512 kept), margin 1.373e-02
+    real miss: occ 0 row 1408: our rank 512 (512 kept), margin 5.021e-04
+    real miss: occ 0 row 1536: our rank 532 (512 kept), margin 1.266e-02
+    real miss: occ 0 row 1536: our rank 514 (512 kept), margin 1.667e-03
+    real miss: occ 0 row 1600: our rank 514 (512 kept), margin 7.341e-04
+    real miss: occ 0 row 1600: our rank 512 (512 kept), margin 3.508e-04
+    real miss: occ 0 row 1600: our rank 515 (512 kept), margin 4.810e-03
+    real miss: occ 0 row 1664: our rank 512 (512 kept), margin 1.184e-03
+    real miss: occ 0 row 1728: our rank 520 (512 kept), margin 6.643e-03
+    real miss: occ 0 row 1792: our rank 515 (512 kept), margin 2.831e-03
+    real miss: occ 0 row 1792: our rank 513 (512 kept), margin 4.802e-04
+    real miss: occ 0 row 1856: our rank 519 (512 kept), margin 1.033e-02
+    real miss: occ 0 row 1920: our rank 513 (512 kept), margin 2.490e-03
+    real miss: occ 0 row 1920: our rank 518 (512 kept), margin 7.372e-03
+    real miss: occ 0 row 1984: our rank 517 (512 kept), margin 3.278e-03
+    real miss: occ 1 row 0: our rank 512 (512 kept), margin 1.042e-04
+    real miss: occ 1 row 64: our rank 512 (512 kept), margin 4.591e-04
+    real miss: occ 1 row 128: our rank 513 (512 kept), margin 2.110e-03
+    real miss: occ 1 row 128: our rank 512 (512 kept), margin 5.856e-04
+    rows whose top-k is EXACT, per occurrence: /tmp/claude-1000/-home-flocka-atlas/153d8f07-762d-4884-a8f5-8f7a1a13f1ce/scratchpad/w11_ktaps/L02.exact_topk_rows.txt
+L02 PRE-REGISTERED (mean >= 0.999, no row < 0.95): FAIL
+  L20 occ   0 t= 2048 valid/row=448: overlap mean 0.98381 min 0.6367 | rows<0.99 1298 | exact 525/2048 | sampled-row misses: tie 0 near 0 real 279 (outside our pool 0)
+  L20 occ   1 t= 2048 valid/row=512: overlap mean 0.96805 min 0.6172 | rows<0.99 2044 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 531 (outside our pool 0)
+  L20 occ   2 t= 2048 valid/row=512: overlap mean 0.95998 min 0.2891 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 567 (outside our pool 0)
+  L20 occ   3 t= 2048 valid/row=512: overlap mean 0.95774 min 0.3262 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 955 (outside our pool 0)
+  L20 occ   4 t= 2048 valid/row=512: overlap mean 0.95220 min 0.3887 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 732 (outside our pool 0)
+  L20 occ   5 t= 2048 valid/row=512: overlap mean 0.94773 min 0.5742 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 731 (outside our pool 0)
+  L20 occ   6 t= 2048 valid/row=512: overlap mean 0.94722 min 0.2383 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 772 (outside our pool 0)
+  L20 occ   7 t= 2048 valid/row=512: overlap mean 0.94711 min 0.4746 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 816 (outside our pool 0)
+  L20 occ   8 t= 2048 valid/row=512: overlap mean 0.94831 min 0.1875 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 738 (outside our pool 0)
+  L20 occ   9 t= 2048 valid/row=512: overlap mean 0.93954 min 0.3242 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 855 (outside our pool 0)
+  L20 occ  10 t= 2048 valid/row=512: overlap mean 0.93363 min 0.4297 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 1028 (outside our pool 0)
+  L20 occ  11 t= 2048 valid/row=512: overlap mean 0.93228 min 0.5059 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 1171 (outside our pool 0)
+  L20 occ  12 t= 2048 valid/row=512: overlap mean 0.93865 min 0.4531 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 903 (outside our pool 0)
+  L20 occ  13 t= 2048 valid/row=512: overlap mean 0.94351 min 0.5293 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 1063 (outside our pool 0)
+  L20 occ  14 t= 2048 valid/row=512: overlap mean 0.93781 min 0.5625 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 945 (outside our pool 0)
+  L20 occ  15 t= 2048 valid/row=512: overlap mean 0.93197 min 0.2734 | rows<0.99 2048 | exact 0/2048 | sampled-row misses: tie 0 near 0 real 1080 (outside our pool 0)
+L20 TOTAL 32768 rows: overlap mean 0.94810 min 0.1875 rows<0.99 32014 | misses tie 0 near 0 real 13166
+    real miss: occ 0 row 576: our rank 513 (512 kept), margin 4.910e-03
+    real miss: occ 0 row 576: our rank 512 (512 kept), margin 4.870e-03
+    real miss: occ 0 row 576: our rank 525 (512 kept), margin 4.156e-02
+    real miss: occ 0 row 640: our rank 515 (512 kept), margin 1.967e-02
+    real miss: occ 0 row 640: our rank 513 (512 kept), margin 1.392e-02
+    real miss: occ 0 row 640: our rank 512 (512 kept), margin 4.490e-03
+    real miss: occ 0 row 704: our rank 513 (512 kept), margin 3.560e-03
+    real miss: occ 0 row 704: our rank 523 (512 kept), margin 4.679e-02
+    real miss: occ 0 row 704: our rank 517 (512 kept), margin 1.186e-02
+    real miss: occ 0 row 768: our rank 513 (512 kept), margin 3.130e-03
+    real miss: occ 0 row 768: our rank 512 (512 kept), margin 2.795e-03
+    real miss: occ 0 row 832: our rank 514 (512 kept), margin 1.201e-02
+    real miss: occ 0 row 832: our rank 512 (512 kept), margin 4.257e-03
+    real miss: occ 0 row 832: our rank 661 (512 kept), margin 2.125e-01
+    real miss: occ 0 row 832: our rank 693 (512 kept), margin 2.726e-01
+    real miss: occ 0 row 896: our rank 521 (512 kept), margin 2.015e-02
+    real miss: occ 0 row 896: our rank 512 (512 kept), margin 4.460e-03
+    real miss: occ 0 row 896: our rank 517 (512 kept), margin 1.242e-02
+    real miss: occ 0 row 896: our rank 548 (512 kept), margin 6.953e-02
+    real miss: occ 0 row 896: our rank 560 (512 kept), margin 9.292e-02
+    rows whose top-k is EXACT, per occurrence: /tmp/claude-1000/-home-flocka-atlas/153d8f07-762d-4884-a8f5-8f7a1a13f1ce/scratchpad/w11_ktaps/L20.exact_topk_rows.txt
+L20 PRE-REGISTERED (mean >= 0.99, rows<0.90 <= 1% (got 5.07%), real <= 10% of classified (got 100.0% of 13166)): FAIL
+  L24 occ   0 t=  128 valid/row=512: overlap mean 0.90576 min 0.2910 | rows<0.99 128 | exact 0/128 | sampled-row misses: tie 0 near 0 real 66 (outside our pool 14)
+L24 TOTAL 128 rows: overlap mean 0.90576 min 0.2910 rows<0.99 128 | misses tie 0 near 0 real 66
+    real miss: occ 0 row 0: our rank 16377 (512 kept), margin inf
+    real miss: occ 0 row 0: our rank 542 (512 kept), margin 1.044e-02
+    real miss: occ 0 row 0: our rank 1261 (512 kept), margin 1.867e-01
+    real miss: occ 0 row 0: our rank 16377 (512 kept), margin inf
+    real miss: occ 0 row 0: our rank 16377 (512 kept), margin inf
+    real miss: occ 0 row 0: our rank 536 (512 kept), margin 8.064e-03
+    real miss: occ 0 row 0: our rank 16377 (512 kept), margin inf
+    real miss: occ 0 row 0: our rank 16377 (512 kept), margin inf
+    real miss: occ 0 row 0: our rank 16377 (512 kept), margin inf
+    real miss: occ 0 row 0: our rank 521 (512 kept), margin 4.035e-03
+    real miss: occ 0 row 0: our rank 567 (512 kept), margin 1.914e-02
+    real miss: occ 0 row 0: our rank 16377 (512 kept), margin inf
+    real miss: occ 0 row 0: our rank 540 (512 kept), margin 9.895e-03
+    real miss: occ 0 row 0: our rank 16377 (512 kept), margin inf
+    real miss: occ 0 row 0: our rank 534 (512 kept), margin 7.673e-03
+    real miss: occ 0 row 0: our rank 555 (512 kept), margin 1.549e-02
+    real miss: occ 0 row 0: our rank 526 (512 kept), margin 5.688e-03
+    real miss: occ 0 row 0: our rank 514 (512 kept), margin 5.568e-04
+    real miss: occ 0 row 0: our rank 530 (512 kept), margin 7.319e-03
+    real miss: occ 0 row 0: our rank 833 (512 kept), margin 9.555e-02
+    of the real misses, 14 lie OUTSIDE our candidate pool (inherited from L20), 52 inside it
+    rows whose top-k is EXACT, per occurrence: /tmp/claude-1000/-home-flocka-atlas/153d8f07-762d-4884-a8f5-8f7a1a13f1ce/scratchpad/w11_ktaps/L24.exact_topk_rows.txt
+L24 PRE-REGISTERED (mean >= 0.98, rows<0.90 <= 2% (got 22.66%), real <= 15% of classified (got 100.0% of 66)): FAIL
+TOPK OVERLAP FAIL (3)

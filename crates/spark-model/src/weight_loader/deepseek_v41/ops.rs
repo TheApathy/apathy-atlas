@@ -195,9 +195,9 @@ pub struct Dsv41Kernels {
     pub mul_bf16_to_f32: KernelHandle,
     /// `dsv41_hc_mean_bf16`: the DSpark seed (mean over the hc streams).
     pub hc_mean_bf16: KernelHandle,
-    /// `dsv41_hc_mixes_tb`: [`HC_TB`] tokens per block for prefill passes, bit-identical per
-    /// token to `hc_mixes`. [`HC_MIX_TB_ENV`]`=1` only, until the end-to-end byte test.
-    pub hc_mixes_tb: Option<KernelHandle>,
+    /// `dsv41_hc_mixes_v2`: `hc_mixes` with its 25 reductions in ONE tree (same pairings), for
+    /// prefill passes; bit-identical. [`HC_MIX_V2_ENV`]`=1` only, until the end-to-end byte test.
+    pub hc_mixes_v2: Option<KernelHandle>,
     /// `dsv41_hc_fused_tb` + `dsv41_hc_add_post`: the fused mHC stream passes for prefill,
     /// bit-identical to the separate kernels. [`HC_FUSED_ENV`]`=1` only, until the byte test.
     pub hc_fused: Option<(KernelHandle, KernelHandle)>,
@@ -217,12 +217,10 @@ pub struct Dsv41Kernels {
     pub fp8_fused: Option<Fp8Gemm>,
 }
 
-/// `ATLAS_DSV41_HC_MIX_TB=1`: non-decode `hc_mixes` serve [`HC_TB`] tokens per block.
-pub const HC_MIX_TB_ENV: &str = "ATLAS_DSV41_HC_MIX_TB";
+/// `ATLAS_DSV41_HC_MIX_V2=1`: non-decode `hc_mixes` run `dsv41_hc_mixes_v2`.
+pub const HC_MIX_V2_ENV: &str = "ATLAS_DSV41_HC_MIX_V2";
 /// `ATLAS_DSV41_HC_FUSED=1`: non-decode blocks run their mHC stream passes as two fused kernels.
 pub const HC_FUSED_ENV: &str = "ATLAS_DSV41_HC_FUSED";
-/// Tokens per block of `dsv41_hc_mixes_tb` (`DSV41_HC_TB` in the kernel).
-pub const HC_TB: usize = 4;
 
 /// `ATLAS_DSV41_FP8_FUSED=1`: prefill FP8 linears on the winning shapes skip the bf16 dequant.
 pub const FP8_FUSED_ENV: &str = "ATLAS_DSV41_FP8_FUSED";
@@ -280,11 +278,11 @@ impl Dsv41Kernels {
             mul_bf16_to_f32: k("dsv41_mul_bf16_to_f32")?,
             hc_mean_bf16: k("dsv41_hc_mean_bf16")?,
             hc_fused: if std::env::var(HC_FUSED_ENV).as_deref() == Ok("1") {
-                Some((k("dsv41_hc_fused_tb")?, k("dsv41_hc_add_post")?))
+                Some((k("dsv41_hc_fused_v2")?, k("dsv41_hc_add_post")?))
             } else {
                 None
             },
-            hc_mixes_tb: if std::env::var(HC_MIX_TB_ENV).as_deref() == Ok("1") { Some(k("dsv41_hc_mixes_tb")?) } else { None },
+            hc_mixes_v2: if std::env::var(HC_MIX_V2_ENV).as_deref() == Ok("1") { Some(k("dsv41_hc_mixes_v2")?) } else { None },
             fp8_gemv_m1: if std::env::var(DENSE_GEMV_ENV).as_deref() != Ok("0") {
                 Some(gpu.kernel(DECODE_DENSE_MODULE, "dsv41_fp8_gemv_m1").with_context(|| {
                     format!("{DENSE_GEMV_ENV}=1 but {DECODE_DENSE_MODULE}::dsv41_fp8_gemv_m1 is not in the PTX")
@@ -376,13 +374,13 @@ impl Ops<'_> {
                 .arg_u32(d as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
                 .launch(self.stream);
         }
-        if let Some(tb) = self.k.hc_mixes_tb.filter(|_| !decode_pass()) {
+        if let Some(tb) = self.k.hc_mixes_v2.filter(|_| !decode_pass()) {
             return self
                 .l(tb)
-                .grid([t.div_ceil(HC_TB) as u32, 1, 1])
+                .grid([t as u32, 1, 1])
                 .arg_ptr(h).arg_ptr(hc.func).arg_ptr(hc.scale).arg_ptr(hc.base)
                 .arg_ptr(pre).arg_ptr(post).arg_ptr(comb)
-                .arg_u32(d as u32).arg_u32(t as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
+                .arg_u32(d as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
                 .launch(self.stream);
         }
         self.l(self.k.hc_mixes)
@@ -409,11 +407,11 @@ impl Ops<'_> {
     ) -> Result<()> {
         let (fused, _) = self.k.hc_fused.context("hc_fused: kernels not loaded (ATLAS_DSV41_HC_FUSED=1)")?;
         self.l(fused)
-            .grid([t.div_ceil(HC_TB) as u32, 1, 1])
+            .grid([t as u32, 1, 1])
             .arg_ptr(ya).arg_ptr(yb).arg_ptr(post_in).arg_ptr(comb_in).arg_ptr(h)
             .arg_ptr(hc.func).arg_ptr(hc.scale).arg_ptr(hc.base)
             .arg_ptr(pre).arg_ptr(post).arg_ptr(comb).arg_ptr(side_pre).arg_ptr(norm_w).arg_ptr(x)
-            .arg_u32(d as u32).arg_u32(t as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
+            .arg_u32(d as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
             .launch(self.stream)
     }
 
