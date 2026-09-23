@@ -423,7 +423,45 @@ impl TransformerModel {
                 }
             }
         };
+        let strided = crate::layers::dflash_capture_strided_enabled()
+            && self.strided_copy_rows_kernel.0 != 0;
         for span in append.write.spans() {
+            if strided {
+                // One strided copy per span: rows are consecutive physical
+                // slots, so the destination stride is exactly one slot. The
+                // per-row offset check below is kept for the span's ends,
+                // which bound every row in between.
+                let first_abs = chunk_start + span.linear_slot;
+                let last_abs = first_abs + span.slot_count - 1;
+                let offset_of = |abs| {
+                    crate::layers::dflash_head::ring_window::accumulator_capture_offset(
+                        abs,
+                        slot_idx,
+                        dstate.ctx_capacity,
+                        dstate.ctx_slot_bytes,
+                        h * bf16,
+                    )
+                };
+                let dst_offset = offset_of(first_abs)?;
+                anyhow::ensure!(
+                    dst_offset / dstate.ctx_slot_bytes == span.physical_slot
+                        && offset_of(last_abs)? / dstate.ctx_slot_bytes
+                            == span.physical_slot + span.slot_count - 1,
+                    "DFlash capture plan and byte offset disagree"
+                );
+                crate::layers::ops::strided_copy_rows(
+                    self.gpu.as_ref(),
+                    self.strided_copy_rows_kernel,
+                    src_base.offset(span.linear_slot * source_stride * bf16),
+                    acc_base.offset(dst_offset),
+                    span.slot_count as u32,
+                    (h * bf16) as u32,
+                    (source_stride * bf16) as u64,
+                    dstate.ctx_slot_bytes as u64,
+                    stream,
+                )?;
+                continue;
+            }
             for local in 0..span.slot_count {
                 let source_row = span.linear_slot + local;
                 let physical_slot = span.physical_slot + local;
