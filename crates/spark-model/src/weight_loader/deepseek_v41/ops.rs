@@ -198,8 +198,9 @@ pub struct Dsv41Kernels {
     /// `dsv41_hc_mixes_v2`: `hc_mixes` with its 25 reductions in ONE tree (same pairings), for
     /// prefill passes; bit-identical. [`HC_MIX_V2_ENV`]`=1` only, until the end-to-end byte test.
     pub hc_mixes_v2: Option<KernelHandle>,
-    /// `dsv41_hc_fused_tb` + `dsv41_hc_add_post`: the fused mHC stream passes for prefill,
-    /// bit-identical to the separate kernels. [`HC_FUSED_ENV`]`=1` only, until the byte test.
+    /// `dsv41_hc_fused_v2` + `dsv41_hc_add_post`: the fused mHC stream passes for prefill,
+    /// bit-identical to the separate kernels (window9 byte + split tests). ON by default;
+    /// [`HC_FUSED_ENV`]`=0` restores the separate kernels.
     pub hc_fused: Option<(KernelHandle, KernelHandle)>,
     /// `dsv41_decode::dsv41_fp8_gemv_m1`, used at M = 1 when [`DENSE_GEMV_ENV`] is on.
     pub fp8_gemv_m1: Option<KernelHandle>,
@@ -219,7 +220,7 @@ pub struct Dsv41Kernels {
 
 /// `ATLAS_DSV41_HC_MIX_V2=1`: non-decode `hc_mixes` run `dsv41_hc_mixes_v2`.
 pub const HC_MIX_V2_ENV: &str = "ATLAS_DSV41_HC_MIX_V2";
-/// `ATLAS_DSV41_HC_FUSED=1`: non-decode blocks run their mHC stream passes as two fused kernels.
+/// `ATLAS_DSV41_HC_FUSED=0`: non-decode blocks run the separate mHC kernels instead of the two fused ones.
 pub const HC_FUSED_ENV: &str = "ATLAS_DSV41_HC_FUSED";
 
 /// `ATLAS_DSV41_FP8_FUSED=1`: prefill FP8 linears on the winning shapes skip the bf16 dequant.
@@ -277,7 +278,7 @@ impl Dsv41Kernels {
             engram_gate: k("dsv41_engram_gate")?,
             mul_bf16_to_f32: k("dsv41_mul_bf16_to_f32")?,
             hc_mean_bf16: k("dsv41_hc_mean_bf16")?,
-            hc_fused: if std::env::var(HC_FUSED_ENV).as_deref() == Ok("1") {
+            hc_fused: if std::env::var(HC_FUSED_ENV).as_deref() != Ok("0") {
                 Some((k("dsv41_hc_fused_v2")?, k("dsv41_hc_add_post")?))
             } else {
                 None

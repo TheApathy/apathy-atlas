@@ -14,13 +14,13 @@ C="--run runG_replay --layers 40 --path model --moe-real --attn-real --tap-names
 $B/keep124_window.sh k124_w10 \
   $C --chunk 2048 --tile-prompt 2 --tap-dir $S/w10_def ::: \
   $C --chunk 2048 --tile-prompt 2 --env ATLAS_DSV41_CORE_PROF=1 --prof ::: \
-  $C --chunk 2048 --tile-prompt 2 --env ATLAS_DSV41_HC_FUSED=1 --tap-dir $S/w10_fu ::: \
+  $C --chunk 2048 --tile-prompt 2 --env ATLAS_DSV41_HC_FUSED=0 --tap-dir $S/w10_fu ::: \
   $C --chunk 2048 --tile-prompt 8 --max-seq 10240 --tap-dir $S/w10_8k2048 ::: \
   $C --chunk 3968 --tile-prompt 8 --max-seq 10240 --tap-dir $S/w10_8k3968 \
   > $I/k124_w10.log 2>&1
 same() { if cmp -s "$1" "$2"; then echo IDENTICAL; else echo DIFFER; fi; }
 L=L40.logits_last.000.bin
-{ echo "HC_FUSED vs default: $(same $S/w10_def/$L $S/w10_fu/$L)"
+{ echo "HC_FUSED=0 (separate kernels) vs default (fused): $(same $S/w10_def/$L $S/w10_fu/$L)"
   echo "8K chunk 3968 vs 2048: $(same $S/w10_8k2048/$L $S/w10_8k3968/$L)"
   echo "control 8K vs 2K prompt (must DIFFER): $(same $S/w10_8k2048/$L $S/w10_def/$L)"
   grep -E 'WARM prefill|this run' $I/k124_w10.log; } > $I/w10_summary.txt
