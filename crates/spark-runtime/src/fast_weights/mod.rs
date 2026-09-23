@@ -59,6 +59,10 @@ pub struct FastSafetensorsLoader {
     /// Optional tensor-name prefixes. When non-empty, indexed checkpoints
     /// load only matching tensors and skip unrelated/missing shard files.
     pub name_prefixes: Vec<String>,
+    /// Extra "don't load this tensor" predicate, ORed with the EP rule; same contract as
+    /// [`crate::weights::SafetensorsLoader::extra_skip`]. DeepSeek-V4.1 uses it to keep its two
+    /// ~95 GB engram tables (row-gathered from NVMe, never resident) out of the store.
+    pub extra_skip: Option<crate::weights::TensorSkipFn>,
 }
 
 /// Default tensor-count cap for per-shard `O_DIRECT`. Above this, the fast
@@ -83,6 +87,7 @@ impl FastSafetensorsLoader {
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             name_prefixes: Vec::new(),
+            extra_skip: None,
         }
     }
 
@@ -96,6 +101,7 @@ impl FastSafetensorsLoader {
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             name_prefixes: Vec::new(),
+            extra_skip: None,
         }
     }
 
@@ -105,6 +111,11 @@ impl FastSafetensorsLoader {
     }
 
     fn should_skip_tensor(&self, name: &str) -> bool {
+        if let Some(ref extra) = self.extra_skip
+            && extra(name)
+        {
+            return true;
+        }
         if !self.name_prefixes.is_empty()
             && !self
                 .name_prefixes
