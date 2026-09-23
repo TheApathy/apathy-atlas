@@ -116,7 +116,13 @@ const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b3657
 // MACHINE-checked: guard block byte-identical (sha256 9f6f8398...); `git diff
 // -U0` over this file and build.rs matches ZERO lines against
 // admission|max_seq_len|context_extension|ensure!.
-const SERVE_LOAD_SHA256: &str = "8377142ebf273fbecc0fae2d8da560d320e70b512702a8bb8bae4a238965aa8b";
+// Re-pinned 2026-09-23 (EIGHTH time) for merging fix/swap-reclaim@e262b75f0:
+// one new call after the "Selected kernel target" log,
+// `tui::data::kernels::publish_loaded_target(model, quant)`, plus its comment.
+// MACHINE-checked: the guard block extracted before and after is identical
+// (sha256 faf1696a...), the three anchors appear once each, and `git diff
+// -U0` matches ZERO lines against admission|max_seq_len|context_extension|ensure!.
+const SERVE_LOAD_SHA256: &str = "8d41ee286825dd4c767389719cb2021425f162227b1beea9d90df7ba0057788d";
 // Re-pinned 2026-09-22 for integrate/all-models: the ONLY change is the
 // `weights::{..}` re-export gaining `load_dflash_donor` (phaseA-a1's DFlash
 // donor loader, now called from `load_model`), rustfmt-wrapped onto three
