@@ -36,7 +36,7 @@ use super::cb3_arena::Cb3ExpertArena;
 use super::device_allocs::{DeviceAllocs, SharedGpu};
 use super::fwd::V41RoutedMoe;
 use super::moe::{
-    COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_GEMM_MODULE, FUSED_TILE_M,
+    COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_DOWN_SMEM, FUSED_GATE_UP_SMEM, FUSED_GEMM_MODULE, FUSED_TILE_M,
     FUSED_TILE_N, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE,
     PERMUTE_KERNEL, ROUTE_TOPK_FN, SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, expert_matrices, gemm_weight_t_f32out,
     group_by_expert,
@@ -246,8 +246,8 @@ impl Cb3RoutedMoe {
             arena.layer(*layer).with_context(|| format!("router for layer {layer} has no resident experts"))?;
         }
         ensure!(
-            inter % FUSED_TILE_N == 0 && hidden % FUSED_TILE_N == 0 && inter % 32 == 0 && hidden % 32 == 0,
-            "fused CB3 GEMM needs N % {FUSED_TILE_N} == 0 and K % 32 == 0 (hidden {hidden}, inter {inter})"
+            inter % FUSED_TILE_N == 0 && hidden % FUSED_TILE_N == 0 && inter % 64 == 0 && hidden % 64 == 0,
+            "fused CB3 GEMM needs N % {FUSED_TILE_N} == 0 and K % 64 == 0 (one BK step) (hidden {hidden}, inter {inter})"
         );
         let e = max_t * TOP_K;
         // Every group contributes ceil(rows / BM) tiles: at most e / BM + one partial per expert.
@@ -663,8 +663,8 @@ impl Cb3RoutedMoe {
                 .arg_i32(down.cols as i32)
                 .launch(stream)
         };
-        gate_up(self.k_fused_gate_up, self.tiles, n_mma, FUSED_TILE_N, 256, 0)?;
-        down_proj(self.k_fused_down, self.tiles, n_mma, FUSED_TILE_N, 256, 0)?;
+        gate_up(self.k_fused_gate_up, self.tiles, n_mma, FUSED_TILE_N, 256, FUSED_GATE_UP_SMEM)?;
+        down_proj(self.k_fused_down, self.tiles, n_mma, FUSED_TILE_N, 256, FUSED_DOWN_SMEM)?;
         Ok(())
     }
 

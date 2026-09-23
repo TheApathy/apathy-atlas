@@ -76,6 +76,7 @@ fn main() -> Result<()> {
     let mut layer = 2usize;
     let mut token_counts = vec![2048usize, 512, 64, 1];
     let (mut warmup, mut iters) = (2usize, 7usize);
+    let mut production_only = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -86,6 +87,8 @@ fn main() -> Result<()> {
             }
             "--warmup" => warmup = args.next().context("--warmup")?.parse()?,
             "--iters" => iters = args.next().context("--iters")?.parse()?,
+            // Time only the production forward (A/B loops, profilers): no reconstruct phases.
+            "--production-only" => production_only = true,
             other => bail!("unknown argument {other}"),
         }
     }
@@ -149,6 +152,12 @@ fn main() -> Result<()> {
             }
             Ok(median(samples))
         };
+        if production_only {
+            moe.set_expert_kernel(ExpertKernel::Fused);
+            let full = time(&mut || spark_model::weight_loader::deepseek_v41::fwd::V41RoutedMoe::forward(&moe, &Ops { gpu, k: &kernels, stream }, layer, d_in, d_out, t))?;
+            println!("{t:>5} PRODUCTION {full:.2} ms/layer -> {:.2} us/token", 1e3 * full / t as f64);
+            continue;
+        }
         let scores_ms = time(&mut || moe.scores(layer, d_in, t, stream).map(|_| ()))?;
         let scores = moe.scores(layer, d_in, t, stream)?;
         let route_ms = time(&mut || moe.route(layer, &scores, t).map(|_| ()))?;
