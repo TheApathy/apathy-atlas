@@ -3399,7 +3399,7 @@ impl DenseFfnLayer {
         stream: u64,
     ) -> Result<()> {
         debug_assert!(
-            n > 1,
+            n > 1 || self.decode_tc_parity_route(),
             "forward_kgamma is for batched verify; use forward() at n=1"
         );
         let h = ctx.config.hidden_size as u32;
@@ -3935,6 +3935,21 @@ impl DenseFfnLayer {
                     && !self.has_w3_gemm()
                     && self.activation == FfnActivation::SiLU,
             )
+    }
+
+    /// Whether single-token decode should run `forward_kgamma(n = 1)` so it
+    /// shares the K=γ verify's tensor-core FFN route
+    /// (`ATLAS_DECODE_TC_PARITY=1`). Engages only when verify itself is on
+    /// that route: `ATLAS_FFN_TC=1` bypasses the exact dispatcher and
+    /// `ATLAS_FFN_KGAMMA_M16=1` sends verify rows through `forward_kgamma`.
+    pub fn decode_tc_parity_route(&self) -> bool {
+        crate::layers::decode_tc_parity_enabled()
+            && exact_ffn_tc_override()
+            && crate::layers::ffn_kgamma_m16_enabled()
+            && self.bf16_weights.is_none()
+            && !self.has_w3_gemm()
+            && self.activation == FfnActivation::SiLU
+            && self.has_transposed_ffn()
     }
 
     /// N-token prefill: GEMM for all projections.
