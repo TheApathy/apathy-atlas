@@ -19,9 +19,6 @@ DSV41_FP8GEMM5_ENTRY(v5_e3bf, 256, 128, 32, 3, 4, 2, false)
 DSV41_FP8GEMM5_ENTRY(v5_e1bf, 128, 256, 32, 3, 2, 4, false)
 DSV41_FP8GEMM5_ENTRY(v5_e4, 256, 128, 32, 3, 4, 2, true)
 DSV41_FP8GEMM6_ENTRY(v6_f1, 256, 128, 32, 3, 4, 2)
-DSV41_FP8GEMM7_ENTRY(v7_h1, 256, 128, 32, 3, 4, 2)
-DSV41_FP8GEMM7_ENTRY(v7_h2, 128, 256, 32, 3, 2, 4)
-DSV41_FP8GEMM7_ENTRY(v7_h3, 128, 128, 32, 4, 2, 2)
 
 #include <cmath>
 #include <cstdio>
@@ -40,12 +37,11 @@ struct V3 { const char* name; Kern k; int bm, bn, threads, smem; bool bf16b; boo
 #define V5E(n, BM, BN, BK, ST, WM, WN, F) V3{#n, n, BM, BN, 32 * WM * WN, dsv41_fp8gemm3::Cfg5<BM, BN, BK, ST, WM, WN, F>::SMEM, !F}
 #define V5P(n, BM, BN, BK, ST, WM, WN, P) V3{#n, n, BM, BN, 32 * WM * WN, dsv41_fp8gemm3::Cfg5<BM, BN, BK, ST, WM, WN, true, P>::SMEM, false, true}
 #define V6E(n, BM, BN, BK, ST, WM, WN) V3{#n, n, BM, BN, 32 * WM * WN, dsv41_fp8gemm3::Cfg6<BM, BN, BK, ST, WM, WN>::SMEM, false}
-#define V7E(n, BM, BN, BK, ST, WM, WN) V3{#n, n, BM, BN, 32 * WM * WN, dsv41_fp8gemm3::Cfg6<BM, BN, BK, ST, WM, WN>::SMEM, false}
+#define V7E(n, k, BM, BN, BK, ST, WM, WN) V3{#n, k, BM, BN, 32 * WM * WN, dsv41_fp8gemm7::Cfg6<BM, BN, BK, ST, WM, WN>::SMEM, false}
 static const V3 kV3[] = {
     V5E(v5_e3bf, 256, 128, 32, 3, 4, 2, false), V5E(v5_e1bf, 128, 256, 32, 3, 2, 4, false),
     V5E(v5_e4, 256, 128, 32, 3, 4, 2, true), V6E(v6_f1, 256, 128, 32, 3, 4, 2),
-    V7E(v7_h1, 256, 128, 32, 3, 4, 2), V7E(v7_h2, 128, 256, 32, 3, 2, 4),
-    V7E(v7_h3, 128, 128, 32, 4, 2, 2),
+    V7E(v7_m256, dsv41_fp8_gemm_nt_v7_m256, 256, 128, 32, 3, 4, 2), V7E(v7_n256, dsv41_fp8_gemm_nt_v7_n256, 128, 256, 32, 3, 2, 4),
 };
 
 static std::vector<char> slurp(const std::string& p) {
@@ -163,8 +159,20 @@ int main(int argc, char** argv) {
                 std::vector<uint16_t> fc((size_t)M * N); CK(cudaMemcpy(fc.data(), Cf, fc.size() * 2, cudaMemcpyDeviceToHost));
                 size_t csame = 0; for (size_t i = 0; i < fc.size(); ++i) csame += fc[i] == r[i];
                 const bool ctrl = v.bf16b || csame < fc.size() / 2;   // the bf16 control reads no scales
+                // Tails (M = 1/4/16/20): rows byte-identical to the big-M rows, nothing stored past
+                // row M (0xFFFF sentinel). CONTROL: launching M+1 rows must be caught.
+                auto tail_ok = [&](int ms, int launch_m) {
+                    CK(cudaMemset(Cf, 0xFF, (size_t)M * N * 2)); run(S, launch_m, Cf); CK(cudaDeviceSynchronize());
+                    std::vector<uint16_t> t((size_t)M * N); CK(cudaMemcpy(t.data(), Cf, t.size() * 2, cudaMemcpyDeviceToHost));
+                    bool ok = std::memcmp(t.data(), r.data(), (size_t)ms * N * 2) == 0;
+                    for (size_t i = (size_t)ms * N; i < t.size() && ok; ++i) ok = t[i] == 0xFFFF;
+                    return ok; };
+                bool tails = true;
+                for (int ms : {1, 4, 16, 20}) tails = tails && tail_ok(ms, ms);
+                const bool tail_ctrl = !tail_ok(4, 5);
                 const float t = time_it([&] { run(S, M, Cf); });
-                const bool ok = v.probe || (ident && inv && ctrl);   // probes compute wrong values by design
+                const bool ok = v.probe || (ident && inv && ctrl && tails && tail_ctrl);
+                if (!tails || !tail_ctrl) std::printf("    %-6s TAILS %s CTRL %s\n", v.name, tails ? "ok" : "FAIL", tail_ctrl ? "caught" : "MISSED");   // probes compute wrong values by design
                 fails += !ok;
                 std::printf("    %-6s %.3f ms %5.1f TF/s  %.2fx gemm-alone %.2fx current | identical %.4f%% M=20 rows %s CTRL scale+1 caught %s %s\n",
                             v.name, t, fl / (t * 1e9), t_gemm / t, t_cur / t, 100.0 * same / f.size(), inv ? "yes" : "NO", ctrl ? "yes" : "NO", ok ? "PASS" : "FAIL");
