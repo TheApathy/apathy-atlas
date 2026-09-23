@@ -165,3 +165,9 @@ first-wins argmax control. Predictions as before plus: ALL vs V96 +5-12%.
   the sequence kernel on this model -> keep it off.
 - GATE (throughput arbiter with a serial arm): chat >= 0.97x (switches to plain), code within 3% of
   ALLZ after warm-up. 50% (per-request probing may cost more than it saves at 256-320 tokens).
+
+# s10 — merged replacement for s8+s9 (box contention), binary vg7, all arms log LOGITS_FNV
+C1 ALL C2 ALLZ C3 GATE C4 ALLF. Predictions carried over from s8/s9:
+- ALL think_code == plain 166af6bb (tie fix); ALLF think_code == "times" divergence (control). 85%/90%.
+- ALL code_py >= 60 tok/s (1.45x). 50%.  ALLZ vs ALL +2-4%, identical outputs. 60%.
+- GATE chat >= 0.97x. 50%.
