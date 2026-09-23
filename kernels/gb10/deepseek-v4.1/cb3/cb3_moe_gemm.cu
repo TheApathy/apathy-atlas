@@ -84,6 +84,9 @@
 //   - BK = 128 (four groups per step, two independent decodes per thread, half the barriers;
 //     64 / 48 KB stages): +5.8% at 2048, +9.2% at 4096, +1.4% at 128. Same as every larger-
 //     smem variant before it: on GB10 the smaller stage wins over fewer barriers or more ILP.
+//   - 128 x 32 gate/up tiles at 128 registers, two CTAs per SM (24 KB stage; half the
+//     threads decode; twice the activation re-reads from L2): +4.4% at 2048, +4.1% at 4096,
+//     flat at 512 / 128. More warps per SM did not buy back the halved decode width.
 // Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
 
 #include <cstdint>
