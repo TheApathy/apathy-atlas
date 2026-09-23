@@ -784,3 +784,25 @@ impl Qwen3AttentionLayer {
         }
     }
 }
+
+#[cfg(test)]
+mod qsa_route_tests {
+    /// Only Qwen4 switches host-route decode to QSA at 2048. Without the model
+    /// check every other model's decode past 2048 (e.g. Qwen3.8's DFlash
+    /// bootstrap and plain decode after a long prompt) failed with "Qwen4
+    /// context beyond 2048 requires QSA".
+    #[test]
+    fn host_route_qsa_switch_is_qwen4_only() {
+        let src = include_str!("attention_forward.rs");
+        let guard = src
+            .find("requires QSA\"))?;")
+            .expect("QSA guard present");
+        let branch = &src[..guard];
+        let branch = &branch[branch.rfind("} else if").unwrap()..];
+        assert!(branch.contains("seq_len >= 2048"), "{branch}");
+        assert!(
+            branch.contains("ctx.config.is_qwen4_exp()"),
+            "the 2048 QSA switch must be gated on Qwen4: {branch}"
+        );
+    }
+}
