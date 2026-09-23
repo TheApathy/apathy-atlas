@@ -1,0 +1,26 @@
+L02: occurrence count differs (oracle 16, atlas 32); comparing the first 16
+  L02 occ   0 t= 2048 valid/row=384: overlap mean 0.99864 min 0.9902 | rows<0.99 0 | exact 1236/2048
+  L02 occ   1 t= 2048 valid/row=512: overlap mean 0.30776 min 0.0000 | rows<0.99 2048 | exact 0/2048
+  L02 occ   2 t= 2048 valid/row=512: overlap mean 0.32433 min 0.1855 | rows<0.99 2048 | exact 0/2048
+  L02 occ   3 t= 2048 valid/row=512: overlap mean 0.24435 min 0.1309 | rows<0.99 2048 | exact 0/2048
+  L02 occ   4 t= 2048 valid/row=512: overlap mean 0.26086 min 0.1406 | rows<0.99 2048 | exact 0/2048
+  L02 occ   5 t= 2048 valid/row=512: overlap mean 0.21656 min 0.1055 | rows<0.99 2048 | exact 0/2048
+  L02 occ   6 t= 2048 valid/row=512: overlap mean 0.21668 min 0.1328 | rows<0.99 2048 | exact 0/2048
+  L02 occ   7 t= 2048 valid/row=512: overlap mean 0.20924 min 0.1152 | rows<0.99 2048 | exact 0/2048
+  L02 occ   8 t= 2048 valid/row=512: overlap mean 0.21842 min 0.1133 | rows<0.99 2048 | exact 0/2048
+  L02 occ   9 t= 2048 valid/row=512: overlap mean 0.19380 min 0.1035 | rows<0.99 2048 | exact 0/2048
+  L02 occ  10 t= 2048 valid/row=512: overlap mean 0.18051 min 0.0918 | rows<0.99 2048 | exact 0/2048
+  L02 occ  11 t= 2048 valid/row=512: overlap mean 0.19481 min 0.1016 | rows<0.99 2048 | exact 0/2048
+  L02 occ  12 t= 2048 valid/row=512: overlap mean 0.18862 min 0.1016 | rows<0.99 2048 | exact 0/2048
+  L02 occ  13 t= 2048 valid/row=512: overlap mean 0.17780 min 0.0977 | rows<0.99 2048 | exact 0/2048
+  L02 occ  14 t= 2048 valid/row=512: overlap mean 0.18777 min 0.0781 | rows<0.99 2048 | exact 0/2048
+  L02 occ  15 t= 2048 valid/row=512: overlap mean 0.16821 min 0.0664 | rows<0.99 2048 | exact 0/2048
+L02 TOTAL 32768 rows: overlap mean 0.26802 min 0.0000 rows<0.99 30720 | misses tie 0 near 0 real 0
+Traceback (most recent call last):
+  File "/home/flocka/atlas/dsv41-integration/kernels/gb10/deepseek-v4.1/attn/check_topk_overlap.py", line 154, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/flocka/atlas/dsv41-integration/kernels/gb10/deepseek-v4.1/attn/check_topk_overlap.py", line 130, in main
+    with open(ex_path, "w") as f:
+         ^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: '/home/flocka/atlas/DSV41_PORT/oracle/ref/runK_32k_kernel/L02.exact_topk_rows.txt'
