@@ -137,7 +137,7 @@ fn deepseek_vision_angles_launch_has_three_arguments_on_the_consumer_stream() {
 #[test]
 fn deepseek_vision_angles_cuda_entry_preserves_the_proven_abi_and_bounds() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../kernels/gb10/deepseek-v4-flash/nvfp4/deepseek_vision_angles.cu");
+        .join("../../kernels/gb10/deepseek-v4.1/cb3/deepseek_vision_angles.cu");
     let source = compact(&std::fs::read_to_string(path).expect("model-local angle kernel missing"));
     assert!(source.contains(
         "extern\"C\"__global__voiddeepseek_vision_angles(float*out,unsignedgh,unsignedgw)"

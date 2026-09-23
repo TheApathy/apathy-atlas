@@ -359,8 +359,27 @@ impl Cb3ExpertArena {
         wanted: &[usize],
         shared: &SharedGpu,
     ) -> Result<Self> {
-        let gpu = shared.as_ref();
-        let mut allocs = DeviceAllocs::owned(shared.clone());
+        Self::subset_impl(pack_dir, pack, wanted, shared.as_ref(), DeviceAllocs::owned(shared.clone()))
+    }
+
+    /// [`Self::load_one_layer`] that NEVER frees — the old behaviour. Exists as the negative
+    /// control for the drop test (a check that cannot see a leak proves nothing).
+    pub fn load_one_layer_unowned(
+        pack_dir: &Path,
+        pack: &ExpertPack,
+        layer: usize,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        Self::subset_impl(pack_dir, pack, &[layer], gpu, DeviceAllocs::unowned())
+    }
+
+    fn subset_impl(
+        pack_dir: &Path,
+        pack: &ExpertPack,
+        wanted: &[usize],
+        gpu: &dyn GpuBackend,
+        mut allocs: DeviceAllocs,
+    ) -> Result<Self> {
         let packed_keep = pack.packed_keep();
         let per_layer = packed_keep as u64 * pack.bytes_per_expert();
         ensure!(!wanted.is_empty(), "CB3 layer subset is empty");

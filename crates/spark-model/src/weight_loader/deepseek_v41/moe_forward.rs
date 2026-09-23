@@ -11,11 +11,12 @@
 //! bf16-bit-identical (runA/runC_2048/runE, layers 0 and 2), with a reversed-weights and a
 //! wrong-expert control at 0.55 and 1.05.
 //!
-//! ## What it is NOT
-//! - **Fast.** Routing runs on the HOST (one D2H of `[T, 384]` fp32 scores and a sync per
-//!   layer), and each expert reconstructs ~70.8 MB of bf16 scratch. It is the correctness
-//!   baseline a fused path must be measured against. Nothing here has been timed.
-//! - **Graph-capturable**, for the same reason.
+//! ## Speed (production forward, runC_2048 L02, warm, clean window)
+//! Router on the device (`dsv41_route_topk`), experts through the fused CB3 grouped GEMM
+//! (`cb3_moe_gemm.cu`, CB3 decoded in shared memory): ~31 ms/layer at T=2048 against 147 for
+//! the reconstruct-to-bf16 path. Still one small host round trip per layer ([T, 6] indices
+//! back for the permutation plan), so it is not graph-capturable. T <= 8 passes belong to
+//! dsv41-decode's decode path.
 //!
 //! ## Image rows
 //! Rows at image-sentinel / image-pad positions route with `gate.bias_vl`. The forward
@@ -36,8 +37,9 @@ use super::device_allocs::{DeviceAllocs, SharedGpu};
 use super::fwd::V41RoutedMoe;
 use super::moe_decode::{self, MAX_DECODE_T, MoeDecode};
 use super::moe::{
-    COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_GEMM_MODULE, FUSED_TILE_M,
-    FUSED_TILE_N, GEMV_DOWN_FN, GEMV_GATE_UP_FN, GEMV_ROWS_PER_BLOCK, GEMV_TILE_M, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE,
+    COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_DOWN_M32_FN, FUSED_DOWN_M32_SMEM, FUSED_DOWN_SMEM, FUSED_GATE_UP_M32_FN, FUSED_GATE_UP_M32_SMEM,
+    FUSED_GATE_UP_SMEM, FUSED_GEMM_MODULE, FUSED_SMALL_M, FUSED_TILE_M,
+    FUSED_TILE_N, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE,
     PERMUTE_KERNEL, ROUTE_TOPK_FN, SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, expert_matrices, gemm_weight_t_f32out,
     group_by_expert,
 };
@@ -46,14 +48,9 @@ use super::routing::{Routing, image_rows, score_of, select_experts_multimodal};
 
 /// `num_experts_per_tok`.
 pub const TOP_K: usize = 6;
-/// GEMV cut-over, rows per expert, applied ONLY to passes of <= [`GEMV_MAX_PASS_T`] tokens
-/// (so at the default every expert of such a pass takes the GEMV). The per-expert cut used to
-/// apply to every pass — a clean sweep had cut 2 best at T=16..512 by up to 0.5 ms — but it
-/// made output depend on chunking; that gain was given up for chunk invariance.
-pub const DEFAULT_GEMV_MAX_ROWS: usize = 8;
-/// Passes of at most this many tokens may use the GEMV kernels (every expert then has at most
-/// this many rows). Larger passes are MMA-only so the arithmetic never depends on chunking.
-pub const GEMV_MAX_PASS_T: usize = 8;
+/// ONE arithmetic for every row of every T > 8 pass: the MMA kernels. A per-expert kernel
+/// choice by row count (the GEMV cut this file used to have) made a token's bits depend on
+/// what else shared its chunk; T <= 8 passes belong to dsv41-decode's decode path.
 /// M at which the pinned router GEMM's algorithm is chosen.
 pub const ROUTER_REF_M: u32 = 512;
 /// Router id space.
@@ -231,12 +228,8 @@ pub struct Cb3RoutedMoe {
     k_route: KernelHandle,
     k_fused_gate_up: KernelHandle,
     k_fused_down: KernelHandle,
-    k_gemv_gate_up: KernelHandle,
-    k_gemv_down: KernelHandle,
-    /// Experts with at most this many rows take the GEMV kernels.
-    gemv_max_rows: Mutex<usize>,
-    /// Largest pass (tokens) allowed to use the GEMV kernels. See [`GEMV_MAX_PASS_T`].
-    gemv_pass_t: Mutex<usize>,
+    k_fused_gate_up_m32: KernelHandle,
+    k_fused_down_m32: KernelHandle,
     tiles: DevicePtr,
     max_tiles: usize,
 }
@@ -265,13 +258,13 @@ impl Cb3RoutedMoe {
         }
         let decode = if moe_decode::enabled() { Some(MoeDecode::new(&shared, &arena, &routers)?) } else { None };
         ensure!(
-            inter % FUSED_TILE_N == 0 && hidden % FUSED_TILE_N == 0 && inter % 32 == 0 && hidden % 32 == 0,
-            "fused CB3 GEMM needs N % {FUSED_TILE_N} == 0 and K % 32 == 0 (hidden {hidden}, inter {inter})"
+            inter % FUSED_TILE_N == 0 && hidden % FUSED_TILE_N == 0 && inter % 128 == 0 && hidden % 128 == 0,
+            "fused CB3 GEMM needs N % {FUSED_TILE_N} == 0 and K % 128 == 0 (a pair of BK steps) (hidden {hidden}, inter {inter})"
         );
         let e = max_t * TOP_K;
         // Every group contributes ceil(rows / BM) tiles: at most e / BM + one partial per expert.
-        // MMA tiles: at most e / 128 + one partial per expert; GEMV tiles: at most one per row.
-        let max_tiles = e + e / FUSED_TILE_M + ROUTER_EXPERTS;
+        // At most e / 128 full tiles plus one partial per expert.
+        let max_tiles = e / FUSED_TILE_M + ROUTER_EXPERTS;
         let handle = shared.clone();
         let gpu = handle.as_ref();
         let mut allocs = DeviceAllocs::owned(shared.clone());
@@ -339,10 +332,8 @@ impl Cb3RoutedMoe {
             k_route: gpu.kernel(COMBINE_MODULE, ROUTE_TOPK_FN)?,
             k_fused_gate_up: gpu.kernel(FUSED_GEMM_MODULE, FUSED_GATE_UP_FN)?,
             k_fused_down: gpu.kernel(FUSED_GEMM_MODULE, FUSED_DOWN_FN)?,
-            k_gemv_gate_up: gpu.kernel(FUSED_GEMM_MODULE, GEMV_GATE_UP_FN)?,
-            k_gemv_down: gpu.kernel(FUSED_GEMM_MODULE, GEMV_DOWN_FN)?,
-            gemv_max_rows: Mutex::new(DEFAULT_GEMV_MAX_ROWS),
-            gemv_pass_t: Mutex::new(GEMV_MAX_PASS_T),
+            k_fused_gate_up_m32: gpu.kernel(FUSED_GEMM_MODULE, FUSED_GATE_UP_M32_FN)?,
+            k_fused_down_m32: gpu.kernel(FUSED_GEMM_MODULE, FUSED_DOWN_M32_FN)?,
             tiles,
             max_tiles,
         })
@@ -404,18 +395,6 @@ impl Cb3RoutedMoe {
     /// Select the expert GEMM path (A/B and gating against the reconstruct baseline).
     pub fn set_expert_kernel(&self, kernel: ExpertKernel) {
         *self.kernel.lock().expect("kernel lock") = kernel;
-    }
-
-    /// Experts routed at most this many rows use the GEMV kernels (0 = never). Tuning knob;
-    /// both paths are gated against the oracle.
-    pub fn set_gemv_max_rows(&self, rows: usize) {
-        *self.gemv_max_rows.lock().expect("gemv lock") = rows;
-    }
-
-    /// CONTROLS / A/B only: let passes up to `t` tokens use the GEMV. Raising it above
-    /// [`GEMV_MAX_PASS_T`] restores the per-expert choice that broke chunk invariance.
-    pub fn set_gemv_pass_t(&self, t: usize) {
-        *self.gemv_pass_t.lock().expect("gemv lock") = t;
     }
 
     /// TIMING ONLY; see [`ExpertWork`].
@@ -678,41 +657,29 @@ impl Cb3RoutedMoe {
         stream: u64,
     ) -> Result<()> {
         let s = &self.scratch;
-        // CHUNK INVARIANCE: the GEMV and MMA kernels sum in different orders, so choosing
-        // between them per EXPERT by its row count made a token's output depend on how many
-        // other tokens shared its chunk (dsv41-integrate measured L00.moe_routed differing
-        // between 512- and 1024-row chunks). The choice is now per PASS: GEMV only when the
-        // whole pass is at most GEMV_MAX_PASS_T tokens (decode), MMA for every expert otherwise.
-        let t = group_rows.last().map_or(0, |(_, end)| *end) / TOP_K;
-        let pass_t = *self.gemv_pass_t.lock().expect("gemv lock");
-        // ...and only on a DECODE pass: a prefill chunk of <= 8 rows (a prompt's tail) must run the
-        // same MMA as the same rows inside a bigger chunk (dsv41-decode measured the 1-row and
-        // 4-row tails breaking chunk invariance at L00/L01 moe_routed through this branch).
-        let gemv_max = if t <= pass_t && super::ops::decode_pass() { *self.gemv_max_rows.lock().expect("gemv lock") } else { 0 };
-        // Experts with few rows take the GEMV kernels (4-row tiles), the rest the MMA
-        // kernels (128-row tiles). One upload: MMA tiles first, then GEMV tiles.
-        let (mut mma, mut gemv): (Vec<i32>, Vec<i32>) = (Vec::new(), Vec::new());
+        // Every expert takes the MMA kernels. A tile's row count (and which of the two tile
+        // shapes it lands in) never changes a row's arithmetic: each output element is the same
+        // m16n8k16 sequence over K. So the result is chunk-invariant; the byte test is
+        // cb3_moe_oracle_microtest --invariance. 128-row tiles first, then experts of <= 32
+        // rows for the 32-row kernels (a large expert's small tail stays on the 128-row
+        // kernel: sending it too measured 2% slower at T=2048).
+        let (mut mma, mut small): (Vec<i32>, Vec<i32>) = (Vec::new(), Vec::new());
         for (group, (begin, end)) in groups.iter().zip(group_rows) {
-            let (list, step) = if end - begin <= gemv_max {
-                (&mut gemv, GEMV_TILE_M)
-            } else {
-                (&mut mma, FUSED_TILE_M)
-            };
             let mut row = *begin;
             while row < *end {
-                let rows = (end - row).min(step);
+                let rows = (end - row).min(FUSED_TILE_M);
+                let list = if end - begin <= FUSED_SMALL_M { &mut small } else { &mut mma };
                 list.extend_from_slice(&[row as i32, rows as i32, group.slot as i32, 0]);
                 row += rows;
             }
         }
-        let (n_mma, n_gemv) = (mma.len() / 4, gemv.len() / 4);
-        if n_mma + n_gemv == 0 {
+        let (n_mma, n_small) = (mma.len() / 4, small.len() / 4);
+        if n_mma + n_small == 0 {
             return Ok(());
         }
-        ensure!(n_mma + n_gemv <= self.max_tiles, "{} tiles exceed the {} allocated", n_mma + n_gemv, self.max_tiles);
-        mma.extend_from_slice(&gemv);
+        mma.extend_from_slice(&small);
+        ensure!(n_mma + n_small <= self.max_tiles, "{} tiles exceed the {} allocated", n_mma + n_small, self.max_tiles);
         self.gpu.copy_h2d(as_bytes_i32(&mma), self.tiles)?;
-        let gemv_tiles = DevicePtr(self.tiles.0 + (n_mma * 16) as u64);
 
         let [gate, up, down] = &self.matrices;
         let base = |t| residency.plane_base(t);
@@ -762,17 +729,18 @@ impl Cb3RoutedMoe {
                 .arg_i32(down.cols as i32)
                 .launch(stream)
         };
+        let small_tiles = DevicePtr(self.tiles.0 + (n_mma * 16) as u64);
         if n_mma > 0 {
-            gate_up(self.k_fused_gate_up, self.tiles, n_mma, FUSED_TILE_N, 256, 0)?;
+            gate_up(self.k_fused_gate_up, self.tiles, n_mma, FUSED_TILE_N, 256, FUSED_GATE_UP_SMEM)?;
         }
-        if n_gemv > 0 {
-            gate_up(self.k_gemv_gate_up, gemv_tiles, n_gemv, GEMV_ROWS_PER_BLOCK, 256, 0)?;
+        if n_small > 0 {
+            gate_up(self.k_fused_gate_up_m32, small_tiles, n_small, FUSED_TILE_N, 256, FUSED_GATE_UP_M32_SMEM)?;
         }
         if n_mma > 0 {
-            down_proj(self.k_fused_down, self.tiles, n_mma, FUSED_TILE_N, 256, 0)?;
+            down_proj(self.k_fused_down, self.tiles, n_mma, FUSED_TILE_N, 256, FUSED_DOWN_SMEM)?;
         }
-        if n_gemv > 0 {
-            down_proj(self.k_gemv_down, gemv_tiles, n_gemv, GEMV_ROWS_PER_BLOCK, 256, 0)?;
+        if n_small > 0 {
+            down_proj(self.k_fused_down_m32, small_tiles, n_small, FUSED_TILE_N, 256, FUSED_DOWN_M32_SMEM)?;
         }
         Ok(())
     }

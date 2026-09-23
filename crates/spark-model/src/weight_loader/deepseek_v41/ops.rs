@@ -39,10 +39,11 @@ pub mod profile {
         let mut t = table().lock().expect("prof poisoned");
         let mut rows: Vec<(String, (f64, u64))> = std::mem::take(&mut *t).into_iter().collect();
         rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
-        let total: f64 = rows.iter().filter(|r| !r.0.contains('/')).map(|r| r.1.0).sum();
+        let top = |k: &str| !k.trim_start_matches("replay:").contains('/');
+        let total: f64 = rows.iter().filter(|r| top(&r.0)).map(|r| r.1.0).sum();
         let mut out = format!("{:<34} {:>9} {:>7} {:>6}\n", "scope (a/b = nested in a)", "ms", "calls", "%top");
         for (k, (sec, n)) in rows {
-            let pct = if k.contains('/') { String::new() } else { format!("{:.1}", 100.0 * sec / total.max(1e-12)) };
+            let pct = if !top(&k) { String::new() } else { format!("{:.1}", 100.0 * sec / total.max(1e-12)) };
             out += &format!("{k:<34} {:>9.1} {n:>7} {pct:>6}\n", sec * 1e3);
         }
         out += &format!("{:<34} {:>9.1}\n", "TOTAL (top-level scopes)", total * 1e3);
@@ -69,6 +70,49 @@ pub fn set_decode_pass(on: bool) {
 
 pub fn decode_pass() -> bool {
     DECODE_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set for the SWA replay pass (layers 21-39 over the last <= 128 prompt rows). Replay rows are
+/// only ever computed by replay passes, so a replay-only kernel choice keeps chunk invariance by
+/// construction (like decode_pass).
+static REPLAY_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_replay_pass(on: bool) {
+    REPLAY_PASS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn replay_pass() -> bool {
+    REPLAY_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `ATLAS_DSV41_REPLAY_FUSED=1`: replay passes run their FP8 linears through the fused FP8 GEMM
+/// (no bf16 dequant copy): at <= 128 rows the per-pass dequant of every dense weight dominates.
+pub const REPLAY_FUSED_ENV: &str = "ATLAS_DSV41_REPLAY_FUSED";
+
+fn replay_fused_enabled() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var(REPLAY_FUSED_ENV).as_deref() == Ok("1"))
+}
+
+fn fp8_fused_all() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var(FP8_FUSED_ENV).as_deref() == Ok("1"))
+}
+
+/// CUDA-graph decode: the device i32 holding the current pass's start (the position of its row
+/// 0), or 0 = none. When set on a decode-kind pass, the attention computes its positions and the
+/// window-ring slot on the DEVICE from it (`dsv41_decode_positions` / `dsv41_ring_write`) instead
+/// of uploading host values, so a captured step replays correctly at any position.
+static GRAPH_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_graph_start(ptr: Option<DevicePtr>) {
+    GRAPH_START.store(ptr.map_or(0, |p| p.0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The device start, if a graph-mode decode pass is running.
+pub fn graph_start() -> Option<DevicePtr> {
+    let v = GRAPH_START.load(std::sync::atomic::Ordering::Relaxed);
+    (v != 0 && decode_pass()).then_some(DevicePtr(v))
 }
 
 static FP8_FIXED_M: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -135,7 +179,10 @@ pub fn prof<R>(ops: &Ops, name: &str, f: impl FnOnce() -> Result<R>) -> Result<R
     ops.gpu.synchronize(ops.stream)?;
     let dt = t0.elapsed().as_secs_f64();
     let mut t = profile::table().lock().expect("prof poisoned");
-    let e = t.entry(name.to_string()).or_insert((0.0, 0));
+    // Replay-pass scopes are recorded separately ("replay:<scope>"), so the table shows the
+    // 128-row SWA replay's share next to the encoder chunks'.
+    let key = if replay_pass() { format!("replay:{name}") } else { name.to_string() };
+    let e = t.entry(key).or_insert((0.0, 0));
     e.0 += dt;
     e.1 += 1;
     Ok(r)
@@ -179,6 +226,13 @@ pub struct Dsv41Kernels {
     pub mul_bf16_to_f32: KernelHandle,
     /// `dsv41_hc_mean_bf16`: the DSpark seed (mean over the hc streams).
     pub hc_mean_bf16: KernelHandle,
+    /// `dsv41_hc_mixes_v2`: `hc_mixes` with its 25 reductions in ONE tree (same pairings), for
+    /// prefill passes; bit-identical. [`HC_MIX_V2_ENV`]`=1` only, until the end-to-end byte test.
+    pub hc_mixes_v2: Option<KernelHandle>,
+    /// `dsv41_hc_fused_v2` + `dsv41_hc_add_post`: the fused mHC stream passes for prefill,
+    /// bit-identical to the separate kernels (window9 byte + split tests). ON by default;
+    /// [`HC_FUSED_ENV`]`=0` restores the separate kernels.
+    pub hc_fused: Option<(KernelHandle, KernelHandle)>,
     /// `dsv41_decode::dsv41_fp8_gemv_m1`, used at M = 1 when [`DENSE_GEMV_ENV`] is on.
     pub fp8_gemv_m1: Option<KernelHandle>,
     /// `dsv41_fp8_gemv_m8`: the same GEMV for 2..=8 rows, each row bit-identical to the M = 1
@@ -186,16 +240,24 @@ pub struct Dsv41Kernels {
     pub fp8_gemv_m8: Option<KernelHandle>,
     /// The bit-identical split `hc_mixes` for T = 1 ([`HC_SPLIT_ENV`]): (dot, finish, raw scratch).
     pub hc_split: Option<(KernelHandle, KernelHandle)>,
+    /// CUDA-graph decode: positions / window positions / ring slot from one device `start`.
+    pub decode_positions: KernelHandle,
+    pub ring_write: KernelHandle,
     /// attention2's fused FP8-weight GEMM (no bf16 dequant copy), used for prefill M > MM_TILE
     /// on the shapes where it measured faster ([`fused_wins`]). [`FP8_FUSED_ENV`]`=1` only,
     /// until the end-to-end byte test passes.
     pub fp8_fused: Option<Fp8Gemm>,
 }
 
+/// `ATLAS_DSV41_HC_MIX_V2=1`: non-decode `hc_mixes` run `dsv41_hc_mixes_v2`.
+pub const HC_MIX_V2_ENV: &str = "ATLAS_DSV41_HC_MIX_V2";
+/// `ATLAS_DSV41_HC_FUSED=0`: non-decode blocks run the separate mHC kernels instead of the two fused ones.
+pub const HC_FUSED_ENV: &str = "ATLAS_DSV41_HC_FUSED";
+
 /// `ATLAS_DSV41_FP8_FUSED=1`: prefill FP8 linears on the winning shapes skip the bf16 dequant.
 pub const FP8_FUSED_ENV: &str = "ATLAS_DSV41_FP8_FUSED";
 
-/// ON by default (`ATLAS_DSV41_HC_SPLIT=0` turns it off): at T = 1, `hc_mixes` runs as 25 blocks + an epilogue instead of one
+/// ON by default (`ATLAS_DSV41_HC_SPLIT=0` turns it off): on decode-kind passes of <= 16 rows, `hc_mixes` runs as 25 x T blocks + an epilogue instead of one
 /// block per token. Bit-identical by construction (same per-thread order, same tree).
 pub const HC_SPLIT_ENV: &str = "ATLAS_DSV41_HC_SPLIT";
 /// Bytes of the split hc_mixes' partials: 25 floats (24 mixes + the sum of squares) per token row.
@@ -247,6 +309,14 @@ impl Dsv41Kernels {
             engram_gate: k("dsv41_engram_gate")?,
             mul_bf16_to_f32: k("dsv41_mul_bf16_to_f32")?,
             hc_mean_bf16: k("dsv41_hc_mean_bf16")?,
+            hc_fused: if std::env::var(HC_FUSED_ENV).as_deref() != Ok("0") {
+                // ATLAS_DSV41_HC_FUSED_V3=1: the h row held in shared memory (D <= 5120).
+                let v3 = std::env::var("ATLAS_DSV41_HC_FUSED_V3").as_deref() == Ok("1");
+                Some((k(if v3 { "dsv41_hc_fused_v3" } else { "dsv41_hc_fused_v2" })?, k("dsv41_hc_add_post")?))
+            } else {
+                None
+            },
+            hc_mixes_v2: if std::env::var(HC_MIX_V2_ENV).as_deref() == Ok("1") { Some(k("dsv41_hc_mixes_v2")?) } else { None },
             fp8_gemv_m1: if std::env::var(DENSE_GEMV_ENV).as_deref() != Ok("0") {
                 Some(gpu.kernel(DECODE_DENSE_MODULE, "dsv41_fp8_gemv_m1").with_context(|| {
                     format!("{DENSE_GEMV_ENV}=1 but {DECODE_DENSE_MODULE}::dsv41_fp8_gemv_m1 is not in the PTX")
@@ -261,6 +331,8 @@ impl Dsv41Kernels {
             } else {
                 None
             },
+            decode_positions: k2("dsv41_decode_positions")?,
+            ring_write: k2("dsv41_ring_write")?,
             hc_split: if std::env::var(HC_SPLIT_ENV).as_deref() != Ok("0") {
                 // No allocation here: this table is Copy and has no owner to free a buffer.
                 // The partials live in the caller's scratch (`PassScratch::hc_raw`).
@@ -268,7 +340,7 @@ impl Dsv41Kernels {
             } else {
                 None
             },
-            fp8_fused: if std::env::var(FP8_FUSED_ENV).as_deref() == Ok("1") { Some(Fp8Gemm::load(gpu)?) } else { None },
+            fp8_fused: if fp8_fused_all() || replay_fused_enabled() { Some(Fp8Gemm::load(gpu)?) } else { None },
         })
     }
 }
@@ -320,16 +392,27 @@ impl Ops<'_> {
     #[allow(clippy::too_many_arguments)]
     /// `raw` is the split path's partials buffer ([`HC_RAW_BYTES`], `PassScratch::hc_raw`).
     pub fn hc_mixes(&self, h: DevicePtr, hc: &HcParams, pre: DevicePtr, post: DevicePtr, comb: DevicePtr, t: usize, d: usize, iters: u32, eps: f32, hc_eps: f32, raw: DevicePtr) -> Result<()> {
-        if let Some((dot, finish)) = self.k.hc_split.filter(|_| t == 1 && decode_pass() && !raw.is_null()) {
+        // Decode-kind passes up to MM_TILE rows (T=1 decode, T=6 DSpark verify): 25 x T blocks, each
+        // token's arithmetic exactly the one-block kernel's (bit-identical at any T).
+        if let Some((dot, finish)) = self.k.hc_split.filter(|_| t >= 1 && t <= MM_TILE && decode_pass() && !raw.is_null()) {
             KernelLaunch::new(self.gpu, dot)
-                .grid([25, 1, 1])
+                .grid([25, t as u32, 1])
                 .block([BLOCK, 1, 1])
                 .arg_ptr(h).arg_ptr(hc.func).arg_ptr(raw).arg_u32(d as u32)
                 .launch(self.stream)?;
             return KernelLaunch::new(self.gpu, finish)
-                .grid([1, 1, 1])
+                .grid([t as u32, 1, 1])
                 .block([32, 1, 1])
                 .arg_ptr(raw).arg_ptr(hc.scale).arg_ptr(hc.base)
+                .arg_ptr(pre).arg_ptr(post).arg_ptr(comb)
+                .arg_u32(d as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
+                .launch(self.stream);
+        }
+        if let Some(tb) = self.k.hc_mixes_v2.filter(|_| !decode_pass()) {
+            return self
+                .l(tb)
+                .grid([t as u32, 1, 1])
+                .arg_ptr(h).arg_ptr(hc.func).arg_ptr(hc.scale).arg_ptr(hc.base)
                 .arg_ptr(pre).arg_ptr(post).arg_ptr(comb)
                 .arg_u32(d as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
                 .launch(self.stream);
@@ -340,6 +423,38 @@ impl Ops<'_> {
             .arg_ptr(pre).arg_ptr(post).arg_ptr(comb)
             .arg_u32(d as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
             .launch(self.stream)
+    }
+
+    /// Whether this pass runs the fused mHC kernels ([`HC_FUSED_ENV`], never on decode passes,
+    /// which keep decode's tuned split path).
+    pub fn hc_fused_on(&self) -> bool {
+        self.k.hc_fused.is_some() && !decode_pass()
+    }
+
+    /// Fused `[hc_post(y = ya (+ yb), post_in, comb_in)] -> hc_mixes -> hc_pre(side_pre) ->
+    /// rmsnorm` over `h` (in place) into `x`; `ya == NULL` skips the post stage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_fused(
+        &self, ya: DevicePtr, yb: DevicePtr, post_in: DevicePtr, comb_in: DevicePtr, h: DevicePtr, hc: &HcParams,
+        pre: DevicePtr, post: DevicePtr, comb: DevicePtr, side_pre: DevicePtr, norm_w: DevicePtr, x: DevicePtr,
+        t: usize, d: usize, iters: u32, eps: f32, hc_eps: f32,
+    ) -> Result<()> {
+        let (fused, _) = self.k.hc_fused.context("hc_fused: kernels not loaded (ATLAS_DSV41_HC_FUSED=0)")?;
+        ensure!(d <= 5120, "hc_fused: hidden {d} > the v3 kernel's shared-memory row (5120)");
+        self.l(fused)
+            .grid([t as u32, 1, 1])
+            .arg_ptr(ya).arg_ptr(yb).arg_ptr(post_in).arg_ptr(comb_in).arg_ptr(h)
+            .arg_ptr(hc.func).arg_ptr(hc.scale).arg_ptr(hc.base)
+            .arg_ptr(pre).arg_ptr(post).arg_ptr(comb).arg_ptr(side_pre).arg_ptr(norm_w).arg_ptr(x)
+            .arg_u32(d as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
+            .launch(self.stream)
+    }
+
+    /// `add_bf16(ya, yb)` then `hc_post` in place on `h`, one pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_add_post(&self, ya: DevicePtr, yb: DevicePtr, h: DevicePtr, post: DevicePtr, comb: DevicePtr, t: usize, d: usize) -> Result<()> {
+        let (_, add_post) = self.k.hc_fused.context("hc_add_post: kernels not loaded (ATLAS_DSV41_HC_FUSED=1)")?;
+        self.l(add_post).grid([t as u32, 1, 1]).arg_ptr(ya).arg_ptr(yb).arg_ptr(h).arg_ptr(post).arg_ptr(comb).arg_u32(d as u32).launch(self.stream)
     }
 
     pub fn hc_pre(&self, h: DevicePtr, pre: DevicePtr, y: DevicePtr, t: usize, d: usize) -> Result<()> {
@@ -446,10 +561,17 @@ impl Ops<'_> {
         // The kernel choice depends on the WEIGHT (N, K) only, never on M: every row of a given
         // weight takes the same kernel whatever the chunking, so chunk invariance holds by
         // construction rather than by fused == cuBLAS bytewise. Decode passes returned above.
+        // Replay passes (REPLAY_FUSED): every aligned shape, since at <= 128 rows the dequant copy of
+        // the weight costs more than the GEMM; the choice keys on the pass kind, never on M.
+        let fused_here = if fp8_fused_all() {
+            fused_wins(w.n, w.k)
+        } else {
+            replay_fused_enabled() && replay_pass() && w.n % 128 == 0 && w.k % 32 == 0
+        };
         if let Some(f) = self.k.fp8_fused
             && !fp8_force_rowtile()
             && fp8_policy() == Fp8Policy::Pinned
-            && fused_wins(w.n, w.k)
+            && fused_here
         {
             return prof(self, "dense/fused", || f.linear(self.gpu, x, w.k, w, out, w.n, m, self.stream));
         }
@@ -508,6 +630,26 @@ impl Ops<'_> {
             .arg_u32(w.n as u32).arg_u32(w.k as u32)
             .arg_u32(n_per_group as u32).arg_u32(x_group_stride as u32)
             .arg_u32(m as u32).arg_u32(ldx as u32).arg_u32(ldo as u32)
+            .launch(self.stream)
+    }
+
+    /// `pos[i] = *dstart + i`, `wpos[i, j] = *dstart + i - (window-1) + j` (-1 below 0), for the
+    /// pass's `t` rows: the device form of the host `window_positions` upload (graph replay).
+    pub fn decode_positions(&self, dstart: DevicePtr, pos: DevicePtr, wpos: DevicePtr, t: usize, window: usize) -> Result<()> {
+        KernelLaunch::new(self.gpu, self.k.decode_positions)
+            .grid([t as u32, 1, 1])
+            .block([128, 1, 1])
+            .arg_ptr(dstart).arg_ptr(pos).arg_ptr(wpos).arg_i32(window as i32)
+            .launch(self.stream)
+    }
+
+    /// `ring[(*dstart + i) % ring_n] = kv[i]` for `t` rows of `row_elems` bf16 (graph replay).
+    pub fn ring_write(&self, kv: DevicePtr, ring: DevicePtr, dstart: DevicePtr, t: usize, ring_n: usize, row_elems: usize) -> Result<()> {
+        ensure!(row_elems % 8 == 0, "ring_write: row of {row_elems} elements");
+        KernelLaunch::new(self.gpu, self.k.ring_write)
+            .grid([t as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(kv).arg_ptr(ring).arg_ptr(dstart).arg_i32(ring_n as i32).arg_i32(row_elems as i32)
             .launch(self.stream)
     }
 

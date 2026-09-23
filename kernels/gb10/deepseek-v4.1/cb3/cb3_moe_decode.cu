@@ -345,6 +345,9 @@ __device__ __forceinline__ void dec_gateup(
                       sc_stride, y, groups, row_w, h, limit);                                      \
     }
 DEC_GATEUP_ENTRY(dsv41_cb3_gateup_decode_r1, 1)
+DEC_GATEUP_ENTRY(dsv41_cb3_gateup_decode_r2, 2)
+DEC_GATEUP_ENTRY(dsv41_cb3_gateup_decode_r4, 4)
+DEC_GATEUP_ENTRY(dsv41_cb3_gateup_decode_r6, 6)
 DEC_GATEUP_ENTRY(dsv41_cb3_gateup_decode_r8, 8)
 
 // ── down ─────────────────────────────────────────────────────────────────────
@@ -391,6 +394,9 @@ __device__ __forceinline__ void dec_down(
         dec_down<R>(lo, hi, cb, s2, lo_stride, hi_stride, cb_stride, sc_stride, h, groups, down);  \
     }
 DEC_DOWN_ENTRY(dsv41_cb3_down_decode_r1, 1)
+DEC_DOWN_ENTRY(dsv41_cb3_down_decode_r2, 2)
+DEC_DOWN_ENTRY(dsv41_cb3_down_decode_r4, 4)
+DEC_DOWN_ENTRY(dsv41_cb3_down_decode_r6, 6)
 DEC_DOWN_ENTRY(dsv41_cb3_down_decode_r8, 8)
 
 // ── sum over the six picks ───────────────────────────────────────────────────

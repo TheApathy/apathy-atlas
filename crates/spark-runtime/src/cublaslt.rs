@@ -18,7 +18,10 @@ use std::sync::OnceLock;
 // references via `use super::*` (the cublasLt type aliases, CUDA_R_* constants) already exists
 // below unchanged.
 mod typed;
-pub use typed::{GemmDtype, gemm_act_weight_t_typed, gemm_act_weight_t_typed_ex, gemm_act_weight_t_typed_pinned};
+pub use typed::{
+    GemmDtype, gemm_act_weight_t_typed, gemm_act_weight_t_typed_ex, gemm_act_weight_t_typed_pinned,
+    register_stream_workspace,
+};
 
 #[allow(non_camel_case_types)]
 type cublasLtHandle_t = *mut c_void;

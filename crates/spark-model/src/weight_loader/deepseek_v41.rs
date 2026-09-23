@@ -43,6 +43,8 @@ pub mod moe;
 pub mod mtp;
 pub mod mtp_moe_decode;
 pub mod dspark;
+pub mod dspark_adapt;
+pub mod dspark_sampling;
 pub mod moe_decode;
 pub mod moe_forward;
 pub mod routing;

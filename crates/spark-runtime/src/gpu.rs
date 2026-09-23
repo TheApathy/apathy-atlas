@@ -449,6 +449,19 @@ pub trait GpuBackend: Send + Sync {
     /// Set device memory to a byte value on the given stream (async — does not wait).
     fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, stream: u64) -> Result<()>;
 
+    /// Set `count` 32-bit words at `ptr` to `value` on the given stream (async).
+    /// Used to publish a small device-resident counter that graphed kernels read
+    /// at replay time (a by-value launch arg would freeze at graph capture).
+    ///
+    /// Default: builds the pattern on the host and H2D-copies it -- correct but not a real
+    /// device-side memset, so it costs one small host allocation and one copy per call. Fine
+    /// for the small, infrequent counters this is used for; backends compiled for real GPU
+    /// work (AtlasCudaBackend) override it with a real `cuMemsetD32Async`.
+    fn memset_u32_async(&self, ptr: DevicePtr, value: u32, count: usize, stream: u64) -> Result<()> {
+        let bytes: Vec<u8> = value.to_le_bytes().iter().copied().cycle().take(count * 4).collect();
+        self.copy_h2d_async(&bytes, ptr, stream)
+    }
+
     /// Total device memory in bytes.
     fn total_memory(&self) -> Result<usize>;
 

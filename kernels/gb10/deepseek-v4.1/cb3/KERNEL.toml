@@ -10,7 +10,9 @@
 # IEEE (no ftz, precise div/sqrt/exp) -- every dsv41 byte-identity/KL/oracle
 # result in this port assumes that. Without the sentinel here, dsv41/port
 # would silently compile with fast math and diverge from the numbers every
-# gate in this effort is checked against.
+# gate in this effort is checked against. (D itself never needs this flag:
+# its build_target.rs never adds --use_fast_math at all -- confirmed by
+# code trace, not just by the flag's absence there.)
 #
 # `-DTQ_PLUS_SIGNS`: per-target KERNEL.toml does not merge the common
 # KERNEL.toml's `extra_nvcc_flags` (A's build_target.rs takes the more

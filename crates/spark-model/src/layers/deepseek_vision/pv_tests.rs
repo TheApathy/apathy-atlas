@@ -75,11 +75,11 @@ fn fp32_pv_tile_covers_each_output_once_and_masks_patch_tails() {
 fn fp32_attention_source_cannot_silently_restore_bf16_probability_rounding() {
     const SOFTMAX: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../kernels/gb10/deepseek-v4-flash/nvfp4/deepseek_vision.cu"
+        "/../../kernels/gb10/deepseek-v4.1/cb3/deepseek_vision.cu"
     ));
     const PV: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../kernels/gb10/deepseek-v4-flash/nvfp4/deepseek_vision_pv.cu"
+        "/../../kernels/gb10/deepseek-v4.1/cb3/deepseek_vision_pv.cu"
     ));
     assert!(SOFTMAX.contains("const float* scores, float* probs"));
     assert!(!SOFTMAX.contains("probs[row + c] = __float2bfloat16"));

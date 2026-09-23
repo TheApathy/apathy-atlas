@@ -13,6 +13,35 @@ use std::ffi::c_void;
 
 use super::*;
 
+/// Dedicated workspaces for side streams (same size as the global one, so the heuristic and
+/// the pinned algorithms are unchanged): two GEMMs running concurrently on different streams
+/// must not share the process-global workspace.
+fn side_workspaces() -> &'static std::sync::Mutex<std::collections::HashMap<u64, u64>> {
+    static W: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, u64>>> = std::sync::OnceLock::new();
+    W.get_or_init(Default::default)
+}
+
+fn stream_workspace(stream: u64) -> Option<u64> {
+    side_workspaces().lock().ok()?.get(&stream).copied()
+}
+
+/// Give `stream` its own cuBLASLt workspace for the typed GEMMs (idempotent). Process-lifetime,
+/// like the global workspace.
+pub fn register_stream_workspace(stream: u64) -> Result<()> {
+    let size = ctx()?.ws_size;
+    let mut map = side_workspaces().lock().map_err(|_| anyhow::anyhow!("cuBLASLt side workspaces poisoned"))?;
+    if map.contains_key(&stream) {
+        return Ok(());
+    }
+    let mut ws: u64 = 0;
+    let st = unsafe { cuMemAlloc_v2(&mut ws, size) };
+    if st != 0 {
+        bail!("cuMemAlloc side-stream cuBLASLt workspace failed: {st}");
+    }
+    map.insert(stream, ws);
+    Ok(())
+}
+
 /// `CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK` (u32).
 const PREF_REDUCTION_SCHEME_MASK: u32 = 3;
 
@@ -257,7 +286,7 @@ fn typed_impl(
                 out as *mut c_void,
                 ld_,
                 result.as_ptr() as *const c_void,
-                ctx.workspace as *mut c_void,
+                stream_workspace(stream).unwrap_or(ctx.workspace) as *mut c_void,
                 ctx.ws_size,
                 stream as *mut c_void,
             ))
