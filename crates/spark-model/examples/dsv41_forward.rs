@@ -372,21 +372,25 @@ fn run_model_path(
             let rows = seq.tail_rows;
             ds.seed(ops, &fwd, rows, seq.len - rows)?;
             let t1 = std::time::Instant::now();
-            let (mut steps, mut acc_hist) = (0usize, [0usize; 6]);
+            let (mut steps, mut acc_hist, mut k_hist) = (0usize, [0usize; 6], [0usize; 6]);
+            let mut policy = spark_model::weight_loader::deepseek_v41::dspark_adapt::AdaptiveK::from_env()?;
             let mut step_ms = Vec::new();
             while got.len() < decode_n {
                 let tok = *got.last().unwrap();
                 let ts = std::time::Instant::now();
-                let out = ds.step(ops, &fwd, &mut seq, tok, hook, core, moe, &Tap::off(), logits, dspark_force)?;
+                let k = policy.choose();
+                let out = ds.step(ops, &fwd, &mut seq, tok, hook, core, moe, &Tap::off(), logits, k, dspark_force)?;
                 step_ms.push(ts.elapsed().as_secs_f64() * 1e3);
                 acc_hist[out.accepted] += 1;
+                k_hist[k] += 1;
+                policy.observe(k, out.accepted);
                 if std::env::var("DSV41_DRIVER_DSPARK_VERBOSE").as_deref() == Ok("1") {
                     // FNV of verify row 0's logits = the plain-decode logits of the same position:
                     // compare with the plain arm's "decode logits fnv per step".
                     ops.gpu.synchronize(ops.stream)?;
                     ops.gpu.copy_d2h(logits, &mut host)?;
                     let h = host.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
-                    println!("spec step {steps:2}: pos {} tok {tok} accepted {} emitted {:?} row0 fnv {h:x}", seq.len - out.emitted.len(), out.accepted, out.emitted);
+                    println!("spec step {steps:2}: pos {} tok {tok} k {k} accepted {} emitted {:?} row0 fnv {h:x}", seq.len - out.emitted.len(), out.accepted, out.emitted);
                 }
                 steps += 1;
                 got.extend_from_slice(&out.emitted);
@@ -398,7 +402,7 @@ fn run_model_path(
             let mut w = step_ms.clone();
             w.sort_by(f64::total_cmp);
             println!(
-                "dspark{}: {} tokens in {steps} steps, {dt:.2}s ({:.2} tok/s); accepted/step mean {mean_a:.2} hist {acc_hist:?}; step ms median {:.2}",
+                "dspark{}: {} tokens in {steps} steps, {dt:.2}s ({:.2} tok/s); accepted/step mean {mean_a:.2} hist {acc_hist:?}; k hist {k_hist:?}; step ms median {:.2}",
                 if dspark_force { " [CONTROL force-accept]" } else { "" },
                 got.len() - 1,
                 (got.len() - 1) as f64 / dt,

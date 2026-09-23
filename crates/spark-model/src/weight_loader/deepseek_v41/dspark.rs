@@ -273,12 +273,13 @@ impl Dspark {
         Ok(out.chunks_exact(4).skip(1).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
     }
 
-    /// Greedy accept over the verify logits `[T_VERIFY, V]` bf16 against the drafts in ids[1..].
-    /// Returns (a, argmax per verify row). One readback.
-    pub fn accept(&self, ops: &Ops, logits: DevicePtr) -> Result<(usize, Vec<u32>)> {
+    /// Greedy accept over the verify logits `[k + 1, V]` bf16 against the first `k` drafts in
+    /// ids[1..]. Returns (a, argmax per verify row). One readback.
+    pub fn accept(&self, ops: &Ops, logits: DevicePtr, k: usize) -> Result<(usize, Vec<u32>)> {
+        ensure!((1..=B).contains(&k), "DSpark accept over {k} drafts");
         let gpu = ops.gpu;
         KernelLaunch::new(gpu, self.k.argmax_rows)
-            .grid([T_VERIFY as u32, 1, 1])
+            .grid([k as u32 + 1, 1, 1])
             .block([1024, 1, 1])
             .arg_ptr(logits)
             .arg_u32(self.vocab as u32)
@@ -289,14 +290,14 @@ impl Dspark {
             .block([1, 1, 1])
             .arg_ptr(self.am)
             .arg_ptr(self.ids.offset(4))
-            .arg_i32(B as i32)
+            .arg_i32(k as i32)
             .arg_ptr(self.res)
             .launch(ops.stream)?;
         gpu.synchronize(ops.stream)?;
         let mut r = [0u8; (2 * B + 2) * 4];
         gpu.copy_d2h(self.res, &mut r)?;
         let v: Vec<u32> = r.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        Ok((v[0] as usize, v[1..=T_VERIFY].to_vec()))
+        Ok((v[0] as usize, v[1..=k + 1].to_vec()))
     }
 
     /// The first half of a step: draft B tokens after `tok` and run the verify pass over
@@ -322,7 +323,7 @@ impl Dspark {
         block_ids.push(tok);
         block_ids.extend_from_slice(&drafts);
         fwd.verify(ops, seq, &block_ids, hook, core, main_moe, tap, logits)?;
-        let (a, am) = self.accept(ops, logits)?;
+        let (a, am) = self.accept(ops, logits, B)?;
         Ok((drafts, a, am))
     }
 
@@ -334,8 +335,9 @@ impl Dspark {
         self.seed(ops, fwd, accepted + 1, pos)
     }
 
-    /// One greedy spec step for input token `tok` at position `seq.len`. `logits` must hold
-    /// `tiled_rows(T_VERIFY)` rows. `force_accept_all` is a NEGATIVE CONTROL ONLY (accepts every
+    /// One greedy spec step for input token `tok` at position `seq.len`, verifying the first `k`
+    /// of the B drafts (k + 1 rows; the output is greedy-exact for any k, see dspark_adapt).
+    /// `logits` must hold `tiled_rows(T_VERIFY)` rows. `force_accept_all` is a NEGATIVE CONTROL ONLY (accepts every
     /// draft without verifying): its output must diverge from non-spec greedy.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
@@ -349,22 +351,24 @@ impl Dspark {
         main_moe: &dyn V41RoutedMoe,
         tap: &Tap,
         logits: DevicePtr,
+        k: usize,
         force_accept_all: bool,
     ) -> Result<StepOut> {
+        ensure!((1..=B).contains(&k), "DSpark step verifying {k} drafts");
         let pos = seq.len;
         let phases = std::env::var("DSV41_DSPARK_PHASES").as_deref() == Ok("1");
         let t0 = std::time::Instant::now();
         // (propose_verify's two readbacks already synchronize after the draft and after accept)
         let drafts = self.draft(ops, fwd, tok, pos, tap)?;
         let t1 = std::time::Instant::now();
-        let mut block_ids = Vec::with_capacity(T_VERIFY);
+        let mut block_ids = Vec::with_capacity(k + 1);
         block_ids.push(tok);
-        block_ids.extend_from_slice(&drafts);
+        block_ids.extend_from_slice(&drafts[..k]);
         fwd.verify(ops, seq, &block_ids, hook, core, main_moe, tap, logits)?;
-        let (mut a, am) = self.accept(ops, logits)?;
+        let (mut a, am) = self.accept(ops, logits, k)?;
         let t2 = std::time::Instant::now();
         if force_accept_all {
-            a = B;
+            a = k;
         }
         self.commit(ops, fwd, seq, pos, a, hook)?;
         if phases {
@@ -374,7 +378,7 @@ impl Dspark {
             self.phase_ms.lock().expect("phase poisoned").push([ms(t0, t1), ms(t1, t2), ms(t2, t3)]);
         }
         let mut emitted: Vec<u32> = drafts[..a].to_vec();
-        emitted.push(if force_accept_all { am[B] } else { am[a] });
+        emitted.push(am[a]);
         Ok(StepOut { accepted: a, emitted })
     }
 }
