@@ -29,8 +29,8 @@ echo "$(date -u +%FT%TZ) dsv41-integrate drop gate keep=6 graphs ON (+leak contr
 flock -w 7200 9 && {
   echo "$(date -u +%FT%TZ) dsv41-integrate drop gate window START (lock held) pid=$$" >> $Q
   G=/home/flocka/atlas/dsv41-integration/target/release/examples/dsv41_drop_gate
-  ATLAS_DSV41_PACKED_KEEP=6 $G > $I/drop_gate10.log 2>&1; r1=$?
-  ATLAS_DSV41_PACKED_KEEP=6 $G --control leak > $I/drop_gate10_control.log 2>&1; r2=$?
+  ATLAS_DSV41_GRAPH=1 ATLAS_DSV41_PACKED_KEEP=6 $G > $I/drop_gate10.log 2>&1; r1=$?
+  ATLAS_DSV41_GRAPH=1 ATLAS_DSV41_PACKED_KEEP=6 $G --control leak > $I/drop_gate10_control.log 2>&1; r2=$?
   echo "$(date -u +%FT%TZ) dsv41-integrate drop gate window END rc=$r1,$r2 pid=$$" >> $Q
   flock -u 9; }
 exec 9>&-
