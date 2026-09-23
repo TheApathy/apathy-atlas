@@ -142,9 +142,23 @@ fn read_header(file: &File, path: &Path, layer: u32) -> Result<(i64, i64, u64)> 
 
 /// The engram row-gather tier: one shard per engram layer, read with a batched
 /// thread fan-out.
+///
+/// The fan-out runs on a PERSISTENT pool ([`rayon::ThreadPool`]), not fresh
+/// `std::thread::spawn` calls per gather. A decode step's nsys trace (dsv41-decode,
+/// scratchpad/h2d/plain.nsys-rep) showed the layer-1 gather sitting on the critical
+/// path between CUDA graph segments, and the OS-runtime trace attributed real time to
+/// it: 2770 `pthread_create` (200 ms), 1596 `pthread_join` (1.17 s), 2871 `mmap64` +
+/// 3237 `munmap` (769 ms combined) over the run -- almost entirely the per-thread stack
+/// alloc/dealloc `std::thread::spawn` does on every call (glibc mmaps a fresh stack for
+/// an ad-hoc thread and munmaps it on join; a pool's worker threads keep the same
+/// stack for the process lifetime). `rayon::ThreadPool::scope` gives the same "borrow
+/// the caller's stack data, block until every spawned closure finishes" contract as
+/// `std::thread::scope` did, but dispatches onto already-running workers via rayon's
+/// work-stealing queue instead of asking the kernel for a new thread each time.
 pub struct EngramTier {
     shards: Vec<EngramShard>,
     threads: usize,
+    pool: rayon::ThreadPool,
 }
 
 impl EngramTier {
@@ -166,7 +180,19 @@ impl EngramTier {
                  latency penalty (1 thread measures 20.3 ms/token vs 1.21 ms at 32)"
             );
         }
-        Ok(Self { shards, threads: threads.clamp(1, 512) })
+        let threads = threads.clamp(1, 512);
+        // A DEDICATED pool, not `rayon::ThreadPoolBuilder::build_global()`: this
+        // workload's thread count is tuned specifically for the pread fan-out (128
+        // default, oversubscribing cores on purpose because the reads block in the
+        // kernel), and a dedicated pool keeps that isolated from whatever else in the
+        // process uses rayon's global pool (weight loading, MoE routing, ...) rather
+        // than fighting them for the same worker count.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("engram-io-{i}"))
+            .build()
+            .context("build the engram reader thread pool")?;
+        Ok(Self { shards, threads, pool })
     }
 
     /// Open from a model directory and the safetensors weight map.
@@ -246,29 +272,32 @@ impl EngramTier {
         let fd = shard.fd();
         let (w_off, s_off) = (shard.w_off, shard.s_off);
 
-        // Hand each thread a disjoint, contiguous slice of the output. No locking,
-        // no shared cursor: the whole point is that a thread blocked in `pread`
-        // blocks nothing else.
-        let mut err: Option<String> = None;
-        std::thread::scope(|sc| {
-            let mut handles = Vec::with_capacity(nthreads);
+        // Hand each task a disjoint, contiguous slice of the output. No locking, no
+        // shared cursor: the whole point is that a task blocked in `pread` blocks
+        // nothing else. `self.pool.scope` dispatches onto the tier's persistent
+        // worker threads (see the struct doc) rather than spawning fresh OS threads;
+        // it still borrows `out`/`row_ids` for exactly the scope's duration and
+        // blocks until every spawned closure finishes, same contract as
+        // `std::thread::scope` had.
+        let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        self.pool.scope(|sc| {
             for (t, chunk) in out.chunks_mut(per * ENGRAM_ROW_BYTES).enumerate() {
                 let ids = &row_ids[t * per..(t * per + chunk.len() / ENGRAM_ROW_BYTES)];
-                handles.push(sc.spawn(move || read_chunk(fd, w_off, s_off, ids, chunk)));
-            }
-            for h in handles {
-                match h.join() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        err.get_or_insert(e);
-                    }
-                    Err(_) => {
-                        err.get_or_insert_with(|| "engram reader thread panicked".to_string());
-                    }
-                }
+                let err = &err;
+                sc.spawn(move |_| {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        read_chunk(fd, w_off, s_off, ids, chunk)
+                    }));
+                    let msg = match result {
+                        Ok(Ok(())) => return,
+                        Ok(Err(e)) => e,
+                        Err(_) => "engram reader task panicked".to_string(),
+                    };
+                    err.lock().expect("engram gather error mutex poisoned").get_or_insert(msg);
+                });
             }
         });
-        match err {
+        match err.into_inner().expect("engram gather error mutex poisoned") {
             Some(e) => bail!("{}: {e}", shard.path.display()),
             None => Ok(()),
         }
