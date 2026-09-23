@@ -303,3 +303,52 @@ fn test_top_n_sigma_filters_extreme_outliers() {
         );
     }
 }
+
+// ── Atlas greedy tie rule: FIRST maximal id wins, compared numerically ──────
+//
+// The device reduction (`argmax_bf16.cu`), `argmax_first_wins_f32` and
+// torch.argmax all keep the FIRST id of an exact tie. Every host greedy pick
+// must agree, or plain decode and speculative verify fork on exact BF16 ties
+// (measured on Qwen3.8-27B: " to"/" answer" tied at -0.7212).
+
+fn bf16_bytes(vals: &[f32]) -> Vec<u8> {
+    vals.iter()
+        .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+        .collect()
+}
+
+#[test]
+fn greedy_sampler_breaks_exact_ties_to_the_first_id() {
+    let row = bf16_bytes(&[1.0, 3.0, -2.0, 3.0, 0.5]);
+    let params = SamplingParams::greedy(10);
+    assert_eq!(sample_with_params(&row, &params), 1);
+}
+
+#[test]
+fn argmax_bf16_first_wins_orders_negative_logits_numerically() {
+    // Every logit negative: -1.0 must beat -2.0 even though -2.0's
+    // sign-magnitude bits compare larger as i16.
+    let row = bf16_bytes(&[-8.0, -1.0, -2.0, -8.0]);
+    assert_eq!(argmax_bf16_first_wins(&row, |_| true), Some(1));
+}
+
+#[test]
+fn argmax_bf16_first_wins_keeps_the_first_of_an_exact_tie() {
+    let row = bf16_bytes(&[1.0, 3.0, -2.0, 3.0]);
+    assert_eq!(argmax_bf16_first_wins(&row, |_| true), Some(1));
+}
+
+#[test]
+fn argmax_bf16_first_wins_treats_signed_zeros_as_equal() {
+    // -0.0 == +0.0 numerically: the first one wins, whichever sign it has.
+    let row = bf16_bytes(&[-8.0, -0.0, 0.0, -8.0]);
+    assert_eq!(argmax_bf16_first_wins(&row, |_| true), Some(1));
+}
+
+#[test]
+fn argmax_bf16_first_wins_honours_the_admit_filter_and_skips_nan() {
+    let row = bf16_bytes(&[f32::NAN, 5.0, 4.0, 4.0]);
+    assert_eq!(argmax_bf16_first_wins(&row, |id| id != 1), Some(2));
+    assert_eq!(argmax_bf16_first_wins(&row, |id| id == 0), None);
+    assert_eq!(argmax_bf16_first_wins(&row, |_| false), None);
+}

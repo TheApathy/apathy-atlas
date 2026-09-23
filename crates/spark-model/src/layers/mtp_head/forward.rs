@@ -456,20 +456,11 @@ impl MtpHead {
             // Grammar-masked CPU argmax path — single fused pass.
             //
             // D2H the BF16 logits, then walk the vocab ONCE: for each token,
-            // skip when the bitmask bit is clear, else compare BF16 values
-            // directly (as u16) to track argmax. This replaces three
-            // sequential vocab-sized passes (BF16→f32, mask apply, argmax)
-            // with one — roughly 3x less memory traffic and zero scratch
-            // allocations beyond the D2H buffer.
-            //
-            // We avoid the BF16→f32 conversion entirely: BF16 ordering on
-            // finite values matches the integer ordering of its u16 bit
-            // pattern when both signs are positive, and for argmax we only
-            // care about the largest finite value (NaN propagation is moot —
-            // softmax over masked logits would discard them anyway). The
-            // logit field on a healthy LM is dominated by positives in the
-            // mid-range; we handle the rare negative-only case by tracking
-            // a signed comparison fallback when we encounter a leading bit.
+            // skip when the bitmask bit is clear, else convert in-register and
+            // track the argmax. This replaces three sequential vocab-sized
+            // passes (BF16→f32, mask apply, argmax) with one — roughly 3x less
+            // memory traffic and zero scratch allocations beyond the D2H
+            // buffer.
             //
             // We then H2D the chosen token id into `out_ptr` so the
             // downstream `embed_from_argmax` kernel can still gather the
@@ -482,46 +473,16 @@ impl MtpHead {
             let mut bf16_buf = vec![0u8; vocab * 2];
             ctx.gpu.copy_d2h(logits, &mut bf16_buf)?;
 
-            let bytes: &[u8] = &bf16_buf;
-            // SAFETY: bf16_buf is exactly vocab * 2 bytes, aligned to 1
-            // (Vec<u8>). u16 read needs 2-byte alignment — we use
-            // `read_unaligned` via from_le_bytes so this is sound regardless.
-            // BF16 representation: bit 15 sign, 14..7 exponent, 6..0 mantissa.
-            // For two finite same-sign BF16 values, ordering matches the
-            // signed integer ordering of the bit pattern reinterpreted as i16.
-            // For mixed signs, the negative value is always smaller — so we
-            // can treat the comparison as i16-signed for a total order over
-            // finite values.
+            // Shared first-wins greedy pick over the allowed ids (the device
+            // argmax's tie rule); f32 comparison orders negative logits
+            // numerically.
+            let picked = spark_runtime::sampler::argmax_bf16_first_wins(&bf16_buf, |tok| {
+                let (word, bit) = ((tok / 32) as usize, tok % 32);
+                word < bitmask.len() && (bitmask[word] & (1i32 << bit)) != 0
+            });
+            let any_allowed = picked.is_some();
+            let best_tok = picked.unwrap_or(0);
 
-            let mut best_tok: u32 = 0;
-            let mut best_val: i16 = i16::MIN;
-            let mut any_allowed = false;
-            for tok in 0..vocab {
-                let word = tok / 32;
-                let bit = tok % 32;
-                if word >= bitmask.len() || (bitmask[word] & (1i32 << bit)) == 0 {
-                    continue;
-                }
-                any_allowed = true;
-                let hi = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]);
-                // Reinterpret BF16 bit pattern as signed i16 for ordering.
-                // This is correct for all finite BF16 values: a more positive
-                // (less negative) BF16 has a larger signed-i16 representation.
-                let signed = hi as i16;
-                if signed > best_val {
-                    best_val = signed;
-                    best_tok = tok as u32;
-                }
-            }
-
-            // Degenerate case: matcher gave us an empty allowed set. Don't
-            // propose a real draft — return 0 (pad) as a sentinel. The
-            // verifier almost certainly returns a non-zero target token, the
-            // draft gets rejected, and the step falls through to target-only
-            // decode. This is safer than re-emitting `last_token`, which
-            // could be a special token (e.g. `<|im_end|>`) that the verifier
-            // might happen to also pick — duplicating a role-boundary
-            // token would poison the model's own context.
             if !any_allowed {
                 tracing::warn!(
                     "MTP grammar mask allowed zero tokens at pos {position}; \
