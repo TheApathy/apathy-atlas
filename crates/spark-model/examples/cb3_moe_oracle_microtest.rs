@@ -399,12 +399,20 @@ fn main() -> Result<()> {
     );
     ensure!(taken >= 1_700_000_000, "loading one layer took only {taken} bytes — the check cannot see a leak");
     // Cycles 2..=6. BAND (ruled by the lead from 6 runs of noise data, before any new run):
-    // over cycles 3-6, |cumulative drift| <= 0.2 GB AND mean returned >= 99%. free_memory on
+    // over cycles 3-6, |cumulative drift| <= 0.2 GB AND MEDIAN returned >= 99%. free_memory on
     // GB10 is system-wide unified memory and moves +-0.1 GB per cycle with other processes, so
     // a per-cycle band of 0.05 GB failed non-leaking runs in BOTH directions; a real leak here
     // is -1.8 GB per cycle (-7.2 GB cumulative), > 30x outside this band.
+    // FINAL REVISION (lead, 2026-09-23), from 10 runs in one window of which 4 failed the
+    // mean-based band on noise, identically on two kernels: 3 had one cycle whose load
+    // "took" only 1.39-1.58 GB (a concurrent release inside the cycle; the next cycle
+    // returned 133-150%), 1 had mean returned 98.1% (97.6/101.5/97.0 per cycle). So: the
+    // median, not the mean, and a cycle that cannot see a leak is SKIPPED and logged — once;
+    // a second such cycle still aborts. The drift telescopes, so a skipped cycle's transient
+    // cancels in it.
     let mut prev_after = free_after;
     let (mut cum_drift, mut returned_pct): (i64, Vec<f64>) = (0, Vec::new());
+    let mut skipped: Option<usize> = None;
     for cycle in 2..=6 {
         let before = gpu.free_memory()? as i64;
         let arena = Arc::new(if leak_control {
@@ -428,20 +436,37 @@ fn main() -> Result<()> {
             100.0 * gave as f64 / took.max(1) as f64,
             drift as f64 / 1e9
         );
-        ensure!(took >= 1_700_000_000, "cycle {cycle} took only {took} bytes — the check cannot see a leak");
+        let blind = took < 1_700_000_000;
+        if blind {
+            ensure!(
+                skipped.is_none(),
+                "cycle {cycle} took only {took} bytes, the second such cycle — the check cannot see a leak"
+            );
+            println!("  ownership cycle {cycle}: SKIPPED — took only {:.3} GB, memory moved under the cycle", took as f64 / 1e9);
+            skipped = Some(cycle);
+        }
         if cycle >= 3 {
             cum_drift += drift;
-            returned_pct.push(100.0 * gave as f64 / took.max(1) as f64);
+            if !blind {
+                returned_pct.push(100.0 * gave as f64 / took.max(1) as f64);
+            }
         }
         prev_after = after;
     }
-    let mean_returned = returned_pct.iter().sum::<f64>() / returned_pct.len() as f64;
+    returned_pct.sort_by(|a, b| a.total_cmp(b));
+    let n = returned_pct.len();
+    let median_returned = if n % 2 == 1 {
+        returned_pct[n / 2]
+    } else {
+        (returned_pct[n / 2 - 1] + returned_pct[n / 2]) / 2.0
+    };
     println!(
-        "  ownership band (cycles 3-6): cumulative drift {:+.3} GB (|.| <= 0.2), mean returned {mean_returned:.1}% (>= 99)",
+        "  ownership band (cycles 3-6{}): cumulative drift {:+.3} GB (|.| <= 0.2), median returned {median_returned:.1}% (>= 99)",
+        skipped.map(|c| format!(", cycle {c} skipped")).unwrap_or_default(),
         cum_drift as f64 / 1e9
     );
     ensure!(cum_drift.abs() <= 200_000_000, "cycles 3-6: cumulative drift {cum_drift} bytes — memory accumulates");
-    ensure!(mean_returned >= 99.0, "cycles 3-6: mean returned {mean_returned:.1}% < 99%");
+    ensure!(median_returned >= 99.0, "cycles 3-6: median returned {median_returned:.1}% < 99%");
 
     if control != MoeControl::None {
         let floor = TOL * MIN_SEPARATION;

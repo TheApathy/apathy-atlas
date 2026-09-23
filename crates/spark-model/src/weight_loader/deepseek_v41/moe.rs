@@ -267,14 +267,13 @@ pub const FUSED_GATE_UP_FN: &str = "cb3_moe_gate_up";
 /// Down projection -> fp32 rows.
 pub const FUSED_DOWN_FN: &str = "cb3_moe_down";
 /// Rows per M tile of the fused kernels (`BM` in the .cu). N must divide by
-/// [`FUSED_TILE_N`], K by 64.
+/// [`FUSED_TILE_N`], K by 128 (a pair of BK steps).
 pub const FUSED_TILE_M: usize = 128;
 pub const FUSED_TILE_N: usize = 64;
-/// Mainloop shared-memory stages of the fused CB3 kernels (`CB3_MOE_STAGES` in the .cu).
-pub const FUSED_STAGES: u32 = 1;
-/// Dynamic shared memory per launch: a stage is 32 KB for gate/up, 24 KB for down.
-pub const FUSED_GATE_UP_SMEM: u32 = FUSED_STAGES * 32_768;
-pub const FUSED_DOWN_SMEM: u32 = FUSED_STAGES * 24_576;
+/// Dynamic shared memory per launch of the fused CB3 kernels: one 32 KB (gate/up) or
+/// 24 KB (down) mainloop stage.
+pub const FUSED_GATE_UP_SMEM: u32 = 32_768;
+pub const FUSED_DOWN_SMEM: u32 = 24_576;
 
 
 /// Bytes of bf16 scratch one expert's reconstruct needs, for all three matrices at once.

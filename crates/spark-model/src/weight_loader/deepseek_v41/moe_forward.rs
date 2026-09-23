@@ -255,8 +255,8 @@ impl Cb3RoutedMoe {
         }
         let decode = if moe_decode::enabled() { Some(MoeDecode::new(&shared, &arena, &routers)?) } else { None };
         ensure!(
-            inter % FUSED_TILE_N == 0 && hidden % FUSED_TILE_N == 0 && inter % 64 == 0 && hidden % 64 == 0,
-            "fused CB3 GEMM needs N % {FUSED_TILE_N} == 0 and K % 64 == 0 (one BK step) (hidden {hidden}, inter {inter})"
+            inter % FUSED_TILE_N == 0 && hidden % FUSED_TILE_N == 0 && inter % 128 == 0 && hidden % 128 == 0,
+            "fused CB3 GEMM needs N % {FUSED_TILE_N} == 0 and K % 128 == 0 (a pair of BK steps) (hidden {hidden}, inter {inter})"
         );
         let e = max_t * TOP_K;
         // Every group contributes ceil(rows / BM) tiles: at most e / BM + one partial per expert.

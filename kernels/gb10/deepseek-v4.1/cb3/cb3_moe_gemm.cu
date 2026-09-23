@@ -65,6 +65,9 @@
 //     T=2048 28.84 -> 27.23, T=128 12.93 -> 12.45, T=4096 47.03 -> 44.09.
 //   - Also measured and rejected: spreading the MMAs over live 16-row fragments so small tiles
 //     use more warps (barrier stall 4.26 -> 2.36 but +20% instructions, 9-14% slower).
+//   - Each row's plane words for a PAIR of K steps (lo 32 B + hi 16 B + 4 scale bytes) loaded
+//     once into registers, prefetched two steps ahead: T=2048 27.20 -> 26.84, T=512
+//     16.57 -> 16.05, T=128 12.44 -> 12.02, T=4096 44.23 -> 43.45 (174 registers, 1 CTA/SM).
 // Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
 
 #include <cstdint>
@@ -109,22 +112,41 @@ __device__ __forceinline__ uint32_t bf16_bits(float v) {
     return (uint32_t)(*reinterpret_cast<const unsigned short*>(&b));
 }
 
-/// The packed bytes one thread needs for one (row, 32-weight group): fetched one K step
-/// AHEAD so the global loads are in flight during the MMAs of the current step.
+/// The packed bytes one thread decodes for one (row, 32-weight group).
 struct Raw {
     uint4 lo;
     uint4 hi;
     uint32_t sc;
 };
 
-__device__ __forceinline__ Raw fetch_group(const Cb3Planes& p, long long n, int k0, int K) {
+/// One row's plane bytes for a PAIR of K steps (k0 % 128 == 0): the 32 lo bytes, the 16 hi
+/// bytes and the 4 scale bytes that both steps' two groups use, each loaded exactly once and
+/// kept in registers, so no plane byte depends on L1 surviving from one K step to the next.
+struct RawPair {
+    uint4 lo0, lo1;
+    uint4 hi;
+    uint32_t sc4;
+};
+
+__device__ __forceinline__ RawPair fetch_pair(const Cb3Planes& p, long long n, int k0, int K) {
     const int block = k0 / 512;
-    const int g = (k0 % 512) / 32;
-    Raw r;
-    r.lo = *reinterpret_cast<const uint4*>(p.lo + n * (K / 4) + block * 128 + (g / 2) * 16);
+    const int g = (k0 % 512) / 32;  // a multiple of 4
+    const uint8_t* lo = p.lo + n * (K / 4) + block * 128 + (g / 2) * 16;
+    RawPair r;
+    r.lo0 = *reinterpret_cast<const uint4*>(lo);
+    r.lo1 = *reinterpret_cast<const uint4*>(lo + 16);
     r.hi = *reinterpret_cast<const uint4*>(p.hi + n * (K / 8) + block * 64 + (g / 4) * 16);
-    r.sc = p.sc[n * (K / 32) + k0 / 32];
+    r.sc4 = *reinterpret_cast<const uint32_t*>(p.sc + n * (K / 32) + k0 / 32);
     return r;
+}
+
+/// Group `dgrp` of step `step` (0/1) of a pair.
+__device__ __forceinline__ Raw pick(const RawPair& r, int step, int dgrp) {
+    Raw x;
+    x.lo = step ? r.lo1 : r.lo0;
+    x.hi = r.hi;
+    x.sc = (r.sc4 >> (8 * (2 * step + dgrp))) & 0xFFu;
+    return x;
 }
 
 __device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
@@ -312,15 +334,11 @@ __device__ __forceinline__ void load_b(uint32_t (&b)[2][4], const uint4* s_w, in
 constexpr int ROW_U4 = BK / 8;
 constexpr int GU_STAGE = (BM + 2 * BN) * ROW_U4;  // 2048 uint4 = 32 KB
 constexpr int DN_STAGE = (BM + BN) * ROW_U4;      // 1536 uint4 = 24 KB
-#ifndef CB3_MOE_STAGES
-#define CB3_MOE_STAGES 1
-#endif
-constexpr int STAGES = CB3_MOE_STAGES;
 
 }  // namespace
 
-// Dynamic shared memory the launcher passes: STAGES x 32 KB (gate/up), STAGES x 24 KB (down)
-// — moe.rs FUSED_GATE_UP_SMEM / FUSED_DOWN_SMEM.
+// Dynamic shared memory the launcher passes: 32 KB (gate/up), 24 KB (down) — moe.rs
+// FUSED_GATE_UP_SMEM / FUSED_DOWN_SMEM. One stage on purpose: see "L1 IS THE LEVER" above.
 static_assert(GU_STAGE * 16 == 32768 && DN_STAGE * 16 == 24576, "keep moe.rs smem sizes in sync");
 
 /// Gate + up + SwiGLU for one (expert tile, N tile):
@@ -364,7 +382,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
     const int dgrp = threadIdx.x % 2;
     const long long dn = n0 + drow;
     const RowTable tab = row_table(*reinterpret_cast<const uint2*>(mine.cb + dn * 8));
-    Raw raw = fetch_group(mine, dn, dgrp * 32, K);
+    RawPair cur = fetch_pair(mine, dn, 0, K);
     uint4 a_reg[ACT_CHUNKS];
     fetch_act(act, row_begin, rows, 0, K, a_reg);
 
@@ -379,45 +397,22 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
             ATLAS_CB3_MMA_32x32(acc_u, a, b3)
         }
     };
-    if (STAGES == 1) {
-        for (int k0 = 0; k0 < K; k0 += BK) {
+    for (int k0 = 0; k0 < K; k0 += 2 * BK) {
+        RawPair nxt = cur;
+#pragma unroll
+        for (int step = 0; step < 2; ++step) {
+            const int ks = k0 + step * BK;
             store_act(a_reg, smem);
-            decode_group_swz(raw, tab, k0 + dgrp * 32, smem + mine_off, drow, dgrp);
+            decode_group_swz(pick(cur, step, dgrp), tab, ks + dgrp * 32, smem + mine_off, drow, dgrp);
             __syncthreads();
-            if (k0 + BK < K) {
-                // Next step's loads go out now and land during this step's MMAs.
-                raw = fetch_group(mine, dn, k0 + BK + dgrp * 32, K);
-                fetch_act(act, row_begin, rows, k0 + BK, K, a_reg);
-            }
+            // Next loads go out now and land during the MMAs: the plane pair two steps
+            // ahead, the activations one step ahead.
+            if (step == 0 && k0 + 2 * BK < K) nxt = fetch_pair(mine, dn, k0 + 2 * BK, K);
+            if (ks + BK < K) fetch_act(act, row_begin, rows, ks + BK, K, a_reg);
             if (live) mma_step(smem);
             __syncthreads();
         }
-    } else {
-        // Two stages: step k's MMAs read one while step k+1 is decoded into the other, so a
-        // step needs one barrier and each warp's decode issues behind its own HMMAs.
-        store_act(a_reg, smem);
-        decode_group_swz(raw, tab, dgrp * 32, smem + mine_off, drow, dgrp);
-        if (BK < K) {
-            raw = fetch_group(mine, dn, BK + dgrp * 32, K);
-            fetch_act(act, row_begin, rows, BK, K, a_reg);
-        }
-        __syncthreads();
-        int cur = 0;
-        for (int k0 = 0; k0 < K; k0 += BK) {
-            if (live) mma_step(smem + cur * GU_STAGE);
-            const int kn = k0 + BK;
-            if (kn < K) {
-                uint4* nxt = smem + (cur ^ 1) * GU_STAGE;
-                store_act(a_reg, nxt);
-                decode_group_swz(raw, tab, kn + dgrp * 32, nxt + mine_off, drow, dgrp);
-                if (kn + BK < K) {
-                    raw = fetch_group(mine, dn, kn + BK + dgrp * 32, K);
-                    fetch_act(act, row_begin, rows, kn + BK, K, a_reg);
-                }
-            }
-            __syncthreads();
-            cur ^= 1;
-        }
+        cur = nxt;
     }
 
     // Epilogue straight from the accumulators: gate and up share the fragment layout, so the
@@ -485,10 +480,10 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_down(
     const long long dn = n0 + drow;
     constexpr int W_OFF = BM * ROW_U4;
     RowTable tab{};
-    Raw raw{};
+    RawPair cur{};
     if (decoder) {
         tab = row_table(*reinterpret_cast<const uint2*>(p2.cb + dn * 8));
-        raw = fetch_group(p2, dn, dgrp * 32, K);
+        cur = fetch_pair(p2, dn, 0, K);
     }
     uint4 a_reg[ACT_CHUNKS];
     fetch_act(h, row_begin, rows, 0, K, a_reg);
@@ -502,42 +497,20 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_down(
             ATLAS_CB3_MMA_32x32(acc, a, b)
         }
     };
-    if (STAGES == 1) {
-        for (int k0 = 0; k0 < K; k0 += BK) {
+    for (int k0 = 0; k0 < K; k0 += 2 * BK) {
+        RawPair nxt = cur;
+#pragma unroll
+        for (int step = 0; step < 2; ++step) {
+            const int ks = k0 + step * BK;
             store_act(a_reg, smem);
-            if (decoder) decode_group_swz(raw, tab, k0 + dgrp * 32, smem + W_OFF, drow, dgrp);
+            if (decoder) decode_group_swz(pick(cur, step, dgrp), tab, ks + dgrp * 32, smem + W_OFF, drow, dgrp);
             __syncthreads();
-            if (k0 + BK < K) {
-                if (decoder) raw = fetch_group(p2, dn, k0 + BK + dgrp * 32, K);
-                fetch_act(h, row_begin, rows, k0 + BK, K, a_reg);
-            }
+            if (decoder && step == 0 && k0 + 2 * BK < K) nxt = fetch_pair(p2, dn, k0 + 2 * BK, K);
+            if (ks + BK < K) fetch_act(h, row_begin, rows, ks + BK, K, a_reg);
             if (live) mma_step(smem);
             __syncthreads();
         }
-    } else {
-        store_act(a_reg, smem);
-        if (decoder) decode_group_swz(raw, tab, dgrp * 32, smem + W_OFF, drow, dgrp);
-        if (BK < K) {
-            if (decoder) raw = fetch_group(p2, dn, BK + dgrp * 32, K);
-            fetch_act(h, row_begin, rows, BK, K, a_reg);
-        }
-        __syncthreads();
-        int cur = 0;
-        for (int k0 = 0; k0 < K; k0 += BK) {
-            if (live) mma_step(smem + cur * DN_STAGE);
-            const int kn = k0 + BK;
-            if (kn < K) {
-                uint4* nxt = smem + (cur ^ 1) * DN_STAGE;
-                store_act(a_reg, nxt);
-                if (decoder) decode_group_swz(raw, tab, kn + dgrp * 32, nxt + W_OFF, drow, dgrp);
-                if (kn + BK < K) {
-                    if (decoder) raw = fetch_group(p2, dn, kn + BK + dgrp * 32, K);
-                    fetch_act(h, row_begin, rows, kn + BK, K, a_reg);
-                }
-            }
-            __syncthreads();
-            cur ^= 1;
-        }
+        cur = nxt;
     }
 
     if (!live) return;
