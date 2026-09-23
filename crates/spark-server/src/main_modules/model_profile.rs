@@ -189,6 +189,7 @@ pub(crate) fn apply_env(profile: &ModelProfile) -> Vec<(String, String)> {
         if std::env::var_os(k).is_none() {
             // SAFETY: see the function doc — serialized by the swap guard, after the drain.
             unsafe { std::env::set_var(k, v) };
+            super::swap_env::record_profile_set(k, v);
             set.push((k.clone(), v.clone()));
         }
     }

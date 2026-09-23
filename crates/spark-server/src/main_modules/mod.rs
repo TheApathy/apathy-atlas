@@ -18,6 +18,7 @@ pub(crate) mod serve_load;
 pub(crate) mod serve_phases;
 mod serve_router;
 mod serve_shutdown;
+pub(crate) mod swap_env;
 
 #[cfg(test)]
 mod tests;

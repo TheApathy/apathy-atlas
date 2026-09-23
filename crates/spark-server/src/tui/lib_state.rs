@@ -394,8 +394,13 @@ impl LibState {
             .map_err(|e| problem_line(&format!("{e:#}")))?;
         // A checkpoint listed from `ATLAS_MODEL_DIRS` is named by its DIRECTORY, which the
         // model resolver cannot find from anywhere but that root. Serve its path instead.
+        // The same command line as argv, for a swap that has to re-exec (`swap_env`).
+        let mut argv = recipe
+            .argv_edited(&self.overrides, &self.removed)
+            .map_err(|e| problem_line(&format!("{e:#}")))?;
         if let Some(path) = local_model_path(&recipe.model, self.current().and_then(|e| e.local.as_ref())) {
             args.model = Some(path.to_string_lossy().into_owned());
+            argv[2] = path.to_string_lossy().into_owned();
         }
 
         let host = host.clone();
@@ -408,7 +413,7 @@ impl LibState {
                 // pane the user may never scroll to, while the load pill sits
                 // on LOADING forever. Dropping the sender on success is what
                 // `poll_launch` reads as "it worked".
-                if let Err(e) = crate::main_modules::model_swap::swap(&host, args) {
+                if let Err(e) = crate::main_modules::model_swap::swap_with(&host, args, Some(argv)) {
                     let _ = tx.send(format!("{e:#}"));
                 }
             })

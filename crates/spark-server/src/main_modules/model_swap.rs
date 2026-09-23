@@ -33,7 +33,9 @@
 //! | Bad argv / missing checkpoint / no kernels for   | **Nothing released.** Old model still serving. |
 //! | the model / shutting down / multi-rank          | |
 //! | A leaked `Arc<AppState>` outlives the drain      | **Refused, transactionally.** Model put back, still serving. |
-//! | New model fails to load                          | **Old argv reloaded automatically** into memory its own teardown just freed. Returns `Err`. |
+//! | New model needs an environment this process has  | **Nothing released** when re-exec is unavailable (`swap_env`). |
+//! | latched otherwise                                | |
+//! | New model fails to load, or its re-exec fails    | **Old argv reloaded automatically** into memory its own teardown just freed. Returns `Err`. |
 //! | New model fails AND restore fails                | **NOT RECOVERABLE.** No model loaded, 503s, error names both failures. |
 //! | Scheduler thread panics during drain             | **NOT RECOVERABLE.** Returns before loading; no model. |
 //!
@@ -250,6 +252,18 @@ fn signal_listener_phases(host: &Arc<ModelHost>) {
 ///
 /// Blocking — it loads a model. Call it off the runtime.
 pub(crate) fn swap(host: &Arc<ModelHost>, next: cli::ServeArgs) -> Result<SwapOutcome> {
+    swap_with(host, next, None)
+}
+
+/// [`swap`], able to re-exec: `recipe_argv` is the `spark serve` argv `next` was parsed from.
+/// When the new model needs an environment this process has already latched otherwise (see
+/// `swap_env`), the outgoing model is drained and released and the process is replaced by
+/// one started with that argv. Without it such a swap is refused before anything is released.
+pub(crate) fn swap_with(
+    host: &Arc<ModelHost>,
+    next: cli::ServeArgs,
+    recipe_argv: Option<Vec<String>>,
+) -> Result<SwapOutcome> {
     // Serialised HERE, not at one call site. Two swaps at once both call
     // `ModelHost::take`; the second gets `None`, mistakes it for a modelless
     // boot, and loads a second model onto a GPU that is already loading one.
@@ -349,6 +363,30 @@ pub(crate) fn swap(host: &Arc<ModelHost>, next: cli::ServeArgs) -> Result<SwapOu
         );
     }
 
+    // Env-on-swap: decided HERE, before anything is released. In-process when the new model's
+    // environment is compatible with what this process may have latched; a clean process
+    // (re-exec) when it is not; refused when re-exec is unavailable.
+    let conflicts = super::swap_env::swap_conflicts(profile.as_ref(), previous_args.is_some());
+    let reexec = if conflicts.is_empty() {
+        tracing::info!("swap: in-process (no latched-environment conflict)");
+        None
+    } else {
+        let recipe = profile.as_ref().map_or("the new model", |p| p.recipe_id.as_str());
+        let Some(argv) = recipe_argv else {
+            return Err(super::swap_env::refusal(recipe, &conflicts, "This caller cannot re-exec"));
+        };
+        if !super::swap_env::reexec_enabled() {
+            return Err(super::swap_env::refusal(
+                recipe,
+                &conflicts,
+                "Re-exec is disabled (ATLAS_SWAP_REEXEC=0)",
+            ));
+        }
+        let list: Vec<String> = conflicts.iter().map(ToString::to_string).collect();
+        tracing::warn!("swap: re-exec for {recipe}, environment conflicts: {}", list.join(", "));
+        Some(argv)
+    };
+
     // The policy the host has held since boot. NOT rebuilt from `next`: a
     // recipe's argv must not be able to drop `--require-auth` from a server
     // that was started with it.
@@ -414,18 +452,29 @@ pub(crate) fn swap(host: &Arc<ModelHost>, next: cli::ServeArgs) -> Result<SwapOu
     let admitted = match profile.as_ref() {
         None => Ok(()),
         Some(p) => {
-            let set = super::model_profile::apply_env(p);
-            if !set.is_empty() {
-                tracing::info!("{}: launch environment {:?}", p.recipe_id, set);
+            // A re-exec hands the environment to the new process instead.
+            if reexec.is_none() {
+                let set = super::model_profile::apply_env(p);
+                if !set.is_empty() {
+                    tracing::info!("{}: launch environment {:?}", p.recipe_id, set);
+                }
             }
-            let dspark_on = std::env::var("ATLAS_DSV41_DSPARK").is_ok_and(|v| v == "1");
+            let dspark_on = std::env::var("ATLAS_DSV41_DSPARK")
+                .ok()
+                .or_else(|| p.env.get("ATLAS_DSV41_DSPARK").cloned())
+                .is_some_and(|v| v == "1");
             super::model_profile::mem_available_bytes()
                 .and_then(|available| super::model_profile::admit(p, available, dspark_on))
         }
     };
-    let load_result = match admitted {
-        Ok(()) => load_model(next, tui_handles_tx.clone(), carried.clone(), auth.clone()),
-        Err(e) => Err(e),
+    let load_result = match (admitted, reexec) {
+        (Err(e), _) => Err(e),
+        // Returns only if the exec failed; the restore below then reloads the previous model.
+        (Ok(()), Some(argv)) => {
+            let empty = std::collections::BTreeMap::new();
+            Err(super::swap_env::exec(&argv, profile.as_ref().map_or(&empty, |p| &p.env)))
+        }
+        (Ok(()), None) => load_model(next, tui_handles_tx.clone(), carried.clone(), auth.clone()),
     };
     let load_err = match load_result {
         Ok(Some(prepared)) => {
