@@ -13,8 +13,9 @@ use anyhow::{ensure, Result};
 
 use super::dspark::B;
 
-/// Verify all B drafts at least once every PROBE steps.
-const PROBE: usize = 16;
+/// Verify all B drafts at least once every PROBE steps (16 cost ~1% on chat in k124v: each probe
+/// is a ~40 ms longer step).
+const PROBE: usize = 32;
 /// Per-step decay of the hit/trial counts (an effective window of ~20 steps).
 const DECAY: f64 = 0.95;
 /// Prior mean of each c_i and its weight in pseudo-trials. Chosen by replaying the measured

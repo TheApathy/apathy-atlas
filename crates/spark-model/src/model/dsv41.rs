@@ -358,7 +358,8 @@ impl Model for Dsv41Model {
         self.dspark.is_some()
     }
 
-    fn spec_verify(&self, token: u32, seq: &mut SequenceState, sampling: Option<&crate::traits::SpecSampling>, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
+    fn spec_verify(&self, token: u32, seq: &mut SequenceState, sampling: Option<&crate::traits::SpecSampling>, verify_drafts: Option<usize>, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
+        let k = verify_drafts.unwrap_or(crate::weight_loader::deepseek_v41::dspark::B);
         let ds = self.dspark.as_ref().context("dsv41 spec_verify: DSpark is not loaded")?;
         let ops = self.ops();
         let l = &self.lanes;
@@ -381,7 +382,7 @@ impl Model for Dsv41Model {
             };
             *self.spec_sampled.lock().expect("dsv41 spec sampled poisoned") = draft_sampling.as_ref().is_some_and(|(t, _)| *t > 0.0);
             ds.set_draft_sampling(draft_sampling);
-            let (drafts, _a, am) = ds.propose_verify(&ops, &self.fwd, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits)?;
+            let (drafts, _a, am) = ds.propose_verify(&ops, &self.fwd, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits, k)?;
             Ok(Some((drafts, am)))
         })?;
         if let Some((drafts, _)) = &r {

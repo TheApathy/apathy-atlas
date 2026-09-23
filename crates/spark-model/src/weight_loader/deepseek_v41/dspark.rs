@@ -300,10 +300,11 @@ impl Dspark {
         Ok((v[0] as usize, v[1..=k + 1].to_vec()))
     }
 
-    /// The first half of a step: draft B tokens after `tok` and run the verify pass over
-    /// [tok, d1..dB] at position `seq.len` (T_VERIFY rows of logits in `logits`). Returns the
-    /// drafts, the greedy accept count and the argmax of every verify row. `seq` holds the
-    /// T_VERIFY verify positions until [`Dspark::commit`] rolls it back to the accepted prefix.
+    /// The first half of a step: draft B tokens after `tok` and run the verify pass over the
+    /// first `k` of them, [tok, d1..dk], at position `seq.len` (k + 1 rows of logits in `logits`).
+    /// Returns the k verified drafts, the greedy accept count and the argmax of every verify row.
+    /// `seq` holds the k + 1 verify positions until [`Dspark::commit`] rolls it back to the
+    /// accepted prefix.
     #[allow(clippy::too_many_arguments)]
     pub fn propose_verify(
         &self,
@@ -316,14 +317,17 @@ impl Dspark {
         main_moe: &dyn V41RoutedMoe,
         tap: &Tap,
         logits: DevicePtr,
+        k: usize,
     ) -> Result<(Vec<u32>, usize, Vec<u32>)> {
+        ensure!((1..=B).contains(&k), "DSpark propose_verify over {k} drafts");
         let pos = seq.len;
-        let drafts = self.draft(ops, fwd, tok, pos, tap)?;
-        let mut block_ids = Vec::with_capacity(T_VERIFY);
+        let mut drafts = self.draft(ops, fwd, tok, pos, tap)?;
+        drafts.truncate(k);
+        let mut block_ids = Vec::with_capacity(k + 1);
         block_ids.push(tok);
         block_ids.extend_from_slice(&drafts);
         fwd.verify(ops, seq, &block_ids, hook, core, main_moe, tap, logits)?;
-        let (a, am) = self.accept(ops, logits, B)?;
+        let (a, am) = self.accept(ops, logits, k)?;
         Ok((drafts, a, am))
     }
 
