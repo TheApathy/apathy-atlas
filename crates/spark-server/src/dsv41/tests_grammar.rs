@@ -202,7 +202,7 @@ fn dump_value_masks_for_range_fix() {
         &qwen,
         248046,
         &move |e| {
-            e.compile_qwen3_coder_tool_grammar(&[t1.clone()], false, "</parameter>")
+            e.compile_qwen3_coder_tool_grammar(&[t1.clone()], false)
                 .unwrap()
         },
         "<tool_call>\n<function=write_file>\n<parameter=path>\nx",
