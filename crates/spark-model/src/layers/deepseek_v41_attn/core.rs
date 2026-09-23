@@ -34,6 +34,7 @@ use super::index::{CandidateMask, INDEX_HEAD_DIM, INDEX_HEADS, INDEX_TOPK, Index
 use crate::weight_loader::deepseek_v41::attn_block::{AttnCore, CoreArgs, RING, WINDOW};
 use crate::weight_loader::deepseek_v41::device_allocs::{DeviceAllocs, SharedGpu};
 use crate::weight_loader::deepseek_v41::forward::{PassHook, PassKind};
+use crate::weight_loader::deepseek_v41::fwd::Tap;
 use crate::weight_loader::deepseek_v41::ops::{FWD_MODULE, Fp8Linear, Ops, RopeTable, bf16_tensor};
 
 /// Kernel module compiled from `cb3/dsv41_sparse_attn.cu`.
@@ -64,6 +65,8 @@ const CANDIDATE_BLOCK_SIZE: usize = 8;
 /// rows (`v41_ref.mm`), because cuBLAS picks its algorithm from M. Measured: with M = chunk
 /// length, re-chunking the same prompt changed L20's replay-tail top-k on 19 of 128 rows.
 const MM_TILE: usize = 16;
+/// `index_score_rows` tap: every this-many-th row of a pass (check_topk_overlap.py SAMPLE).
+const TAP_ROW_STRIDE: usize = 64;
 
 /// Bytes of the ONE fp32 score scratch all index layers share: `[rows, n_pad(max_seq)]`, rows =
 /// [`score_rows_per_block`] (the whole chunk up to ~200K context; 224 rows at 1M). Layers >= 20 run
@@ -192,6 +195,10 @@ struct Scratch {
     pad_out: DevicePtr,
     /// Static decode: the pass's index-key rows before they are published `[DECODE_MAX_T, 128]`.
     iks: DevicePtr,
+    /// TAPS: every TAP_ROW_STRIDE-th score row of the pass `[ceil(max_chunk / 64), n_pad]` fp32
+    /// (`ATLAS_DSV41_TAP_INDEX_SCORE=1` at load, else NULL), and a small host-value buffer.
+    tap_rows: DevicePtr,
+    tap_val: DevicePtr,
 }
 
 /// Mutable per-sequence / per-pass state.
@@ -217,6 +224,9 @@ struct SeqState {
     /// replay), and whether the core has written its own copy for the current pass otherwise.
     dstart_ext: Option<DevicePtr>,
     dstart_written: bool,
+    /// TAPS: the last indexer's score width and n_c (what `taps` dumps for that layer).
+    tap_ld: usize,
+    tap_n_c: usize,
 }
 
 #[derive(Default)]
@@ -438,6 +448,12 @@ impl Dsv41SparseCore {
             pad_in: alloc(MM_TILE * HIDDEN * 4)?,
             pad_out: alloc(MM_TILE * INDEX_HEADS * INDEX_HEAD_DIM * 4)?,
             iks: alloc(DECODE_MAX_T * INDEX_HEAD_DIM * 2)?,
+            tap_rows: if std::env::var("ATLAS_DSV41_TAP_INDEX_SCORE").as_deref() == Ok("1") {
+                alloc(max_chunk.div_ceil(TAP_ROW_STRIDE) * n_pad_max * 4)?
+            } else {
+                DevicePtr::NULL
+            },
+            tap_val: alloc(16)?,
         };
         let own_dstart = alloc(4)?;
         let part = alloc(DECODE_MAX_T * 64 * (WINDOW + INDEX_TOPK).div_ceil(DECODE_SLICE) * (2 + HEAD_DIM) * 4)?;
@@ -810,6 +826,19 @@ impl Dsv41SparseCore {
         Ok(())
     }
 
+    /// TAPS: keep rows r0..r0+r's sampled score rows (every TAP_ROW_STRIDE-th of the pass) before
+    /// the next row block or layer overwrites the scratch. No-op unless enabled at load.
+    fn tap_score_rows(&self, gpu: &dyn GpuBackend, r0: usize, r: usize, n_pad: usize, stream: u64) -> Result<()> {
+        if self.s.tap_rows == DevicePtr::NULL {
+            return Ok(());
+        }
+        for row in (r0.div_ceil(TAP_ROW_STRIDE) * TAP_ROW_STRIDE..r0 + r).step_by(TAP_ROW_STRIDE) {
+            let src = self.s.score.offset((row - r0) * n_pad * 4);
+            gpu.copy_d2d_async(src, self.s.tap_rows.offset(row / TAP_ROW_STRIDE * n_pad * 4), n_pad * 4, stream)?;
+        }
+        Ok(())
+    }
+
     fn index(&self, ops: &Ops, a: &CoreArgs, st: &mut SeqState, dstart: Option<DevicePtr>) -> Result<()> {
         let (layer, t, start, stream) = (a.layer, a.t, a.start, ops.stream);
         let lw = &self.layers[layer];
@@ -864,6 +893,7 @@ impl Dsv41SparseCore {
         if let Some(d) = dstart {
             // Static decode/verify: t <= DECODE_MAX_T <= score_rows, one block.
             iops.score_dev(s.qi, ik, s.wts, cand_in, s.score, t, n_pad, d, ratio)?;
+            self.tap_score_rows(gpu, 0, t, n_pad, stream)?;
             self.prof.mark(ops, "index.score")?;
             if is_src {
                 iops.select_candidates_dev(s.score, s.blocks, s.cand, t, n_pad, d, ratio, CANDIDATE_TOPK_BLOCKS, CANDIDATE_BLOCK_SIZE)?;
@@ -878,6 +908,7 @@ impl Dsv41SparseCore {
                 let r = s.score_rows.min(t - r0);
                 let cand_b = cand_in.map(|c| CandidateMask { mask: c.mask.offset(r0 * cand_row_bytes(c.ld)), ld: c.ld });
                 iops.score(s.qi.offset(r0 * qrow), ik, s.wts.offset(r0 * INDEX_HEADS * 4), cand_b, s.score, r, rows, n_pad, start + r0, ratio)?;
+                self.tap_score_rows(gpu, r0, r, n_pad, stream)?;
                 self.prof.mark(ops, "index.score")?;
                 if is_src {
                     let cand_out = s.cand.offset(r0 * cand_row_bytes(n_pad));
@@ -893,6 +924,8 @@ impl Dsv41SparseCore {
         if is_src {
             st.cand = Some((s.cand, n_pad));
         }
+        st.tap_ld = n_pad;
+        st.tap_n_c = n_c;
         st.topk = Some(w.topk);
         self.prof.mark(ops, "index.topk")?;
         if layer == CANDIDATE_SOURCE_LAYER && st.kind == Some(PassKind::EncoderChunk) {
@@ -1076,6 +1109,25 @@ impl PassHook for Dsv41SparseCore {
 }
 
 impl AttnCore for Dsv41SparseCore {
+    /// On index-source layers, in the oracle's names: `topk` `[t, 512]` i64 (the selection this
+    /// layer's attention used), `n_c` `[1]` i64, and with ATLAS_DSV41_TAP_INDEX_SCORE=1
+    /// `index_score_rows` `[ceil(t / 64), n_pad]` fp32 (check_topk_overlap.py's miss triage).
+    fn taps(&self, ops: &Ops, tap: &Tap, layer: usize, t: usize) -> Result<()> {
+        if self.layers.get(layer).is_none_or(|l| l.idx.is_none()) {
+            return Ok(());
+        }
+        let st = self.st.lock().expect("core state poisoned");
+        let topk = st.topk.context("tap: no top-k after an index layer")?;
+        tap.bytes(ops, "topk", layer, topk, t * INDEX_TOPK * 8)?;
+        ops.gpu.synchronize(ops.stream)?;
+        ops.gpu.copy_h2d(&(st.tap_n_c as i64).to_le_bytes(), self.s.tap_val)?;
+        tap.bytes(ops, "n_c", layer, self.s.tap_val, 8)?;
+        if self.s.tap_rows != DevicePtr::NULL {
+            tap.bytes(ops, "index_score_rows", layer, self.s.tap_rows, t.div_ceil(TAP_ROW_STRIDE) * st.tap_ld * 4)?;
+        }
+        Ok(())
+    }
+
     fn run(&self, ops: &Ops, a: &CoreArgs) -> Result<()> {
         ensure!(a.layer < self.layers.len(), "layer {} out of range", a.layer);
         let mut st = self.st.lock().expect("core state poisoned");
@@ -1134,6 +1186,10 @@ impl PassHook for std::sync::Arc<Dsv41SparseCore> {
 impl AttnCore for std::sync::Arc<Dsv41SparseCore> {
     fn run(&self, ops: &Ops, a: &CoreArgs) -> Result<()> {
         self.as_ref().run(ops, a)
+    }
+
+    fn taps(&self, ops: &Ops, tap: &Tap, layer: usize, t: usize) -> Result<()> {
+        self.as_ref().taps(ops, tap, layer, t)
     }
 }
 
