@@ -32,7 +32,10 @@ defaults:
 # Atlas extension block, read by `main_modules::model_profile` (Recipe::parse ignores it).
 atlas:
   model_type: deepseek_v41
-  # 85 GB measured + ~1.5 GB shared-expert residency (dsv41/shared) + replay headroom.
+  # Admission is on the BASE: 85 GB measured + 2.83 GB shared-expert bf16 copies = ~88.
+  # Attention wq_b/wo_b/wo_a bf16 copies (up to +9.4 GB, ~97.4 max) are elastic: made one
+  # layer at a time only while free memory stays above a 20 GB floor, so they never refuse a
+  # load. Pin either with ATLAS_DSV41_SHARED_RESIDENT=0 / ATLAS_DSV41_ATTN_RESIDENT=0.
   resident_gb: 88
   dspark_extra_gb: 8
   headroom_gb: 16
