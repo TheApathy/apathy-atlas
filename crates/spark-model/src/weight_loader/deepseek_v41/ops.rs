@@ -220,6 +220,7 @@ pub struct Dsv41Kernels {
     pub hc_pre: KernelHandle,
     pub hc_post: KernelHandle,
     pub swiglu: KernelHandle,
+    pub swiglu_cat: KernelHandle,
     pub rope_tail: KernelHandle,
     pub engram_rows_bf16: KernelHandle,
     pub engram_gate: KernelHandle,
@@ -304,6 +305,7 @@ impl Dsv41Kernels {
             hc_pre: k("dsv41_hc_pre")?,
             hc_post: k("dsv41_hc_post")?,
             swiglu: k("dsv41_swiglu")?,
+            swiglu_cat: k("dsv41_swiglu_cat")?,
             rope_tail: k("dsv41_rope_tail")?,
             engram_rows_bf16: k("dsv41_engram_rows_bf16")?,
             engram_gate: k("dsv41_engram_gate")?,
@@ -466,6 +468,18 @@ impl Ops<'_> {
         self.l(self.k.hc_post).grid([t as u32, 1, 1]).arg_ptr(y).arg_ptr(res).arg_ptr(post).arg_ptr(comb).arg_ptr(out).arg_u32(d as u32).launch(self.stream)
     }
 
+    /// [`Ops::swiglu`] over a concatenated `[rows, 2 * inter]` gate|up GEMM output.
+    pub fn swiglu_cat(&self, gu: DevicePtr, out: DevicePtr, rows: usize, inter: usize, limit: f32) -> Result<()> {
+        self.l(self.k.swiglu_cat)
+            .grid([grid_1d(rows * inter)?, 1, 1])
+            .arg_ptr(gu)
+            .arg_ptr(out)
+            .arg_u64(rows as u64)
+            .arg_u64(inter as u64)
+            .arg_f32(limit)
+            .launch(self.stream)
+    }
+
     pub fn swiglu(&self, gate: DevicePtr, up: DevicePtr, out: DevicePtr, n: usize, limit: f32) -> Result<()> {
         self.l(self.k.swiglu).grid([grid_1d(n)?, 1, 1]).arg_ptr(gate).arg_ptr(up).arg_ptr(out).arg_u64(n as u64).arg_f32(limit).launch(self.stream)
     }
@@ -551,6 +565,27 @@ impl Ops<'_> {
     /// one GEMM over all rows (no split-K); M <= MM_TILE runs one 16-row tile (slack contract).
     /// Measured: untiled vs 16-row-tiled gave bit-identical h over all 40 layers at M=512, and
     /// the tiled form re-reads the whole bf16 weight once per 16 rows (32x per 512-row chunk).
+    /// Whether [`Ops::linear_fp8_tiled`] would take its dequant + bf16 GEMM path for `w` at `m`
+    /// rows, and whether that GEMM is the policy (M > MM_TILE) one. The same predicates, in the
+    /// same order, as the function below.
+    pub fn dense_dequant_route(&self, w: &Fp8Linear, m: usize) -> Option<bool> {
+        if m == 1 && decode_pass() && self.k.fp8_gemv_m1.is_some() {
+            return None;
+        }
+        if m <= GEMV_MAX_M && decode_pass() && self.k.fp8_gemv_m8.is_some() {
+            return None;
+        }
+        let fused_here = if fp8_fused_all() {
+            fused_wins(w.n, w.k)
+        } else {
+            replay_fused_enabled() && replay_pass() && w.n % 128 == 0 && w.k % 32 == 0
+        };
+        if self.k.fp8_fused.is_some() && !fp8_force_rowtile() && fp8_policy() == Fp8Policy::Pinned && fused_here {
+            return None;
+        }
+        Some(m > MM_TILE && !fp8_force_rowtile())
+    }
+
     pub fn linear_fp8_tiled(&self, x: DevicePtr, w: &Fp8Linear, scratch: DevicePtr, out: DevicePtr, m: usize) -> Result<()> {
         if m == 1 && decode_pass() && self.k.fp8_gemv_m1.is_some() {
             return self.fp8_gemv_m1(x, w, out, w.n, 0);
@@ -575,7 +610,15 @@ impl Ops<'_> {
         {
             return prof(self, "dense/fused", || f.linear(self.gpu, x, w.k, w, out, w.n, m, self.stream));
         }
-        prof(self, "dense/dequant", || self.dequant(w, scratch))?;
+        // A resident bf16 copy holds exactly what the dequant would write, so the GEMM below
+        // sees the same bytes either way.
+        let scratch = match w.bf16 {
+            Some(resident) => resident,
+            None => {
+                prof(self, "dense/dequant", || self.dequant(w, scratch))?;
+                scratch
+            }
+        };
         prof(self, "dense/gemm", || {
             if m > MM_TILE && !fp8_force_rowtile() {
                 self.linear_bf16_policy(x, w.k, scratch, out, w.n, m, w.n, w.k)
@@ -717,6 +760,10 @@ pub struct Fp8Linear {
     pub scale: DevicePtr,
     pub n: usize,
     pub k: usize,
+    /// A resident bf16 copy of `dequant(weight)` (made once by [`Ops::dequant`], so the same
+    /// bytes the transient copy would hold). When set, [`Ops::linear_fp8_tiled`] skips the
+    /// per-pass dequant on its dequant path; every other path ignores it.
+    pub bf16: Option<DevicePtr>,
 }
 
 impl Fp8Linear {
@@ -734,7 +781,7 @@ impl Fp8Linear {
              would dequantize every weight with the wrong scale)",
             s.shape
         );
-        Ok(Self { weight: w.ptr, scale: s.ptr, n, k })
+        Ok(Self { weight: w.ptr, scale: s.ptr, n, k, bf16: None })
     }
 
     pub fn bf16_bytes(&self) -> usize {

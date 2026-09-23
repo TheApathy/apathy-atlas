@@ -94,6 +94,44 @@ fn apply_dead_arm(arm: DeadArm, dead: Vec<bool>, t: usize) -> Vec<bool> {
 
 /// `candidate_source_layer`: the last encoder layer.
 pub const ENCODER_LAST: usize = 20;
+
+/// `ATLAS_DSV41_SHARED_RESIDENT=0` turns OFF the resident bf16 shared-expert weights on the
+/// encoder layers (default ON: +[`super::fwd::shared_resident_bytes`] x 21 = 1.49 GB, which
+/// the CB3 arena's free-memory check then sees and budgets around). For tight-memory configs.
+pub const SHARED_RESIDENT_ENV: &str = "ATLAS_DSV41_SHARED_RESIDENT";
+
+/// Free device memory that must remain after the resident copies (the arena, KV and
+/// activations are sized after them and apply their own floors).
+const SHARED_RESIDENT_MIN_FREE: u64 = 16_000_000_000;
+
+/// Resident bf16 shared-expert weights for layers `0..=ENCODER_LAST` (the layers whose shared
+/// expert runs on the dequant path every prefill chunk). Byte-identical to the per-pass
+/// dequant; see `SharedExpert::make_resident`. Returns the allocations to own.
+fn make_shared_resident(ops: &Ops, dims: &V41Dims, blocks: &mut [V41BlockWeights]) -> Result<Vec<DevicePtr>> {
+    if std::env::var(SHARED_RESIDENT_ENV).as_deref() == Ok("0") {
+        return Ok(Vec::new());
+    }
+    let n = (ENCODER_LAST + 1).min(blocks.len());
+    let bytes = (n * super::fwd::shared_resident_bytes(dims)) as u64;
+    let free = ops.gpu.free_memory().context("shared-expert residency: querying free memory")? as u64;
+    ensure!(
+        free >= bytes + SHARED_RESIDENT_MIN_FREE,
+        "DeepSeek-V4.1 resident shared-expert weights REFUSED: {:.2} GB would leave {:.1} GB of \
+         {:.1} GB free, under {:.0} GB (GB10 memory is unified: over-allocation takes the host \
+         down). Set {SHARED_RESIDENT_ENV}=0 to run without them.",
+        bytes as f64 / 1e9,
+        free.saturating_sub(bytes) as f64 / 1e9,
+        free as f64 / 1e9,
+        SHARED_RESIDENT_MIN_FREE as f64 / 1e9,
+    );
+    let mut owned = Vec::with_capacity(2 * n);
+    for b in &mut blocks[..n] {
+        owned.extend(b.shared.make_resident(ops)?);
+    }
+    ops.gpu.synchronize(ops.stream)?;
+    tracing::info!("DeepSeek-V4.1: {:.2} GB of resident bf16 shared-expert weights (layers 0..={})", bytes as f64 / 1e9, n - 1);
+    Ok(owned)
+}
 pub const N_LAYERS: usize = 40;
 
 /// Which pass a core call belongs to. The attention lane's state machine keys on it: the
@@ -251,6 +289,8 @@ pub struct V41Forward {
     /// hc-mean of the INPUT stream of L37, L38, L39 on every pass that runs them (replay,
     /// decode, verify). `None` unless the drafter is loaded (`enable_dspark_seed`).
     pub dspark_seed: Option<DevicePtr>,
+    /// Resident bf16 shared-expert weights (see [`SHARED_RESIDENT_ENV`]).
+    pub shared_resident: Vec<DevicePtr>,
     /// The DSpark drafter's weights (store-resident), when loaded. Consumed by dsv41-decode's
     /// draft/verify path.
     pub dspark: Option<super::mtp::DsparkWeights>,
@@ -310,7 +350,8 @@ impl V41Forward {
         model_dir: &std::path::Path,
         engram_threads: usize,
     ) -> Result<Self> {
-        let blocks = (0..n_layers).map(|l| V41BlockWeights::load(store, l, &dims, ops)).collect::<Result<Vec<_>>>()?;
+        let mut blocks = (0..n_layers).map(|l| V41BlockWeights::load(store, l, &dims, ops)).collect::<Result<Vec<_>>>()?;
+        let shared_resident = make_shared_resident(ops, &dims, &mut blocks)?;
         let attn = (0..n_layers).map(|l| V41AttnWeights::load(store, l, dims.hidden)).collect::<Result<Vec<_>>>()?;
         let largest = blocks
             .iter()
@@ -349,6 +390,7 @@ impl V41Forward {
             dspark_seed: None,
             dspark: None,
             graph: None,
+            shared_resident,
         })
     }
 
@@ -404,6 +446,9 @@ impl V41Forward {
             if let Some(e) = &b.engram {
                 a.adopt(e.weight);
             }
+        }
+        for p in &self.shared_resident {
+            a.adopt(*p);
         }
         self.allocs = a;
     }

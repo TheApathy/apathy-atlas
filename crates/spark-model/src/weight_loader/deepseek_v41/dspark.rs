@@ -119,7 +119,7 @@ impl Dspark {
                 ffn_norm: b.ffn_norm,
                 hc_attn: b.hc_attn,
                 hc_ffn: b.hc_ffn,
-                shared: SharedExpert { w1: b.shared.w1, w2: b.shared.w2, w3: b.shared.w3 },
+                shared: SharedExpert { w1: b.shared.w1, w2: b.shared.w2, w3: b.shared.w3, w13: b.shared.w13 },
                 engram: None,
             })
             .collect();

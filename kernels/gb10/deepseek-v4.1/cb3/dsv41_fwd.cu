@@ -572,6 +572,24 @@ extern "C" __global__ void dsv41_swiglu(const __nv_bfloat16* __restrict__ gate,
     out[i] = __float2bfloat16(g / (1.f + expf(-g)) * u);
 }
 
+// swiglu over the concatenated w1|w3 GEMM output: gu bf16 [rows, 2 * inter], gate in columns
+// [0, inter), up in [inter, 2 * inter). Same arithmetic as dsv41_swiglu, element for element.
+extern "C" __global__ void dsv41_swiglu_cat(const __nv_bfloat16* __restrict__ gu,
+                                            __nv_bfloat16* __restrict__ out,
+                                            const unsigned long long rows, const unsigned long long inter,
+                                            const float limit) {
+    const unsigned long long i = (unsigned long long)blockIdx.x * DSV41_BLOCK + threadIdx.x;
+    if (i >= rows * inter) return;
+    const unsigned long long r = i / inter, c = i % inter;
+    float g = bf(gu[r * 2 * inter + c]);
+    float u = bf(gu[r * 2 * inter + inter + c]);
+    if (limit > 0.f) {
+        u = fminf(fmaxf(u, -limit), limit);
+        g = fminf(g, limit);
+    }
+    out[i] = __float2bfloat16(g / (1.f + expf(-g)) * u);
+}
+
 // ── RoPE on the tail: v41_ref.apply_rotary (adjacent pairs as complex) ────────
 // x bf16 [T, H, Dh], rotate the LAST 2*P dims in place. Row t uses table row pos[t]
 // (cos/sin fp32 [*, P]); inverse = conj. Grid: (T, H)  Block: P.

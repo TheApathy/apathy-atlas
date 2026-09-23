@@ -64,6 +64,15 @@ pub struct SharedExpert {
     pub w1: Fp8Linear,
     pub w2: Fp8Linear,
     pub w3: Fp8Linear,
+    /// RESIDENT bf16 `[2 * inter, hidden]`: dequant(w1) rows then dequant(w3) rows
+    /// ([`Self::make_resident`]); `w1.bf16` / `w3.bf16` point at its halves, `w2.bf16` at its
+    /// own copy. Set on the encoder layers (see `forward::SHARED_RESIDENT_ENV`).
+    pub w13: Option<DevicePtr>,
+}
+
+/// Bytes [`SharedExpert::make_resident`] allocates per layer (w1|w3 plus w2, bf16).
+pub fn shared_resident_bytes(dims: &V41Dims) -> usize {
+    3 * dims.moe_inter * dims.hidden * 2
 }
 
 impl SharedExpert {
@@ -77,7 +86,29 @@ impl SharedExpert {
             w1: Fp8Linear::load(store, &format!("{p}.w1"), dims.moe_inter, dims.hidden)?,
             w2: Fp8Linear::load(store, &format!("{p}.w2"), dims.hidden, dims.moe_inter)?,
             w3: Fp8Linear::load(store, &format!("{p}.w3"), dims.moe_inter, dims.hidden)?,
+            w13: None,
         })
+    }
+
+    /// Dequantize the weights ONCE into resident bf16 copies (the bytes the per-pass dequant
+    /// would write), so the dequant path skips its dequant and w1|w3 run as one N = 2 * inter
+    /// GEMM. Byte-identical by construction for the copies; the concatenated GEMM is gated by
+    /// `dsv41_shared_bench` (cuBLASLt computes every element as the two N = inter GEMMs do).
+    /// Returns the allocations for the caller to own.
+    pub fn make_resident(&mut self, ops: &Ops) -> Result<[DevicePtr; 2]> {
+        ensure!(self.w1.n == self.w3.n && self.w1.k == self.w3.k, "w1 and w3 shapes differ");
+        let half = self.w1.bf16_bytes();
+        let w13 = ops.gpu.alloc(2 * half)?;
+        let w2 = ops.gpu.alloc(self.w2.bf16_bytes())?;
+        let w3_at = DevicePtr(w13.0 + half as u64);
+        ops.dequant(&self.w1, w13)?;
+        ops.dequant(&self.w3, w3_at)?;
+        ops.dequant(&self.w2, w2)?;
+        self.w1.bf16 = Some(w13);
+        self.w3.bf16 = Some(w3_at);
+        self.w2.bf16 = Some(w2);
+        self.w13 = Some(w13);
+        Ok([w13, w2])
     }
 
     /// `v41_ref.expert_ffn(y, w1, w2, w3, limit)`: out = w2(bf16(silu(clamp(w1 y)) * clamp(w3 y))).
@@ -89,6 +120,17 @@ impl SharedExpert {
     #[allow(clippy::too_many_arguments)]
     pub fn forward_with(&self, ops: &Ops, y: DevicePtr, out: DevicePtr, t: usize, s: &PassScratch, dims: &V41Dims, wscratch: DevicePtr) -> Result<()> {
         let n = t * dims.moe_inter;
+        // Resident weights on the policy-GEMM dequant path: w1|w3 as ONE N = 2 * inter GEMM into
+        // the double-width `gate` scratch (bytes as the two GEMMs; see make_resident).
+        if let Some(w13) = self.w13
+            && ops.dense_dequant_route(&self.w1, t) == Some(true)
+            && ops.dense_dequant_route(&self.w3, t) == Some(true)
+        {
+            let (i, h) = (dims.moe_inter, dims.hidden);
+            prof(ops, "dense/gemm", || ops.linear_bf16_policy(y, h, w13, s.gate, 2 * i, t, 2 * i, h))?;
+            ops.swiglu_cat(s.gate, s.act, t, i, dims.swiglu_limit)?;
+            return ops.linear_fp8_tiled(s.act, &self.w2, wscratch, out, t);
+        }
         ops.linear_fp8_tiled(y, &self.w1, wscratch, s.gate, t)?;
         ops.linear_fp8_tiled(y, &self.w3, wscratch, s.up, t)?;
         ops.swiglu(s.gate, s.up, s.act, n, dims.swiglu_limit)?;
@@ -247,7 +289,9 @@ impl PassScratch {
             y: a(t * d * 2)?,
             routed: a(t * d * 2)?,
             shared: a(t * d * 2)?,
-            gate: a(t * dims.moe_inter * 2)?,
+            // Double width: the resident shared expert's concatenated w1|w3 GEMM writes
+            // [t, 2 * inter] here.
+            gate: a(t * dims.moe_inter * 2 * 2)?,
             up: a(t * dims.moe_inter * 2)?,
             act: a(t * dims.moe_inter * 2)?,
             engram_rows: a(t * ENGRAM_ROW_WIDTH * 4)?,
