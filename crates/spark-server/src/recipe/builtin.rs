@@ -112,48 +112,6 @@ mod tests {
         }
     }
 
-    /// A prefill chunk larger than DFlash's context-cache ring fails closed
-    /// with "chunk exceeds ring capacity" (dflash_head/ring_window.rs:134) —
-    /// per CHUNK, not a hard cap on total conversation length, but every
-    /// built-in that sets `ATLAS_DFLASH_CTX_WINDOW` must still keep
-    /// `max_prefill_tokens` at or below it, or the very first long turn
-    /// crashes the request. qwen3.8-27b-optimized-local shipped with
-    /// max_prefill_tokens=8192 vs ctx_window=4096 until this test was added
-    /// (found serving an 8192-token prompt on 2026-09-23).
-    #[test]
-    fn dflash_ctx_window_is_not_smaller_than_max_prefill_tokens() {
-        for (id, text) in BUILTIN_YAML {
-            let doc = super::yaml::parse(text).unwrap_or_else(|e| panic!("{id}: {e:#}"));
-            let map = doc.as_map().unwrap_or_else(|| panic!("{id}: not a map"));
-            let Some(max_prefill) = map
-                .get("defaults")
-                .and_then(|d| d.as_map())
-                .and_then(|d| d.get("max_prefill_tokens"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<usize>().ok())
-            else {
-                continue;
-            };
-            let Some(ctx_window) = map
-                .get("atlas")
-                .and_then(|a| a.as_map())
-                .and_then(|a| a.get("env"))
-                .and_then(|e| e.as_map())
-                .and_then(|e| e.get("ATLAS_DFLASH_CTX_WINDOW"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<usize>().ok())
-            else {
-                continue; // this built-in doesn't use DFlash's ring at all
-            };
-            assert!(
-                max_prefill <= ctx_window,
-                "{id}: max_prefill_tokens={max_prefill} exceeds ATLAS_DFLASH_CTX_WINDOW={ctx_window} \
-                 — the first prefill chunk over {ctx_window} tokens will fail with \
-                 \"chunk exceeds ring capacity\""
-            );
-        }
-    }
-
     /// A published recipe with the same id wins; a different id is additive.
     #[test]
     fn a_fetched_recipe_with_the_same_id_replaces_the_builtin() {

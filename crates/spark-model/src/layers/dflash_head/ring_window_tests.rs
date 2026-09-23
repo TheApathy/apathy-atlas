@@ -73,7 +73,6 @@ fn arbitrary_write_chunk_splits_once_across_wrap() {
 fn impossible_write_capacity_and_absolute_overflow_fail_closed() {
     assert!(plan_write_chunk(0, 1, 10, 0).is_err());
     assert!(plan_write_chunk(0, 1, 10, 11).is_err());
-    assert!(plan_write_chunk(0, 4097, MAX_ABSOLUTE_CONTEXT, 4096).is_err());
     assert!(plan_write_chunk(MAX_ABSOLUTE_CONTEXT, 1, MAX_ABSOLUTE_CONTEXT, 4096).is_err());
     assert!(plan_write_chunk(usize::MAX, 1, usize::MAX, 4096).is_err());
 }
@@ -248,4 +247,117 @@ fn compatibility_copy_rejects_zero_window_and_oversized_requests() {
     assert!(plan_ring_copy(0, 1, 0, 0, 1).is_err());
     assert!(plan_ring_copy(0, 1, 8, 2, 1).is_err());
     assert!(plan_ring_copy(0, 8, 8, 0, 9).is_err());
+}
+
+/// Replay `plan`'s spans into a simulated ring whose slots record the
+/// absolute position written there, the same way the capture loop in
+/// `impl_b3.rs` derives `absolute_position = chunk_start + linear_slot`.
+fn replay(ring: &mut [Option<usize>], chunk_start: usize, plan: &RingSpanPlan) {
+    for span in plan.spans() {
+        for local in 0..span.slot_count {
+            ring[span.physical_slot + local] = Some(chunk_start + span.linear_slot + local);
+        }
+    }
+}
+
+/// Fill a ring from absolute 0 in chunks of `chunk` rows; return the ring and
+/// the final state.
+fn fill_in_chunks(total: usize, chunk: usize, capacity: usize) -> (Vec<Option<usize>>, RingState) {
+    let mut ring = vec![None; capacity];
+    let mut state = RingState::new(MAX_ABSOLUTE_CONTEXT, capacity).unwrap();
+    let mut start = 0;
+    while start < total {
+        let rows = chunk.min(total - start);
+        let append = state.plan_append_at(start, rows).unwrap();
+        replay(&mut ring, start, &append.write);
+        state = append.next;
+        start += rows;
+    }
+    (ring, state)
+}
+
+#[test]
+fn chunk_wider_than_ring_keeps_only_its_last_capacity_rows() {
+    let plan = plan_write_chunk(0, 8192, MAX_ABSOLUTE_CONTEXT, 4096).unwrap();
+    assert_eq!(
+        plan.spans(),
+        &[RingSpan {
+            physical_slot: 0,
+            linear_slot: 4096,
+            slot_count: 4096,
+        }]
+    );
+    // Dropped rows are not addressable; kept rows land at absolute % capacity.
+    assert!(plan.physical_slot_for(4095).is_err());
+    assert_eq!(plan.physical_slot_for(4096).unwrap(), 0);
+    assert_eq!(plan.physical_slot_for(8191).unwrap(), 4095);
+}
+
+#[test]
+fn wide_chunk_tail_wraps_at_its_absolute_position() {
+    // Start 1000, 6000 rows: keep absolute [2904, 7000) = slots 2904..4095
+    // then 0..2903.
+    let plan = plan_write_chunk(1000, 6000, MAX_ABSOLUTE_CONTEXT, 4096).unwrap();
+    assert_eq!(
+        plan.spans(),
+        &[
+            RingSpan {
+                physical_slot: 2904,
+                linear_slot: 1904,
+                slot_count: 1192,
+            },
+            RingSpan {
+                physical_slot: 0,
+                linear_slot: 3096,
+                slot_count: 2904,
+            },
+        ]
+    );
+    let kept: usize = plan.spans().iter().map(|s| s.slot_count).sum();
+    assert_eq!(kept, 4096);
+    for linear in 1904..6000 {
+        assert_eq!(plan.physical_slot_for(linear).unwrap(), (1000 + linear) % 4096);
+    }
+}
+
+#[test]
+fn one_wide_chunk_leaves_the_ring_identical_to_capacity_sized_chunks() {
+    for total in [4097, 6000, 7000, 8192, 12288] {
+        let (wide, wide_state) = fill_in_chunks(total, 8192, 4096);
+        let (narrow, narrow_state) = fill_in_chunks(total, 4096, 4096);
+        assert_eq!(wide, narrow, "total={total}");
+        assert_eq!(wide_state, narrow_state, "total={total}");
+        // Every slot is resident and holds the position `slot_for` promises.
+        for pos in wide_state.resident_start()..wide_state.absolute_len {
+            assert_eq!(wide[wide_state.slot_for(pos).unwrap()], Some(pos));
+        }
+    }
+    // A wide chunk after a narrow one (the second turn of a chat).
+    let (mut ring, state) = fill_in_chunks(300, 4096, 4096);
+    let append = state.plan_append_at(300, 8000).unwrap();
+    replay(&mut ring, 300, &append.write);
+    let (reference, reference_state) = fill_in_chunks(8300, 4096, 4096);
+    assert_eq!(ring, reference);
+    assert_eq!(append.next, reference_state);
+}
+
+#[test]
+fn head_keeping_plan_is_caught_by_the_ring_replay() {
+    // Control: a plan that keeps the FIRST capacity rows (the obvious wrong
+    // fix) must fail the same comparison the real plan passes.
+    let wrong = RingSpanPlan {
+        spans: [
+            RingSpan {
+                physical_slot: 0,
+                linear_slot: 0,
+                slot_count: 4096,
+            },
+            RingSpan::default(),
+        ],
+        len: 1,
+    };
+    let mut ring = vec![None; 4096];
+    replay(&mut ring, 0, &wrong);
+    let (reference, _) = fill_in_chunks(8192, 4096, 4096);
+    assert_ne!(ring, reference);
 }
