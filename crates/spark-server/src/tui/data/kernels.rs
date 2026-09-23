@@ -73,6 +73,11 @@ pub struct KernelTableModel {
 static LOADED_TARGET: Mutex<Option<(String, String)>> = Mutex::new(None);
 
 /// Record which kernel target the serve path resolved.
+///
+/// NOTE (dsv41-engine, 2026-09-22): nothing in this tree calls this yet, so the Kernels table
+/// is always empty. The natural call site is right after `serve_load`'s "Selected kernel
+/// target" log, but `serve_load.rs` is pinned by `context_extension_source_authority_tests`,
+/// so the line is left for that file's owner rather than slipped past its hash.
 pub fn publish_loaded_target(model: &str, quant: &str) {
     if let Ok(mut g) = LOADED_TARGET.lock() {
         *g = Some((model.to_string(), quant.to_string()));
@@ -82,6 +87,17 @@ pub fn publish_loaded_target(model: &str, quant: &str) {
 fn loaded_target() -> Option<(String, String)> {
     let guard = LOADED_TARGET.lock().ok()?;
     guard.clone()
+}
+
+/// Index of the target named EXACTLY `(model, quant)`.
+///
+/// Not `atlas_kernels::ptx_for_model`, which is a substring match on the model name and
+/// returns the first hit in directory order: `deepseek-v4` would find `deepseek-v4-flash`, and
+/// `qwen3.6-35b-a3b` would find `qwen3.6-35b-a3b-abl` or the canonical target depending on
+/// sort order. The table must render the modules of the target serve RESOLVED, so the lookup
+/// is by the identity serve published, both halves.
+pub(crate) fn exact_target(names: &[(&str, &str)], model: &str, quant: &str) -> Option<usize> {
+    names.iter().position(|(m, q)| *m == model && *q == quant)
 }
 
 /// FNV-1a 12-hex content hash — matches `kernel_audit`'s `ptx_hash`.
@@ -107,9 +123,15 @@ pub fn build() -> KernelTableModel {
     // the model half; a build carrying two quants of the same model would match
     // the first, which is the "some other target's module list" failure the
     // comment above is about — so it is narrowed by the loaded quant below.
-    let Some(ptx) =
-        loaded_target().and_then(|(model, _quant)| atlas_kernels::ptx_for_model(&model))
-    else {
+    let Some(ptx) = loaded_target().and_then(|(model, quant)| {
+        let targets = atlas_kernels::available_targets();
+        let names: Vec<(&str, &str)> = targets
+            .iter()
+            .map(|t| (t.target.model, t.target.quant))
+            .collect();
+        let idx = exact_target(&names, &model, &quant)?;
+        targets.into_iter().nth(idx)
+    }) else {
         return KernelTableModel::default();
     };
     let mut rows: Vec<KernelRow> = ptx
@@ -150,5 +172,29 @@ pub fn build() -> KernelTableModel {
         rows,
         missing_required: Vec::new(),
         missing_expected: failed.iter().map(MissingKernel::from_row).collect(),
+    }
+}
+
+#[cfg(test)]
+mod exact_target_tests {
+    use super::exact_target;
+
+    /// The lookup is exact on BOTH halves. The control is the substring rule it replaced:
+    /// `deepseek-v4` is a prefix of `deepseek-v4-flash` and `deepseek-v4.1`, and a quant-blind
+    /// match would pick the first quant of a model built twice.
+    #[test]
+    fn the_loaded_target_is_matched_exactly_not_by_substring() {
+        let names = [
+            ("deepseek-v4-flash", "nvfp4"),
+            ("deepseek-v4.1", "cb3"),
+            ("glm5.3-flash", "exl3"),
+            ("glm5.3-flash", "iq3"),
+        ];
+        assert_eq!(exact_target(&names, "deepseek-v4.1", "cb3"), Some(1));
+        assert_eq!(exact_target(&names, "glm5.3-flash", "iq3"), Some(3));
+        assert_eq!(exact_target(&names, "deepseek-v4", "nvfp4"), None, "a prefix is not a match");
+        assert_eq!(exact_target(&names, "deepseek-v4.1", "nvfp4"), None, "the quant must match too");
+        // What the old substring rule would have answered for the V4.1 needle's prefix:
+        assert_eq!(names.iter().position(|(m, _)| m.contains("deepseek-v4")), Some(0));
     }
 }
