@@ -40,6 +40,7 @@ use spark_model::weight_loader::deepseek_v41::fwd::V41RoutedMoe;
 use spark_model::weight_loader::deepseek_v41::moe_forward::{
     Cb3RoutedMoe, ExpertKernel, MoeControl, ROUTER_EXPERTS, RouterF32, TOP_K,
 };
+use spark_model::weight_loader::deepseek_v41::moe::fused_tile_height;
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops};
 use spark_model::weight_loader::deepseek_v41::routing::Routing;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
@@ -313,12 +314,30 @@ fn main() -> Result<()> {
         let d_split = gpu.alloc(tokens * hidden * 2)?;
         let ops = Ops { gpu, k: &kernels, stream };
         let mut all_identical = true;
+        // Which tile shape each (row, pick) lands in: per pass, an expert's shape follows its
+        // row count in THAT pass. A split only tests the shapes against each other if some
+        // picks change shape between it and the single pass.
+        let shapes_of = |start: usize, n: usize| -> Result<Vec<usize>> {
+            let scores = moe.scores(layer, DevicePtr(d_in.0 + (start * hidden * 2) as u64), n, stream)?;
+            let routing = moe.route(layer, &scores, n)?;
+            let mut count = std::collections::HashMap::<i64, usize>::new();
+            for &e in &routing.indices {
+                *count.entry(e).or_default() += 1;
+            }
+            Ok(routing.indices.iter().map(|e| fused_tile_height(count[e])).collect())
+        };
+        moe.set_pass_tokens(pass_ids);
+        let whole = shapes_of(0, tokens)?;
+        let mut crossings_total = 0usize;
         for split in spec.split(';') {
             let sizes: Vec<usize> = split.split(',').map(str::parse).collect::<Result<_, _>>()?;
             ensure!(sizes.iter().sum::<usize>() == tokens, "split {split} does not sum to {tokens}");
             let mut start = 0usize;
+            let mut crossings = 0usize;
             for &n in &sizes {
                 moe.set_pass_tokens(&pass_ids[start..start + n]);
+                let part = shapes_of(start, n)?;
+                crossings += part.iter().zip(&whole[start * TOP_K..(start + n) * TOP_K]).filter(|(a, b)| a != b).count();
                 let off = (start * hidden * 2) as u64;
                 moe.forward(&ops, layer, DevicePtr(d_in.0 + off), DevicePtr(d_split.0 + off), n)?;
                 start += n;
@@ -330,11 +349,20 @@ fn main() -> Result<()> {
             let rows = (0..tokens)
                 .filter(|r| bytes[r * hidden * 2..(r + 1) * hidden * 2] != out_bytes[r * hidden * 2..(r + 1) * hidden * 2])
                 .count();
-            println!("  invariance [{split}] vs one pass of {tokens}: {differ} values differ on {rows} rows");
+            println!(
+                "  invariance [{split}] vs one pass of {tokens}: {differ} values differ on {rows} rows; \
+                 {crossings} of {} (row, expert) picks change tile shape",
+                tokens * TOP_K
+            );
+            crossings_total += crossings;
             all_identical &= differ == 0;
         }
         moe.set_pass_tokens(pass_ids);
         println!("  CHUNK INVARIANCE: {}", if all_identical { "BYTE-IDENTICAL" } else { "DIFFERS" });
+        ensure!(
+            crossings_total > 0,
+            "no split moved any pick between tile shapes: the invariance check cannot see a shape-dependent row"
+        );
         // Only the production path must be invariant; `--kernel reconstruct` (cuBLASLt per
         // expert, M = its row count) is the control that is expected to DIFFER.
         if control == MoeControl::None && kernel == ExpertKernel::Fused {

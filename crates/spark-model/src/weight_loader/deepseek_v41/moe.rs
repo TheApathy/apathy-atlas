@@ -275,6 +275,14 @@ pub const FUSED_TILE_M: usize = 128;
 pub const FUSED_TILE_N: usize = 64;
 /// Row count at or below which a whole expert takes the 32-row kernels.
 pub const FUSED_SMALL_M: usize = 32;
+
+/// Tile height of the fused kernels an expert with `expert_rows` routed rows in a pass runs
+/// on (its first tile; the policy `fused_experts` applies). A row's bytes must not depend on
+/// it — `cb3_moe_oracle_microtest --invariance` counts rows whose shape changes between
+/// chunkings, so that check can see both paths.
+pub fn fused_tile_height(expert_rows: usize) -> usize {
+    if expert_rows <= FUSED_SMALL_M { FUSED_SMALL_M } else { FUSED_TILE_M }
+}
 /// Dynamic shared memory per launch of the fused CB3 kernels: one mainloop stage, 32 KB
 /// (gate/up) / 24 KB (down) for 128-row tiles, 20 KB / 12 KB for 32-row tiles.
 pub const FUSED_GATE_UP_SMEM: u32 = 32_768;

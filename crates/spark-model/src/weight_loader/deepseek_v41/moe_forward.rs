@@ -37,7 +37,7 @@ use super::device_allocs::{DeviceAllocs, SharedGpu};
 use super::fwd::V41RoutedMoe;
 use super::moe::{
     COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_DOWN_M32_FN, FUSED_DOWN_M32_SMEM, FUSED_DOWN_SMEM, FUSED_GATE_UP_M32_FN, FUSED_GATE_UP_M32_SMEM,
-    FUSED_GATE_UP_SMEM, FUSED_GEMM_MODULE, FUSED_SMALL_M, FUSED_TILE_M,
+    FUSED_GATE_UP_SMEM, FUSED_GEMM_MODULE, FUSED_SMALL_M, FUSED_TILE_M, fused_tile_height,
     FUSED_TILE_N, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE,
     PERMUTE_KERNEL, ROUTE_TOPK_FN, SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, expert_matrices, gemm_weight_t_f32out,
     group_by_expert,
@@ -612,7 +612,7 @@ impl Cb3RoutedMoe {
             let mut row = *begin;
             while row < *end {
                 let rows = (end - row).min(FUSED_TILE_M);
-                let list = if end - begin <= FUSED_SMALL_M { &mut small } else { &mut mma };
+                let list = if fused_tile_height(end - begin) == FUSED_SMALL_M { &mut small } else { &mut mma };
                 list.extend_from_slice(&[row as i32, rows as i32, group.slot as i32, 0]);
                 row += rows;
             }

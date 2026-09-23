@@ -71,6 +71,16 @@
 //   - Experts of <= 32 rows on 32-row tiles (120 registers, 2 CTAs/SM): T=128 12.00 -> 11.46,
 //     T=2048 26.93 -> 26.76. Routing a large expert's <= 32-row TAIL there too was worse at
 //     large T (T=2048 +2.1%); gating the path on pass size (<= 3072 routed rows) was neutral.
+// MEASURED AND REJECTED on this base (2026-09-23, byte-identical, 6 interleaved rounds):
+//   - Two smem stages again, now that no plane byte needs L1: +1.3% (2048) .. +2.4% (4096).
+//   - Skipping padding per 16-row fragment: +0.3% / -0.7% (noise). MMA padding is not the bound.
+//   - 256-row tiles for > 128-row experts (255 registers, no spill): -0.3% at 2048, -2.0% at 4096.
+//   - 32-row kernels as 2 x 4 warps of 16 x 16 (ncu: mio_throttle 10.05 from 8x-redundant A
+//     ldmatrix) plus down at 128 columns so all 256 threads decode (ncu: barrier 5-9): each
+//     removes its ncu stall and neither moves the wall (+0.9% / -0.4% at 2048, +0.5% / +0.3%
+//     at 128). A first cut of the 2 x 4 down_m32 was WRONG (rel_l2 0.70) yet passed the chunk
+//     invariance check, which compares chunkings with each other: only the byte-cmp and
+//     rel_l2 gates catch a kernel that is wrong the same way in every chunking.
 // Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
 
 #include <cstdint>
