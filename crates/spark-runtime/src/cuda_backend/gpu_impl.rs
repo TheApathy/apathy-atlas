@@ -41,8 +41,8 @@ use super::{
     AtlasCudaBackend, cuCtxSetCurrent, cuEventCreate, cuEventDestroy_v2, cuEventRecord,
     cuGraphDestroy, cuGraphExecDestroy, cuGraphInstantiateWithFlags, cuGraphLaunch, cuMemAlloc_v2,
     cuMemAllocHost_v2, cuMemAllocManaged, cuMemFree_v2, cuMemFreeHost, cuMemGetInfo_v2,
-    cuMemcpyDtoDAsync_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyHtoDAsync_v2, cuMemsetD8Async,
-    cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture, cuStreamSynchronize,
+    cuMemcpyDtoDAsync_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyHtoDAsync_v2, cuMemsetD32Async,
+    cuMemsetD8Async, cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture, cuStreamSynchronize,
     cuStreamWaitEvent,
 };
 use crate::gpu::{
@@ -462,6 +462,40 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(())
     }
 
+    fn copy_d2d_2d_async(
+        &self,
+        src: DevicePtr,
+        src_pitch: usize,
+        dst: DevicePtr,
+        dst_pitch: usize,
+        width_bytes: usize,
+        height: usize,
+        stream: u64,
+    ) -> Result<()> {
+        // One pitched copy (cudaMemcpyDeviceToDevice = 3) on the caller's stream, replacing a
+        // per-row copy_d2d_async loop. cudart is linked (cutlass/flashinfer use the runtime
+        // API); a CUstream handle is a valid cudaStream_t. Ported from dsv41/integration.
+        unsafe extern "C" {
+            fn cudaMemcpy2DAsync(
+                dst: *mut c_void,
+                dpitch: usize,
+                src: *const c_void,
+                spitch: usize,
+                width: usize,
+                height: usize,
+                kind: i32,
+                stream: u64,
+            ) -> i32;
+        }
+        let status = unsafe {
+            cudaMemcpy2DAsync(dst.0 as *mut c_void, dst_pitch, src.0 as *const c_void, src_pitch, width_bytes, height, 3, stream)
+        };
+        if status != 0 {
+            bail!("cudaMemcpy2DAsync failed: status {status}");
+        }
+        Ok(())
+    }
+
     fn begin_capture(&self, stream: u64) -> Result<()> {
         // CU_STREAM_CAPTURE_MODE_RELAXED = 2
         // Relaxed mode allows NCCL's internal streams to operate during
@@ -525,6 +559,14 @@ impl GpuBackend for AtlasCudaBackend {
         let status = unsafe { cuMemsetD8Async(ptr.0, value, bytes, stream) };
         if status != 0 {
             bail!("cuMemsetD8Async failed: status {status}");
+        }
+        Ok(())
+    }
+
+    fn memset_u32_async(&self, ptr: DevicePtr, value: u32, count: usize, stream: u64) -> Result<()> {
+        let status = unsafe { cuMemsetD32Async(ptr.0, value, count, stream) };
+        if status != 0 {
+            bail!("cuMemsetD32Async failed: status {status}");
         }
         Ok(())
     }

@@ -1,0 +1,22 @@
+           v2 (on-the-fly B, 3 stages): byte-identical to v1: yes, 1.592 ms (27.0 TF/s, 0.82x current)
+           PROBE v2 without the fp8->bf16 conversion (wrong values, timing only): 1.604 ms (26.8 TF/s)
+fx/wq_b    M=512 N=32768 K= 1280 | identical 100.0000% rel 0.00e+00 | M=20 rows byte-identical: yes | CTRL scale+1 rel 1.00e+00 | current (dequant+gemm) 1.299 ms, gemm alone 0.638 ms, FUSED 1.592 ms (27.0 TF/s, 0.82x current) PASS
+           v2 (on-the-fly B, 3 stages): byte-identical to v1: yes, 0.843 ms (51.0 TF/s, 1.50x current)
+           PROBE v2 without the fp8->bf16 conversion (wrong values, timing only): 0.891 ms (48.2 TF/s)
+fx/wo_b    M=512 N= 5120 K= 8192 | identical 100.0000% rel 0.00e+00 | M=20 rows byte-identical: yes | CTRL scale+1 rel 1.00e+00 | current (dequant+gemm) 1.261 ms, gemm alone 0.590 ms, FUSED 0.993 ms (43.3 TF/s, 1.27x current) PASS
+           v2 (on-the-fly B, 3 stages): byte-identical to v1: yes, 0.256 ms (47.2 TF/s, 1.14x current)
+           PROBE v2 without the fp8->bf16 conversion (wrong values, timing only): 0.213 ms (56.6 TF/s)
+fx/w1      M=512 N= 2304 K= 5120 | identical 100.0000% rel 0.00e+00 | M=20 rows byte-identical: yes | CTRL scale+1 rel 1.00e+00 | current (dequant+gemm) 0.291 ms, gemm alone 0.114 ms, FUSED 0.221 ms (54.7 TF/s, 1.32x current) PASS
+           v2 (on-the-fly B, 3 stages): byte-identical to v1: yes, 0.130 ms (51.5 TF/s, 1.15x current)
+           PROBE v2 without the fp8->bf16 conversion (wrong values, timing only): 0.117 ms (57.5 TF/s)
+fx/wq_a    M=512 N= 1280 K= 5120 | identical 100.0000% rel 0.00e+00 | M=20 rows byte-identical: yes | CTRL scale+1 rel 1.00e+00 | current (dequant+gemm) 0.150 ms, gemm alone 0.075 ms, FUSED 0.154 ms (43.6 TF/s, 0.98x current) PASS
+           v2 (on-the-fly B, 3 stages): byte-identical to v1: yes, 0.130 ms (20.6 TF/s, 0.49x current)
+           PROBE v2 without the fp8->bf16 conversion (wrong values, timing only): 0.118 ms (22.8 TF/s)
+fx/wkv     M=512 N=  512 K= 5120 | identical 100.0000% rel 0.00e+00 | M=20 rows byte-identical: yes | CTRL scale+1 rel 1.00e+00 | current (dequant+gemm) 0.064 ms, gemm alone 0.043 ms, FUSED 0.140 ms (19.1 TF/s, 0.45x current) PASS
+           v2 (on-the-fly B, 3 stages): byte-identical to v1: yes, 0.210 ms (57.5 TF/s, 1.51x current)
+           PROBE v2 without the fp8->bf16 conversion (wrong values, timing only): 0.195 ms (61.8 TF/s)
+fx/w2      M=512 N= 5120 K= 2304 | identical 100.0000% rel 0.00e+00 | M=20 rows byte-identical: yes | CTRL scale+1 rel 1.00e+00 | current (dequant+gemm) 0.316 ms, gemm alone 0.173 ms, FUSED 0.209 ms (57.9 TF/s, 1.52x current) PASS
+           v2 (on-the-fly B, 3 stages): byte-identical to v1: yes, 0.102 ms (41.9 TF/s, 0.86x current)
+           PROBE v2 without the fp8->bf16 conversion (wrong values, timing only): 0.092 ms (46.5 TF/s)
+fx/wo_a_g0 M=512 N= 1024 K= 4096 | identical 100.0000% rel 0.00e+00 | M=20 rows byte-identical: yes | CTRL scale+1 rel 1.00e+00 | current (dequant+gemm) 0.088 ms, gemm alone 0.051 ms, FUSED 0.115 ms (37.4 TF/s, 0.77x current) PASS
+GATE PASS

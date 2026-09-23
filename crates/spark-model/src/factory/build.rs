@@ -261,6 +261,22 @@ pub fn build_model(
     // MTP / no-spec paths unchanged.
     dflash_args: Option<DflashBuildArgs<'_>>,
 ) -> Result<Box<dyn Model>> {
+    // DeepSeek-V4.1 (forward-ported from dsv41/integration): standalone model over the CED +
+    // SWA-replay forward (`model::dsv41`). Dispatched FIRST: none of the decoder-only
+    // construction below describes it.
+    #[cfg(feature = "cuda")]
+    if config.model_type == "deepseek_v41" {
+        if max_batch_size > 1 {
+            tracing::warn!(
+                "DeepSeek-V4.1 serves ONE live sequence (model-wide compressed-KV caches); \
+                 --max-batch-size {max_batch_size} is ignored"
+            );
+        }
+        let model_dir = crate::weight_loader::deepseek_v41::resolve_model_dir()?;
+        let max_chunk = std::env::var("ATLAS_DSV41_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+        let model = crate::model::dsv41::Dsv41Model::new(&config, store, gpu, &model_dir, max_seq_len, max_chunk)?;
+        return Ok(Box::new(model));
+    }
     // ── Step 1: Select weight loader (only model-specific dispatch) ──
     let loader = loader_for_config(&config)?;
 
@@ -408,7 +424,7 @@ pub fn build_model(
 
     crate::weight_loader::transform_cache::configure_construction_mode(use_speculative)?;
     let mut layers = loader.load_layers(store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
-    let embed = loader.load_embedding(store, &config)?;
+    let embed = loader.load_embedding(store, &config, gpu.as_ref())?;
     let final_norm = loader.load_final_norm(store, &config, gpu.as_ref())?;
     let qwen4_final_mixer = loader.load_qwen4_final_mixer(store, &config, gpu.as_ref())?;
     #[cfg(all(feature = "cuda", target_os = "linux"))]

@@ -179,6 +179,12 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
         }
         "gemma4" => parse_gemma4_params(&raw),
         "glm5_next" => parse_glm5_next(&raw),
+        // The earlier, flat DeepSeek-V4 family (a different release from V4.1 -- do NOT share
+        // the v41 arm, see parsers/deepseek_v41.rs). Ported alongside V4.1's parser since both
+        // share parsers/deepseek_v4.rs::parse_deepseek_family.
+        "deepseek_v4" => super::parse_deepseek_v4(json),
+        // DeepSeek-V4.1 nests its text config under `text_config`; own parser.
+        "deepseek_v41" => super::parse_deepseek_v41(json),
         "minimax_m2" => parse_minimax_m2(&raw),
         _ => {
             // Flat config (qwen3_next, etc.)

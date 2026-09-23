@@ -51,6 +51,8 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
     match normalized.as_str() {
         // Qwen3 family: sub-dispatch by config predicates
         "qwen3_next" => Ok(Box::new(Qwen3WeightLoader)),
+        // DeepSeek-V4.1 (forward-ported): its own loader — CB3 experts, not EXL3/NVFP4.
+        "deepseek_v41" => Ok(Box::new(crate::weight_loader::deepseek_v41::DeepSeekV41WeightLoader)),
         "qwen3_vl_moe" => Ok(Box::new(Qwen3VLWeightLoader)),
         "qwen3_5_moe" | "qwen3_5" | "qwen35_moe" | "qwen35" => {
             // Dense check has to come first. Qwen3.6-27B-FP8 is the dense text

@@ -421,6 +421,28 @@ pub trait GpuBackend: Send + Sync {
         self.copy_d2d(src, dst, bytes)
     }
 
+    /// Strided device-to-device 2D (pitched) copy: `height` rows of `width_bytes`, source rows
+    /// spaced by `src_pitch`, dest rows by `dst_pitch`. Default = per-row `copy_d2d_async` loop;
+    /// the CUDA backend overrides with ONE `cudaMemcpy2DAsync` (replaces a per-token loop of
+    /// up to num_tokens×num_layers launches/forward — DeepSeek-V4.1's sparse attention uses
+    /// this for the compressed-KV publish). Ported from dsv41/integration.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_d2d_2d_async(
+        &self,
+        src: DevicePtr,
+        src_pitch: usize,
+        dst: DevicePtr,
+        dst_pitch: usize,
+        width_bytes: usize,
+        height: usize,
+        stream: u64,
+    ) -> Result<()> {
+        for r in 0..height {
+            self.copy_d2d_async(src.offset(r * src_pitch), dst.offset(r * dst_pitch), width_bytes, stream)?;
+        }
+        Ok(())
+    }
+
     /// Begin capturing CUDA operations on `stream` into a graph.
     ///
     /// All kernel launches and async copies on this stream between
@@ -450,6 +472,19 @@ pub trait GpuBackend: Send + Sync {
 
     /// Set device memory to a byte value on the given stream (async — does not wait).
     fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, stream: u64) -> Result<()>;
+
+    /// Set `count` 32-bit words at `ptr` to `value` on the given stream (async).
+    /// Used to publish a small device-resident counter that graphed kernels read
+    /// at replay time (a by-value launch arg would freeze at graph capture).
+    ///
+    /// Default: builds the pattern on the host and H2D-copies it -- correct but not a real
+    /// device-side memset, so it costs one small host allocation and one copy per call. Fine
+    /// for the small, infrequent counters this is used for; backends compiled for real GPU
+    /// work (AtlasCudaBackend) override it with a real `cuMemsetD32Async`.
+    fn memset_u32_async(&self, ptr: DevicePtr, value: u32, count: usize, stream: u64) -> Result<()> {
+        let bytes: Vec<u8> = value.to_le_bytes().iter().copied().cycle().take(count * 4).collect();
+        self.copy_h2d_async(&bytes, ptr, stream)
+    }
 
     /// Total device memory in bytes.
     fn total_memory(&self) -> Result<usize>;

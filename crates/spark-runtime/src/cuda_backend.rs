@@ -32,6 +32,7 @@ unsafe extern "C" {
     pub(super) fn cuStreamSynchronize(stream: u64) -> i32;
     pub(super) fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> i32;
     pub(super) fn cuMemsetD8Async(dst: u64, value: u8, n: usize, stream: u64) -> i32;
+    pub(super) fn cuMemsetD32Async(dst: u64, value: u32, n: usize, stream: u64) -> i32;
     // CUDA graph capture/replay
     pub(super) fn cuStreamBeginCapture(hStream: u64, mode: u32) -> i32;
     pub(super) fn cuStreamEndCapture(hStream: u64, phGraph: *mut u64) -> i32;

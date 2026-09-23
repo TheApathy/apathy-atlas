@@ -121,6 +121,12 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
             "U8" => WeightDtype::UInt8,
             "I64" => WeightDtype::Int64,
             "F8_E4M3" => WeightDtype::FP8E4M3,
+            // UE8M0 block scales (DeepSeek-V4.1's FP8 weights, as the plain loader).
+            "F8_E8M0" => WeightDtype::FP8E8M0,
+            // A 1-byte raw container: DeepSeek-V4.1's DSpark (mtp.*) experts ship 4-bit-packed
+            // weights as I8. Signedness is irrelevant to packed FP4 (nibbles are extracted by bit
+            // ops), so it stages as UInt8, as in the D lineage's fast loader.
+            "I8" => WeightDtype::UInt8,
             other => bail!("Unsupported safetensors dtype '{other}' for tensor {name}"),
         };
         let shape: Vec<usize> = info["shape"]

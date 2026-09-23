@@ -303,3 +303,28 @@ fn test_top_n_sigma_filters_extreme_outliers() {
         );
     }
 }
+
+#[test]
+fn test_greedy_breaks_exact_ties_toward_the_lowest_index() {
+    use super::sample_impl::first_max_index;
+    assert_eq!(first_max_index(&[1.0, 3.0, 3.0]), 1);
+    // Exact bf16 tie seen on DeepSeek-V4.1 (25.375 twice): torch.argmax takes the first.
+    assert_eq!(first_max_index(&[0.0, 25.375, 1.0, 25.375]), 1);
+    // Through the full greedy path (penalties/bias are no-ops here).
+    let logits: Vec<u8> = [1.0f32, 3.0, 3.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+    let params = SamplingParams::greedy(3);
+    assert_eq!(sample_with_params_history(&logits, &params, &[]), 1);
+    // NaN is skipped wherever it sits; it never wins and never hides a later max.
+    assert_eq!(first_max_index(&[f32::NAN, 1.0, 3.0, 3.0]), 2);
+    assert_eq!(first_max_index(&[1.0, 3.0, f32::NAN]), 1);
+    assert_eq!(first_max_index(&[f32::NAN, f32::NAN]), 0);
+    assert_eq!(first_max_index(&[]), 0);
+    // Negative control: the previous max_by selection picks the LAST of the tie.
+    let old = [1.0f32, 3.0, 3.0]
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap();
+    assert_eq!(old, 2);
+}
