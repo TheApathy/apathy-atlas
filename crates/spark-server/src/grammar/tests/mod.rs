@@ -6,6 +6,9 @@ use super::*;
 use crate::tool_parser::ToolDefinition;
 
 mod engine_state;
+mod glm_native_tokenizer;
+mod glm_tool_contract_grammar;
+mod glm_tool_prefix_contract;
 mod minimax;
 mod misc;
 mod qwen3_coder_required;
@@ -14,6 +17,20 @@ mod qwen3_coder_required;
 // left on disk; un-comment once updated to the current schema-cleaner API.
 // mod sanitize;
 mod tools_basic;
+
+/// all-models port: this tree's GrammarState has no `stop_legal` /
+/// `with_stop_tokens` (upstream's EOS-exempt matcher), which the GLM grammar
+/// tests use. Stop legality is read from the ordinary next-token mask.
+pub(super) trait StopLegal {
+    fn stop_legal(&mut self, stop: &[u32]) -> bool;
+}
+
+impl StopLegal for GrammarState {
+    fn stop_legal(&mut self, stop: &[u32]) -> bool {
+        self.fill_bitmask();
+        stop.iter().any(|&token| self.is_token_allowed(token))
+    }
+}
 
 /// Build a minimal vocabulary for testing.
 /// Contains basic ASCII + JSON structural tokens.

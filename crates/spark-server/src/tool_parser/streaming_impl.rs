@@ -33,6 +33,11 @@ impl StreamingToolDetector {
         let mut outputs = Vec::new();
         self.buffer.push_str(new_text);
         loop {
+            match self.process_glm_native(&mut outputs) {
+                glm_xml_stream::NativeStep::Consumed => continue,
+                glm_xml_stream::NativeStep::Pending => break,
+                glm_xml_stream::NativeStep::NotNative => {}
+            }
             if self.inside_tag {
                 // Check for closing tag. Recognised forms:
                 //   - `</tool_call>` (hermes / qwen3-coder, 12 chars)
@@ -273,6 +278,11 @@ impl StreamingToolDetector {
         let text = std::mem::take(&mut self.buffer);
         let was_inside_tag = self.inside_tag;
         self.inside_tag = false;
+        if was_inside_tag && glm_xml_scan::native_prefix(&text) {
+            // Never salvage an unclosed native GLM envelope.
+            self.reset_call_state();
+            return vec![DetectorOutput::Content(format!("<tool_call>{text}"))];
+        }
 
         // When inside_tag was true, we have the raw content between
         // <tool_call> and end-of-stream (</tool_call> was a stop token
@@ -357,6 +367,13 @@ impl StreamingToolDetector {
         }
 
         vec![DetectorOutput::Content(text)]
+    }
+
+    /// Clear the per-tool-call incremental bookkeeping (native GLM path).
+    pub(super) fn reset_call_state(&mut self) {
+        self.current_tc_name = None;
+        self.current_tc_id = None;
+        self.current_tc_emitted = 0;
     }
 
     pub fn has_tool_calls(&self) -> bool {

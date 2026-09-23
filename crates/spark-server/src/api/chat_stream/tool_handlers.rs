@@ -40,6 +40,19 @@ fn validate_for_stream(
     }
 }
 
+/// Native GLM publication. The request's tool grammar carries the exact
+/// allowed set (a specific tool_choice narrows it); never recover that
+/// restriction from the all-tools list, and never repair raw native values.
+pub(super) fn validate_native_glm(
+    call: &mut tool_parser::ToolCall,
+    allowed: Option<&[tool_parser::ToolDefinition]>,
+) -> Result<(), String> {
+    let allowed = allowed
+        .ok_or("native GLM publication is missing its exact tool grammar binding")?;
+    *call = tool_parser::native_publication::validate_call(call, allowed)?;
+    Ok(())
+}
+
 /// `DetectorOutput::ToolCall(tc, idx)`: complete tool call.
 pub(super) fn handle_complete_tool_call(
     state: &mut StreamState,
@@ -61,11 +74,24 @@ pub(super) fn handle_complete_tool_call(
             Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
         ));
     }
-    tool_parser::backfill_required_params(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
-    if let Some(ref cwd) = ctx.cwd_for_normalize {
-        tool_parser::normalize_paths(std::slice::from_mut(tc), cwd);
-    }
-    if let Err(e) = validate_for_stream(tc, &ctx.tool_defs_for_backfill) {
+    let native_glm = ctx
+        .state
+        .tool_call_parser
+        .as_ref()
+        .is_some_and(|p| p.name() == "glm_xml");
+    let validation = if native_glm {
+        validate_native_glm(tc, ctx.native_tool_defs.as_deref())
+    } else {
+        tool_parser::backfill_required_params(
+            std::slice::from_mut(tc),
+            &ctx.tool_defs_for_backfill,
+        );
+        if let Some(ref cwd) = ctx.cwd_for_normalize {
+            tool_parser::normalize_paths(std::slice::from_mut(tc), cwd);
+        }
+        validate_for_stream(tc, &ctx.tool_defs_for_backfill)
+    };
+    if let Err(e) = validation {
         tracing::warn!(
             tool = %tc.function.name,
             "tool call validation error: {e}; replacing with content and ending"

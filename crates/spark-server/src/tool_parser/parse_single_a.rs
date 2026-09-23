@@ -6,6 +6,12 @@ use super::*;
 /// Auto-detect and parse inner content of a `<tool_call>` block.
 /// Tries Gemma-4 native, JSON (hermes), qwen3_coder XML, then tag-style XML fallback.
 pub(super) fn parse_one_call(text: &str, idx: u32) -> Option<ToolCall> {
+    // GLM requires proof of a complete native envelope from its dispatcher.
+    // A body handed to a legacy salvage path must not be reinterpreted using
+    // JSON/function/invoke fragments that happen to occur inside its values.
+    if glm_xml_scan::native_prefix(text) {
+        return None;
+    }
     // Try Gemma-4 native: call:fn_name{...} or _call:fn_name{...}
     if text.starts_with("call:") || text.starts_with("_call:") {
         return parse_gemma4_native_call(text);

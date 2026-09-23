@@ -27,6 +27,10 @@ pub(super) struct MsgEntry {
     /// Structured tool_calls for the Jinja template (arguments
     /// pre-parsed to dicts).
     pub(super) tool_calls: Option<Vec<serde_json::Value>>,
+    /// The caller's association with a historical tool invocation. Rendered
+    /// into the Jinja message only for the native GLM contract (see
+    /// `template::render_template`); other templates never see it.
+    pub(super) tool_call_id: Option<String>,
     /// Number of image content parts on this message. When > 0
     /// the json_messages builder emits a structured content array
     /// so the Jinja template can render
@@ -138,6 +142,7 @@ pub(super) fn build_msg_entries(
             role: m.role.clone(),
             content: text,
             tool_calls: tool_calls_json,
+            tool_call_id: m.tool_call_id.clone(),
             image_count,
             image_text_offsets: content.image_text_offsets,
         });

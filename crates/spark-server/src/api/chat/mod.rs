@@ -98,6 +98,15 @@ pub(crate) async fn chat_completions_inner(
     if let Err(resp) = super::chat_phases::validate_input(&req) {
         return resp;
     }
+    // Native GLM tool contract admission (no-op for every other parser).
+    if let Err(message) = crate::tool_parser::request_admission::capability(
+        req.tools.as_deref().unwrap_or(&[]),
+        req.tool_choice.as_ref(),
+        state.tool_call_parser.as_deref(),
+        state.behavior.disable_tool_grammar,
+    ) {
+        return openai_error_response(StatusCode::BAD_REQUEST, message);
+    }
     for message in &req.messages {
         if let Err(error) = message.content.validate_order() {
             return openai_error_response(StatusCode::BAD_REQUEST, error);

@@ -27,6 +27,9 @@ mod state;
 mod token_ids;
 mod tool_handlers;
 
+#[cfg(test)]
+mod glm_tool_publication_stream_tests;
+
 pub(in crate::api) use handle_token::filter_stop_delta;
 
 use axum::http::StatusCode;
@@ -113,6 +116,13 @@ pub(crate) async fn chat_completions_stream(
     // `<think>\n\n</think>\n\n` and the model generates no thinking tokens —
     // no need for scheduler tracking.
     let scheduler_thinking = enable_thinking;
+    // Native GLM publication validates against the grammar's exact tool set.
+    let native_tool_defs = match &grammar_spec {
+        Some(GrammarSpec::ToolCall { tools, parser, .. }) if parser.name() == "glm_xml" => {
+            Some(tools.clone())
+        }
+        _ => None,
+    };
     let request = InferenceRequest::Streaming {
         prompt_tokens,
         session_hash,
@@ -194,6 +204,7 @@ pub(crate) async fn chat_completions_stream(
         prompt_len,
         enable_thinking,
         tool_defs_for_backfill: tool_defs,
+        native_tool_defs,
         cwd_for_normalize: cwd_hint,
         stop_strings,
         leak_markers,

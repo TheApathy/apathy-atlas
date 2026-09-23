@@ -64,6 +64,9 @@ fn normalize_tool_call_arguments(messages: &[serde_json::Value]) -> Vec<serde_js
 mod chat_impl;
 mod jinja_helpers;
 
+#[cfg(test)]
+mod glm_tool_contract_template_tests;
+
 pub struct ChatTokenizer {
     tokenizer: Tokenizer,
     eos_token_id: u32,

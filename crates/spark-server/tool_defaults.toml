@@ -6,8 +6,10 @@
 #   qwen3_coder — XML:  <tool_call><function=fn><parameter=k>v</parameter></function></tool_call>
 #   gemma4      — Native: <|tool_call>call:fn{key:val,...}<tool_call|>
 #   mistral     — Native: [TOOL_CALLS]fn[ARGS]{"k":"v",...}
+#   glm_xml     — Native: <tool_call>fn<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
 
 [model_type]
+glm5_next  = "glm_xml"       # GLM-5.3-Flash — native arg_key/arg_value format
 qwen3_5_moe = "qwen3_coder"    # Qwen3.5-35B, Qwen3.5-122B — native XML format
 qwen3_5     = "qwen3_coder"    # Qwen3.5-27B Dense — native XML format
 qwen3_6_moe = "qwen3_coder"    # Qwen3.6-35B — same XML format; MRoPE-interleaved only differs at kernel layer

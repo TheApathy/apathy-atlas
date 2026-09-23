@@ -90,17 +90,49 @@ pub(super) fn build_jinja_env(chat_template: &str) -> Result<minijinja::Environm
     env.set_unknown_method_callback(
         |state, value, method, args| -> Result<minijinja::Value, minijinja::Error> {
             use minijinja::value::{ValueKind, from_args};
-            if value.kind() == ValueKind::String && method == "split" {
-                // Python `str.split(sep)` → minijinja `split` filter.
-                // The separator is forwarded verbatim; an absent
-                // separator falls through to the filter's default
-                // (whitespace split), matching Python semantics.
-                let (sep,): (Option<minijinja::Value>,) = from_args(args)?;
-                let mut filter_args = vec![value.clone()];
-                if let Some(sep) = sep {
-                    filter_args.push(sep);
+            if value.kind() == ValueKind::String {
+                match method {
+                    "split" => {
+                        // Python `str.split(sep)` → minijinja `split` filter.
+                        // The separator is forwarded verbatim; an absent
+                        // separator falls through to the filter's default
+                        // (whitespace split), matching Python semantics.
+                        let (sep,): (Option<minijinja::Value>,) = from_args(args)?;
+                        let mut filter_args = vec![value.clone()];
+                        if let Some(sep) = sep {
+                            filter_args.push(sep);
+                        }
+                        return state.apply_filter("split", &filter_args);
+                    }
+                    // Python `str.find/rfind/replace/strip()` (upstream's
+                    // bridge). GLM-5.3's template calls `content.strip()` on
+                    // every assistant history turn. These only fire where
+                    // minijinja would otherwise raise UnknownMethod, so no
+                    // template that renders today changes.
+                    "find" | "rfind" => {
+                        let (needle,): (String,) = from_args(args)?;
+                        let haystack = value.as_str().unwrap_or_default();
+                        let idx = if method == "find" {
+                            haystack.find(&needle)
+                        } else {
+                            haystack.rfind(&needle)
+                        }
+                        .map(|v| v as i64)
+                        .unwrap_or(-1);
+                        return Ok(minijinja::Value::from(idx));
+                    }
+                    "replace" => {
+                        let (from, to): (String, String) = from_args(args)?;
+                        let s = value.as_str().unwrap_or_default().replace(&from, &to);
+                        return Ok(minijinja::Value::from(s));
+                    }
+                    "strip" => {
+                        let _: () = from_args(args)?;
+                        let s = value.as_str().unwrap_or_default().trim().to_string();
+                        return Ok(minijinja::Value::from(s));
+                    }
+                    _ => {}
                 }
-                return state.apply_filter("split", &filter_args);
             }
             if value.kind() == ValueKind::Map {
                 match method {

@@ -55,6 +55,9 @@ pub mod stubs;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod glm_tool_publication_fixture;
+
 // Re-exports to preserve the original `crate::api::*` import surface.
 // `#[allow(unused_imports)]` is applied only where the re-export is
 // part of the public surface but happens to be unreferenced this build

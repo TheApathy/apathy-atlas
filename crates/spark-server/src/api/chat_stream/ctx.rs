@@ -18,6 +18,9 @@ pub(super) struct StreamCtx {
     pub(super) prompt_len: usize,
     pub(super) enable_thinking: bool,
     pub(super) tool_defs_for_backfill: Vec<tool_parser::ToolDefinition>,
+    /// Native GLM only: the exact tool set bound into the request's tool
+    /// grammar (a specific tool_choice narrows it). `None` for other parsers.
+    pub(super) native_tool_defs: Option<Vec<tool_parser::ToolDefinition>>,
     pub(super) cwd_for_normalize: Option<String>,
     pub(super) stop_strings: Vec<String>,
     pub(super) leak_markers: tool_parser::LeakMarkers,

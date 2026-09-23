@@ -65,6 +65,12 @@ pub(super) fn render_template(
 
     // Build JSON messages with structured tool_calls for Jinja.
     let stripper_tools: &[tool_parser::ToolDefinition] = req.tools.as_deref().unwrap_or(&[]);
+    // GLM's template orders parallel tool results by `tool_call_id`. Only the
+    // native GLM contract forwards it, so no other template's input changes.
+    let forward_tool_call_id = state
+        .tool_call_parser
+        .as_ref()
+        .is_some_and(|parser| parser.name() == "glm_xml");
     let json_messages: Vec<serde_json::Value> = messages
         .iter()
         .map(|m| {
@@ -85,6 +91,9 @@ pub(super) fn render_template(
             let mut msg = serde_json::json!({"role": m.role, "content": content_val});
             if let Some(ref tcs) = m.tool_calls {
                 msg["tool_calls"] = serde_json::Value::Array(tcs.clone());
+            }
+            if forward_tool_call_id && let Some(ref id) = m.tool_call_id {
+                msg["tool_call_id"] = serde_json::Value::String(id.clone());
             }
             Ok::<_, String>(msg)
         })

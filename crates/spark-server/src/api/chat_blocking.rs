@@ -269,11 +269,49 @@ fn decode_response_text(
     }
 }
 
+#[cfg(test)]
+#[path = "glm_tool_publication_blocking_tests.rs"]
+mod glm_tool_publication_blocking_tests;
+
+/// Publication validation for one choice's parsed tool calls. The native GLM
+/// contract validates exactly (no backfill, fuzzy-name repair or path
+/// rewriting, which would change raw native values); every other parser keeps
+/// the legacy repair + validation pipeline unchanged.
+fn validate_parsed_tool_calls(
+    native_glm: bool,
+    mut calls: Vec<tool_parser::ToolCall>,
+    tools: &[tool_parser::ToolDefinition],
+    tool_choice: Option<&tool_parser::ToolChoice>,
+    cwd_hint: Option<&str>,
+) -> tool_parser::ValidatedToolCalls {
+    if native_glm {
+        return tool_parser::native_publication::validate_calls(calls, tools, tool_choice);
+    }
+    tool_parser::backfill_required_params(&mut calls, tools);
+    if let Some(cwd) = cwd_hint {
+        tool_parser::normalize_paths(&mut calls, cwd);
+    }
+    tool_parser::validate_tool_calls(calls, tools)
+}
+
+/// Native GLM: match streaming's explicit rejection feedback. Never turn
+/// invalid native calls into an unexplained empty response.
+fn native_rejection_feedback(content: Option<String>, errors: &[String]) -> Option<String> {
+    if errors.is_empty() {
+        return content;
+    }
+    let feedback = format!("[atlas] Tool call rejected: {}", errors.join("; "));
+    Some(match content {
+        Some(text) if !text.is_empty() => format!("{text}\n{feedback}"),
+        _ => feedback,
+    })
+}
+
 /// Build the assistant message + finish_reason for one choice. Tool
 /// parsing, validation, content-strip + refusal-classifier all live
 /// here.
 fn build_choice_message(
-    _state: &AppState,
+    state: &AppState,
     req: &ChatCompletionRequest,
     response: &super::inference_types::InferenceResponse,
     reasoning_content_i: Option<String>,
@@ -301,14 +339,20 @@ fn build_choice_message(
                 "raw pre-parse output (tools_active, choice {choice_idx}): {output_text_i:?}"
             );
         }
-        let (content, mut tool_calls_i) = tool_parser::parse_tool_calls(&output_text_i);
+        let (content, tool_calls_i) = tool_parser::parse_tool_calls(&output_text_i);
         if !tool_calls_i.is_empty() {
             let tools_ref = req.tools.as_ref().cloned().unwrap_or_default();
-            tool_parser::backfill_required_params(&mut tool_calls_i, &tools_ref);
-            if let Some(cwd) = cwd_hint {
-                tool_parser::normalize_paths(&mut tool_calls_i, cwd);
-            }
-            let validated = tool_parser::validate_tool_calls(tool_calls_i, &tools_ref);
+            let native_glm = state
+                .tool_call_parser
+                .as_ref()
+                .is_some_and(|p| p.name() == "glm_xml");
+            let validated = validate_parsed_tool_calls(
+                native_glm,
+                tool_calls_i,
+                &tools_ref,
+                req.tool_choice.as_ref(),
+                cwd_hint,
+            );
             if !validated.errors.is_empty() {
                 for err in &validated.errors {
                     tracing::warn!("Tool call validation error: {err}");
@@ -338,7 +382,11 @@ fn build_choice_message(
                 }
                 c.trim().to_string()
             });
-            message.content = content;
+            message.content = if native_glm {
+                native_rejection_feedback(content, &validated.errors)
+            } else {
+                content
+            };
             if !validated.valid.is_empty() {
                 for tc in &validated.valid {
                     let p: String = tc.function.arguments.chars().take(120).collect();

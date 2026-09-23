@@ -22,6 +22,14 @@ fn next_tool_call_id() -> String {
     format!("call_{id:016x}")
 }
 
+/// Native tool-name component: nonempty ASCII alphanumerics plus `_-.`.
+/// Used by the GLM native parser and request admission only.
+fn is_tool_name_component(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
 // ── Request types (from OpenAI-compatible clients) ──
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -271,6 +279,7 @@ impl std::fmt::Display for dyn ToolCallParser {
 /// Maps CLI `--tool-call-parser` string to a concrete parser.
 #[derive(Debug, Clone, Copy)]
 pub enum ToolCallFormat {
+    GlmXml,
     Hermes,
     Qwen3Coder,
     Gemma4,
@@ -283,6 +292,7 @@ impl std::str::FromStr for ToolCallFormat {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "glm_xml" => Ok(Self::GlmXml),
             "hermes" => Ok(Self::Hermes),
             "qwen3_coder" => Ok(Self::Qwen3Coder),
             "gemma4" => Ok(Self::Gemma4),
@@ -290,7 +300,7 @@ impl std::str::FromStr for ToolCallFormat {
             "minimax_xml" => Ok(Self::MinimaxXml),
             "bare_json" => Ok(Self::BareJson),
             other => Err(format!(
-                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, gemma4, mistral, minimax_xml, bare_json",
+                "Unknown tool call parser '{other}'. Supported: glm_xml, hermes, qwen3_coder, gemma4, mistral, minimax_xml, bare_json",
             )),
         }
     }
@@ -300,6 +310,7 @@ impl ToolCallFormat {
     /// Create a boxed parser implementation for this format.
     pub fn into_parser(self) -> Box<dyn ToolCallParser> {
         match self {
+            Self::GlmXml => Box::new(GlmXmlParser),
             Self::Hermes => Box::new(HermesParser),
             Self::Qwen3Coder => Box::new(Qwen3CoderParser),
             Self::Gemma4 => Box::new(Gemma4Parser),
@@ -325,6 +336,7 @@ impl ToolCallFormat {
     /// F66 (2026-04-29): canonical name used in CLI flags and logs.
     pub fn name(self) -> &'static str {
         match self {
+            Self::GlmXml => "glm_xml",
             Self::Hermes => "hermes",
             Self::Qwen3Coder => "qwen3_coder",
             Self::Gemma4 => "gemma4",
@@ -341,11 +353,15 @@ impl ToolCallFormat {
 mod bare_json;
 mod fuzzy_match;
 mod gemma4;
+mod glm_xml;
+mod glm_xml_scan;
+mod glm_xml_stream;
 mod helpers_a;
 mod helpers_b;
 mod hermes;
 mod minimax_xml;
 mod mistral;
+pub(crate) mod native_publication;
 mod parse_dispatch;
 mod parse_single_a;
 mod parse_single_b;
@@ -353,12 +369,14 @@ mod parse_tools_tag;
 mod pipeline;
 mod pipeline_helpers;
 mod qwen3_coder;
+pub(crate) mod request_admission;
 mod streaming;
 mod streaming_impl;
 mod validation;
 
 pub use bare_json::*;
 pub use gemma4::*;
+pub use glm_xml::GlmXmlParser;
 use helpers_a::*;
 use helpers_b::*;
 pub use hermes::*;
