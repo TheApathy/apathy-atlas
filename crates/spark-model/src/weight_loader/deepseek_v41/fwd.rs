@@ -267,6 +267,29 @@ pub struct SideStream {
 }
 
 impl PassScratch {
+    /// The same buffers seen from row `r0` on: the per-row stream, pre/post/comb, x, y, routed
+    /// and shared pointers are offset; per-pass intermediates (gate/up/act, dequant scratch,
+    /// engram, hc_raw) are not. Owns nothing.
+    pub fn row_view(&self, r0: usize, dims: &V41Dims) -> PassScratch {
+        let (d, hc) = (dims.hidden, dims.hc);
+        PassScratch {
+            h: self.h.offset(r0 * hc * d * 2),
+            pre_mix: self.pre_mix.offset(r0 * hc * 4),
+            attn_pre: self.attn_pre.offset(r0 * hc * 4),
+            attn_post: self.attn_post.offset(r0 * hc * 4),
+            attn_comb: self.attn_comb.offset(r0 * hc * hc * 4),
+            ffn_pre: self.ffn_pre.offset(r0 * hc * 4),
+            ffn_post: self.ffn_post.offset(r0 * hc * 4),
+            ffn_comb: self.ffn_comb.offset(r0 * hc * hc * 4),
+            x: self.x.offset(r0 * d * 2),
+            y: self.y.offset(r0 * d * 2),
+            routed: self.routed.offset(r0 * d * 2),
+            shared: self.shared.offset(r0 * d * 2),
+            allocations: Vec::new(),
+            ..*self
+        }
+    }
+
     /// The device buffers this scratch allocated (for an owner that frees them on drop).
     pub fn allocations(&self) -> &[DevicePtr] {
         &self.allocations
@@ -368,8 +391,10 @@ pub fn block(
     moe: &dyn V41RoutedMoe,
     tap: &Tap,
     control: BlockControl,
+    post_from: usize,
 ) -> Result<()> {
     ensure!(t <= s.max_t, "pass of {t} tokens exceeds scratch sized for {}", s.max_t);
+    ensure!(post_from < t.max(1), "post_from {post_from} of a {t}-row pass");
     let (d, hc, l) = (dims.hidden, dims.hc, w.layer);
     let (eps, it, hce) = (dims.norm_eps, dims.sinkhorn_iters, dims.hc_eps);
 
@@ -394,6 +419,15 @@ pub fn block(
     tap.bf16(ops, "attn_x", l, s.x, &[t, d])?;
     prof(ops, "attention", || attn.forward(ops, l, s.x, s.y, t, start))?;
     tap.bf16(ops, "attn_out", l, s.y, &[t, d])?;
+    // From here only rows post_from.. (the replay's last layer: only its last row reaches the
+    // logits; its attention above ran for every row, so ring/cache state is unchanged).
+    let view;
+    let (s, t) = if post_from > 0 {
+        view = s.row_view(post_from, dims);
+        (&view, t - post_from)
+    } else {
+        (s, t)
+    };
 
     // ---- FFN sub-layer (collapses with THIS block's attention-side pre)
     let ffn_side_pre = match control {

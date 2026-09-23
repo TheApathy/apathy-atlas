@@ -373,6 +373,9 @@ pub struct V41Forward {
     pub ids_dev: DevicePtr,
     pub max_chunk: usize,
     pub max_seq: usize,
+    /// Set only around the replay's run_layers when TRIM_LAST is on: the last prompt token's id
+    /// (the MoE's pass tokens for the one-row post-attention path of the last layer).
+    trim_last_id: std::sync::Mutex<Option<u32>>,
     /// Every device allocation this forward made (scratch, RoPE tables, ids, the engram
     /// q*k weight products), freed on drop once [`Self::own_allocations`] hands it a backend.
     /// Until then (the driver) it only records them.
@@ -479,6 +482,7 @@ impl V41Forward {
             vision: None,
             max_chunk,
             max_seq,
+            trim_last_id: std::sync::Mutex::new(None),
             allocs: super::device_allocs::DeviceAllocs::unowned(),
             dspark_seed: None,
             dspark: None,
@@ -666,7 +670,18 @@ impl V41Forward {
                 ops.hc_mean_bf16(s.h, seed, t, d, super::mtp::DSPARK_TARGET_LAYERS.len() * d, col * d)?;
             }
             let adapter = AttnAdapter { fwd: self, ring: seq.rings[l], win_lo, core, tap };
-            block(ops, w, &self.dims, s, t, start, &adapter, moe, tap, BlockControl::None)?;
+            // TRIM_LAST (replay only): the model's last layer needs its post-attention path for the
+            // last row only -- nothing reads the other rows' layer-39 output (the DSpark seed takes
+            // the INPUT streams of L37-39, captured above).
+            let trim = *self.trim_last_id.lock().expect("trim lock");
+            let post_from = match trim {
+                Some(id) if l + 1 == self.blocks.len() && t > 1 => {
+                    moe.begin_pass(&[id])?;
+                    t - 1
+                }
+                _ => 0,
+            };
+            block(ops, w, &self.dims, s, t, start, &adapter, moe, tap, BlockControl::None, post_from)?;
         }
         Ok(())
     }
@@ -847,7 +862,11 @@ impl V41Forward {
             hook.begin_pass(PassKind::Replay, start, t)?;
             ensure!(seq.tail_ids.len() == t, "replay tail holds {} ids for {t} rows", seq.tail_ids.len());
             moe.begin_pass(&seq.tail_ids)?;
+            if trim_last_enabled() {
+                *self.trim_last_id.lock().expect("trim lock") = seq.tail_ids.last().copied();
+            }
             let r = self.run_layers(ops, seq, (ENCODER_LAST + 1)..n, t, start, start, None, core, moe, tap);
+            *self.trim_last_id.lock().expect("trim lock") = None;
             super::ops::set_replay_pass(false);
             r?;
         }

@@ -224,7 +224,7 @@ impl Dspark {
         set_decode_pass(true);
         for (k, bw) in self.bw.iter().enumerate() {
             let attn = DraftAttention { ds: self, fwd, k, blk: &w.blocks[k] };
-            block(ops, bw, &fwd.dims, s, B, pos, &attn, &self.moe as &dyn V41RoutedMoe, tap, BlockControl::None)?;
+            block(ops, bw, &fwd.dims, s, B, pos, &attn, &self.moe as &dyn V41RoutedMoe, tap, BlockControl::None, 0)?;
         }
         // Head: hc_pre -> mtp.2.norm -> LM head over the B rows.
         ops.hc_pre(s.h, s.pre_mix, s.x, B, d)?;

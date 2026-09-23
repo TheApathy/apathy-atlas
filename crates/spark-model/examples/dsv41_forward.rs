@@ -941,7 +941,7 @@ fn main() -> Result<()> {
                 e.forward(&ops, s.h, s.engram_rows, dead_ptr, t, &s, &dims)?;
                 tap.bf16(&ops, "engram_out", w.layer, s.h, &[t, dims.hc, dims.hidden])?;
             }
-            block(&ops, w, &dims, &s, t, start, attn, moe, &tap, control)?;
+            block(&ops, w, &dims, &s, t, start, attn, moe, &tap, control, 0)?;
         }
         gpu.synchronize(stream)?;
         println!("chunk S={start} T={t}: {n_layers} layers done");
