@@ -48,6 +48,26 @@ import json,glob
 for f in sorted(glob.glob('$I/serve11t/*.response.json')):
     u=json.load(open(f)).get('usage',{}); print('serve TTFT', f.split('/')[-1], u.get('prompt_tokens'), u.get('time_to_first_token_ms'), 'ms')
 " >> $I/w11_summary.txt 2>&1
+# graphs (decode 1c2175d1c, re-capture per sequence): 7 requests back to back, plain and DSpark;
+# text must equal serve8 (eager, same requests) for every request.
+ATLAS_DSV41_GRAPH=1 $B/serve_window.sh serve11g 8900 $I/serve11g > $I/serve11g.log 2>&1
+ATLAS_DSV41_GRAPH=1 ATLAS_DSV41_DSPARK=1 $B/serve_window.sh serve11gd 8900 $I/serve11gd > $I/serve11gd.log 2>&1
+python3 - "$I" >> $I/w11_summary.txt 2>&1 <<'PY'
+import json, sys, glob, os, re
+I = sys.argv[1]
+strip = lambda s: re.sub(r'"id": "call_[0-9a-f]+"', '"id": "X"', s)
+def body(f):
+    r = json.load(open(f))
+    if "choices" not in r:
+        return "ERROR " + json.dumps(r)[:120], 0
+    c = r["choices"][0]
+    return strip(json.dumps(c.get("text", c.get("message")), sort_keys=True)), r["usage"].get("response_token/s", 0)
+for f in sorted(glob.glob(f"{I}/serve11g/*.response.json")):
+    n = os.path.basename(f)
+    ref = f"{I}/serve8/{n}" if os.path.exists(f"{I}/serve8/{n}") else f"{I}/serve8/01_completion_raw_runG_48.response.json"
+    e, te = body(ref); g, tg = body(f); d, td = body(f"{I}/serve11gd/{n}")
+    print("graph", n, "graph==eager:", g == e, "graph+dspark==eager:", d == e, "tok/s eager %.2f graph %.2f graph+dspark %.2f" % (te, tg, td))
+PY
 ATLAS_DSV41_DSPARK=1 ATLAS_DSV41_CHUNK=2048 $B/serve_window.sh serve11d 8900 $I/serve11d > $I/serve11d.log 2>&1
 low=$(awk '/^low-water MemAvailable:/ {print $3}' $I/serve11d.log)
 echo "DSpark chunk-2048 low-water: ${low:-?} GB" >> $I/w11_summary.txt
