@@ -178,6 +178,11 @@ impl V41RoutedMoe for Refuse {
     }
 }
 
+/// DSV41_DRIVER_SEQ_RUNS: spacer allocations after each freed sequence, sized like one ring
+/// (`[128, 512]` bf16) so the allocator hands the freed rings' memory to them.
+const N_SPACERS: usize = 48;
+const SPACER_BYTES: usize = 128 * 512 * 2;
+
 fn manifest_ids(dir: &Path) -> Result<Vec<u32>> {
     let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)?;
     m["token_ids"]
@@ -460,6 +465,48 @@ fn run_model_path(
         println!("decode logits fnv per step: {:x?}", hashes);
         println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
         println!("decode: first {agree} identical; top-1 agreement {matches}/{}", got.len().min(want.len()));
+        // DSV41_DRIVER_SEQ_RUNS=dirB,dirA: more sequences in this process, as serve runs them: a
+        // new V41Seq per prompt, the previous one freed and its memory re-used by a garbage-filled
+        // spacer, then prefill + greedy decode of decode_n tokens. A graph replaying a previous
+        // sequence's buffers reads that garbage (the ATLAS_DSV41_CONTROL_GRAPH_KEEP_STALE=1 control).
+        if let Ok(runs) = std::env::var("DSV41_DRIVER_SEQ_RUNS") {
+            let argmax = |h: &[u8]| -> u32 {
+                let v = to_f32(h);
+                // lowest id on a tie, as the device argmax
+                v.iter().enumerate().fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0 as u32
+            };
+            let mut spacers = Vec::new();
+            for (i, dir) in runs.split(',').filter(|d| !d.is_empty()).enumerate() {
+                let ids_i = manifest_ids(Path::new(dir))?;
+                let old = std::mem::replace(&mut seq, V41Seq::new(ops.gpu, &dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?);
+                ops.gpu.synchronize(ops.stream)?;
+                old.free(ops.gpu)?;
+                for _ in 0..N_SPACERS {
+                    let sp = ops.gpu.alloc(SPACER_BYTES)?;
+                    ops.gpu.memset(sp, 0x7f, SPACER_BYTES)?;
+                    spacers.push(sp);
+                }
+                fwd.prefill(ops, &mut seq, &ids_i, PrefillMode::Replay, hook, core, moe, &Tap::off(), logits)?;
+                ops.gpu.synchronize(ops.stream)?;
+                ops.gpu.copy_d2h(logits, &mut host)?;
+                let mut toks = vec![argmax(&host)];
+                let ts = std::time::Instant::now();
+                while toks.len() < decode_n {
+                    fwd.decode(ops, &mut seq, *toks.last().unwrap(), hook, core, moe, &Tap::off(), logits)?;
+                    ops.gpu.synchronize(ops.stream)?;
+                    ops.gpu.copy_d2h(logits, &mut host)?;
+                    toks.push(argmax(&host));
+                }
+                let dt = ts.elapsed().as_secs_f64();
+                println!("seq {} ({dir}, {} prompt tokens, seq id {}): {:.2} tok/s tokens {toks:?}", i + 1, ids_i.len(), seq.id, (toks.len() - 1) as f64 / dt);
+            }
+            for sp in spacers {
+                ops.gpu.free(sp)?;
+            }
+            if let Some(g) = &fwd.graph {
+                println!("graph captures after all sequences: {}", g.captures.load(std::sync::atomic::Ordering::Relaxed));
+            }
+        }
     }
     if warm_prefill {
         // Second prefill of the same prompt in the same process: weights, arena, kernels and
