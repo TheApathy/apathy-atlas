@@ -106,9 +106,14 @@ pub const SHARED_RESIDENT_ENV: &str = "ATLAS_DSV41_SHARED_RESIDENT";
 /// activations and page cache — nothing loaded later is budgeted against a guess.
 const SHARED_RESIDENT_MIN_FREE: u64 = 16_000_000_000;
 
+/// The opt-in attention copies keep MORE free memory: measured with DSpark on, prefill and decode
+/// transients take ~2 GB below the free memory seen at residency time (a 16 GB check gave a 14 GB
+/// low-water), so 20 GB here keeps the real low-water >= 16 GB (lead, 2026-09-23).
+const ATTN_RESIDENT_MIN_FREE: u64 = 20_000_000_000;
+
 /// `ATLAS_DSV41_ATTN_RESIDENT=1`: OPT-IN ("prefill-max") resident bf16 copies of the attention's
 /// biggest FP8 weights, wq_b (84 MB), wo_b (84 MB) and wo_a (67 MB) per layer, encoder layers
-/// first, as far as free memory allows above the 16 GB floor (same rule as the shared expert).
+/// first, as far as free memory allows above a 20 GB floor (the shared expert keeps 16 GB).
 /// Default OFF: 5-10 GB would eat into DSpark's low-water and the long-context KV.
 /// `=swap_control` makes them resident with each even/odd layer pair's wq_b SWAPPED (real
 /// matrices, the wrong layer's) - a byte gate must FAIL under it.
@@ -125,7 +130,7 @@ fn make_attn_resident(ops: &Ops, attn: &mut [V41AttnWeights]) -> Result<Vec<Devi
     let mut resident = 0usize;
     for a in attn.iter_mut() {
         let free = ops.gpu.free_memory().context("attention residency: querying free memory")? as u64;
-        if free < per_layer(a) + SHARED_RESIDENT_MIN_FREE {
+        if free < per_layer(a) + ATTN_RESIDENT_MIN_FREE {
             break;
         }
         for w in [&mut a.wq_b, &mut a.wo_b, &mut a.wo_a] {
@@ -144,11 +149,17 @@ fn make_attn_resident(ops: &Ops, attn: &mut [V41AttnWeights]) -> Result<Vec<Devi
     }
     ops.gpu.synchronize(ops.stream)?;
     let bytes: u64 = attn[..resident].iter().map(per_layer).sum();
-    eprintln!("DeepSeek-V4.1: resident attention on {resident} of {} layers ({:.2} GB)", attn.len(), bytes as f64 / 1e9);
-    tracing::info!(
-        "DeepSeek-V4.1: resident bf16 attention wq_b/wo_b/wo_a on {resident} of {} layers ({:.2} GB{})",
+    eprintln!(
+        "DeepSeek-V4.1: resident attention on {resident} of {} layers ({:.2} GB, floor {:.0} GB)",
         attn.len(),
         bytes as f64 / 1e9,
+        ATTN_RESIDENT_MIN_FREE as f64 / 1e9
+    );
+    tracing::info!(
+        "DeepSeek-V4.1: resident bf16 attention wq_b/wo_b/wo_a on {resident} of {} layers ({:.2} GB, floor {:.0} GB{})",
+        attn.len(),
+        bytes as f64 / 1e9,
+        ATTN_RESIDENT_MIN_FREE as f64 / 1e9,
         if mode == "swap_control" { ", SWAP CONTROL" } else { "" },
     );
     Ok(owned)
@@ -181,7 +192,11 @@ fn make_shared_resident(
         resident += 1;
     }
     ops.gpu.synchronize(ops.stream)?;
-    eprintln!("DeepSeek-V4.1: resident shared expert on {resident} of {} layers", blocks.len());
+    eprintln!(
+        "DeepSeek-V4.1: resident shared expert on {resident} of {} layers (floor {:.0} GB)",
+        blocks.len(),
+        SHARED_RESIDENT_MIN_FREE as f64 / 1e9
+    );
     tracing::info!(
         "DeepSeek-V4.1: resident bf16 shared-expert weights on {resident} of {} layers ({:.2} GB; the rest use the \
          dequant path; {:.0} GB floor kept)",
