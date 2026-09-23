@@ -14,9 +14,9 @@ metadata:
   kv_dtype: nvfp4
   description: |
     Qwen3.8-27B NVFP4 on its own kernel target (qwen3.8-27b, not the qwen3.6 auto-pick), with
-    the exact prefill levers and the v3 drafter (gamma 8). FAST: ATLAS_FFN_TC/SSM_PROJ_TC/
-    LM_HEAD_TC on. Speculation is greedy-approximate: differs from plain decode on bf16
-    near-ties (see qwen3.8-27b-exact-local for a byte-identical, slower alternative).
+    the exact prefill levers and the v3 drafter (gamma 8). Same as qwen3.8-27b-optimized-local
+    but with ATLAS_FFN_TC/ATLAS_SSM_PROJ_TC/ATLAS_LM_HEAD_TC off: speculation byte-identical to
+    plain decode, ~45-65% slower (q38-spec-correct measured 30.7 MinHeap / 17.9 coding tok/s).
 defaults:
   port: 8888
   host: 0.0.0.0
@@ -50,9 +50,9 @@ atlas:
   resident_gb: 66
   headroom_gb: 8
   env:
-    ATLAS_FFN_TC: "1"
-    ATLAS_SSM_PROJ_TC: "1"
-    ATLAS_LM_HEAD_TC: "1"
+    ATLAS_FFN_TC: "0"
+    ATLAS_SSM_PROJ_TC: "0"
+    ATLAS_LM_HEAD_TC: "0"
     ATLAS_LM_HEAD_T: "1"
     ATLAS_ACCEPT_FAST_ARGMAX: "1"
     ATLAS_E2M1_GEMM: "0"
