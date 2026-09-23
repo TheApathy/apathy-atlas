@@ -1,113 +1,113 @@
-wq_b      M= 512 N=32768 K= 1280 | current 1.263 ms | gemm alone 0.624 ms (68.8 TF/s) | v2 1.605 ms (26.8 TF/s)
-    v5_e3bf 0.689 ms  62.4 TF/s  0.91x gemm-alone 1.83x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.767 ms  56.0 TF/s  0.81x gemm-alone 1.65x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.744 ms  57.7 TF/s  0.84x gemm-alone 1.70x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.769 ms  55.9 TF/s  0.81x gemm-alone 1.64x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.746 ms  57.5 TF/s  0.84x gemm-alone 1.69x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.795 ms  54.0 TF/s  0.79x gemm-alone 1.59x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.888 ms  48.3 TF/s  0.70x gemm-alone 1.42x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-wq_b      M=2048 N=32768 K= 1280 | current 2.528 ms | gemm alone 1.835 ms (93.6 TF/s) | v2 6.240 ms (27.5 TF/s)
-    v5_e3bf 2.144 ms  80.1 TF/s  0.86x gemm-alone 1.18x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  2.835 ms  60.6 TF/s  0.65x gemm-alone 0.89x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  2.770 ms  62.0 TF/s  0.66x gemm-alone 0.91x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  3.125 ms  55.0 TF/s  0.59x gemm-alone 0.81x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  2.847 ms  60.3 TF/s  0.64x gemm-alone 0.89x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  3.011 ms  57.1 TF/s  0.61x gemm-alone 0.84x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  3.503 ms  49.0 TF/s  0.52x gemm-alone 0.72x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-wo_b      M= 512 N= 5120 K= 8192 | current 1.285 ms | gemm alone 0.570 ms (75.4 TF/s) | v2 0.908 ms (47.3 TF/s)
-    v5_e3bf 0.704 ms  61.0 TF/s  0.81x gemm-alone 1.82x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.776 ms  55.3 TF/s  0.73x gemm-alone 1.66x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.743 ms  57.8 TF/s  0.77x gemm-alone 1.73x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.786 ms  54.6 TF/s  0.72x gemm-alone 1.63x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.718 ms  59.8 TF/s  0.79x gemm-alone 1.79x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.790 ms  54.4 TF/s  0.72x gemm-alone 1.63x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.891 ms  48.2 TF/s  0.64x gemm-alone 1.44x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-wo_b      M=2048 N= 5120 K= 8192 | current 2.639 ms | gemm alone 1.940 ms (88.5 TF/s) | v2 3.096 ms (55.5 TF/s)
-    v5_e3bf 2.291 ms  75.0 TF/s  0.85x gemm-alone 1.15x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  2.660 ms  64.6 TF/s  0.73x gemm-alone 0.99x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  2.579 ms  66.6 TF/s  0.75x gemm-alone 1.02x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  2.684 ms  64.0 TF/s  0.72x gemm-alone 0.98x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  2.655 ms  64.7 TF/s  0.73x gemm-alone 0.99x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  2.988 ms  57.5 TF/s  0.65x gemm-alone 0.88x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  3.942 ms  43.6 TF/s  0.49x gemm-alone 0.67x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-w1        M= 512 N= 2304 K= 5120 | current 0.284 ms | gemm alone 0.115 ms (105.2 TF/s) | v2 0.217 ms (55.6 TF/s)
-    v5_e3bf 0.183 ms  65.9 TF/s  0.63x gemm-alone 1.55x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.231 ms  52.3 TF/s  0.50x gemm-alone 1.23x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.219 ms  55.2 TF/s  0.52x gemm-alone 1.30x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.273 ms  44.3 TF/s  0.42x gemm-alone 1.04x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.228 ms  53.0 TF/s  0.50x gemm-alone 1.25x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.252 ms  47.9 TF/s  0.46x gemm-alone 1.13x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.312 ms  38.7 TF/s  0.37x gemm-alone 0.91x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-w1        M=2048 N= 2304 K= 5120 | current 0.799 ms | gemm alone 0.606 ms (79.8 TF/s) | v2 0.713 ms (67.8 TF/s)
-    v5_e3bf 0.630 ms  76.7 TF/s  0.96x gemm-alone 1.27x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.749 ms  64.5 TF/s  0.81x gemm-alone 1.07x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.712 ms  67.8 TF/s  0.85x gemm-alone 1.12x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.710 ms  68.1 TF/s  0.85x gemm-alone 1.13x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.687 ms  70.3 TF/s  0.88x gemm-alone 1.16x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.754 ms  64.1 TF/s  0.80x gemm-alone 1.06x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.901 ms  53.6 TF/s  0.67x gemm-alone 0.89x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-w2        M= 512 N= 5120 K= 2304 | current 0.355 ms | gemm alone 0.162 ms (74.4 TF/s) | v2 0.212 ms (57.0 TF/s)
-    v5_e3bf 0.201 ms  60.2 TF/s  0.81x gemm-alone 1.77x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.228 ms  53.1 TF/s  0.71x gemm-alone 1.56x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.213 ms  56.7 TF/s  0.76x gemm-alone 1.66x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.260 ms  46.4 TF/s  0.62x gemm-alone 1.36x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.221 ms  54.6 TF/s  0.73x gemm-alone 1.60x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.238 ms  50.8 TF/s  0.68x gemm-alone 1.49x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.262 ms  46.1 TF/s  0.62x gemm-alone 1.35x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-w2        M=2048 N= 5120 K= 2304 | current 0.752 ms | gemm alone 0.571 ms (84.6 TF/s) | v2 0.750 ms (64.5 TF/s)
-    v5_e3bf 0.577 ms  83.8 TF/s  0.99x gemm-alone 1.30x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.782 ms  61.8 TF/s  0.73x gemm-alone 0.96x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.746 ms  64.8 TF/s  0.77x gemm-alone 1.01x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.816 ms  59.2 TF/s  0.70x gemm-alone 0.92x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.799 ms  60.5 TF/s  0.72x gemm-alone 0.94x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.867 ms  55.7 TF/s  0.66x gemm-alone 0.87x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.974 ms  49.6 TF/s  0.59x gemm-alone 0.77x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-wq_a      M= 512 N= 1280 K= 5120 | current 0.152 ms | gemm alone 0.075 ms (90.0 TF/s) | v2 0.129 ms (52.0 TF/s)
-    v5_e3bf 0.151 ms  44.4 TF/s  0.49x gemm-alone 1.01x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.233 ms  28.8 TF/s  0.32x gemm-alone 0.65x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.215 ms  31.3 TF/s  0.35x gemm-alone 0.71x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.230 ms  29.2 TF/s  0.32x gemm-alone 0.66x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.226 ms  29.7 TF/s  0.33x gemm-alone 0.67x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.130 ms  51.8 TF/s  0.58x gemm-alone 1.17x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.139 ms  48.4 TF/s  0.54x gemm-alone 1.10x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-wq_a      M=2048 N= 1280 K= 5120 | current 0.415 ms | gemm alone 0.313 ms (85.7 TF/s) | v2 0.433 ms (62.0 TF/s)
-    v5_e3bf 0.336 ms  79.9 TF/s  0.93x gemm-alone 1.24x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.493 ms  54.4 TF/s  0.63x gemm-alone 0.84x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.484 ms  55.5 TF/s  0.65x gemm-alone 0.86x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.471 ms  57.0 TF/s  0.66x gemm-alone 0.88x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.508 ms  52.9 TF/s  0.62x gemm-alone 0.82x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.545 ms  49.3 TF/s  0.57x gemm-alone 0.76x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.599 ms  44.8 TF/s  0.52x gemm-alone 0.69x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-wkv       M= 512 N=  512 K= 5120 | current 0.064 ms | gemm alone 0.042 ms (64.3 TF/s) | v2 0.125 ms (21.5 TF/s)
-    v5_e3bf 0.160 ms  16.8 TF/s  0.26x gemm-alone 0.40x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.226 ms  11.9 TF/s  0.19x gemm-alone 0.28x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.213 ms  12.6 TF/s  0.20x gemm-alone 0.30x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.234 ms  11.5 TF/s  0.18x gemm-alone 0.27x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.222 ms  12.1 TF/s  0.19x gemm-alone 0.29x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.123 ms  21.9 TF/s  0.34x gemm-alone 0.52x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.134 ms  20.0 TF/s  0.31x gemm-alone 0.47x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-wkv       M=2048 N=  512 K= 5120 | current 0.146 ms | gemm alone 0.109 ms (98.1 TF/s) | v2 0.215 ms (50.0 TF/s)
-    v5_e3bf 0.154 ms  69.6 TF/s  0.71x gemm-alone 0.95x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.231 ms  46.5 TF/s  0.47x gemm-alone 0.63x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.217 ms  49.4 TF/s  0.50x gemm-alone 0.67x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.249 ms  43.1 TF/s  0.44x gemm-alone 0.59x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.225 ms  47.8 TF/s  0.49x gemm-alone 0.65x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.271 ms  39.7 TF/s  0.40x gemm-alone 0.54x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.274 ms  39.1 TF/s  0.40x gemm-alone 0.53x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-wo_a_g0   M= 512 N= 1024 K= 4096 | current 0.088 ms | gemm alone 0.053 ms (81.0 TF/s) | v2 0.102 ms (41.9 TF/s)
-    v5_e3bf 0.161 ms  26.6 TF/s  0.33x gemm-alone 0.55x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.182 ms  23.6 TF/s  0.29x gemm-alone 0.48x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.172 ms  24.9 TF/s  0.31x gemm-alone 0.51x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.185 ms  23.2 TF/s  0.29x gemm-alone 0.48x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.189 ms  22.7 TF/s  0.28x gemm-alone 0.47x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.099 ms  43.3 TF/s  0.53x gemm-alone 0.89x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.109 ms  39.3 TF/s  0.49x gemm-alone 0.81x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-wo_a_g0   M=2048 N= 1024 K= 4096 | current 0.226 ms | gemm alone 0.213 ms (80.6 TF/s) | v2 0.270 ms (63.6 TF/s)
-    v5_e3bf 0.269 ms  63.8 TF/s  0.79x gemm-alone 0.84x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_e4  0.391 ms  43.9 TF/s  0.55x gemm-alone 0.58x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g1  0.360 ms  47.8 TF/s  0.59x gemm-alone 0.63x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g2  0.378 ms  45.5 TF/s  0.56x gemm-alone 0.60x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g3  0.367 ms  46.8 TF/s  0.58x gemm-alone 0.62x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g4  0.301 ms  57.1 TF/s  0.71x gemm-alone 0.75x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
-    v5_g5  0.331 ms  51.9 TF/s  0.64x gemm-alone 0.68x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+wq_b      M= 512 N=32768 K= 1280 | current 1.312 ms | gemm alone 0.646 ms (66.5 TF/s) | v2 1.592 ms (27.0 TF/s)
+    v5_e3bf 0.713 ms  60.2 TF/s  0.91x gemm-alone 1.84x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.723 ms  59.4 TF/s  0.89x gemm-alone 1.82x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.766 ms  56.1 TF/s  0.84x gemm-alone 1.71x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.722 ms  59.5 TF/s  0.89x gemm-alone 1.82x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.607 ms  70.7 TF/s  1.06x gemm-alone 2.16x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.573 ms  75.0 TF/s  1.13x gemm-alone 2.29x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.781 ms  55.0 TF/s  0.83x gemm-alone 1.68x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+wq_b      M=2048 N=32768 K= 1280 | current 2.491 ms | gemm alone 1.837 ms (93.5 TF/s) | v2 6.345 ms (27.1 TF/s)
+    v5_e3bf 2.169 ms  79.2 TF/s  0.85x gemm-alone 1.15x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 2.324 ms  73.9 TF/s  0.79x gemm-alone 1.07x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  2.820 ms  60.9 TF/s  0.65x gemm-alone 0.88x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  2.437 ms  70.5 TF/s  0.75x gemm-alone 1.02x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  2.403 ms  71.5 TF/s  0.76x gemm-alone 1.04x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  2.175 ms  79.0 TF/s  0.84x gemm-alone 1.15x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  2.944 ms  58.4 TF/s  0.62x gemm-alone 0.85x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+wo_b      M= 512 N= 5120 K= 8192 | current 1.368 ms | gemm alone 0.575 ms (74.7 TF/s) | v2 0.921 ms (46.6 TF/s)
+    v5_e3bf 0.662 ms  64.8 TF/s  0.87x gemm-alone 2.06x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.713 ms  60.3 TF/s  0.81x gemm-alone 1.92x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.773 ms  55.6 TF/s  0.74x gemm-alone 1.77x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.840 ms  51.1 TF/s  0.68x gemm-alone 1.63x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.627 ms  68.5 TF/s  0.92x gemm-alone 2.18x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.640 ms  67.1 TF/s  0.90x gemm-alone 2.14x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.813 ms  52.8 TF/s  0.71x gemm-alone 1.68x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+wo_b      M=2048 N= 5120 K= 8192 | current 2.624 ms | gemm alone 1.938 ms (88.7 TF/s) | v2 3.133 ms (54.8 TF/s)
+    v5_e3bf 2.290 ms  75.0 TF/s  0.85x gemm-alone 1.15x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 2.288 ms  75.1 TF/s  0.85x gemm-alone 1.15x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  2.692 ms  63.8 TF/s  0.72x gemm-alone 0.97x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  3.124 ms  55.0 TF/s  0.62x gemm-alone 0.84x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  2.295 ms  74.9 TF/s  0.84x gemm-alone 1.14x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  2.120 ms  81.0 TF/s  0.91x gemm-alone 1.24x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  2.810 ms  61.1 TF/s  0.69x gemm-alone 0.93x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+w1        M= 512 N= 2304 K= 5120 | current 0.330 ms | gemm alone 0.116 ms (104.5 TF/s) | v2 0.219 ms (55.2 TF/s)
+    v5_e3bf 0.162 ms  74.6 TF/s  0.71x gemm-alone 2.04x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.201 ms  60.2 TF/s  0.58x gemm-alone 1.64x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.231 ms  52.3 TF/s  0.50x gemm-alone 1.43x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.179 ms  67.5 TF/s  0.65x gemm-alone 1.84x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.167 ms  72.4 TF/s  0.69x gemm-alone 1.98x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.183 ms  66.0 TF/s  0.63x gemm-alone 1.80x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.245 ms  49.3 TF/s  0.47x gemm-alone 1.35x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+w1        M=2048 N= 2304 K= 5120 | current 0.770 ms | gemm alone 0.612 ms (79.0 TF/s) | v2 0.712 ms (67.9 TF/s)
+    v5_e3bf 0.586 ms  82.5 TF/s  1.05x gemm-alone 1.32x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.639 ms  75.6 TF/s  0.96x gemm-alone 1.20x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.706 ms  68.4 TF/s  0.87x gemm-alone 1.09x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.706 ms  68.4 TF/s  0.87x gemm-alone 1.09x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.535 ms  90.2 TF/s  1.14x gemm-alone 1.44x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.562 ms  86.0 TF/s  1.09x gemm-alone 1.37x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.829 ms  58.3 TF/s  0.74x gemm-alone 0.93x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+w2        M= 512 N= 5120 K= 2304 | current 0.332 ms | gemm alone 0.136 ms (88.9 TF/s) | v2 0.212 ms (57.1 TF/s)
+    v5_e3bf 0.167 ms  72.4 TF/s  0.81x gemm-alone 1.99x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.168 ms  71.9 TF/s  0.81x gemm-alone 1.98x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.260 ms  46.4 TF/s  0.52x gemm-alone 1.28x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.170 ms  71.1 TF/s  0.80x gemm-alone 1.96x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.165 ms  73.2 TF/s  0.82x gemm-alone 2.01x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.168 ms  71.7 TF/s  0.81x gemm-alone 1.97x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.235 ms  51.4 TF/s  0.58x gemm-alone 1.42x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+w2        M=2048 N= 5120 K= 2304 | current 0.737 ms | gemm alone 0.565 ms (85.5 TF/s) | v2 0.750 ms (64.4 TF/s)
+    v5_e3bf 0.600 ms  80.5 TF/s  0.94x gemm-alone 1.23x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.621 ms  77.8 TF/s  0.91x gemm-alone 1.19x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.803 ms  60.2 TF/s  0.70x gemm-alone 0.92x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.633 ms  76.3 TF/s  0.89x gemm-alone 1.16x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.580 ms  83.3 TF/s  0.97x gemm-alone 1.27x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.610 ms  79.2 TF/s  0.93x gemm-alone 1.21x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.845 ms  57.2 TF/s  0.67x gemm-alone 0.87x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+wq_a      M= 512 N= 1280 K= 5120 | current 0.154 ms | gemm alone 0.095 ms (70.6 TF/s) | v2 0.130 ms (51.5 TF/s)
+    v5_e3bf 0.151 ms  44.3 TF/s  0.63x gemm-alone 1.02x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.152 ms  44.3 TF/s  0.63x gemm-alone 1.02x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.230 ms  29.2 TF/s  0.41x gemm-alone 0.67x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.159 ms  42.2 TF/s  0.60x gemm-alone 0.97x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.154 ms  43.7 TF/s  0.62x gemm-alone 1.00x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.158 ms  42.6 TF/s  0.60x gemm-alone 0.98x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.123 ms  54.7 TF/s  0.77x gemm-alone 1.26x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+wq_a      M=2048 N= 1280 K= 5120 | current 0.430 ms | gemm alone 0.304 ms (88.4 TF/s) | v2 0.476 ms (56.4 TF/s)
+    v5_e3bf 0.393 ms  68.2 TF/s  0.77x gemm-alone 1.09x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.346 ms  77.6 TF/s  0.88x gemm-alone 1.24x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.483 ms  55.6 TF/s  0.63x gemm-alone 0.89x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.444 ms  60.5 TF/s  0.68x gemm-alone 0.97x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.330 ms  81.4 TF/s  0.92x gemm-alone 1.30x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.385 ms  69.7 TF/s  0.79x gemm-alone 1.12x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.491 ms  54.7 TF/s  0.62x gemm-alone 0.88x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+wkv       M= 512 N=  512 K= 5120 | current 0.066 ms | gemm alone 0.047 ms (56.6 TF/s) | v2 0.129 ms (20.9 TF/s)
+    v5_e3bf 0.149 ms  18.0 TF/s  0.32x gemm-alone 0.44x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.150 ms  18.0 TF/s  0.32x gemm-alone 0.44x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.226 ms  11.9 TF/s  0.21x gemm-alone 0.29x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.164 ms  16.4 TF/s  0.29x gemm-alone 0.40x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.154 ms  17.5 TF/s  0.31x gemm-alone 0.43x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.158 ms  17.0 TF/s  0.30x gemm-alone 0.42x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.119 ms  22.6 TF/s  0.40x gemm-alone 0.56x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+wkv       M=2048 N=  512 K= 5120 | current 0.145 ms | gemm alone 0.110 ms (97.7 TF/s) | v2 0.215 ms (50.0 TF/s)
+    v5_e3bf 0.163 ms  65.7 TF/s  0.67x gemm-alone 0.89x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.159 ms  67.4 TF/s  0.69x gemm-alone 0.91x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.229 ms  46.9 TF/s  0.48x gemm-alone 0.63x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.240 ms  44.7 TF/s  0.46x gemm-alone 0.60x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.158 ms  67.9 TF/s  0.69x gemm-alone 0.92x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.163 ms  66.0 TF/s  0.68x gemm-alone 0.89x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.268 ms  40.1 TF/s  0.41x gemm-alone 0.54x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+wo_a_g0   M= 512 N= 1024 K= 4096 | current 0.085 ms | gemm alone 0.051 ms (85.0 TF/s) | v2 0.109 ms (39.6 TF/s)
+    v5_e3bf 0.121 ms  35.5 TF/s  0.42x gemm-alone 0.71x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.121 ms  35.5 TF/s  0.42x gemm-alone 0.71x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.182 ms  23.5 TF/s  0.28x gemm-alone 0.47x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.123 ms  34.8 TF/s  0.41x gemm-alone 0.69x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.133 ms  32.2 TF/s  0.38x gemm-alone 0.64x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.129 ms  33.4 TF/s  0.39x gemm-alone 0.66x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.097 ms  44.1 TF/s  0.52x gemm-alone 0.88x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+wo_a_g0   M=2048 N= 1024 K= 4096 | current 0.227 ms | gemm alone 0.175 ms (98.0 TF/s) | v2 0.269 ms (63.8 TF/s)
+    v5_e3bf 0.262 ms  65.5 TF/s  0.67x gemm-alone 0.87x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e1bf 0.307 ms  56.0 TF/s  0.57x gemm-alone 0.74x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v5_e4  0.370 ms  46.4 TF/s  0.47x gemm-alone 0.61x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v6_f1  0.286 ms  60.0 TF/s  0.61x gemm-alone 0.79x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h1  0.264 ms  65.0 TF/s  0.66x gemm-alone 0.86x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h2  0.269 ms  63.8 TF/s  0.65x gemm-alone 0.84x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
+    v7_h3  0.317 ms  54.2 TF/s  0.55x gemm-alone 0.72x current | identical 100.0000% M=20 rows yes CTRL scale+1 caught yes PASS
 GATE PASS

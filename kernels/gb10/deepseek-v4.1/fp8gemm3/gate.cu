@@ -16,12 +16,12 @@
 #include "fp8_gemm_v3.cuh"
 
 DSV41_FP8GEMM5_ENTRY(v5_e3bf, 256, 128, 32, 3, 4, 2, false)
+DSV41_FP8GEMM5_ENTRY(v5_e1bf, 128, 256, 32, 3, 2, 4, false)
 DSV41_FP8GEMM5_ENTRY(v5_e4, 256, 128, 32, 3, 4, 2, true)
-DSV41_FP8GEMM5_ENTRY(v5_g1, 256, 128, 32, 3, 2, 4, true)
-DSV41_FP8GEMM5_ENTRY(v5_g2, 128, 256, 32, 3, 1, 8, true)
-DSV41_FP8GEMM5_ENTRY(v5_g3, 128, 256, 32, 4, 1, 8, true)
-DSV41_FP8GEMM5_ENTRY(v5_g4, 128, 128, 32, 4, 1, 4, true)
-DSV41_FP8GEMM5_ENTRY(v5_g5, 256, 64, 32, 3, 2, 2, true)
+DSV41_FP8GEMM6_ENTRY(v6_f1, 256, 128, 32, 3, 4, 2)
+DSV41_FP8GEMM7_ENTRY(v7_h1, 256, 128, 32, 3, 4, 2)
+DSV41_FP8GEMM7_ENTRY(v7_h2, 128, 256, 32, 3, 2, 4)
+DSV41_FP8GEMM7_ENTRY(v7_h3, 128, 128, 32, 4, 2, 2)
 
 #include <cmath>
 #include <cstdio>
@@ -40,11 +40,12 @@ struct V3 { const char* name; Kern k; int bm, bn, threads, smem; bool bf16b; boo
 #define V5E(n, BM, BN, BK, ST, WM, WN, F) V3{#n, n, BM, BN, 32 * WM * WN, dsv41_fp8gemm3::Cfg5<BM, BN, BK, ST, WM, WN, F>::SMEM, !F}
 #define V5P(n, BM, BN, BK, ST, WM, WN, P) V3{#n, n, BM, BN, 32 * WM * WN, dsv41_fp8gemm3::Cfg5<BM, BN, BK, ST, WM, WN, true, P>::SMEM, false, true}
 #define V6E(n, BM, BN, BK, ST, WM, WN) V3{#n, n, BM, BN, 32 * WM * WN, dsv41_fp8gemm3::Cfg6<BM, BN, BK, ST, WM, WN>::SMEM, false}
+#define V7E(n, BM, BN, BK, ST, WM, WN) V3{#n, n, BM, BN, 32 * WM * WN, dsv41_fp8gemm3::Cfg6<BM, BN, BK, ST, WM, WN>::SMEM, false}
 static const V3 kV3[] = {
-    V5E(v5_e3bf, 256, 128, 32, 3, 4, 2, false), V5E(v5_e4, 256, 128, 32, 3, 4, 2, true),
-    V5E(v5_g1, 256, 128, 32, 3, 2, 4, true), V5E(v5_g2, 128, 256, 32, 3, 1, 8, true),
-    V5E(v5_g3, 128, 256, 32, 4, 1, 8, true), V5E(v5_g4, 128, 128, 32, 4, 1, 4, true),
-    V5E(v5_g5, 256, 64, 32, 3, 2, 2, true),
+    V5E(v5_e3bf, 256, 128, 32, 3, 4, 2, false), V5E(v5_e1bf, 128, 256, 32, 3, 2, 4, false),
+    V5E(v5_e4, 256, 128, 32, 3, 4, 2, true), V6E(v6_f1, 256, 128, 32, 3, 4, 2),
+    V7E(v7_h1, 256, 128, 32, 3, 4, 2), V7E(v7_h2, 128, 256, 32, 3, 2, 4),
+    V7E(v7_h3, 128, 128, 32, 4, 2, 2),
 };
 
 static std::vector<char> slurp(const std::string& p) {
