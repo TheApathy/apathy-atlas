@@ -36,7 +36,7 @@ fn run_alone_admission_refuses_one_byte_short() {
     admit(&p, need, false).expect("exactly enough must be admitted");
     let err = admit(&p, need - 1, false).expect_err("one byte short must be refused").to_string();
     assert!(err.contains("must run alone"), "{err}");
-    assert!(err.contains("101.0 GB free"), "{err}");
+    assert!(err.contains("104.0 GB free"), "{err}");
     // DSpark raises the bar: what admitted without it is refused with it.
     assert!(admit(&p, need, true).is_err());
 }
