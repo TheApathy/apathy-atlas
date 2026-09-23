@@ -347,7 +347,63 @@ impl Qwen3SsmLayer {
         }
 
         let gdn_rows = conv_rows.offset(conv_dim * FP32);
-        if batch_gdn {
+        // ATLAS_SSM_GDN_LAZY: the async commit decides replay-vs-copy from
+        // `gdn_seq_lazy_engaged(rows)`, so this dispatch must take the lazy
+        // kernel exactly when that predicate holds (and fail closed where it
+        // cannot), or the commit would replay a retain buffer nobody wrote.
+        let lazy = self.gdn_seq_lazy_engaged_inner(rows);
+        anyhow::ensure!(
+            !lazy || (batch_gdn && ctx.ddtree_parent_ids_dev.is_none()),
+            "ATLAS_SSM_GDN_LAZY on the Qwen4 exact route requires the batched GDN sequence \
+             (ATLAS_QWEN4_K5_BATCH_GDN=1) and no tree payload"
+        );
+        if lazy {
+            // Retain this step's GDN inputs for the commit replay, in the
+            // layout the generic lazy path uses: rows x qkvz FP32, then the
+            // per-row gate/beta pairs at max_k x qkvz.
+            let max_k = crate::layers::qwen3_ssm::GDN_LAZY_MAX_K;
+            let retain = match self.gdn_lazy_retain.get() {
+                Some(pp) => *pp,
+                None => {
+                    let bytes = max_k * qkvz_size * FP32 + max_k * nv * 2 * FP32;
+                    let pp = ctx.gpu.alloc(bytes)?;
+                    let _ = self.gdn_lazy_retain.set(pp);
+                    pp
+                }
+            };
+            ctx.gpu
+                .copy_d2d_async(conv_rows, retain, rows * qkvz_size * FP32, stream)?;
+            ctx.gpu.copy_d2d_async(
+                gates,
+                retain.offset(max_k * qkvz_size * FP32),
+                rows * nv * 2 * FP32,
+                stream,
+            )?;
+            // Final H only, into inter[rows - 1]; h_state stays step-initial.
+            ops::gdn_decode_f32_sequence_persistent(
+                ctx.gpu,
+                self.gdn_f32_sequence_lazyfinal_k,
+                state.h_state,
+                conv_rows,
+                conv_rows.offset(key_dim * FP32),
+                conv_rows.offset(key_dim * 2 * FP32),
+                gates,
+                gates.offset(nv * FP32),
+                gdn_rows,
+                h_intermediate,
+                rows as u32,
+                nk as u32,
+                nv as u32,
+                kd as u32,
+                vd as u32,
+                qkvz_size as u32,
+                qkvz_size as u32,
+                (nv * 2) as u32,
+                qkvz_size as u32,
+                (h_intermediate_stride / FP32) as u32,
+                stream,
+            )?;
+        } else if batch_gdn {
             ops::gdn_decode_f32_sequence(
                 ctx.gpu,
                 self.gdn_f32_sequence_k,
