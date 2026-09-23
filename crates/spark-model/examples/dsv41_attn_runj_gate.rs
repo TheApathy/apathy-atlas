@@ -68,17 +68,24 @@ impl G<'_> {
     }
     /// CoreArgs for (layer, occurrence) straight from the capture. `wpos_shift` is the control.
     fn args(&self, l: usize, occ: usize, out: DevicePtr, wpos_shift: i64) -> Result<(CoreArgs, Vec<DevicePtr>)> {
-        let q = self.tap(l, "q", occ)?;
-        let t = q.len() / QROW;
-        let wpos: Vec<i32> = i64s(&self.tap(l, "wpos", occ)?)
-            .iter()
-            .map(|&p| if p < 0 { -1 } else { (p - wpos_shift).max(-1) as i32 })
-            .collect();
-        let start = i64s(&self.tap(l, "wpos", occ)?)[127] as usize; // newest slot of row 0 = its position
+        let t = self.tap(l, "q", occ)?.len() / QROW;
+        self.args_rows(l, occ, out, wpos_shift, 0, t)
+    }
+    /// Rows `r0..r0 + t` of an occurrence as one pass (the TAIL-SPLIT arms). The ring is the whole
+    /// chunk's: each row's wpos names only its own window, so later rows' slots are never read.
+    fn args_rows(&self, l: usize, occ: usize, out: DevicePtr, wpos_shift: i64, r0: usize, t: usize) -> Result<(CoreArgs, Vec<DevicePtr>)> {
+        let rows = |b: Vec<u8>| -> Vec<u8> {
+            let per = b.len() / (self.tap(l, "q", occ).map(|q| q.len() / QROW).unwrap_or(1));
+            b[r0 * per..(r0 + t) * per].to_vec()
+        };
+        let q = rows(self.tap(l, "q", occ)?);
+        let w64 = i64s(&rows(self.tap(l, "wpos", occ)?));
+        let wpos: Vec<i32> = w64.iter().map(|&p| if p < 0 { -1 } else { (p - wpos_shift).max(-1) as i32 }).collect();
+        let start = w64[127] as usize; // newest slot of row 0 = its position
         let win_lo = i64s(&self.tap(l, "win_lo", occ)?)[0] as usize;
         let bufs = vec![
-            self.up(&self.tap(l, "attn_x", occ)?)?,
-            self.up(&self.tap(l, "qr", occ)?)?,
+            self.up(&rows(self.tap(l, "attn_x", occ)?))?,
+            self.up(&rows(self.tap(l, "qr", occ)?))?,
             self.up(&q)?,
             self.up(&self.tap(l, "ring", occ)?)?,
             self.up(bytemuck_i32(&wpos))?,
@@ -102,11 +109,17 @@ fn digest(b: &[u8]) {
 /// (rows whose top-k differs, attention bf16-exact share, rel_l2) for one core call vs capture.
 fn score(g: &G, core: &Dsv41SparseCore, l: usize, occ: usize, t: usize, out: DevicePtr) -> Result<(usize, f64, f64)> {
     let tk_b = g.down(core.current_topk().context("no topk")?, t * INDEX_TOPK * 8)?;
+    let o_b = g.down(out, t * QROW)?;
+    score_bytes(g, l, occ, t, tk_b, o_b)
+}
+
+/// [`score`] on already-downloaded bytes (a tail split reassembles its sub-passes first, so the
+/// DIGEST sees the same byte stream as the unsplit chunk).
+fn score_bytes(g: &G, l: usize, occ: usize, t: usize, tk_b: Vec<u8>, o_b: Vec<u8>) -> Result<(usize, f64, f64)> {
     digest(&tk_b);
     let tk = i64s(&tk_b);
     let want = i64s(&g.tap(l, "topk", occ)?);
     let bad = (0..t).filter(|r| tk[r * INDEX_TOPK..(r + 1) * INDEX_TOPK] != want[r * INDEX_TOPK..(r + 1) * INDEX_TOPK]).count();
-    let o_b = g.down(out, t * QROW)?;
     digest(&o_b);
     let o = u16s(&o_b);
     let w = u16s(&g.tap(l, "attn_o_pre_inverse_rope", occ)?);
@@ -147,7 +160,34 @@ fn main() -> Result<()> {
 
     // ---- A. encoder: 3 chunks (512, 512, 20) at L2 and L20
     let chunks = [(0usize, 512usize), (512, 512), (1024, 20)];
+    // ATLAS_GATE_TAIL_SPLIT=16,4 (or 19,1 ...): run the 20-row chunk as those sub-passes. Every
+    // row, top-k and cache byte must equal the unsplit run: the DIGEST must not move.
+    let tail_split: Option<Vec<usize>> = std::env::var("ATLAS_GATE_TAIL_SPLIT").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect());
     for (c, &(s, t)) in chunks.iter().enumerate() {
+        if c == 2 && let Some(parts) = &tail_split {
+            ensure!(parts.iter().sum::<usize>() == t, "tail split {parts:?} must sum to {t}");
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = vec![(Vec::new(), Vec::new()); 2];
+            let mut r0 = 0;
+            for &tp in parts {
+                core.begin_pass(PassKind::EncoderChunk, s + r0, tp)?;
+                for (li, l) in [2usize, 20].into_iter().enumerate() {
+                    let (a, bufs) = g.args_rows(l, c, out, 0, r0, tp)?;
+                    ensure!(a.start == s + r0 && a.t == tp, "L{l} sub-pass at {} T={}", a.start, a.t);
+                    core.run(&ops, &a)?;
+                    got[li].0.extend(g.down(core.current_topk().context("no topk")?, tp * INDEX_TOPK * 8)?);
+                    got[li].1.extend(g.down(out, tp * QROW)?);
+                    free(&g, bufs)?;
+                }
+                r0 += tp;
+            }
+            for (li, l) in [2usize, 20].into_iter().enumerate() {
+                let (tk_b, o_b) = std::mem::take(&mut got[li]);
+                let (bad, ex, rl) = score_bytes(&g, l, c, t, tk_b, o_b)?;
+                println!("ENCODER L{l:02} chunk {c} (S={s}, T={t}) AS SUB-PASSES {parts:?}: topk {bad}/{t} rows differ; attention bit-exact {ex:.4} rel {rl:.2e}");
+                fail += usize::from(bad * 50 > t.max(50) || ex < 0.98);
+            }
+            continue;
+        }
         core.begin_pass(PassKind::EncoderChunk, s, t)?;
         for l in [2usize, 20] {
             let (a, bufs) = g.args(l, c, out, 0)?;
@@ -229,7 +269,9 @@ fn main() -> Result<()> {
     println!("DECODE total: {} top-k rows differ over {} layer-steps (band: at most 1 per step, at ties); worst attention {:.4}", worst.0, steps * 6, worst.1);
     fail += usize::from(worst.0 > steps);
 
-    println!("DIGEST {:016x} (score row blocks: ATLAS_DSV41_SCORE_ROWS={})", *DIGEST.lock().unwrap(), std::env::var("ATLAS_DSV41_SCORE_ROWS").unwrap_or_else(|_| "default".into()));
+    println!("DIGEST {:016x} (score row blocks: ATLAS_DSV41_SCORE_ROWS={}; tail split {})", *DIGEST.lock().unwrap(),
+             std::env::var("ATLAS_DSV41_SCORE_ROWS").unwrap_or_else(|_| "default".into()),
+             std::env::var("ATLAS_GATE_TAIL_SPLIT").unwrap_or_else(|_| "none".into()));
     ensure!(fail == 0, "RUNJ GATE FAIL ({fail})");
     println!("RUNJ GATE PASS");
     Ok(())

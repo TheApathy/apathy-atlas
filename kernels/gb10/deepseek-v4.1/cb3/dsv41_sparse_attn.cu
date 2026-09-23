@@ -289,6 +289,58 @@ extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn_combine(
         O[((size_t)t * NH + h) * D + tid + i * NT] = __float2bfloat16_rn(acc[i] / denom);
 }
 
+// DECODE/VERIFY entry with the combine FUSED by last-block-done: the same split partials as
+// dsv41_sparse_attn_split, then the LAST of the S slice CTAs of each (t, head group) -- found by an
+// atomic ticket -- merges them with dsv41_sparse_attn_combine's exact arithmetic (fixed slice order,
+// same expressions), reading the partials back from L2 (__ldcg) while they are hot. Saves the
+// combine launch and its cold re-read; BYTE-IDENTICAL to split + combine (gate). CNT: [T, NH / HB]
+// u32 tickets, zero at load; the last CTA resets its ticket, so every launch starts from zero.
+__device__ __forceinline__ void combine_head(const float* __restrict__ pr, const float* __restrict__ SINK,
+                                             __nv_bfloat16* __restrict__ O, int t, int h, int NH, int D, int S)
+{
+    const int tid = threadIdx.x;
+    float M = -INFINITY;
+    for (int s = 0; s < S; ++s) M = fmaxf(M, __ldcg(pr + (size_t)s * (2 + D)));
+    const float m_safe = (M == -INFINITY) ? 0.f : M;
+    float L = 0.f, acc[DPT];
+    for (int i = 0; i < DPT; ++i) acc[i] = 0.f;
+    for (int s = 0; s < S; ++s) {
+        const float* q = pr + (size_t)s * (2 + D);
+        const float w = __expf(__ldcg(q) - m_safe);
+        L = L + __ldcg(q + 1) * w;
+        for (int i = 0; i < DPT; ++i) acc[i] = acc[i] + __ldcg(q + 2 + tid + i * NT) * w;
+    }
+    const float denom = L + __expf(SINK[h] - m_safe);
+    for (int i = 0; i < DPT; ++i)
+        O[((size_t)t * NH + h) * D + tid + i * NT] = __float2bfloat16_rn(acc[i] / denom);
+}
+
+extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn_split_lb(
+    const __nv_bfloat16* Q, const __nv_bfloat16* RING, const int32_t* WPOS,
+    const __nv_bfloat16* CKV, const long long* CIDX, float* PART, const float* SINK,
+    __nv_bfloat16* O, unsigned* CNT,
+    int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale, int SLICE)
+{
+    const int k_lo = blockIdx.z * SLICE;
+    sparse_attn_body<false, false, long long, float, int32_t>(
+        Q, RING, WPOS, CKV, CIDX, nullptr, nullptr, T, NH, D, NW, NC, RING_N, win_lo, scale,
+        k_lo, k_lo + SLICE, PART);
+    __shared__ int last;
+    __threadfence();                  // this CTA's partials are visible device-wide ...
+    __syncthreads();                  // ... for every thread, before the ticket is taken
+    const int t = blockIdx.x, hb = blockIdx.y, S = gridDim.z;
+    unsigned* c = CNT + (size_t)t * gridDim.y + hb;
+    if (threadIdx.x == 0) last = atomicAdd(c, 1u) == (unsigned)(S - 1);
+    __syncthreads();
+    if (!last) return;
+    __threadfence();                  // acquire: the other slices' partials
+    for (int h = 0; h < HB; ++h) {
+        const int hh = hb * HB + h;
+        combine_head(PART + ((size_t)t * NH + hh) * S * (2 + D), SINK, O, t, hh, NH, D, S);
+    }
+    if (threadIdx.x == 0) *c = 0u;    // ready for the next launch
+}
+
 // ------------------------------------------------------------------ TENSOR-CORE PREFILL
 // dsv41_sparse_attn_mma: the same computation on mma.sync.m16n8k16 (bf16 in, fp32 accumulate).
 // One CTA = one token x 16 heads (MQA: the 16 heads share every gathered K/V row), 4 warps.
@@ -1421,6 +1473,44 @@ int main() {
                     std::printf("    split SLICE=%2d (S=%2d, %3d CTAs) + combine %.1f us (%.1fx)  [split alone %.1f, combine alone %.1f]\n",
                                 sl, ss, ss * NH / HB, spl, one / spl, so, co);
                 }
+                // LAST-BLOCK COMBINE + the slice sweep for T=1 AND T=6 (verify), SAME slice for both
+                // (spec == plain needs each verify row == its T=1 decode). PRE-REGISTERED: split_lb
+                // BYTE-IDENTICAL to split + combine at every (T, slice), on two back-to-back launches
+                // (the ticket reset). Numerics per slice: bf16 identity vs one-pass on those rows.
+                unsigned* d_cnt; CUDA_OK(cudaMalloc(&d_cnt, 64 * 64 * 4)); CUDA_OK(cudaMemset(d_cnt, 0, 64 * 64 * 4));
+                for (int tt : {1, 6}) {
+                    const int t0 = T - tt;
+                    const __nv_bfloat16* qv = d_q + (size_t)t0 * NH * D;
+                    const int32_t* wv = d_wpos + (size_t)t0 * NW;
+                    const long long* cv = d_c64 + (size_t)t0 * NC;
+                    const size_t nv = (size_t)tt * NH * D;
+                    std::vector<__nv_bfloat16> onep(nv), ref(nv), got(nv);
+                    dsv41_sparse_attn_w32<<<dim3(tt, NH / HB), NT>>>(qv, d_ring, wv, d_ckv, cv, d_sink, d_ob, tt, NH, D, NW, NC, RING_N, 0, scale);
+                    CUDA_OK(cudaDeviceSynchronize()); CUDA_OK(cudaMemcpy(onep.data(), d_ob, nv * 2, cudaMemcpyDeviceToHost));
+                    for (int sl : {16, 32, 64, 128}) {
+                        const int ss = (NW + NC + sl - 1) / sl;
+                        auto sc2 = [&] {
+                            dsv41_sparse_attn_split<<<dim3(tt, NH / HB, ss), NT>>>(qv, d_ring, wv, d_ckv, cv, d_part, tt, NH, D, NW, NC, RING_N, 0, scale, sl);
+                            dsv41_sparse_attn_combine<<<dim3(tt, NH), NT>>>(d_part, d_sink, d_ob, NH, D, ss); };
+                        auto lbk = [&] {
+                            dsv41_sparse_attn_split_lb<<<dim3(tt, NH / HB, ss), NT>>>(qv, d_ring, wv, d_ckv, cv, d_part, d_sink, d_ob, d_cnt, tt, NH, D, NW, NC, RING_N, 0, scale, sl); };
+                        sc2(); CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
+                        CUDA_OK(cudaMemcpy(ref.data(), d_ob, nv * 2, cudaMemcpyDeviceToHost));
+                        size_t dlb = 0;
+                        for (int rep2 = 0; rep2 < 2; ++rep2) {
+                            CUDA_OK(cudaMemset(d_ob, 0, nv * 2));
+                            lbk(); CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
+                            CUDA_OK(cudaMemcpy(got.data(), d_ob, nv * 2, cudaMemcpyDeviceToHost));
+                            for (size_t i = 0; i < nv; ++i) dlb += std::memcmp(&got[i], &ref[i], 2) != 0;
+                        }
+                        size_t vs1 = 0; for (size_t i = 0; i < nv; ++i) vs1 += std::memcmp(&ref[i], &onep[i], 2) != 0;
+                        const float t_sc = time_it(sc2), t_lb = time_it(lbk);
+                        std::printf("    T=%d SLICE=%3d (S=%2d): split+combine %.1f us | split_lb %.1f us (%.2fx) | split_lb vs split+combine: %zu differ (must be 0) | vs one-pass %.4f%% identical\n",
+                                    tt, sl, ss, t_sc, t_lb, t_sc / t_lb, dlb, 100.0 * (1.0 - (double)vs1 / nv));
+                        prod_ok = prod_ok && dlb == 0;
+                    }
+                }
+                cudaFree(d_cnt);
             }
             cudaFree(d_part);
         }
@@ -1518,6 +1608,15 @@ int main() {
                     const double flop = 2.0 * TT * NH * (double)(NW + NC) * D * 3;   // QK + 2 x PV (P_hi + P_lo)
                     const float tp16 = time_it([&] { dsv41_sparse_attn_mma16p<<<dim3(TT, NH / 16), MNT>>>(qq, d_ring, ww, d_ckv, cc, d_sink, oo, TT, NH, D, NW, NC, RING_N, 0, scale); });
                     const float tp32 = time_it([&] { dsv41_sparse_attn_mma32p<<<dim3(TT, NH / 32), MNT * 2>>>(qq, d_ring, ww, d_ckv, cc, d_sink, oo, TT, NH, D, NW, NC, RING_N, 0, scale); });
+                    // PROBE (timing only): identical MMA work, every gather hitting ONE row (L1/L2-hot).
+                    // If the kernel is K-gather bound, this collapses the time.
+                    {
+                        std::vector<int32_t> wh((size_t)TT * NW, 0); std::vector<long long> ch((size_t)TT * NC, 0);
+                        CUDA_OK(cudaMemcpy(ww, wh.data(), wh.size() * 4, cudaMemcpyHostToDevice));
+                        CUDA_OK(cudaMemcpy(cc, ch.data(), ch.size() * 8, cudaMemcpyHostToDevice));
+                        const float thot = time_it([&] { dsv41_sparse_attn_mma32h<<<dim3(TT, NH / 32), MNT * 2>>>(qq, d_ring, ww, d_ckv, cc, d_sink, oo, TT, NH, D, NW, NC, RING_N, 0, scale); });
+                        std::printf("PROBE T=%d mma32h with every K gather on ONE hot row: %.3f ms vs %.3f ms real (%.2fx) -- gather share of the time\n", TT, thot, tm, tm / thot);
+                    }
                     std::printf("T=%d (fixture x%d): mma32h %.3f ms (%.1f TF/s) | fa16h %.3f ms (%.2fx) | fa32h %.3f ms (%.2fx) | mma16p %.3f ms (%.2fx) | mma32p %.3f ms (%.2fx, %.1f TF/s)\n",
                                 TT, R, tm, flop / (tm * 1e9), t16, tm / t16, t32f, tm / t32f, tp16, tm / tp16, tp32, tm / tp32, flop / (tp32 * 1e9));
                     cudaFree(qq); cudaFree(ww); cudaFree(cc); cudaFree(oo);
