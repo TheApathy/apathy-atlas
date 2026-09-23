@@ -46,6 +46,7 @@ struct Kernels {
     attn: KernelHandle,
     markov: KernelHandle,
     argmax_f32: KernelHandle,
+    sample_softmax: KernelHandle,
     argmax_rows: KernelHandle,
     accept: KernelHandle,
 }
@@ -84,6 +85,13 @@ pub struct Dspark {
     am: DevicePtr,
     res: DevicePtr,
     vocab: usize,
+    /// fp32 `[B, V]`: the distributions the sampled drafts were drawn from (`draft_probs`).
+    q: DevicePtr,
+    /// The NEXT draft's sampling (temperature, B uniforms in [0,1)), consumed by `draft`;
+    /// None = greedy (argmax) drafts.
+    sampling: std::sync::Mutex<Option<(f32, [f32; B])>>,
+    /// Per-step wall ms (draft, verify+accept, commit) when `DSV41_DSPARK_PHASES=1`.
+    pub phase_ms: std::sync::Mutex<Vec<[f64; 3]>>,
     _allocs: DeviceAllocs,
 }
 
@@ -97,6 +105,7 @@ impl Dspark {
             attn: k(ATTN_MODULE, "dsv41_sparse_attn_w32")?,
             markov: k(DSPARK_MODULE, "dsv41_markov_bias")?,
             argmax_f32: k(DSPARK_MODULE, "dsv41_argmax_f32")?,
+            sample_softmax: k(DSPARK_MODULE, "dsv41_sample_softmax")?,
             argmax_rows: k(DSPARK_MODULE, "dsv41_argmax_rows_bf16")?,
             accept: k(DSPARK_MODULE, "dsv41_dspark_accept")?,
         };
@@ -140,6 +149,9 @@ impl Dspark {
             am: a(16 * 4)?,
             res: a(32 * 4)?,
             vocab: v,
+            q: a(B * v * 4)?,
+            sampling: std::sync::Mutex::new(None),
+            phase_ms: std::sync::Mutex::new(Vec::new()),
             _allocs: DeviceAllocs::unowned(),
         };
         let cidx: Vec<u8> = (0..B).flat_map(|_| (0..B as i64).flat_map(|j| j.to_le_bytes())).collect();
@@ -175,6 +187,19 @@ impl Dspark {
         Ok(())
     }
 
+    /// SAMPLED drafts for the next [`Self::draft`] only: d_i ~ q_i = softmax(markov_logits_i / T)
+    /// (Python `dspark_draft` at temperature > 0: no top_p on q), using `uniforms[i]` (the
+    /// caller's request RNG) for draft i. The q rows are kept at [`Self::draft_probs`].
+    /// `temperature <= 0` or None = greedy drafts.
+    pub fn set_draft_sampling(&self, sampling: Option<(f32, [f32; B])>) {
+        *self.sampling.lock().expect("dspark sampling poisoned") = sampling.filter(|(t, _)| *t > 0.0);
+    }
+
+    /// fp32 `[B, vocab]`: q_i of the last SAMPLED draft (undefined after a greedy draft).
+    pub fn draft_probs(&self) -> DevicePtr {
+        self.q
+    }
+
     /// Draft B tokens after `tok` at position `pos` (the drafter ring holds main positions < pos).
     /// Leaves ids[0] = tok, ids[1..=B] = drafts on the device; returns the drafts (one readback).
     pub fn draft(&self, ops: &Ops, fwd: &V41Forward, tok: u32, pos: usize, tap: &Tap) -> Result<Vec<u32>> {
@@ -205,7 +230,8 @@ impl Dspark {
         ops.hc_pre(s.h, s.pre_mix, s.x, B, d)?;
         ops.rmsnorm(s.x, w.head.norm, s.x, B, d, fwd.dims.norm_eps)?;
         ops.linear_bf16_tiled(s.x, d, fwd.head, self.draft_logits, v, B, v, d)?;
-        // Markov chain: draft i+1 = argmax(logits[i] + markov(ids[i])).
+        // Markov chain: draft i+1 = argmax (or a sample at T > 0) of logits[i] + markov(ids[i]).
+        let sampling = self.sampling.lock().expect("dspark sampling poisoned").take();
         for i in 0..B {
             KernelLaunch::new(gpu, self.k.markov)
                 .grid([(v as u32).div_ceil(8), 1, 1])
@@ -218,14 +244,28 @@ impl Dspark {
                 .arg_ptr(self.lg)
                 .arg_u32(v as u32)
                 .launch(ops.stream)?;
-            KernelLaunch::new(gpu, self.k.argmax_f32)
-                .grid([1, 1, 1])
-                .block([1024, 1, 1])
-                .arg_ptr(self.lg)
-                .arg_u32(v as u32)
-                .arg_ptr(self.ids)
-                .arg_i32(i as i32 + 1)
-                .launch(ops.stream)?;
+            if let Some((temp, u)) = sampling {
+                KernelLaunch::new(gpu, self.k.sample_softmax)
+                    .grid([1, 1, 1])
+                    .block([1024, 1, 1])
+                    .arg_ptr(self.lg)
+                    .arg_u32(v as u32)
+                    .arg_f32(temp)
+                    .arg_f32(u[i])
+                    .arg_ptr(self.q.offset(i * v * 4))
+                    .arg_ptr(self.ids)
+                    .arg_i32(i as i32 + 1)
+                    .launch(ops.stream)?;
+            } else {
+                KernelLaunch::new(gpu, self.k.argmax_f32)
+                    .grid([1, 1, 1])
+                    .block([1024, 1, 1])
+                    .arg_ptr(self.lg)
+                    .arg_u32(v as u32)
+                    .arg_ptr(self.ids)
+                    .arg_i32(i as i32 + 1)
+                    .launch(ops.stream)?;
+            }
         }
         gpu.synchronize(ops.stream)?;
         let mut out = [0u8; (B + 1) * 4];
@@ -312,11 +352,27 @@ impl Dspark {
         force_accept_all: bool,
     ) -> Result<StepOut> {
         let pos = seq.len;
-        let (drafts, mut a, am) = self.propose_verify(ops, fwd, seq, tok, hook, core, main_moe, tap, logits)?;
+        let phases = std::env::var("DSV41_DSPARK_PHASES").as_deref() == Ok("1");
+        let t0 = std::time::Instant::now();
+        // (propose_verify's two readbacks already synchronize after the draft and after accept)
+        let drafts = self.draft(ops, fwd, tok, pos, tap)?;
+        let t1 = std::time::Instant::now();
+        let mut block_ids = Vec::with_capacity(T_VERIFY);
+        block_ids.push(tok);
+        block_ids.extend_from_slice(&drafts);
+        fwd.verify(ops, seq, &block_ids, hook, core, main_moe, tap, logits)?;
+        let (mut a, am) = self.accept(ops, logits)?;
+        let t2 = std::time::Instant::now();
         if force_accept_all {
             a = B;
         }
         self.commit(ops, fwd, seq, pos, a, hook)?;
+        if phases {
+            ops.gpu.synchronize(ops.stream)?;
+            let t3 = std::time::Instant::now();
+            let ms = |x: std::time::Instant, y: std::time::Instant| (y - x).as_secs_f64() * 1e3;
+            self.phase_ms.lock().expect("phase poisoned").push([ms(t0, t1), ms(t1, t2), ms(t2, t3)]);
+        }
         let mut emitted: Vec<u32> = drafts[..a].to_vec();
         emitted.push(if force_accept_all { am[B] } else { am[a] });
         Ok(StepOut { accepted: a, emitted })

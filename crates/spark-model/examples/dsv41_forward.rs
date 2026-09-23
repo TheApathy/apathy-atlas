@@ -192,7 +192,11 @@ fn manifest_ids(dir: &Path) -> Result<Vec<u32>> {
 /// computed pass line up occurrence for occurrence.
 fn manifest_chunks(dir: &Path, n: usize) -> Result<Vec<(usize, usize)>> {
     let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)?;
-    let chunk = m["model_globals"]["MAX_CHUNK"].as_u64().context("no MAX_CHUNK")? as usize;
+    // DSV41_DRIVER_CHUNK overrides the capture's chunk (e.g. 2048, the serving default).
+    let chunk = match std::env::var("DSV41_DRIVER_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(c) => c,
+        None => m["model_globals"]["MAX_CHUNK"].as_u64().context("no MAX_CHUNK")? as usize,
+    };
     Ok((0..n).step_by(chunk).map(|s| (s, chunk.min(n - s))).collect())
 }
 
@@ -265,7 +269,7 @@ fn run_model_path(
         fwd.dspark = Some(spark_model::weight_loader::deepseek_v41::mtp::DsparkWeights::load(store, &dims, config.vocab_size)?);
         fwd.enable_dspark_seed(ops.gpu)?;
     }
-    let fwd = fwd;
+    let mut fwd = fwd;
     let ds = if dspark_on {
         Some(spark_model::weight_loader::deepseek_v41::dspark::Dspark::new(&shared_dyn, &fwd, 10.0, 1.5)?)
     } else {
@@ -280,6 +284,12 @@ fn run_model_path(
     } else {
         (&fed_core, &NoHook)
     };
+    // Whole-step CUDA graphs for Decode/Verify passes (DSV41_DRIVER_GRAPH=1): shape-static core.
+    if std::env::var("DSV41_DRIVER_GRAPH").as_deref() == Ok("1") {
+        fwd.enable_graphs(ops.gpu, hook)?;
+        println!("decode: CUDA graphs ON (Decode/Verify passes captured once, replayed)");
+    }
+    let fwd = fwd;
     let fed_moe = FedMoe(&feeder, dims.hidden);
     let real;
     let moe: &dyn V41RoutedMoe = if moe_real {
@@ -397,6 +407,14 @@ fn run_model_path(
             println!("decode ours:   {got:?}");
             println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
             println!("decode: first {agree} identical");
+            let ph = ds.phase_ms.lock().expect("phase").clone();
+            if ph.len() > 2 {
+                let med = |k: usize| { let mut v: Vec<f64> = ph[1..].iter().map(|p| p[k]).collect(); v.sort_by(f64::total_cmp); v[v.len() / 2] };
+                println!("dspark phases ms (median, warm): draft {:.2}  verify+accept {:.2}  commit(rollback+seed) {:.2}", med(0), med(1), med(2));
+            }
+            if let Some(g) = &fwd.graph {
+                println!("graph captures: {}", g.captures.load(std::sync::atomic::Ordering::Relaxed));
+            }
             println!("DONE dsv41_forward path=model dspark");
             return Ok(());
         }
@@ -429,6 +447,9 @@ fn run_model_path(
                 "decode step ms (warm, n={}): median {:.2}  min {:.2}  max {:.2}  first {:.2}",
                 w.len(), w[w.len() / 2], w[0], w[w.len() - 1], steps_ms[0]
             );
+        }
+        if let Some(g) = &fwd.graph {
+            println!("graph captures: {} over {} decode steps", g.captures.load(std::sync::atomic::Ordering::Relaxed), got.len() - 1);
         }
         println!("decode ours:   {got:?}");
         println!("decode logits fnv: {:016x}", hashes.iter().fold(0u64, |a, h| a.rotate_left(7) ^ h));
@@ -576,7 +597,9 @@ fn main() -> Result<()> {
             o => bail!("unknown argument {o}"),
         }
     }
-    let ref_dir = PathBuf::from(REF_ROOT).join(&run);
+    // `--run` is a capture under REF_ROOT, or (containing '/') any directory with a manifest.json
+    // holding `token_ids` (+ optional `greedy_continuation`, `model_globals.MAX_CHUNK`): real prompts.
+    let ref_dir = if run.contains('/') { PathBuf::from(&run) } else { PathBuf::from(REF_ROOT).join(&run) };
     ensure!(ref_dir.join("manifest.json").is_file(), "{} has no manifest", ref_dir.display());
     let ids = manifest_ids(&ref_dir)?.repeat(tile_prompt);
     let chunks = match chunk_override {

@@ -127,6 +127,11 @@ required-features = ["cuda", "gpu-examples"]
 name = "dsv41_mtp_moe_gate"
 required-features = ["cuda", "gpu-examples"]
 
+# Sampled DSpark draft kernel: draws follow softmax(lg/T), q exact, control fails.
+[[example]]
+name = "dsv41_sampler_gate"
+required-features = ["cuda", "gpu-examples"]
+
 # Served DeepSeek-V4.1: dropping the model must return >= 95% of its memory (TUI swap);
 # `--control leak` forgets it and must FAIL.
 [[example]]

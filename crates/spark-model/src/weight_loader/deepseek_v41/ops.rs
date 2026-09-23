@@ -71,6 +71,22 @@ pub fn decode_pass() -> bool {
     DECODE_PASS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// CUDA-graph decode: the device i32 holding the current pass's start (the position of its row
+/// 0), or 0 = none. When set on a decode-kind pass, the attention computes its positions and the
+/// window-ring slot on the DEVICE from it (`dsv41_decode_positions` / `dsv41_ring_write`) instead
+/// of uploading host values, so a captured step replays correctly at any position.
+static GRAPH_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_graph_start(ptr: Option<DevicePtr>) {
+    GRAPH_START.store(ptr.map_or(0, |p| p.0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The device start, if a graph-mode decode pass is running.
+pub fn graph_start() -> Option<DevicePtr> {
+    let v = GRAPH_START.load(std::sync::atomic::Ordering::Relaxed);
+    (v != 0 && decode_pass()).then_some(DevicePtr(v))
+}
+
 static FP8_FIXED_M: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_fp8_fixed_m(m: usize) {
@@ -192,6 +208,9 @@ pub struct Dsv41Kernels {
     pub fp8_gemv_m8: Option<KernelHandle>,
     /// The bit-identical split `hc_mixes` for T = 1 ([`HC_SPLIT_ENV`]): (dot, finish, raw scratch).
     pub hc_split: Option<(KernelHandle, KernelHandle)>,
+    /// CUDA-graph decode: positions / window positions / ring slot from one device `start`.
+    pub decode_positions: KernelHandle,
+    pub ring_write: KernelHandle,
     /// attention2's fused FP8-weight GEMM (no bf16 dequant copy), used for prefill M > MM_TILE
     /// on the shapes where it measured faster ([`fused_wins`]). [`FP8_FUSED_ENV`]`=1` only,
     /// until the end-to-end byte test passes.
@@ -278,6 +297,8 @@ impl Dsv41Kernels {
             } else {
                 None
             },
+            decode_positions: k2("dsv41_decode_positions")?,
+            ring_write: k2("dsv41_ring_write")?,
             hc_split: if std::env::var(HC_SPLIT_ENV).as_deref() != Ok("0") {
                 // No allocation here: this table is Copy and has no owner to free a buffer.
                 // The partials live in the caller's scratch (`PassScratch::hc_raw`).
@@ -567,6 +588,26 @@ impl Ops<'_> {
             .arg_u32(w.n as u32).arg_u32(w.k as u32)
             .arg_u32(n_per_group as u32).arg_u32(x_group_stride as u32)
             .arg_u32(m as u32).arg_u32(ldx as u32).arg_u32(ldo as u32)
+            .launch(self.stream)
+    }
+
+    /// `pos[i] = *dstart + i`, `wpos[i, j] = *dstart + i - (window-1) + j` (-1 below 0), for the
+    /// pass's `t` rows: the device form of the host `window_positions` upload (graph replay).
+    pub fn decode_positions(&self, dstart: DevicePtr, pos: DevicePtr, wpos: DevicePtr, t: usize, window: usize) -> Result<()> {
+        KernelLaunch::new(self.gpu, self.k.decode_positions)
+            .grid([t as u32, 1, 1])
+            .block([128, 1, 1])
+            .arg_ptr(dstart).arg_ptr(pos).arg_ptr(wpos).arg_i32(window as i32)
+            .launch(self.stream)
+    }
+
+    /// `ring[(*dstart + i) % ring_n] = kv[i]` for `t` rows of `row_elems` bf16 (graph replay).
+    pub fn ring_write(&self, kv: DevicePtr, ring: DevicePtr, dstart: DevicePtr, t: usize, ring_n: usize, row_elems: usize) -> Result<()> {
+        ensure!(row_elems % 8 == 0, "ring_write: row of {row_elems} elements");
+        KernelLaunch::new(self.gpu, self.k.ring_write)
+            .grid([t as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(kv).arg_ptr(ring).arg_ptr(dstart).arg_i32(ring_n as i32).arg_i32(row_elems as i32)
             .launch(self.stream)
     }
 

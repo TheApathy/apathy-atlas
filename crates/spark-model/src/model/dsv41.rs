@@ -114,6 +114,8 @@ pub struct Dsv41Model {
     spec_stats: Mutex<(usize, usize)>,
     /// The input token and drafts of an uncommitted `spec_verify`.
     spec_pending: Mutex<Option<(u32, Vec<u32>)>>,
+    /// Whether the last spec_verify drew SAMPLED drafts (its q rows are valid).
+    spec_sampled: Mutex<bool>,
 }
 
 // SAFETY-adjacent: every field is either immutable after construction, behind a Mutex, or a
@@ -152,6 +154,13 @@ impl Dsv41Model {
         fwd.own_allocations(shared.clone());
         fwd.vision = load_vision(store, model_dir, dims.hidden, &shared)?;
         let lanes = build_lanes(store, config, gpu, kernels, &shared, &fwd, model_dir, max_seq, max_chunk)?;
+        // Whole-step CUDA graphs for Decode/Verify passes, segmented around the engram gathers
+        // (measured full model: -3.21 ms/step, bit-identical to eager over 63 steps; see
+        // V41Forward::step_graphed). `ATLAS_DSV41_GRAPH=0` = eager.
+        if std::env::var("ATLAS_DSV41_GRAPH").as_deref() != Ok("0") {
+            fwd.enable_graphs(gpu, lanes.hook.as_ref())?;
+            tracing::info!("DeepSeek-V4.1: decode CUDA graphs ON (segmented; ATLAS_DSV41_GRAPH=0 for eager)");
+        }
         let mode = match std::env::var("ATLAS_DSV41_PREFILL").ok().as_deref() {
             None | Some("replay") => PrefillMode::Replay,
             Some("full") => {
@@ -192,6 +201,7 @@ impl Dsv41Model {
             dspark,
             spec_stats: Mutex::new((0, 0)),
             spec_pending: Mutex::new(None),
+            spec_sampled: Mutex::new(false),
         })
     }
 
@@ -348,7 +358,7 @@ impl Model for Dsv41Model {
         self.dspark.is_some()
     }
 
-    fn spec_verify(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
+    fn spec_verify(&self, token: u32, seq: &mut SequenceState, sampling: Option<&crate::traits::SpecSampling>, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
         let ds = self.dspark.as_ref().context("dsv41 spec_verify: DSpark is not loaded")?;
         let ops = self.ops();
         let l = &self.lanes;
@@ -359,6 +369,18 @@ impl Model for Dsv41Model {
                 return Ok(None);
             }
             let ds = ds.lock().expect("dspark poisoned");
+            // Sampled drafts (T > 0): q_i = softmax(markov_logits_i / T) at the caller's uniforms.
+            let draft_sampling = match sampling {
+                Some(sp) => {
+                    ensure!(sp.draft_uniforms.len() == crate::weight_loader::deepseek_v41::dspark::B, "dsv41 spec_verify: {} draft uniforms for {} drafts", sp.draft_uniforms.len(), crate::weight_loader::deepseek_v41::dspark::B);
+                    let mut u = [0f32; crate::weight_loader::deepseek_v41::dspark::B];
+                    u.copy_from_slice(&sp.draft_uniforms);
+                    Some((sp.temperature, u))
+                }
+                None => None,
+            };
+            *self.spec_sampled.lock().expect("dsv41 spec sampled poisoned") = draft_sampling.as_ref().is_some_and(|(t, _)| *t > 0.0);
+            ds.set_draft_sampling(draft_sampling);
             let (drafts, _a, am) = ds.propose_verify(&ops, &self.fwd, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits)?;
             Ok(Some((drafts, am)))
         })?;
@@ -366,6 +388,14 @@ impl Model for Dsv41Model {
             *self.spec_pending.lock().expect("dsv41 spec pending poisoned") = Some((token, drafts.clone()));
         }
         Ok(r)
+    }
+
+    fn spec_draft_probs(&self) -> Option<DevicePtr> {
+        let sampled = *self.spec_sampled.lock().expect("dsv41 spec sampled poisoned");
+        match (&self.dspark, sampled) {
+            (Some(ds), true) => Some(ds.lock().expect("dspark poisoned").draft_probs()),
+            _ => None,
+        }
     }
 
     fn spec_commit(&self, seq: &mut SequenceState, accepted: usize, _stream: u64) -> Result<()> {

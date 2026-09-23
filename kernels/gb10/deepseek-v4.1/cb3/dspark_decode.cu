@@ -114,3 +114,64 @@ extern "C" __global__ void dsv41_dspark_accept(const uint32_t* __restrict__ am, 
     for (int i = 0; i <= B; ++i) res[1 + i] = am[i];
     for (int i = 0; i < B; ++i) res[2 + B + i] = drafts[i];
 }
+
+// Sampled draft (T > 0): q = softmax(lg / T) over the vocab (fp32, as Python's
+// `torch.softmax(lg / temperature, -1)`, no top_p), written to `q`; then ids[slot] = the
+// inverse-CDF sample of q at uniform `u` (a host/request RNG value, so a step is reproducible).
+// Deterministic: fixed thread->range split, an in-order block scan. Grid (1), Block 1024.
+extern "C" __global__ void __launch_bounds__(1024) dsv41_sample_softmax(const float* __restrict__ lg, const unsigned V,
+                                                                         const float temperature, const float u,
+                                                                         float* __restrict__ q, uint32_t* __restrict__ ids,
+                                                                         const int slot) {
+    __shared__ float red[1024];
+    __shared__ float part[1024];
+    const int tid = threadIdx.x, nt = blockDim.x;
+    const float inv_t = 1.0f / temperature;
+    float m = -INFINITY;
+    for (unsigned v = tid; v < V; v += nt) m = fmaxf(m, lg[v] * inv_t);
+    red[tid] = m;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    const float mx = red[0];
+    __syncthreads();
+    // Contiguous ranges per thread so the CDF order is the vocab order.
+    const unsigned chunk = (V + nt - 1) / nt;
+    const unsigned lo = tid * chunk, hi = min(V, lo + chunk);
+    float s = 0.0f;
+    for (unsigned v = lo; v < hi; ++v) {
+        const float e = expf(lg[v] * inv_t - mx);
+        q[v] = e;
+        s += e;
+    }
+    part[tid] = s;
+    __syncthreads();
+    if (tid == 0) {  // in-order exclusive scan
+        float acc = 0.0f;
+        for (int i = 0; i < nt; ++i) { const float x = part[i]; part[i] = acc; acc += x; }
+        red[0] = acc;
+    }
+    __syncthreads();
+    const float total = red[0];
+    const float inv = 1.0f / total;
+    const float target = u * total;
+    for (unsigned v = lo; v < hi; ++v) q[v] *= inv;
+    // The thread whose range holds the target walks it. (Exactly one does; the last thread
+    // with a non-empty range takes u rounding past the total.)
+    const float base = part[tid];
+    const float end = tid + 1 < nt ? part[tid + 1] : total;
+    const bool mine = (target >= base && target < end) || (tid == nt - 1 && target >= total);
+    if (mine && lo < hi) {
+        float acc = base;
+        unsigned pick = hi - 1;
+        for (unsigned v = lo; v < hi; ++v) {
+            acc += q[v] * total;
+            if (acc > target) { pick = v; break; }
+        }
+        ids[slot] = pick;
+    } else if (mine) {
+        ids[slot] = V - 1;
+    }
+}
