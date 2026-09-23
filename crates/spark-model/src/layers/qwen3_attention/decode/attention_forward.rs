@@ -669,8 +669,13 @@ impl Qwen3AttentionLayer {
         } else if matches!(
             device_row.map(|row| row.route),
             Some(Qwen4DeviceAttentionRoute::SparseQsa)
-        ) || host_seq_len.is_some_and(|seq_len| seq_len >= 2048)
+        ) || (ctx.config.is_qwen4_exp()
+            && host_seq_len.is_some_and(|seq_len| seq_len >= 2048))
         {
+            // Only Qwen4 switches to sparse attention at 2048. Without the
+            // model check every other model's host-route decode past 2048
+            // (e.g. Qwen3.8's DFlash bootstrap decode after a long prompt)
+            // failed here for want of a QSA indexer it never has.
             let qsa = self
                 .qwen4_qsa
                 .as_ref()

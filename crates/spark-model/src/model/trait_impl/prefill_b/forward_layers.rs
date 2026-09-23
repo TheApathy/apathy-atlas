@@ -323,6 +323,9 @@ impl TransformerModel {
         if let Some(receipt) = prefill_receipt {
             receipt.finish()?;
         }
+        // Every layer of this chunk has captured; advance the DFlash ring so
+        // the next chunk's capture starts at the right absolute cursor.
+        self.update_dflash_ctx_len_after_prefill(seq, effective_seq_len_start, proc_count)?;
         Ok(())
     }
 }

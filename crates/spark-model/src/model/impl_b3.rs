@@ -726,8 +726,9 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// After prefill completes, advance the seq's DFlash `ctx_len` to
-    /// `chunk_start + proc_count` so the drafter sees all captured prompt
+    /// After a prefill chunk, advance the seq's DFlash `ctx_len` to
+    /// `chunk_start + proc_count`: the next chunk's capture plans its ring
+    /// writes against this cursor, and the drafter sees all captured prompt
     /// positions on the first propose() call.
     pub(super) fn update_dflash_ctx_len_after_prefill(
         &self,
@@ -751,9 +752,14 @@ impl TransformerModel {
             if proc_count == 0 {
                 return Ok(());
             }
-            let append = dstate
-                .ctx_ring_state()?
-                .plan_append_at(chunk_start, proc_count)?;
+            let ring = dstate.ctx_ring_state()?;
+            // Idempotent: chunked prefill advances after every chunk (the
+            // next chunk's capture plans against this cursor), and the
+            // last-chunk finalizer calls this again for the same rows.
+            if ring.absolute_len == chunk_start + proc_count {
+                return Ok(());
+            }
+            let append = ring.plan_append_at(chunk_start, proc_count)?;
             dstate.apply_ctx_ring_state(append.next)?;
         }
         Ok(())
