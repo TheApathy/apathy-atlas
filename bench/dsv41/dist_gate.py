@@ -11,7 +11,7 @@ def load(d, prefix):
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file('/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K/tokenizer.json')
     out = []
-    for f in sorted(glob.glob(os.path.join(d, prefix + '_*.response.json'))):
+    for f in sorted(glob.glob(os.path.join(d, prefix + '_completion_raw_*.response.json'))):
         r = json.load(open(f))
         if 'choices' not in r:
             continue
@@ -62,7 +62,10 @@ def main(base):
  for prompt in ('nouns', 'prose'):
    plain, spec, ctrl = (load(os.path.join(base, d), prompt) for d in ('dist_plain', 'dist_dspark', 'dist_control'))
    print(f"== prompt {prompt}: n plain {len(plain)} dspark {len(spec)} control {len(ctrl)}")
-   ok = True
+   # A gate over too few samples cannot fail: require the full run (window10 passed vacuously on n=0).
+   ok = min(len(plain), len(spec), len(ctrl)) >= 400
+   if not ok:
+       print("   TOO FEW SAMPLES (need >= 400 per arm): the gate cannot pass")
    for name, key in (('token1', lambda x: x[0] if x else None), ('token2', lambda x: x[1] if len(x) > 1 else None), ('pair', lambda x: x)):
        p_s, k_s = test2(plain, spec, key)
        p_c, k_c = test2(plain, ctrl, key)

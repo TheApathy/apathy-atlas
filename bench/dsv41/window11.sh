@@ -77,4 +77,14 @@ if [ -n "$low" ] && [ "$low" -ge 24 ]; then
 else
   echo "1M load-only serve: SKIPPED (DSpark low-water ${low:-?} < 24 GB)" >> $I/w11_summary.txt
 fi
+# sampled-spec distribution gate (rerun: window10's requests hit the chat endpoint and returned
+# errors; the gate now FAILS on < 400 samples/arm), then adaptive k (DSpark, ADAPTIVE=1) on the
+# serve11gd request set: greedy text == eager, tok/s, tokens/step.
+for d in dist_plain dist_dspark dist_control; do rm -f $I/$d/*.response.json; done
+$B/serve_window.sh dist_plain 8900 $I/dist_plain > $I/dist_plain.log 2>&1
+ATLAS_DSV41_DSPARK=1 $B/serve_window.sh dist_dspark 8900 $I/dist_dspark > $I/dist_dspark.log 2>&1
+ATLAS_DSV41_DSPARK=1 ATLAS_DSV41_CONTROL_SPEC_ACCEPT_ALL=1 $B/serve_window.sh dist_control 8900 $I/dist_control > $I/dist_control.log 2>&1
+python3 $B/dist_gate.py $I > $I/w11_dist_gate.txt 2>&1
+ATLAS_DSV41_DSPARK=1 ATLAS_DSV41_DSPARK_ADAPTIVE=1 $B/serve_window.sh serve11a 8900 $I/serve11a > $I/serve11a.log 2>&1
+grep -h "DSpark:" $I/serve11a/server.log > $I/w11_adaptive_stats.txt 2>&1
 echo "DONE window11 chain"
