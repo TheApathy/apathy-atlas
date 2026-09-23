@@ -95,41 +95,65 @@ fn apply_dead_arm(arm: DeadArm, dead: Vec<bool>, t: usize) -> Vec<bool> {
 /// `candidate_source_layer`: the last encoder layer.
 pub const ENCODER_LAST: usize = 20;
 
-/// `ATLAS_DSV41_SHARED_RESIDENT=0` turns OFF the resident bf16 shared-expert weights on the
-/// encoder layers (default ON: +[`super::fwd::shared_resident_bytes`] x 21 = 1.49 GB, which
-/// the CB3 arena's free-memory check then sees and budgets around). For tight-memory configs.
+/// `ATLAS_DSV41_SHARED_RESIDENT=0` turns OFF the resident bf16 shared-expert weights (default
+/// ON: +[`super::fwd::shared_resident_bytes`] = 70.8 MB per layer, 2.83 GB for all 40, as far
+/// as free memory allows after the planned arena; the arena's own check then sees them).
 pub const SHARED_RESIDENT_ENV: &str = "ATLAS_DSV41_SHARED_RESIDENT";
 
-/// Free device memory that must remain after the resident copies (the arena, KV and
-/// activations are sized after them and apply their own floors).
+/// Free device memory that must remain after the resident copies AND the CB3 arena that is
+/// loaded after them (the arena applies its own 16 GB floor then; this keeps residency from
+/// eating into it).
 const SHARED_RESIDENT_MIN_FREE: u64 = 16_000_000_000;
 
-/// Resident bf16 shared-expert weights for layers `0..=ENCODER_LAST` (the layers whose shared
-/// expert runs on the dequant path every prefill chunk). Byte-identical to the per-pass
-/// dequant; see `SharedExpert::make_resident`. Returns the allocations to own.
-fn make_shared_resident(ops: &Ops, dims: &V41Dims, blocks: &mut [V41BlockWeights]) -> Result<Vec<DevicePtr>> {
+/// Bytes the CB3 expert arena will take (the pack manifest at the served keep), so residency
+/// can leave room for it. None if the pack cannot be read here (then nothing is made resident).
+fn planned_arena_bytes(model_dir: &std::path::Path) -> Option<u64> {
+    use super::cb3_arena::resolve_packed_keep;
+    let manifest = std::fs::read_to_string(model_dir.join("k154-cb3").join("manifest.json")).ok()?;
+    let pack = atlas_core::config::ExpertPack::parse(&manifest, resolve_packed_keep().ok()?).ok()?;
+    Some(pack.resident_bytes() as u64)
+}
+
+/// Resident bf16 shared-expert weights, layer by layer: the encoder layers `0..=ENCODER_LAST`
+/// first (every prefill chunk), then the replay layers (once per prompt, T <= 128). Each takes
+/// the dequant path otherwise. Byte-identical to the per-pass dequant; see
+/// `SharedExpert::make_resident`. A layer is made resident only while free memory stays at
+/// least the planned arena plus [`SHARED_RESIDENT_MIN_FREE`]; past that, the remaining layers
+/// FALL BACK to the dequant path (logged), never a refusal. Returns the allocations to own.
+fn make_shared_resident(
+    ops: &Ops,
+    dims: &V41Dims,
+    blocks: &mut [V41BlockWeights],
+    model_dir: &std::path::Path,
+) -> Result<Vec<DevicePtr>> {
     if std::env::var(SHARED_RESIDENT_ENV).as_deref() == Ok("0") {
+        tracing::info!("DeepSeek-V4.1: resident shared-expert weights OFF ({SHARED_RESIDENT_ENV}=0)");
         return Ok(Vec::new());
     }
-    let n = (ENCODER_LAST + 1).min(blocks.len());
-    let bytes = (n * super::fwd::shared_resident_bytes(dims)) as u64;
-    let free = ops.gpu.free_memory().context("shared-expert residency: querying free memory")? as u64;
-    ensure!(
-        free >= bytes + SHARED_RESIDENT_MIN_FREE,
-        "DeepSeek-V4.1 resident shared-expert weights REFUSED: {:.2} GB would leave {:.1} GB of \
-         {:.1} GB free, under {:.0} GB (GB10 memory is unified: over-allocation takes the host \
-         down). Set {SHARED_RESIDENT_ENV}=0 to run without them.",
-        bytes as f64 / 1e9,
-        free.saturating_sub(bytes) as f64 / 1e9,
-        free as f64 / 1e9,
-        SHARED_RESIDENT_MIN_FREE as f64 / 1e9,
-    );
-    let mut owned = Vec::with_capacity(2 * n);
-    for b in &mut blocks[..n] {
+    let Some(arena) = planned_arena_bytes(model_dir) else {
+        tracing::warn!("DeepSeek-V4.1: expert pack manifest unreadable here; shared expert stays on the dequant path");
+        return Ok(Vec::new());
+    };
+    let per_layer = super::fwd::shared_resident_bytes(dims) as u64;
+    let mut owned = Vec::with_capacity(2 * blocks.len());
+    let mut resident = 0usize;
+    for b in blocks.iter_mut() {
+        let free = ops.gpu.free_memory().context("shared-expert residency: querying free memory")? as u64;
+        if free < per_layer + arena + SHARED_RESIDENT_MIN_FREE {
+            break;
+        }
         owned.extend(b.shared.make_resident(ops)?);
+        resident += 1;
     }
     ops.gpu.synchronize(ops.stream)?;
-    tracing::info!("DeepSeek-V4.1: {:.2} GB of resident bf16 shared-expert weights (layers 0..={})", bytes as f64 / 1e9, n - 1);
+    tracing::info!(
+        "DeepSeek-V4.1: resident bf16 shared-expert weights on {resident} of {} layers ({:.2} GB; the rest use the \
+         dequant path; room kept for the {:.1} GB arena + {:.0} GB floor)",
+        blocks.len(),
+        (resident as u64 * per_layer) as f64 / 1e9,
+        arena as f64 / 1e9,
+        SHARED_RESIDENT_MIN_FREE as f64 / 1e9,
+    );
     Ok(owned)
 }
 pub const N_LAYERS: usize = 40;
@@ -351,7 +375,7 @@ impl V41Forward {
         engram_threads: usize,
     ) -> Result<Self> {
         let mut blocks = (0..n_layers).map(|l| V41BlockWeights::load(store, l, &dims, ops)).collect::<Result<Vec<_>>>()?;
-        let shared_resident = make_shared_resident(ops, &dims, &mut blocks)?;
+        let shared_resident = make_shared_resident(ops, &dims, &mut blocks, model_dir)?;
         let attn = (0..n_layers).map(|l| V41AttnWeights::load(store, l, dims.hidden)).collect::<Result<Vec<_>>>()?;
         let largest = blocks
             .iter()

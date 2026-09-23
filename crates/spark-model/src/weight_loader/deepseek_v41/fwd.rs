@@ -101,8 +101,15 @@ impl SharedExpert {
         let w13 = ops.gpu.alloc(2 * half)?;
         let w2 = ops.gpu.alloc(self.w2.bf16_bytes())?;
         let w3_at = DevicePtr(w13.0 + half as u64);
-        ops.dequant(&self.w1, w13)?;
-        ops.dequant(&self.w3, w3_at)?;
+        // NEGATIVE CONTROL (`ATLAS_DSV41_SHARED_RESIDENT=swap_control`): the halves swapped, so
+        // w1 serves w3's bytes. Real matrices, the wrong ones: a byte gate must FAIL under it.
+        if std::env::var("ATLAS_DSV41_SHARED_RESIDENT").as_deref() == Ok("swap_control") {
+            ops.dequant(&self.w3, w13)?;
+            ops.dequant(&self.w1, w3_at)?;
+        } else {
+            ops.dequant(&self.w1, w13)?;
+            ops.dequant(&self.w3, w3_at)?;
+        }
         ops.dequant(&self.w2, w2)?;
         self.w1.bf16 = Some(w13);
         self.w3.bf16 = Some(w3_at);
