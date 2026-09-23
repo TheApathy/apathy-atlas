@@ -38,10 +38,17 @@ extern "C" __global__ void argmax_bf16(
     s_idx[tid] = local_idx;
     __syncthreads();
 
-    // Phase 2: tree reduction in shared memory
+    // Phase 2: tree reduction in shared memory. Tie-break on the LOWER array index, not on
+    // which side of the comparison a thread happens to land: `s_val[tid+s] > s_val[tid]` alone
+    // keeps whichever slot the tree structure put at `tid`, which is thread-position-dependent,
+    // not index-dependent -- a tie between global indices 3 and 1026 at blockDim 1024 returned
+    // 1026 (thread 2's slot beat thread 3's slot at the final reduction level), which is
+    // neither first-max nor last-max. First-max requires comparing the index on every tie.
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            if (s_val[tid + s] > s_val[tid]) {
+            bool other_wins = (s_val[tid + s] > s_val[tid])
+                || (s_val[tid + s] == s_val[tid] && s_idx[tid + s] < s_idx[tid]);
+            if (other_wins) {
                 s_val[tid] = s_val[tid + s];
                 s_idx[tid] = s_idx[tid + s];
             }
@@ -94,20 +101,25 @@ extern "C" __global__ void top2_bf16_rows(
 
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            // Merge two (top1, top2) pairs into one.
-            float av1 = s_v1[tid], av2 = s_v2[tid];
-            unsigned int ai1 = s_i1[tid], ai2 = s_i2[tid];
-            const float bv1 = s_v1[tid + s], bv2 = s_v2[tid + s];
-            const unsigned int bi1 = s_i1[tid + s], bi2 = s_i2[tid + s];
-            if (bv1 > av1) {
-                av2 = av1; ai2 = ai1;
-                av1 = bv1; ai1 = bi1;
-                if (bv2 > av2) { av2 = bv2; ai2 = bi2; }
-            } else if (bv1 > av2) {
-                av2 = bv1; ai2 = bi1;
+            // Merge two (top1, top2) pairs into one, first-max on ties: pick the top 2 of the
+            // 4 candidates by (value desc, index asc) explicitly, rather than a value-only `>`
+            // cascade whose tie behaviour depends on which side of the tree a thread landed on
+            // (the same bug as the plain argmax reduction above). `a`'s and `b`'s index sets
+            // are always disjoint (different threads/partitions), so no candidate needs
+            // excluding by identity, only by rank.
+            const float cv[4] = {s_v1[tid], s_v1[tid + s], s_v2[tid], s_v2[tid + s]};
+            const unsigned int ci[4] = {s_i1[tid], s_i1[tid + s], s_i2[tid], s_i2[tid + s]};
+            int best = 0;
+            for (int k = 1; k < 4; k++) {
+                if (cv[k] > cv[best] || (cv[k] == cv[best] && ci[k] < ci[best])) best = k;
             }
-            s_v1[tid] = av1; s_i1[tid] = ai1;
-            s_v2[tid] = av2; s_i2[tid] = ai2;
+            int second = -1;
+            for (int k = 0; k < 4; k++) {
+                if (k == best) continue;
+                if (second < 0 || cv[k] > cv[second] || (cv[k] == cv[second] && ci[k] < ci[second])) second = k;
+            }
+            s_v1[tid] = cv[best]; s_i1[tid] = ci[best];
+            s_v2[tid] = cv[second]; s_i2[tid] = ci[second];
         }
         __syncthreads();
     }
@@ -142,10 +154,16 @@ extern "C" __global__ void argmax_fp32(
     s_idx[tid] = local_idx;
     __syncthreads();
 
+    // Same first-max tie-break as argmax_bf16 above: value-only `>` picks whichever slot the
+    // reduction tree put at `tid`, not the lower array index.
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && s_val[tid + s] > s_val[tid]) {
-            s_val[tid] = s_val[tid + s];
-            s_idx[tid] = s_idx[tid + s];
+        if (tid < s) {
+            bool other_wins = (s_val[tid + s] > s_val[tid])
+                || (s_val[tid + s] == s_val[tid] && s_idx[tid + s] < s_idx[tid]);
+            if (other_wins) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
         }
         __syncthreads();
     }

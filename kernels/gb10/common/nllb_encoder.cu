@@ -482,10 +482,18 @@ extern "C" __global__ void nllb_argmax_batched(
     sval[tid] = best;
     sidx[tid] = bi;
     __syncthreads();
+    // First-max tie-break (kernels/gb10/common/argmax_bf16.cu has the full explanation): a
+    // value-only `>` keeps whichever slot the reduction tree put at `tid`, which is thread-
+    // position-dependent, not index-dependent, so an exact tie can return neither the first
+    // nor the last index. Compare the index on every value tie instead.
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && sval[tid + s] > sval[tid]) {
-            sval[tid] = sval[tid + s];
-            sidx[tid] = sidx[tid + s];
+        if (tid < s) {
+            bool other_wins = (sval[tid + s] > sval[tid])
+                || (sval[tid + s] == sval[tid] && sidx[tid + s] < sidx[tid]);
+            if (other_wins) {
+                sval[tid] = sval[tid + s];
+                sidx[tid] = sidx[tid + s];
+            }
         }
         __syncthreads();
     }

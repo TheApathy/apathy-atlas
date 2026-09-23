@@ -160,6 +160,25 @@ pub struct V41Seq {
     /// `engine/model.py:747`'s local fallback, which only applies to decode/text
     /// (dsv41-parity, 2026-09-22).
     pub dead_carry: Vec<u32>,
+    /// Prefetched engram hashes, keyed by chunk `start_pos`. Populated by
+    /// [`V41Forward::plan_engram_prefetch`] before the chunk loop runs; `pass()` consumes
+    /// (removes) an entry here instead of calling `hash.forward()` again when one exists, since
+    /// the hash state is append-only and can only be advanced once per position.
+    pub engram_hash_cache: std::collections::HashMap<usize, Vec<i64>>,
+    /// Prefetched, dequantized (host, PRE-mask) engram rows, keyed by `(start_pos, layer)`.
+    /// `run_layers` checks here first and uploads straight from it, skipping the synchronous
+    /// NVMe gather, whenever an entry exists (either already received off
+    /// `engram_prefetch_rx`, or inserted directly by a caller that isn't using the channel).
+    pub engram_row_cache: std::collections::HashMap<(usize, usize), Vec<f32>>,
+    /// Set for the duration of a prefetching `prefill()` call: the channel a background thread
+    /// is sending `((start_pos, layer), rows)` down, in job order (chunk-major, then this
+    /// model's engram layers in order). `run_layers`'s engram branch blocks on this -- not on a
+    /// per-chunk wait in `prefill`'s loop -- so the wait happens exactly when that SPECIFIC
+    /// layer's rows are needed, overlapping with every layer before it in the SAME chunk (the
+    /// embedding step plus layers 0..L-1), not only with earlier chunks. A single-chunk prompt
+    /// (chunk >= prompt length) has no chunk-level overlap to exploit at all; per-layer overlap
+    /// is what makes prefetch pay off there (dsv41-lead, 2026-09-22).
+    pub engram_prefetch_rx: Option<std::sync::mpsc::Receiver<((usize, usize), Result<Vec<f32>>)>>,
 }
 
 impl V41Seq {
@@ -180,6 +199,9 @@ impl V41Seq {
             tail_rows: 0,
             tail_ids: Vec::new(),
             dead_carry: Vec::new(),
+            engram_hash_cache: std::collections::HashMap::new(),
+            engram_row_cache: std::collections::HashMap::new(),
+            engram_prefetch_rx: None,
         })
     }
 
@@ -422,7 +444,38 @@ impl V41Forward {
                 let li = if l == 1 { 0 } else { 1 };
                 let rows: Vec<i64> = (0..t).flat_map(|tok| all[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
                 let g = &self.engram.iter().find(|(el, _)| *el == l).context("no engram gather")?.1;
-                prof(ops, "engram.gather", || g.gather_rows_gpu(&rows, t, s.engram_rows, ops.gpu, ops.stream))?;
+                // A prefetch thread may already have this chunk's rows staged in host memory
+                // (see `V41Forward::prefill`/`engram_prefetch_rx`); if so, skip the synchronous
+                // NVMe gather and just upload. Falls back to the live gather otherwise (decode,
+                // or prefill without prefetch) -- correctness never depends on prefetch having
+                // run. Blocking on the CHANNEL here, not on a cache check alone, is what gives
+                // per-LAYER overlap: this wait only happens when THIS layer's rows are actually
+                // needed, so it overlaps with every layer before it in the same chunk (the
+                // embed step and layers 0..L-1), not only with earlier chunks -- the thing that
+                // makes prefetch pay off even on a single-chunk prompt.
+                if !seq.engram_row_cache.contains_key(&(start, l)) {
+                    if let Some(rx) = &seq.engram_prefetch_rx {
+                        loop {
+                            let (key, host) =
+                                rx.recv().context("engram prefetch thread ended before sending this layer's rows")?;
+                            let found = key == (start, l);
+                            seq.engram_row_cache.insert(key, host?);
+                            if found {
+                                break;
+                            }
+                        }
+                    }
+                }
+                match seq.engram_row_cache.remove(&(start, l)) {
+                    Some(host) => {
+                        prof(ops, "engram.upload_prefetched", || {
+                            EngramGather::upload_rows(&host, s.engram_rows, ops.gpu, ops.stream, l)
+                        })?;
+                    }
+                    None => {
+                        prof(ops, "engram.gather", || g.gather_rows_gpu(&rows, t, s.engram_rows, ops.gpu, ops.stream))?;
+                    }
+                }
                 let debug = engram_debug();
                 if debug {
                     tap.bf16(ops, "engram_in", l, s.h, &[t, self.dims.hc, self.dims.hidden])?;
@@ -468,7 +521,13 @@ impl V41Forward {
         let t = ids.len();
         ensure!(seq.len == start, "sequence holds {} positions, pass starts at {start}", seq.len);
         ensure!(start + t <= self.max_seq, "position {} exceeds max_seq {}", start + t, self.max_seq);
-        let hashes = seq.hash.forward(ids, start, None)?;
+        // `prefetch_engram` may have already computed this chunk's hashes (and advanced
+        // `seq.hash`'s append-only state) up front; reuse them instead of calling forward()
+        // again, which would either panic (position mismatch) or double-count.
+        let hashes = match seq.engram_hash_cache.remove(&start) {
+            Some(h) => h,
+            None => seq.hash.forward(ids, start, None)?,
+        };
         // PREFILL (`engine/v41_engine.py:755`) hashes the WHOLE image-expanded prompt once and
         // slices per chunk -- carrying the trailing MAX_LOOKBACK raw ids across chunks is the
         // exact equivalent (see deepseek_v41_engram::dead_heads's module doc). DECODE does NOT
@@ -642,9 +701,61 @@ impl V41Forward {
         logits: DevicePtr,
     ) -> Result<()> {
         ensure!(!ids.is_empty(), "empty prompt");
-        for chunk in ids.chunks(self.max_chunk) {
-            self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
+        let prefetch = !self.engram.is_empty() && std::env::var("ATLAS_DSV41_ENGRAM_PREFETCH").as_deref() != Ok("0");
+        if !prefetch {
+            for chunk in ids.chunks(self.max_chunk) {
+                self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
+            }
+            return self.finish_prefill(ops, seq, mode, hook, core, moe, tap, logits);
         }
+
+        // Real overlap requires the chunk loop (this thread's GPU work) to run INSIDE the same
+        // scope as the background gather thread, not after it -- joining before this thread
+        // reaches the loop (the original version of this code did exactly that bug: it moved
+        // the ~73 ms/chunk NVMe cost earlier without ever overlapping it, still fully serial;
+        // caught before it was ever GPU-measured). `receiver.recv()` below blocks only on THIS
+        // chunk's own (start, layer) result, so a chunk whose gather finished early costs
+        // nothing extra, and a chunk that hasn't finished yet blocks no more than the
+        // synchronous path already would have.
+        let (hashes_by_start, jobs) = self.plan_engram_prefetch(seq, ids)?;
+        for (start, hashes) in hashes_by_start {
+            seq.engram_hash_cache.insert(start, hashes);
+        }
+        // Staging memory bound (team-lead's ask): each row is ENGRAM_HEAD_DIM=256 f32 = 1024 B,
+        // 24 rows/token/layer -- 24 KiB/token/layer, 48 KiB/token across both engram layers.
+        // Bounded by max_seq (8192 in this driver's V41Forward::load call): 8192 * 48 KiB ~=
+        // 384 MiB worst case, well under this box's ~25 GB floor. Logged, not capped -- capping
+        // would reintroduce exactly the "this chunk's gather sits on its own critical path"
+        // cost for whichever chunk falls outside the cap, for no memory-pressure benefit here.
+        let staging_bytes: usize = jobs.iter().map(|(_, _, ids)| (ids.len() / 24) * 256 * 4).sum();
+        tracing::debug!("engram prefetch: {} jobs, {:.1} MiB staged", jobs.len(), staging_bytes as f64 / (1024.0 * 1024.0));
+        let (tx, rx) = std::sync::mpsc::channel::<((usize, usize), Result<Vec<f32>>)>();
+        std::thread::scope(|scope| -> Result<()> {
+            scope.spawn(move || {
+                for (start, l, row_ids) in jobs {
+                    let g = &self.engram.iter().find(|(el, _)| *el == l).expect("layer just read from self.engram").1;
+                    let t = row_ids.len() / 24;
+                    // A closed receiver (main thread returned early on an earlier error, or
+                    // dropped the receiver at the end of prefill) just stops the sends -- not an
+                    // error on this side.
+                    if tx.send(((start, l), g.gather_rows_host(&row_ids, t))).is_err() {
+                        return;
+                    }
+                }
+            });
+            // NOT waited on here: `run_layers`'s engram branch blocks on `seq.engram_prefetch_rx`
+            // itself, exactly when it reaches a given (start, layer), so the wait overlaps with
+            // every layer before it in the SAME chunk -- not just with earlier chunks. A single-
+            // chunk prompt has no chunk-level overlap to exploit; this is what makes prefetch
+            // pay off there at all.
+            seq.engram_prefetch_rx = Some(rx);
+            for chunk in ids.chunks(self.max_chunk) {
+                self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
+            }
+            seq.engram_prefetch_rx = None; // drop -> closes our end; the sender thread (already
+            // finished, since the scope can't exit until it's joined) is unaffected either way
+            Ok(())
+        })?;
         self.finish_prefill(ops, seq, mode, hook, core, moe, tap, logits)
     }
 
@@ -685,6 +796,29 @@ impl V41Forward {
         seq.hash.rollback(n)?;
         seq.len = n;
         Ok(())
+    }
+
+    /// Compute every chunk's engram hashes up front (cheap, CPU-only, must be sequential --
+    /// the hash cache is append-only) and the row-gather job list, WITHOUT touching NVMe.
+    /// Split out of `prefill` so the hash-forward calls (which need `&mut seq`) happen before
+    /// `prefill`'s `std::thread::scope` borrows `seq` for the chunk loop.
+    fn plan_engram_prefetch(&self, seq: &mut V41Seq, ids: &[u32]) -> Result<(Vec<(usize, Vec<i64>)>, Vec<(usize, usize, Vec<i64>)>)> {
+        let mut start = seq.len;
+        let mut hashes_by_start = Vec::new();
+        let mut jobs: Vec<(usize, usize, Vec<i64>)> = Vec::new();
+        for chunk in ids.chunks(self.max_chunk) {
+            let t = chunk.len();
+            let hashes = seq.hash.forward(chunk, start, None)?;
+            for &(l, _) in &self.engram {
+                let li = if l == 1 { 0 } else { 1 };
+                let rows: Vec<i64> =
+                    (0..t).flat_map(|tok| hashes[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
+                jobs.push((start, l, rows));
+            }
+            hashes_by_start.push((start, hashes));
+            start += t;
+        }
+        Ok((hashes_by_start, jobs))
     }
 
     /// One decode step at position `seq.len`; bf16 logits `[vocab]`.
