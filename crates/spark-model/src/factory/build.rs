@@ -71,11 +71,13 @@ pub fn build_model(
             );
         }
         let model_dir = crate::weight_loader::deepseek_v41::resolve_model_dir()?;
-        // 2048 (window6, 2026-09-22): logits byte-identical to 512 and 1024, warm prefill of a
-        // 2048-token prompt 814 -> 1112 -> 1334 tok/s (every chunk re-dequantizes the dense
-        // weights), MemAvailable low-water 33.7 -> 33.8 -> 32.7 GB. ATLAS_DSV41_CHUNK overrides.
+        // Window6: 2048-token chunks 814 -> 1334 tok/s vs 512 (byte-identical). ATLAS_DSV41_CHUNK
+        // overrides the whole policy with one fixed chunk.
         let explicit = std::env::var("ATLAS_DSV41_CHUNK").ok().and_then(|v| v.parse::<usize>().ok());
-        let mut max_chunk = explicit.unwrap_or(2048).min(max_seq_len);
+        // Scratch is sized for 3968 (the core's RING - WINDOW cap); a prefill uses it only for
+        // prompts >= forward::LONG_PROMPT tokens and 2048-token chunks below that (window10:
+        // 8192-token prompt 1791 vs 1712 tok/s, byte-identical; costs ~1.5 GB of low-water).
+        let mut max_chunk = explicit.unwrap_or(3968).min(max_seq_len);
         // Pre-registered (lead, window7): DSpark's drafter adds 7.93 GB; with it, chunk 2048
         // measured a 22 GB MemAvailable low-water (serve8d) < the 24 GB bar, so DSpark caps the
         // default chunk at 1024 (~1.1 GB less scratch). An explicit ATLAS_DSV41_CHUNK wins.

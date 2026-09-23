@@ -37,6 +37,11 @@ use crate::layers::deepseek_v41_engram::{
 /// every run.
 pub const ENGRAM_DEBUG_ENV: &str = "ATLAS_DSV41_ENGRAM_DEBUG";
 
+/// Prompts at least this long prefill in `max_chunk` pieces; shorter ones in [`SHORT_CHUNK`].
+pub const LONG_PROMPT: usize = 6144;
+/// The chunk for prompts under [`LONG_PROMPT`] tokens (window8: faster than 3968 at 4096 tokens).
+pub const SHORT_CHUNK: usize = 2048;
+
 fn engram_debug() -> bool {
     std::env::var(ENGRAM_DEBUG_ENV).is_ok()
 }
@@ -701,9 +706,10 @@ impl V41Forward {
         logits: DevicePtr,
     ) -> Result<()> {
         ensure!(!ids.is_empty(), "empty prompt");
+        let chunk_len = self.prefill_chunk_len(ids.len());
         let prefetch = !self.engram.is_empty() && std::env::var("ATLAS_DSV41_ENGRAM_PREFETCH").as_deref() != Ok("0");
         if !prefetch {
-            for chunk in ids.chunks(self.max_chunk) {
+            for chunk in ids.chunks(chunk_len) {
                 self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
             }
             return self.finish_prefill(ops, seq, mode, hook, core, moe, tap, logits);
@@ -749,7 +755,7 @@ impl V41Forward {
             // chunk prompt has no chunk-level overlap to exploit; this is what makes prefetch
             // pay off there at all.
             seq.engram_prefetch_rx = Some(rx);
-            for chunk in ids.chunks(self.max_chunk) {
+            for chunk in ids.chunks(chunk_len) {
                 self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
             }
             seq.engram_prefetch_rx = None; // drop -> closes our end; the sender thread (already
@@ -798,6 +804,14 @@ impl V41Forward {
         Ok(())
     }
 
+    /// The chunk a whole-prompt prefill of `n` tokens uses (window10, 8192-token prompt: chunk 3968
+    /// 1791 vs chunk 2048 1712 tok/s, logits byte-identical; on a 2048-4096 prompt 3968 lost to
+    /// 2048): `max_chunk` for prompts of at least [`LONG_PROMPT`] tokens, else at most
+    /// [`SHORT_CHUNK`]. Output does not depend on it (chunk invariance).
+    pub fn prefill_chunk_len(&self, n: usize) -> usize {
+        if n >= LONG_PROMPT { self.max_chunk } else { self.max_chunk.min(SHORT_CHUNK) }
+    }
+
     /// Compute every chunk's engram hashes up front (cheap, CPU-only, must be sequential --
     /// the hash cache is append-only) and the row-gather job list, WITHOUT touching NVMe.
     /// Split out of `prefill` so the hash-forward calls (which need `&mut seq`) happen before
@@ -806,7 +820,7 @@ impl V41Forward {
         let mut start = seq.len;
         let mut hashes_by_start = Vec::new();
         let mut jobs: Vec<(usize, usize, Vec<i64>)> = Vec::new();
-        for chunk in ids.chunks(self.max_chunk) {
+        for chunk in ids.chunks(self.prefill_chunk_len(ids.len())) {
             let t = chunk.len();
             let hashes = seq.hash.forward(chunk, start, None)?;
             for &(l, _) in &self.engram {
