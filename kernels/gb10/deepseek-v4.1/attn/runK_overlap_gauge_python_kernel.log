@@ -1,0 +1,46 @@
+  /home/flocka/atlas/DSV41_PORT/oracle/ref/runK_32k_kernel: L02 16 byte-identical duplicate topk taps collapsed (32 -> 16; n_c taps 16)
+  L02 occ   0 t= 2048 valid/row=384: overlap mean 0.99864 min 0.9902 | rows<0.99 0 | exact 1236/2048
+  L02 occ   1 t= 2048 valid/row=512: overlap mean 0.99518 min 0.9844 | rows<0.99 42 | exact 44/2048
+  L02 occ   2 t= 2048 valid/row=512: overlap mean 0.99453 min 0.9824 | rows<0.99 52 | exact 31/2048
+  L02 occ   3 t= 2048 valid/row=512: overlap mean 0.99408 min 0.9785 | rows<0.99 82 | exact 14/2048
+  L02 occ   4 t= 2048 valid/row=512: overlap mean 0.99349 min 0.9805 | rows<0.99 151 | exact 11/2048
+  L02 occ   5 t= 2048 valid/row=512: overlap mean 0.99345 min 0.9707 | rows<0.99 148 | exact 8/2048
+  L02 occ   6 t= 2048 valid/row=512: overlap mean 0.99297 min 0.9805 | rows<0.99 223 | exact 6/2048
+  L02 occ   7 t= 2048 valid/row=512: overlap mean 0.99284 min 0.9629 | rows<0.99 212 | exact 11/2048
+  L02 occ   8 t= 2048 valid/row=512: overlap mean 0.99261 min 0.9766 | rows<0.99 251 | exact 5/2048
+  L02 occ   9 t= 2048 valid/row=512: overlap mean 0.99195 min 0.9668 | rows<0.99 363 | exact 0/2048
+  L02 occ  10 t= 2048 valid/row=512: overlap mean 0.99177 min 0.9590 | rows<0.99 414 | exact 7/2048
+  L02 occ  11 t= 2048 valid/row=512: overlap mean 0.99163 min 0.9688 | rows<0.99 418 | exact 2/2048
+  L02 occ  12 t= 2048 valid/row=512: overlap mean 0.99092 min 0.9707 | rows<0.99 545 | exact 2/2048
+  L02 occ  13 t= 2048 valid/row=512: overlap mean 0.99158 min 0.9707 | rows<0.99 418 | exact 0/2048
+  L02 occ  14 t= 2048 valid/row=512: overlap mean 0.99078 min 0.9570 | rows<0.99 604 | exact 3/2048
+  L02 occ  15 t= 2048 valid/row=512: overlap mean 0.99069 min 0.9727 | rows<0.99 627 | exact 1/2048
+L02 TOTAL 32768 rows: overlap mean 0.99295 min 0.9570 rows<0.99 4550 | misses tie 0 near 0 real 0
+    rows whose top-k is EXACT, per occurrence: /tmp/claude-1000/-home-flocka-atlas/153d8f07-762d-4884-a8f5-8f7a1a13f1ce/scratchpad/gauge_out/L02.exact_topk_rows.txt
+L02 PRE-REGISTERED (mean >= 0.999, no row < 0.95): FAIL
+  /home/flocka/atlas/DSV41_PORT/oracle/ref/runK_32k_kernel: L20 16 byte-identical duplicate topk taps collapsed (32 -> 16; n_c taps 16)
+  L20 occ   0 t= 2048 valid/row=448: overlap mean 0.98214 min 0.7559 | rows<0.99 1374 | exact 522/2048
+  L20 occ   1 t= 2048 valid/row=512: overlap mean 0.96315 min 0.6289 | rows<0.99 2047 | exact 0/2048
+  L20 occ   2 t= 2048 valid/row=512: overlap mean 0.95743 min 0.5352 | rows<0.99 2048 | exact 0/2048
+  L20 occ   3 t= 2048 valid/row=512: overlap mean 0.95329 min 0.3281 | rows<0.99 2048 | exact 0/2048
+  L20 occ   4 t= 2048 valid/row=512: overlap mean 0.94819 min 0.5117 | rows<0.99 2048 | exact 0/2048
+  L20 occ   5 t= 2048 valid/row=512: overlap mean 0.94359 min 0.4707 | rows<0.99 2048 | exact 0/2048
+  L20 occ   6 t= 2048 valid/row=512: overlap mean 0.94364 min 0.2148 | rows<0.99 2048 | exact 0/2048
+  L20 occ   7 t= 2048 valid/row=512: overlap mean 0.93945 min 0.4297 | rows<0.99 2048 | exact 0/2048
+  L20 occ   8 t= 2048 valid/row=512: overlap mean 0.94108 min 0.1953 | rows<0.99 2048 | exact 0/2048
+  L20 occ   9 t= 2048 valid/row=512: overlap mean 0.93255 min 0.4590 | rows<0.99 2048 | exact 0/2048
+  L20 occ  10 t= 2048 valid/row=512: overlap mean 0.92552 min 0.4414 | rows<0.99 2048 | exact 0/2048
+  L20 occ  11 t= 2048 valid/row=512: overlap mean 0.92568 min 0.3848 | rows<0.99 2048 | exact 0/2048
+  L20 occ  12 t= 2048 valid/row=512: overlap mean 0.93090 min 0.4492 | rows<0.99 2048 | exact 0/2048
+  L20 occ  13 t= 2048 valid/row=512: overlap mean 0.93416 min 0.5703 | rows<0.99 2048 | exact 0/2048
+  L20 occ  14 t= 2048 valid/row=512: overlap mean 0.92826 min 0.4805 | rows<0.99 2048 | exact 0/2048
+  L20 occ  15 t= 2048 valid/row=512: overlap mean 0.92518 min 0.3867 | rows<0.99 2048 | exact 0/2048
+L20 TOTAL 32768 rows: overlap mean 0.94214 min 0.1953 rows<0.99 32093 | misses tie 0 near 0 real 0
+    rows whose top-k is EXACT, per occurrence: /tmp/claude-1000/-home-flocka-atlas/153d8f07-762d-4884-a8f5-8f7a1a13f1ce/scratchpad/gauge_out/L20.exact_topk_rows.txt
+L20 PRE-REGISTERED (mean >= 0.99, rows<0.90 <= 1% (got 6.30%), real <= 10% of classified (got 0.0% of 0) -- UNCLASSIFIED: no index_score_rows taps): FAIL
+  /home/flocka/atlas/DSV41_PORT/oracle/ref/runK_32k_kernel: L24 1 byte-identical duplicate topk taps collapsed (2 -> 1; n_c taps 1)
+  L24 occ   0 t=  128 valid/row=512: overlap mean 0.90170 min 0.5977 | rows<0.99 128 | exact 0/128
+L24 TOTAL 128 rows: overlap mean 0.90170 min 0.5977 rows<0.99 128 | misses tie 0 near 0 real 0
+    rows whose top-k is EXACT, per occurrence: /tmp/claude-1000/-home-flocka-atlas/153d8f07-762d-4884-a8f5-8f7a1a13f1ce/scratchpad/gauge_out/L24.exact_topk_rows.txt
+L24 PRE-REGISTERED (mean >= 0.98, rows<0.90 <= 2% (got 24.22%), real <= 15% of classified (got 0.0% of 0) -- UNCLASSIFIED: no index_score_rows taps): FAIL
+TOPK OVERLAP FAIL (3)
