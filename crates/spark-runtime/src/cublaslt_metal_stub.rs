@@ -139,3 +139,7 @@ pub fn gemm_act_weight_t_typed_pinned(
 ) -> Result<()> {
     unreachable!("cublaslt::gemm_act_weight_t_typed_pinned is cuda-only (not built for metal)")
 }
+
+pub fn register_stream_workspace(_stream: u64) -> anyhow::Result<()> {
+    unreachable!("cublaslt::register_stream_workspace is cuda-only (not built for metal)")
+}

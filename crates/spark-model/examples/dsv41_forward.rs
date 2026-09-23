@@ -192,7 +192,11 @@ fn manifest_ids(dir: &Path) -> Result<Vec<u32>> {
 /// computed pass line up occurrence for occurrence.
 fn manifest_chunks(dir: &Path, n: usize) -> Result<Vec<(usize, usize)>> {
     let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)?;
-    let chunk = m["model_globals"]["MAX_CHUNK"].as_u64().context("no MAX_CHUNK")? as usize;
+    // DSV41_DRIVER_CHUNK overrides the capture's chunk (e.g. 2048, the serving default).
+    let chunk = match std::env::var("DSV41_DRIVER_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(c) => c,
+        None => m["model_globals"]["MAX_CHUNK"].as_u64().context("no MAX_CHUNK")? as usize,
+    };
     Ok((0..n).step_by(chunk).map(|s| (s, chunk.min(n - s))).collect())
 }
 
@@ -253,7 +257,11 @@ fn run_model_path(
     let shared_dyn: spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu = gpu.clone();
     spark_model::model::dsv41::log_run_identity("driver", ops.stream);
     let max_chunk = splits.iter().flatten().copied().chain(chunks.iter().map(|c| c.1)).max().unwrap_or(1);
-    let mut fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, 8192, Path::new(MODEL_DIR), 128)?;
+    // --max-seq N (default 8192): sizes the compressed caches, rope tables and score scratch.
+    let max_seq: usize = std::env::var("DSV41_DRIVER_MAX_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
+    ensure!(ids.len() <= max_seq, "prompt of {} tokens exceeds --max-seq {max_seq}", ids.len());
+    println!("max_seq {max_seq}");
+    let mut fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, max_seq, Path::new(MODEL_DIR), 128)?;
     // DSpark (DSV41_DRIVER_DSPARK=1): the drafter's weights and the L37-39 seed buffer.
     let dspark_on = std::env::var("DSV41_DRIVER_DSPARK").as_deref() == Ok("1");
     let dspark_force = std::env::var("DSV41_DRIVER_DSPARK_FORCE_ACCEPT").as_deref() == Ok("1");
@@ -261,7 +269,7 @@ fn run_model_path(
         fwd.dspark = Some(spark_model::weight_loader::deepseek_v41::mtp::DsparkWeights::load(store, &dims, config.vocab_size)?);
         fwd.enable_dspark_seed(ops.gpu)?;
     }
-    let fwd = fwd;
+    let mut fwd = fwd;
     let ds = if dspark_on {
         Some(spark_model::weight_loader::deepseek_v41::dspark::Dspark::new(&shared_dyn, &fwd, 10.0, 1.5)?)
     } else {
@@ -271,11 +279,17 @@ fn run_model_path(
     let fed_core = FedCore(&feeder);
     let real_core;
     let (core, hook): (&dyn AttnCore, &dyn PassHook) = if attn_real {
-        real_core = Dsv41SparseCore::load_prefix(&shared_dyn, store, config, 8192, max_chunk, fwd.freqs_c, n_layers)?;
+        real_core = Dsv41SparseCore::load_prefix(&shared_dyn, store, config, max_seq, max_chunk, fwd.freqs_c, n_layers)?;
         (&real_core, &real_core)
     } else {
         (&fed_core, &NoHook)
     };
+    // Whole-step CUDA graphs for Decode/Verify passes (DSV41_DRIVER_GRAPH=1): shape-static core.
+    if std::env::var("DSV41_DRIVER_GRAPH").as_deref() == Ok("1") {
+        fwd.enable_graphs(ops.gpu, hook)?;
+        println!("decode: CUDA graphs ON (Decode/Verify passes captured once, replayed)");
+    }
+    let fwd = fwd;
     let fed_moe = FedMoe(&feeder, dims.hidden);
     let real;
     let moe: &dyn V41RoutedMoe = if moe_real {
@@ -393,6 +407,14 @@ fn run_model_path(
             println!("decode ours:   {got:?}");
             println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
             println!("decode: first {agree} identical");
+            let ph = ds.phase_ms.lock().expect("phase").clone();
+            if ph.len() > 2 {
+                let med = |k: usize| { let mut v: Vec<f64> = ph[1..].iter().map(|p| p[k]).collect(); v.sort_by(f64::total_cmp); v[v.len() / 2] };
+                println!("dspark phases ms (median, warm): draft {:.2}  verify+accept {:.2}  commit(rollback+seed) {:.2}", med(0), med(1), med(2));
+            }
+            if let Some(g) = &fwd.graph {
+                println!("graph captures: {}", g.captures.load(std::sync::atomic::Ordering::Relaxed));
+            }
             println!("DONE dsv41_forward path=model dspark");
             return Ok(());
         }
@@ -425,6 +447,9 @@ fn run_model_path(
                 "decode step ms (warm, n={}): median {:.2}  min {:.2}  max {:.2}  first {:.2}",
                 w.len(), w[w.len() / 2], w[0], w[w.len() - 1], steps_ms[0]
             );
+        }
+        if let Some(g) = &fwd.graph {
+            println!("graph captures: {} over {} decode steps", g.captures.load(std::sync::atomic::Ordering::Relaxed), got.len() - 1);
         }
         println!("decode ours:   {got:?}");
         println!("decode logits fnv: {:016x}", hashes.iter().fold(0u64, |a, h| a.rotate_left(7) ^ h));
@@ -469,6 +494,8 @@ fn main() -> Result<()> {
     let mut dead_arm = DeadArm::Ported;
     let mut head_test = false;
     let mut core_real = false;
+    let mut chunk_override: Option<usize> = None;
+    let mut tile_prompt = 1usize;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -507,6 +534,17 @@ fn main() -> Result<()> {
             "--decode" => decode_n = args.next().context("--decode")?.parse()?,
             "--force-decode" => force_decode = true,
             "--warm-prefill" => warm_prefill = true,
+            // --chunk N: prefill chunk (and every chunk-sized scratch) instead of the capture's.
+            "--chunk" => chunk_override = Some(args.next().context("--chunk")?.parse()?),
+            // --tile-prompt K: the capture's prompt repeated K times (speed/memory/identity only:
+            // there is no oracle for the longer prompt).
+            // --max-seq N: the model path's max_seq (caches, rope tables, score scratch).
+            "--max-seq" => {
+                let v = args.next().context("--max-seq")?;
+                // SAFETY: single-threaded at argument parsing; nothing has read the env yet.
+                unsafe { std::env::set_var("DSV41_DRIVER_MAX_SEQ", v) }
+            }
+            "--tile-prompt" => tile_prompt = args.next().context("--tile-prompt")?.parse()?,
             // Per-run switches for the env-gated ops (read once, so set before any GPU work).
             // SAFETY: single-threaded at argument parsing; nothing has read the environment yet.
             "--fp8-rowtile" => unsafe { std::env::set_var("ATLAS_DSV41_FP8_ROWTILE", "1") },
@@ -559,10 +597,16 @@ fn main() -> Result<()> {
             o => bail!("unknown argument {o}"),
         }
     }
-    let ref_dir = PathBuf::from(REF_ROOT).join(&run);
+    // `--run` is a capture under REF_ROOT, or (containing '/') any directory with a manifest.json
+    // holding `token_ids` (+ optional `greedy_continuation`, `model_globals.MAX_CHUNK`): real prompts.
+    let ref_dir = if run.contains('/') { PathBuf::from(&run) } else { PathBuf::from(REF_ROOT).join(&run) };
     ensure!(ref_dir.join("manifest.json").is_file(), "{} has no manifest", ref_dir.display());
-    let ids = manifest_ids(&ref_dir)?;
-    let chunks = manifest_chunks(&ref_dir, ids.len())?;
+    let ids = manifest_ids(&ref_dir)?.repeat(tile_prompt);
+    let chunks = match chunk_override {
+        Some(c) => (0..ids.len()).step_by(c).map(|s| (s, c.min(ids.len() - s))).collect(),
+        None if tile_prompt > 1 => (0..ids.len()).step_by(512).map(|s| (s, 512.min(ids.len() - s))).collect(),
+        None => manifest_chunks(&ref_dir, ids.len())?,
+    };
     println!("{run}: {} tokens in chunks {chunks:?}; layers 0..{n_layers}; feed {feed:?}; control {control:?}", ids.len());
 
     let config = parse_config(&std::fs::read_to_string(format!("{MODEL_DIR}/config.json"))?)?;

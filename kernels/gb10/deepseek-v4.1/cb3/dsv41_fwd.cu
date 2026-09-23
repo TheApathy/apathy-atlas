@@ -206,6 +206,207 @@ extern "C" __global__ void dsv41_hc_mixes(const __nv_bfloat16* __restrict__ h,
     for (unsigned q = 0; q < HC * HC; ++q) comb[t * HC * HC + q] = c[q];
 }
 
+// ── hc_mixes with ONE batched reduction tree (prefill) ─────────────────────────
+// dsv41_hc_mixes runs 25 sequential block_sum()s per token (8 barriers each). Here all 25 sums
+// (24 mix dots + the sum of squares) go through ONE tree with block_sum's exact pairings:
+// shared-memory steps s = 128, 64, 32 (3 barriers), then warp shuffles s = 16..1, where lane l
+// adds lane l+s's current value -- the same red[tid] += red[tid + s] as block_sum. The per-thread
+// accumulation is dsv41_hc_mixes' (k stride, fma chain), so the result is BIT-IDENTICAL.
+#define DSV41_NSUM (DSV41_NMIX + 1)
+
+// Mixes of one token row x = h[t] (HC*D bf16). On return (after a barrier) mix_out[m] holds
+// dsv41_hc_mixes' mix[m] (= dot * rsqrt(mean(x^2) + eps)) in every thread's view.
+__device__ __forceinline__ void hc_mix_dots(const __nv_bfloat16* __restrict__ x,
+                                            const float* __restrict__ fn, const unsigned R,
+                                            const float eps, float (*red)[DSV41_BLOCK],
+                                            float* mix_out) {
+    const unsigned tid = threadIdx.x;
+    float acc[DSV41_NMIX];
+#pragma unroll
+    for (int m = 0; m < DSV41_NMIX; ++m) acc[m] = 0.f;
+    float ss = 0.f;
+    for (unsigned k = tid; k < R; k += DSV41_BLOCK) {
+        const float v = bf(x[k]);
+        ss += v * v;
+#pragma unroll
+        for (int m = 0; m < DSV41_NMIX; ++m) acc[m] += v * fn[(size_t)m * R + k];
+    }
+#pragma unroll
+    for (int m = 0; m < DSV41_NMIX; ++m) red[m][tid] = acc[m];
+    red[DSV41_NMIX][tid] = ss;
+    __syncthreads();
+    for (unsigned s = DSV41_BLOCK / 2; s >= 32; s >>= 1) {
+        if (tid < s) {
+#pragma unroll
+            for (int m = 0; m < DSV41_NSUM; ++m) red[m][tid] += red[m][tid + s];
+        }
+        __syncthreads();
+    }
+    const unsigned warp = tid / 32, lane = tid % 32;
+    for (unsigned m = warp; m < DSV41_NSUM; m += DSV41_BLOCK / 32) {
+        float v = red[m][lane];
+#pragma unroll
+        for (unsigned s = 16; s > 0; s >>= 1) v += __shfl_down_sync(0xffffffffu, v, s);
+        if (lane == 0) red[m][0] = v;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const float rs = rsqrtf(red[DSV41_NMIX][0] / (float)R + eps);
+        for (int m = 0; m < DSV41_NMIX; ++m) mix_out[m] = red[m][0] * rs;
+    }
+    __syncthreads();
+}
+
+// The Sinkhorn epilogue of token t from its mixes, run by ONE WARP (all 32 lanes): decode's
+// dsv41_hc_mix_finish arithmetic (dsv41_decode.cu). Lane (i, j) = (lane / 4, lane % 4) owns
+// comb[i][j]; every row / column sum gathers its four values by shuffle and adds them in the
+// original sequential order (0.f + v0 + v1 + v2 + v3), every division is the same division, so
+// each value is bit-identical to dsv41_hc_mixes' single-thread epilogue.
+__device__ __forceinline__ void hc_mix_epilogue_warp(const float* mix, const unsigned t,
+                                                     const float* __restrict__ scale,
+                                                     const float* __restrict__ base, float* pre,
+                                                     float* post, float* comb,
+                                                     const unsigned iters, const float hc_eps) {
+    const unsigned lane = threadIdx.x & 31;
+    const unsigned HC = DSV41_HC;
+    if (lane < HC) {
+        const float vp = mix[lane] * scale[0] + base[lane];
+        pre[t * HC + lane] = 1.f / (1.f + expf(-vp)) + hc_eps;
+    } else if (lane < 2 * HC) {
+        const unsigned i = lane - HC;
+        const float vq = mix[HC + i] * scale[1] + base[HC + i];
+        post[t * HC + i] = 2.f * (1.f / (1.f + expf(-vq)));
+    }
+    const unsigned i = (lane >> 2) & 3u, j = lane & 3u;  // lanes 16..31 mirror 0..15, unused
+    const unsigned m = 2 * HC + i * HC + j;
+    float c = mix[m] * scale[2] + base[m];
+    auto row = [&](float v, unsigned q) { return __shfl_sync(0xffffffffu, v, (lane & ~3u) + q); };
+    auto col = [&](float v, unsigned q) { return __shfl_sync(0xffffffffu, v, (lane & 16u) + q * 4 + j); };
+    float mx = -INFINITY;
+#pragma unroll
+    for (unsigned q = 0; q < 4; ++q) mx = fmaxf(mx, row(c, q));
+    c = expf(c - mx);
+    float z = 0.f;
+#pragma unroll
+    for (unsigned q = 0; q < 4; ++q) z += row(c, q);
+    c = c / z + hc_eps;
+    for (unsigned it = 0; it < iters; ++it) {
+        if (it > 0) {
+            float zr = 0.f;
+#pragma unroll
+            for (unsigned q = 0; q < 4; ++q) zr += row(c, q);
+            zr += hc_eps;
+            c /= zr;
+        }
+        float zc = 0.f;
+#pragma unroll
+        for (unsigned q = 0; q < 4; ++q) zc += col(c, q);
+        zc += hc_eps;
+        c /= zc;
+    }
+    if (lane < 16) comb[t * HC * HC + i * HC + j] = c;
+}
+
+// Grid: (T)  Block: 256. Bit-identical to dsv41_hc_mixes.
+extern "C" __global__ void dsv41_hc_mixes_v2(const __nv_bfloat16* __restrict__ h,
+                                             const float* __restrict__ fn,
+                                             const float* __restrict__ scale,
+                                             const float* __restrict__ base,
+                                             float* __restrict__ pre, float* __restrict__ post,
+                                             float* __restrict__ comb, const unsigned D,
+                                             const unsigned iters, const float eps,
+                                             const float hc_eps) {
+    __shared__ float red[DSV41_NSUM][DSV41_BLOCK];
+    __shared__ float mix[DSV41_NMIX];
+    const unsigned t = blockIdx.x;
+    const unsigned R = DSV41_HC * D;
+    hc_mix_dots(h + (size_t)t * R, fn, R, eps, red, mix);
+    if (threadIdx.x < 32) hc_mix_epilogue_warp(mix, t, scale, base, pre, post, comb, iters, hc_eps);
+}
+
+// ── fused mHC stream passes (prefill), one token per block ────────────────────
+//   [hc_post(y = ya (+ yb))] -> hc_mixes -> hc_pre(side_pre) -> rmsnorm, in place on h / into x.
+// Each stage is the separate kernel's per-thread arithmetic (post/pre/norm) or dsv41_hc_mixes_v2's
+// identical tree, so the result is BIT-IDENTICAL to the unfused sequence. `side_pre` may alias
+// `pre_o` (BlockControl::OwnPre): it is read after the epilogue wrote it, as in the unfused order.
+// Grid: (T)  Block: 256.
+extern "C" __global__ void dsv41_hc_fused_v2(
+    const __nv_bfloat16* __restrict__ ya, const __nv_bfloat16* __restrict__ yb,
+    const float* __restrict__ post_in, const float* __restrict__ comb_in,
+    __nv_bfloat16* h,
+    const float* __restrict__ fn, const float* __restrict__ scale, const float* __restrict__ base,
+    float* pre_o, float* __restrict__ post_o, float* __restrict__ comb_o,
+    const float* side_pre, const __nv_bfloat16* __restrict__ norm_w,
+    __nv_bfloat16* x, const unsigned D, const unsigned iters,
+    const float eps, const float hc_eps) {
+    __shared__ float red[DSV41_NSUM][DSV41_BLOCK];
+    __shared__ float mix[DSV41_NMIX];
+    const unsigned t = blockIdx.x;
+    const unsigned R = DSV41_HC * D;
+    __nv_bfloat16* ht = h + (size_t)t * R;
+    if (ya != nullptr) {
+        const float* po = post_in + t * DSV41_HC;
+        const float* cb = comb_in + t * DSV41_HC * DSV41_HC;
+        for (unsigned d = threadIdx.x; d < D; d += DSV41_BLOCK) {
+            const size_t yi = (size_t)t * D + d;
+            const float yv = yb != nullptr ? bf(__float2bfloat16(bf(ya[yi]) + bf(yb[yi]))) : bf(ya[yi]);
+            float r[DSV41_HC];
+#pragma unroll
+            for (unsigned i = 0; i < DSV41_HC; ++i) r[i] = bf(ht[i * D + d]);
+#pragma unroll
+            for (unsigned j = 0; j < DSV41_HC; ++j) {
+                float acc = po[j] * yv;
+#pragma unroll
+                for (unsigned i = 0; i < DSV41_HC; ++i) acc += cb[i * DSV41_HC + j] * r[i];
+                ht[j * D + d] = __float2bfloat16(acc);
+            }
+        }
+        __syncthreads();
+    }
+    hc_mix_dots(ht, fn, R, eps, red, mix);
+    if (threadIdx.x < 32) hc_mix_epilogue_warp(mix, t, scale, base, pre_o, post_o, comb_o, iters, hc_eps);
+    __syncthreads();
+    const float* p = side_pre + t * DSV41_HC;
+    float ssq = 0.f;
+    for (unsigned d = threadIdx.x; d < D; d += DSV41_BLOCK) {
+        float acc = 0.f;
+#pragma unroll
+        for (unsigned i = 0; i < DSV41_HC; ++i) acc += p[i] * bf(ht[i * D + d]);
+        const __nv_bfloat16 xv = __float2bfloat16(acc);
+        x[(size_t)t * D + d] = xv;
+        const float v = bf(xv);
+        ssq += v * v;
+    }
+    const float rs = rsqrtf(block_sum(ssq, red[0]) / (float)D + eps);
+    for (unsigned d = threadIdx.x; d < D; d += DSV41_BLOCK)
+        x[(size_t)t * D + d] = __float2bfloat16(bf(norm_w[d]) * (bf(x[(size_t)t * D + d]) * rs));
+}
+
+// ── add + hc_post: dsv41_add_bf16 then dsv41_hc_post, one pass (the FFN end of a block) ──
+// Grid: (T)  Block: 256.
+extern "C" __global__ void dsv41_hc_add_post(const __nv_bfloat16* __restrict__ ya,
+                                             const __nv_bfloat16* __restrict__ yb,
+                                             __nv_bfloat16* h, const float* __restrict__ post,
+                                             const float* __restrict__ comb, const unsigned D) {
+    const unsigned t = blockIdx.x;
+    const float* po = post + t * DSV41_HC;
+    const float* cb = comb + t * DSV41_HC * DSV41_HC;
+    for (unsigned d = threadIdx.x; d < D; d += DSV41_BLOCK) {
+        const size_t yi = (size_t)t * D + d;
+        const float yv = bf(__float2bfloat16(bf(ya[yi]) + bf(yb[yi])));
+        float r[DSV41_HC];
+#pragma unroll
+        for (unsigned i = 0; i < DSV41_HC; ++i) r[i] = bf(h[((size_t)t * DSV41_HC + i) * D + d]);
+#pragma unroll
+        for (unsigned j = 0; j < DSV41_HC; ++j) {
+            float acc = po[j] * yv;
+#pragma unroll
+            for (unsigned i = 0; i < DSV41_HC; ++i) acc += cb[i * DSV41_HC + j] * r[i];
+            h[((size_t)t * DSV41_HC + j) * D + d] = __float2bfloat16(acc);
+        }
+    }
+}
+
 // ── hc_pre: v41_ref.hc_pre  y[t] = bf16(sum_i pre[t,i] * h[t,i]) ───────────────
 // Grid: (T)  Block: 256.
 extern "C" __global__ void dsv41_hc_pre(const __nv_bfloat16* __restrict__ h,

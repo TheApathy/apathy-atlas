@@ -283,3 +283,62 @@ fn test_top_n_sigma_filters_extreme_outliers() {
         );
     }
 }
+
+#[test]
+fn test_greedy_breaks_exact_ties_toward_the_lowest_index() {
+    use super::sample_impl::first_max_index;
+    assert_eq!(first_max_index(&[1.0, 3.0, 3.0]), 1);
+    // Exact bf16 tie seen on DeepSeek-V4.1 (25.375 twice): torch.argmax takes the first.
+    assert_eq!(first_max_index(&[0.0, 25.375, 1.0, 25.375]), 1);
+    // Through the full greedy path (penalties/bias are no-ops here).
+    let logits: Vec<u8> = [1.0f32, 3.0, 3.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+    let params = SamplingParams::greedy(3);
+    assert_eq!(sample_with_params_history(&logits, &params, &[]), 1);
+    // NaN is skipped wherever it sits; it never wins and never hides a later max.
+    assert_eq!(first_max_index(&[f32::NAN, 1.0, 3.0, 3.0]), 2);
+    assert_eq!(first_max_index(&[1.0, 3.0, f32::NAN]), 1);
+    assert_eq!(first_max_index(&[f32::NAN, f32::NAN]), 0);
+    assert_eq!(first_max_index(&[]), 0);
+    // Negative control: the previous max_by selection picks the LAST of the tie.
+    let old = [1.0f32, 3.0, 3.0]
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap();
+    assert_eq!(old, 2);
+}
+
+#[test]
+fn test_sampling_distribution_matches_the_draw() {
+    // The distribution the draw walks, normalized; every seeded draw lands in its support, and a
+    // point mass comes back for greedy.
+    let logits_f32 = [2.0f32, 1.0, 0.5, -1.0, 3.0];
+    let logits: Vec<u8> = logits_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let mut params = SamplingParams::greedy(5);
+    params.temperature = 0.7;
+    params.top_p = 0.9;
+    let dist = sampling_distribution(&logits, &params, &[]);
+    let total: f32 = dist.iter().map(|p| p.1).sum();
+    assert!((total - 1.0).abs() < 1e-5, "normalized: {total}");
+    for seed in 0..200u64 {
+        let tok = sample_with_params_seeded(&logits, &params, &[], Some(seed));
+        assert!(dist.iter().any(|&(t, _)| t == tok), "seed {seed}: token {tok} outside {dist:?}");
+    }
+    // Empirical frequencies follow the distribution (loose bound, 20k unseeded draws).
+    let n = 20_000;
+    let mut hits = std::collections::HashMap::new();
+    for _ in 0..n {
+        *hits.entry(sample_with_params_seeded(&logits, &params, &[], None)).or_insert(0usize) += 1;
+    }
+    for &(t, p) in &dist {
+        let f = *hits.get(&t).unwrap_or(&0) as f32 / n as f32;
+        assert!((f - p).abs() < 0.02, "token {t}: freq {f} vs p {p}");
+    }
+    // Negative control: a wrong distribution (uniform over the support) must fail the same bound.
+    let wrong = 1.0 / dist.len() as f32;
+    assert!(dist.iter().any(|&(t, _)| ((*hits.get(&t).unwrap_or(&0) as f32 / n as f32) - wrong).abs() >= 0.02));
+    // Greedy: a point mass on the first max.
+    let g = sampling_distribution(&logits, &SamplingParams::greedy(5), &[]);
+    assert_eq!(g, vec![(4, 1.0)]);
+}

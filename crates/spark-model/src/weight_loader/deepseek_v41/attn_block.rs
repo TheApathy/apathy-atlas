@@ -161,6 +161,12 @@ pub struct CoreArgs {
 /// fed from a capture in the driver.
 pub trait AttnCore {
     fn run(&self, ops: &Ops, a: &CoreArgs) -> Result<()>;
+
+    /// Dump the core's internal state for `layer` after `run` (e.g. the index top-k) when
+    /// `tap` is enabled. Default: nothing.
+    fn taps(&self, _ops: &Ops, _tap: &Tap, _layer: usize, _t: usize) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// `[T, 128]` window positions: `pos - 127 .. pos`, -1 below 0 (`Model._window_positions`).
@@ -200,10 +206,16 @@ pub fn attention(
     ensure!(start + t <= rope.positions, "attention: position {} past the RoPE table", start + t);
     let l = w.layer;
     let gpu = ops.gpu;
-    let pos: Vec<i32> = (start..start + t).map(|p| p as i32).collect();
-    gpu.copy_h2d_async(bytemuck_i32(&pos), s.pos, ops.stream)?;
-    let wpos = window_positions(start, t);
-    gpu.copy_h2d_async(bytemuck_i32(&wpos), s.wpos, ops.stream)?;
+    let dstart = super::ops::graph_start();
+    if let Some(ds) = dstart {
+        // Graph mode: positions from the device start (identical values, no host upload).
+        ops.decode_positions(ds, s.pos, s.wpos, t, WINDOW)?;
+    } else {
+        let pos: Vec<i32> = (start..start + t).map(|p| p as i32).collect();
+        gpu.copy_h2d_async(bytemuck_i32(&pos), s.pos, ops.stream)?;
+        let wpos = window_positions(start, t);
+        gpu.copy_h2d_async(bytemuck_i32(&wpos), s.wpos, ops.stream)?;
+    }
 
     ops.linear_fp8_tiled(x, &w.wq_a, wscratch, s.qr, t)?;
     ops.rmsnorm(s.qr, w.q_norm, s.qr, t, Q_LORA, norm_eps)?;
@@ -217,12 +229,16 @@ pub fn attention(
     ops.rope_tail(s.kv, s.pos, rope, t, 1, HEAD_DIM, false)?;
     tap.bf16(ops, "kv_new", l, s.kv, &[t, HEAD_DIM])?;
     // ring[pos % RING] = kv — at most two contiguous runs.
-    let row = HEAD_DIM * 2;
-    let first = start % RING;
-    let n1 = t.min(RING - first);
-    gpu.copy_d2d_async(s.kv, ring.offset(first * row), n1 * row, ops.stream)?;
-    if n1 < t {
-        gpu.copy_d2d_async(s.kv.offset(n1 * row), ring, (t - n1) * row, ops.stream)?;
+    if let Some(ds) = dstart {
+        ops.ring_write(s.kv, ring, ds, t, RING, HEAD_DIM)?;
+    } else {
+        let row = HEAD_DIM * 2;
+        let first = start % RING;
+        let n1 = t.min(RING - first);
+        gpu.copy_d2d_async(s.kv, ring.offset(first * row), n1 * row, ops.stream)?;
+        if n1 < t {
+            gpu.copy_d2d_async(s.kv.offset(n1 * row), ring, (t - n1) * row, ops.stream)?;
+        }
     }
 
     prof(ops, "attention/core", || {
@@ -231,6 +247,9 @@ pub fn attention(
             &CoreArgs { layer: l, x, qr: s.qr, q: s.q, ring, wpos: s.wpos, win_lo, sink: w.attn_sink, t, start, out: s.o },
         )
     })?;
+    if tap.enabled() {
+        core.taps(ops, tap, l, t)?;
+    }
     tap.bf16(ops, "attn_o_pre_inverse_rope", l, s.o, &[t, N_HEADS, HEAD_DIM])?;
     attn_output(ops, w, s, wscratch, rope, t, out, tap)
 }

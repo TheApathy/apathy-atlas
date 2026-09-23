@@ -303,4 +303,4 @@ impl SequenceState {
 mod logprobs;
 mod model;
 pub use logprobs::*;
-pub use model::{BeamReq, Model};
+pub use model::{BeamReq, Model, SpecSampling};

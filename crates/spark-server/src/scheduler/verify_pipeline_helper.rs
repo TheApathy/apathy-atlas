@@ -138,14 +138,15 @@ pub(crate) fn mtp_verify_sample_enabled() -> bool {
 ///
 /// Mirrors the host-side path of `decode_logits_seq::process_seq_logits`
 /// for byte-identical pipeline semantics.
-pub fn verify_pick_with_pipeline(
+/// Steps 1-3 of [`verify_pick_with_pipeline`]: dequant, the Verify-kind penalty params, and the
+/// unified per-position pipeline in place. `Err(tok)` is a forced / bypass token.
+fn verify_row_processed(
     logits_bytes: &[u8],
     is_fp32: bool,
     vocab_size: usize,
     a: &mut ActiveSeq,
     ctx: &LogitsContext,
-    verify_pos: usize,
-) -> u32 {
+) -> Result<(Vec<f32>, spark_runtime::sampler::SamplingParams), u32> {
     use crate::scheduler::mtp_timing::{self, Phase};
     // 1. Dequant per the same scheme as `process_seq_logits`.
     let t_dequant = std::time::Instant::now();
@@ -207,9 +208,26 @@ pub fn verify_pick_with_pipeline(
         crate::scheduler::sample_step::PositionKind::Verify,
     ) {
         mtp_timing::record(Phase::PipelineProc, t_proc);
-        return tok;
+        return Err(tok);
     }
     mtp_timing::record(Phase::PipelineProc, t_proc);
+    Ok((f32_logits, penalties))
+}
+
+
+pub fn verify_pick_with_pipeline(
+    logits_bytes: &[u8],
+    is_fp32: bool,
+    vocab_size: usize,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+    verify_pos: usize,
+) -> u32 {
+    use crate::scheduler::mtp_timing::{self, Phase};
+    let (f32_logits, penalties) = match verify_row_processed(logits_bytes, is_fp32, vocab_size, a, ctx) {
+        Ok(r) => r,
+        Err(tok) => return tok,
+    };
 
     // 4a. P1-3 (2026-07-09): when the request asked for temperature > 0,
     //     SAMPLE from the processed logits instead of taking the argmax.
@@ -522,4 +540,46 @@ pub fn verify_pick_all_with_pipeline(
     }
 
     picks
+}
+
+/// The SAMPLED distribution of one verify row, dense `[vocab]`: the same pipeline as
+/// [`verify_pick_with_pipeline`] and the same sampler shape as its temperature > 0 branch (the
+/// request's temperature / top_k / top_p / top_n_sigma / resolved min_p; penalties already applied
+/// by the pipeline), normalized. A forced token is a point mass. For sampled speculative
+/// acceptance, which needs p(token), not a draw.
+pub fn verify_row_distribution(logits_bytes: &[u8], is_fp32: bool, vocab_size: usize, a: &mut ActiveSeq, ctx: &LogitsContext) -> Vec<f32> {
+    let mut p = vec![0.0f32; vocab_size];
+    let (f32_logits, penalties) = match verify_row_processed(logits_bytes, is_fp32, vocab_size, a, ctx) {
+        Ok(r) => r,
+        Err(tok) => {
+            p[tok as usize] = 1.0;
+            return p;
+        }
+    };
+    let shape = spark_runtime::sampler::SamplingParams {
+        temperature: a.temperature,
+        top_k: a.top_k,
+        top_p: a.top_p,
+        top_n_sigma: a.top_n_sigma,
+        min_p: crate::scheduler::sample_step::effective_min_p(a.min_p),
+        logit_bias: Vec::new(),
+        repetition_penalty: 1.0,
+        repetition_penalty_window: 0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        lz_penalty: 0.0,
+        dry_multiplier: 0.0,
+        dry_base: penalties.dry_base,
+        dry_allowed_length: penalties.dry_allowed_length,
+        dry_sequence_breakers: Vec::new(),
+        max_tokens: 0,
+        stop_token_ids: Vec::new(),
+        seed: None,
+    };
+    // SAFETY: a live Vec<f32> of `vocab_size` elements viewed as bytes (the same cast as above).
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
+    for (t, q) in spark_runtime::sampler::sampling_distribution(bytes, &shape, &[]) {
+        p[t as usize] = q;
+    }
+    p
 }

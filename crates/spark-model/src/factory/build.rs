@@ -71,7 +71,19 @@ pub fn build_model(
             );
         }
         let model_dir = crate::weight_loader::deepseek_v41::resolve_model_dir()?;
-        let max_chunk = std::env::var("ATLAS_DSV41_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+        // 2048 (window6, 2026-09-22): logits byte-identical to 512 and 1024, warm prefill of a
+        // 2048-token prompt 814 -> 1112 -> 1334 tok/s (every chunk re-dequantizes the dense
+        // weights), MemAvailable low-water 33.7 -> 33.8 -> 32.7 GB. ATLAS_DSV41_CHUNK overrides.
+        let explicit = std::env::var("ATLAS_DSV41_CHUNK").ok().and_then(|v| v.parse::<usize>().ok());
+        let mut max_chunk = explicit.unwrap_or(2048).min(max_seq_len);
+        // Pre-registered (lead, window7): DSpark's drafter adds 7.93 GB; with it, chunk 2048
+        // measured a 22 GB MemAvailable low-water (serve8d) < the 24 GB bar, so DSpark caps the
+        // default chunk at 1024 (~1.1 GB less scratch). An explicit ATLAS_DSV41_CHUNK wins.
+        const DSPARK_MAX_CHUNK: usize = 1024;
+        if explicit.is_none() && crate::weight_loader::deepseek_v41::dspark_enabled() && max_chunk > DSPARK_MAX_CHUNK {
+            tracing::info!("DeepSeek-V4.1: DSpark is on, capping the prefill chunk {max_chunk} -> {DSPARK_MAX_CHUNK} (memory; set ATLAS_DSV41_CHUNK to override)");
+            max_chunk = DSPARK_MAX_CHUNK;
+        }
         let model = crate::model::dsv41::Dsv41Model::new(&config, store, gpu, &model_dir, max_seq_len, max_chunk)?;
         return Ok(Box::new(model));
     }
