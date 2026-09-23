@@ -19,6 +19,33 @@ const INDEX_DIM: u32 = 128;
 const HIDDEN: u32 = 4096;
 const INDEX_HEADS: u32 = 32;
 
+/// `ATLAS_GLM53_DSA_INDEX_PROJ_WIDE=1` selects the one-block-per-(row, head)
+/// index projection instead of the one-block-per-row, one-thread-per-head
+/// kernel. Bit-exact by construction: the accumulating lane runs the identical
+/// ascending `fmaf` chain over the same operands, and no partial sums are ever
+/// combined. Default off.
+pub(crate) fn parse_index_projection_wide_flag(
+    value: Option<&str>,
+) -> Result<bool, &'static str> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("ATLAS_GLM53_DSA_INDEX_PROJ_WIDE must be absent, 0, or 1"),
+    }
+}
+
+fn index_projection_wide() -> Result<bool> {
+    static WIDE: std::sync::OnceLock<Result<bool, &'static str>> = std::sync::OnceLock::new();
+    WIDE.get_or_init(|| {
+        parse_index_projection_wide_flag(
+            std::env::var("ATLAS_GLM53_DSA_INDEX_PROJ_WIDE")
+                .ok()
+                .as_deref(),
+        )
+    })
+    .map_err(|message| anyhow::anyhow!(message))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glm53DsaNormProjectionKind {
     AbsoluteRms512,
@@ -136,6 +163,7 @@ pub struct Glm53DsaNormProjectionKernels {
     rms_norm: KernelHandle,
     layer_norm: KernelHandle,
     index_projection: KernelHandle,
+    index_projection_wide: KernelHandle,
 }
 
 impl Glm53DsaNormProjectionKernels {
@@ -152,6 +180,10 @@ impl Glm53DsaNormProjectionKernels {
             index_projection: gpu.kernel(
                 "glm53_dsa_norm_projection",
                 "atlas_glm53_dsa_index_projection_f32_bf16",
+            )?,
+            index_projection_wide: gpu.kernel(
+                "glm53_dsa_norm_projection",
+                "atlas_glm53_dsa_index_projection_f32_bf16_wide",
             )?,
         })
     }
@@ -187,6 +219,17 @@ impl Glm53DsaNormProjectionKernels {
                     .arg_u32(plan.rows)
                     .arg_u32(plan.input_width)
                     .arg_f32(f32::from_bits(plan.epsilon_bits))
+            }
+            Glm53DsaNormProjectionKind::F32IndexProjection if index_projection_wide()? => {
+                KernelLaunch::new(gpu, self.index_projection_wide)
+                    .grid([plan.output_width, plan.rows, 1])
+                    .block([plan.threads, 1, 1])
+                    .arg_ptr(buffers.input_bf16.ptr)
+                    .arg_ptr(buffers.weight_f32.ptr)
+                    .arg_ptr(buffers.output_bf16.ptr)
+                    .arg_u32(plan.rows)
+                    .arg_u32(plan.input_width)
+                    .arg_u32(plan.output_width)
             }
             Glm53DsaNormProjectionKind::F32IndexProjection => {
                 KernelLaunch::new(gpu, self.index_projection)

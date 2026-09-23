@@ -45,6 +45,7 @@ mod partial_replay;
 mod phase_timing;
 mod phase_timing_wrappers;
 mod prefill_capture_ingest;
+mod prefix_commit;
 mod prefill_capture_owner;
 mod prefill_capture_plan;
 mod prefill_exl3;

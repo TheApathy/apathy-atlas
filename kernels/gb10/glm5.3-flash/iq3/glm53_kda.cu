@@ -234,6 +234,106 @@ atlas_glm53_kda_decode(
     output[vector_base + column] = __float2bfloat16_rn(result);
 }
 
+// Out-of-place twin of atlas_glm53_kda_decode (ATLAS_GLM53_KDA_OOP=1): the
+// recurrence reads the committed state from `state_in` and writes the advanced
+// state to `state_out`, so the caller no longer has to copy persistent ->
+// staged before the launch. Every element is read and written by the same
+// thread in the same order as the in-place kernel, and `state_in == state_out`
+// is admitted (no __restrict__ on the state pointers), so the arithmetic and
+// the results are identical to the in-place kernel.
+extern "C" __global__ void __launch_bounds__(GLM53_KDA_HEAD_DIM, 1)
+atlas_glm53_kda_decode_oop(
+        const float * state_in,
+        float * state_out,
+        const __nv_bfloat16 * __restrict__ query,
+        const __nv_bfloat16 * __restrict__ key,
+        const __nv_bfloat16 * __restrict__ value,
+        const float * __restrict__ log_decay,
+        const __nv_bfloat16 * __restrict__ beta,
+        __nv_bfloat16 * __restrict__ output,
+        unsigned int batch, unsigned int heads,
+        unsigned int key_dim, unsigned int value_dim, float l2_epsilon) {
+    if (batch == 0U || heads != GLM53_KDA_HEADS ||
+        key_dim != GLM53_KDA_HEAD_DIM || value_dim != GLM53_KDA_HEAD_DIM ||
+        l2_epsilon != 1.0e-6f) {
+        return;
+    }
+    const unsigned int group = blockIdx.x;
+    if (group >= batch * GLM53_KDA_HEADS) {
+        return;
+    }
+    const unsigned int column = threadIdx.x;
+    const unsigned long long vector_base =
+        (unsigned long long) group * GLM53_KDA_HEAD_DIM;
+    const unsigned long long state_base =
+        (unsigned long long) group * GLM53_KDA_HEAD_DIM * GLM53_KDA_HEAD_DIM;
+
+    __shared__ float q_values[GLM53_KDA_HEAD_DIM];
+    __shared__ float k_values[GLM53_KDA_HEAD_DIM];
+    __shared__ float decay[GLM53_KDA_HEAD_DIM];
+    __shared__ float q_squares[GLM53_KDA_HEAD_DIM];
+    __shared__ float k_squares[GLM53_KDA_HEAD_DIM];
+    __shared__ float q_norm;
+    __shared__ float k_norm;
+
+    const float q = __bfloat162float(query[vector_base + column]);
+    const float k = __bfloat162float(key[vector_base + column]);
+    q_values[column] = q;
+    k_values[column] = k;
+    decay[column] = expf(log_decay[vector_base + column]);
+    q_squares[column] = q * q;
+    k_squares[column] = k * k;
+    __syncthreads();
+    for (unsigned int stride = GLM53_KDA_HEAD_DIM / 2U;
+         stride > 0U; stride >>= 1U) {
+        if (column < stride) {
+            q_squares[column] += q_squares[column + stride];
+            k_squares[column] += k_squares[column + stride];
+        }
+        __syncthreads();
+    }
+    if (column == 0U) {
+        q_norm = sqrtf(q_squares[0] + l2_epsilon);
+        k_norm = sqrtf(k_squares[0] + l2_epsilon);
+    }
+    __syncthreads();
+    q_values[column] =
+        (q_values[column] / q_norm) * (1.0f / sqrtf(128.0f));
+    k_values[column] = k_values[column] / k_norm;
+    __syncthreads();
+
+    float memory = 0.0f;
+    #pragma unroll 4
+    for (unsigned int row = 0; row < GLM53_KDA_HEAD_DIM; row += 4U) {
+        #pragma unroll
+        for (unsigned int inner = 0; inner < 4U; ++inner) {
+            const unsigned int at = row + inner;
+            const unsigned long long index =
+                state_base + (unsigned long long) at * GLM53_KDA_HEAD_DIM + column;
+            const float decayed = state_in[index] * decay[at];
+            state_out[index] = decayed;
+            memory += decayed * k_values[at];
+        }
+    }
+    const float beta_value = __bfloat162float(beta[group]);
+    const float delta =
+        (__bfloat162float(value[vector_base + column]) - memory) * beta_value;
+    float result = 0.0f;
+    #pragma unroll 4
+    for (unsigned int row = 0; row < GLM53_KDA_HEAD_DIM; row += 4U) {
+        #pragma unroll
+        for (unsigned int inner = 0; inner < 4U; ++inner) {
+            const unsigned int at = row + inner;
+            const unsigned long long index =
+                state_base + (unsigned long long) at * GLM53_KDA_HEAD_DIM + column;
+            const float updated = state_out[index] + k_values[at] * delta;
+            state_out[index] = updated;
+            result += updated * q_values[at];
+        }
+    }
+    output[vector_base + column] = __float2bfloat16_rn(result);
+}
+
 extern "C" __global__ void __launch_bounds__(GLM53_KDA_HEAD_DIM, 1)
 atlas_glm53_kda_gated_rms_norm(
         const __nv_bfloat16 * __restrict__ input,
@@ -371,6 +471,112 @@ atlas_glm53_kda_prefill(
                     (unsigned long long) at * GLM53_KDA_HEAD_DIM + column;
                 const float updated = state[index] + k_values[at] * delta;
                 state[index] = updated;
+                result += updated * q_values[at];
+            }
+        }
+        output[vector_base + column] = __float2bfloat16_rn(result);
+        __syncthreads();
+    }
+}
+
+// Out-of-place twin of atlas_glm53_kda_prefill (ATLAS_GLM53_KDA_OOP=1): token 0
+// reads the committed state from `state_in`; every token writes `state_out`
+// and later tokens read it back. Same thread, same element order and the same
+// arithmetic as the in-place kernel; `state_in == state_out` is admitted.
+extern "C" __global__ void __launch_bounds__(GLM53_KDA_HEAD_DIM, 1)
+atlas_glm53_kda_prefill_oop(
+        const float * state_in,
+        float * state_out,
+        const __nv_bfloat16 * __restrict__ query,
+        const __nv_bfloat16 * __restrict__ key,
+        const __nv_bfloat16 * __restrict__ value,
+        const float * __restrict__ log_decay,
+        const __nv_bfloat16 * __restrict__ beta,
+        __nv_bfloat16 * __restrict__ output,
+        unsigned int batch, unsigned int tokens, unsigned int heads,
+        unsigned int key_dim, unsigned int value_dim, float l2_epsilon) {
+    if (batch == 0U || tokens == 0U || heads != GLM53_KDA_HEADS ||
+        key_dim != GLM53_KDA_HEAD_DIM || value_dim != GLM53_KDA_HEAD_DIM ||
+        l2_epsilon != 1.0e-6f) {
+        return;
+    }
+    const unsigned int group = blockIdx.x;
+    if (group >= batch * GLM53_KDA_HEADS) {
+        return;
+    }
+    const unsigned int sequence = group / GLM53_KDA_HEADS;
+    const unsigned int head = group % GLM53_KDA_HEADS;
+    const unsigned int column = threadIdx.x;
+    const unsigned long long state_base =
+        (unsigned long long) group * GLM53_KDA_HEAD_DIM * GLM53_KDA_HEAD_DIM;
+
+    __shared__ float q_values[GLM53_KDA_HEAD_DIM];
+    __shared__ float k_values[GLM53_KDA_HEAD_DIM];
+    __shared__ float decay[GLM53_KDA_HEAD_DIM];
+    __shared__ float q_squares[GLM53_KDA_HEAD_DIM];
+    __shared__ float k_squares[GLM53_KDA_HEAD_DIM];
+    __shared__ float q_norm;
+    __shared__ float k_norm;
+
+    for (unsigned int token = 0U; token < tokens; ++token) {
+        const float * source = (token == 0U) ? state_in : state_out;
+        const unsigned long long token_group =
+            ((unsigned long long) sequence * tokens + token) *
+                GLM53_KDA_HEADS + head;
+        const unsigned long long vector_base =
+            token_group * GLM53_KDA_HEAD_DIM;
+        const float q = __bfloat162float(query[vector_base + column]);
+        const float k = __bfloat162float(key[vector_base + column]);
+        q_values[column] = q;
+        k_values[column] = k;
+        decay[column] = expf(log_decay[vector_base + column]);
+        q_squares[column] = q * q;
+        k_squares[column] = k * k;
+        __syncthreads();
+        for (unsigned int stride = GLM53_KDA_HEAD_DIM / 2U;
+             stride > 0U; stride >>= 1U) {
+            if (column < stride) {
+                q_squares[column] += q_squares[column + stride];
+                k_squares[column] += k_squares[column + stride];
+            }
+            __syncthreads();
+        }
+        if (column == 0U) {
+            q_norm = sqrtf(q_squares[0] + l2_epsilon);
+            k_norm = sqrtf(k_squares[0] + l2_epsilon);
+        }
+        __syncthreads();
+        q_values[column] =
+            (q_values[column] / q_norm) * (1.0f / sqrtf(128.0f));
+        k_values[column] = k_values[column] / k_norm;
+        __syncthreads();
+
+        float memory = 0.0f;
+        #pragma unroll 4
+        for (unsigned int row = 0; row < GLM53_KDA_HEAD_DIM; row += 4U) {
+            #pragma unroll
+            for (unsigned int inner = 0; inner < 4U; ++inner) {
+                const unsigned int at = row + inner;
+                const unsigned long long index = state_base +
+                    (unsigned long long) at * GLM53_KDA_HEAD_DIM + column;
+                const float decayed = source[index] * decay[at];
+                state_out[index] = decayed;
+                memory += decayed * k_values[at];
+            }
+        }
+        const float beta_value = __bfloat162float(beta[token_group]);
+        const float delta =
+            (__bfloat162float(value[vector_base + column]) - memory) * beta_value;
+        float result = 0.0f;
+        #pragma unroll 4
+        for (unsigned int row = 0; row < GLM53_KDA_HEAD_DIM; row += 4U) {
+            #pragma unroll
+            for (unsigned int inner = 0; inner < 4U; ++inner) {
+                const unsigned int at = row + inner;
+                const unsigned long long index = state_base +
+                    (unsigned long long) at * GLM53_KDA_HEAD_DIM + column;
+                const float updated = state_out[index] + k_values[at] * delta;
+                state_out[index] = updated;
                 result += updated * q_values[at];
             }
         }

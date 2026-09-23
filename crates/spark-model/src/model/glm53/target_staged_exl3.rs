@@ -82,6 +82,7 @@ impl Glm53Exl3Model {
                     capacity: self.capacity,
                     nonce,
                 },
+                prefix: self.prefix_commit,
             },
             &self.weights.lm_head,
             GgmlIqBuffer {

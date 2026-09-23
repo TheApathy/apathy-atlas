@@ -388,7 +388,12 @@ impl Glm53Exl3GemmKernel {
 
     pub fn load_row_exact(gpu: &dyn GpuBackend, plan: &Glm53Exl3GemmPlan) -> Result<Self> {
         ensure_row_exact_plan(plan)?;
-        let symbol = format!("glm53_exl3_rowexact_k{}_s{}", plan.bits, plan.shape_index);
+        let family = if row_batch_enabled() {
+            "rowbatch"
+        } else {
+            "rowexact"
+        };
+        let symbol = format!("glm53_exl3_{family}_k{}_s{}", plan.bits, plan.shape_index);
         let handle = gpu.kernel(&plan.module(), &symbol)?;
         gpu.set_kernel_max_dynamic_shared_memory(handle, SHARED_MEMORY_BYTES)?;
         Ok(Self {
@@ -678,6 +683,14 @@ fn ensure_staged_k32_n128_plan(plan: &Glm53Exl3GemmPlan) -> Result<()> {
         bail!("staged K32/N128 kernel received an ineligible plan");
     }
     Ok(())
+}
+
+/// `ATLAS_GLM53_EXL3_ROWBATCH=1`: the row-exact projection runs every row in
+/// one pass of the pinned M=1 inner kernel (weights read once) instead of one
+/// pass per row. Same per-row arithmetic; see `glm53_exl3_rowbatch_body`.
+fn row_batch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ATLAS_GLM53_EXL3_ROWBATCH").as_deref() == Ok("1"))
 }
 
 fn ensure_row_exact_plan(plan: &Glm53Exl3GemmPlan) -> Result<()> {

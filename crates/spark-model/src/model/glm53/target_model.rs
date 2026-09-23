@@ -777,6 +777,7 @@ impl Glm53Model {
                     capacity: self.capacity,
                     nonce,
                 },
+                prefix: None,
             },
             self.weights.output(),
             GgmlIqBuffer {

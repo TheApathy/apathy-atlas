@@ -391,3 +391,41 @@ fn a_zero_transaction_nonce_is_refused() {
             .is_err()
     );
 }
+
+#[test]
+fn kda_out_of_place_flag_is_strict_and_default_off() {
+    assert!(!super::kda_oop_from(None));
+    assert!(!super::kda_oop_from(Some("0")));
+    assert!(!super::kda_oop_from(Some("true")));
+    assert!(!super::kda_oop_from(Some("")));
+    assert!(super::kda_oop_from(Some("1")));
+}
+
+/// The default (flag off) path must be byte-for-byte the shipping protocol:
+/// prime persistent -> scratch, recurrence on scratch, never the OOP kernel.
+#[test]
+fn flag_off_keeps_the_primed_scratch_protocol_and_never_launches_oop() {
+    let gpu = TraceGpu::new();
+    let kernels = Glm53KdaAttentionKernels::load(&gpu).unwrap();
+    let s = walk_scratch(&gpu);
+    let state = scratch_state();
+    let (input, output) = (hidden(&gpu), hidden(&gpu));
+    kernels
+        .stage(
+            &gpu,
+            &weights(8_192),
+            input,
+            s.kda_buffers(),
+            &state,
+            conv_slots(&gpu),
+            0,
+            1_048_576,
+            0xABCD,
+            output,
+            7,
+        )
+        .unwrap();
+    let symbols: Vec<String> = gpu.launches().into_iter().map(|(name, _)| name).collect();
+    assert!(symbols.iter().any(|s| s == "atlas_glm53_kda_decode"));
+    assert!(!symbols.iter().any(|s| s.ends_with("_oop")));
+}

@@ -359,3 +359,198 @@ atlas_glm53_rms_norm(
             __bfloat162float(normalized) * __bfloat162float(model_weight));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wide mHC pre (ATLAS_GLM53_HC_PRE_WIDE=1), bit-exact by construction.
+//
+// `atlas_glm53_hc_pre` runs one block per token. At decode tokens==1, so the
+// whole mixing stage -- 24 dot products over 4*4096 f32, i.e. ~1.5 MiB of
+// `function` per launch -- streams through a SINGLE SM. Measured on GB10:
+// 76.4 us per launch, 90 launches per token, 6.8 ms of a 66.6 ms token (10%),
+// against a ~0.6 ms bandwidth floor.
+//
+// The split below moves the mixing stage to one block PER PROJECTION so the
+// read is spread across 24 SMs, and leaves everything else alone.
+//
+// EXACTNESS. Each projection keeps the identical per-warp accumulation: the
+// same `index = lane; index += 32` fmaf chain in the same order, then the same
+// five-step __shfl_down_sync tree. Only the warp's residence changes (its own
+// block instead of one of eight warps in one block), which no float operation
+// can observe. The `* inverse_rms` scaling moves from phase 1 to phase 2; it
+// is the same multiply on the same two operands, so it yields the same bits.
+// The RMS reduction, the Sinkhorn solve and the final collapse in phase 2 are
+// copied verbatim from the original kernel, including thread count and the
+// glm53_block_sum tree order.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void __launch_bounds__(32, 1)
+atlas_glm53_hc_pre_mix(
+        const float * __restrict__ streams,
+        const float * __restrict__ function,
+        float * __restrict__ mixed_raw,
+        unsigned int hidden_size, unsigned int hc, unsigned int tokens) {
+    if (hidden_size != GLM53_HIDDEN || hc != GLM53_HC ||
+        blockDim.x != 32U || blockDim.y != 1U || blockDim.z != 1U ||
+        gridDim.x != GLM53_MIX || gridDim.y != tokens || gridDim.z != 1U ||
+        tokens == 0U) {
+        return;
+    }
+    const unsigned int output = blockIdx.x;
+    const unsigned int token = blockIdx.y;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int flat_size = hc * hidden_size;
+    const unsigned long long stream_base = (unsigned long long) token * flat_size;
+    const unsigned long long function_base = (unsigned long long) output * flat_size;
+
+    float sum = 0.0f;
+    for (unsigned int index = lane; index < flat_size; index += 32U) {
+        sum = fmaf(
+            function[function_base + index],
+            streams[stream_base + index],
+            sum);
+    }
+    #pragma unroll
+    for (unsigned int offset = 16U; offset > 0U; offset >>= 1U)
+        sum += __shfl_down_sync(0xffffffffU, sum, offset);
+    if (lane == 0U)
+        mixed_raw[(unsigned long long) token * GLM53_MIX + output] = sum;
+}
+
+extern "C" __global__ void __launch_bounds__(GLM53_THREADS, 1)
+atlas_glm53_hc_pre_fold(
+        const float * __restrict__ streams,
+        const float * __restrict__ mixed_raw,
+        const float * __restrict__ scale,
+        const float * __restrict__ base,
+        __nv_bfloat16 * __restrict__ collapsed,
+        __nv_bfloat16 * __restrict__ post,
+        __nv_bfloat16 * __restrict__ combination,
+        unsigned int hidden_size, unsigned int hc,
+        unsigned int sinkhorn_iters, float norm_eps, float hc_eps) {
+    if (hidden_size != GLM53_HIDDEN || hc != GLM53_HC ||
+        sinkhorn_iters != 20U || norm_eps != 1.0e-5f || hc_eps != 1.0e-6f) {
+        return;
+    }
+    const unsigned int token = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int flat_size = hc * hidden_size;
+    const unsigned long long stream_base = (unsigned long long) token * flat_size;
+
+    __shared__ float reduction[GLM53_THREADS];
+    __shared__ float inverse_rms;
+    __shared__ float mixed[GLM53_MIX];
+    __shared__ float pre[GLM53_HC];
+    __shared__ float sinkhorn[GLM53_HC * GLM53_HC];
+
+    float square_sum = 0.0f;
+    for (unsigned int index = tid; index < flat_size; index += GLM53_THREADS) {
+        const float value = streams[stream_base + index];
+        square_sum += value * value;
+    }
+    reduction[tid] = square_sum;
+    __syncthreads();
+    const float total = glm53_block_sum(reduction, tid);
+    if (tid == 0) {
+        inverse_rms = rsqrtf(total / (float) flat_size + norm_eps);
+    }
+    __syncthreads();
+
+    // Same product as the fused kernel's `mixed[output] = sum * inverse_rms`.
+    if (tid < GLM53_MIX) {
+        mixed[tid] =
+            mixed_raw[(unsigned long long) token * GLM53_MIX + tid] * inverse_rms;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        #pragma unroll
+        for (unsigned int index = 0; index < GLM53_HC; ++index) {
+            const float pre_logit = mixed[index] * scale[0] + base[index];
+            pre[index] = 1.0f / (1.0f + expf(-pre_logit)) + hc_eps;
+            const float post_logit =
+                mixed[GLM53_HC + index] * scale[1] + base[GLM53_HC + index];
+            post[(unsigned long long) token * hc + index] =
+                __float2bfloat16(2.0f / (1.0f + expf(-post_logit)));
+        }
+        #pragma unroll
+        for (unsigned int row = 0; row < GLM53_HC; ++row) {
+            float maximum = -FLT_MAX;
+            #pragma unroll
+            for (unsigned int column = 0; column < GLM53_HC; ++column) {
+                const unsigned int index = row * GLM53_HC + column;
+                sinkhorn[index] = mixed[2 * GLM53_HC + index] * scale[2] +
+                    base[2 * GLM53_HC + index];
+                maximum = fmaxf(maximum, sinkhorn[index]);
+            }
+            float sum = 0.0f;
+            #pragma unroll
+            for (unsigned int column = 0; column < GLM53_HC; ++column) {
+                const unsigned int index = row * GLM53_HC + column;
+                sinkhorn[index] = expf(sinkhorn[index] - maximum);
+                sum += sinkhorn[index];
+            }
+            #pragma unroll
+            for (unsigned int column = 0; column < GLM53_HC; ++column) {
+                const unsigned int index = row * GLM53_HC + column;
+                sinkhorn[index] = sinkhorn[index] / sum + hc_eps;
+            }
+        }
+        #pragma unroll
+        for (unsigned int column = 0; column < GLM53_HC; ++column) {
+            float sum = hc_eps;
+            #pragma unroll
+            for (unsigned int row = 0; row < GLM53_HC; ++row) {
+                sum += sinkhorn[row * GLM53_HC + column];
+            }
+            #pragma unroll
+            for (unsigned int row = 0; row < GLM53_HC; ++row) {
+                sinkhorn[row * GLM53_HC + column] /= sum;
+            }
+        }
+        for (unsigned int iteration = 1; iteration < sinkhorn_iters; ++iteration) {
+            #pragma unroll
+            for (unsigned int row = 0; row < GLM53_HC; ++row) {
+                float sum = hc_eps;
+                #pragma unroll
+                for (unsigned int column = 0; column < GLM53_HC; ++column) {
+                    sum += sinkhorn[row * GLM53_HC + column];
+                }
+                #pragma unroll
+                for (unsigned int column = 0; column < GLM53_HC; ++column) {
+                    sinkhorn[row * GLM53_HC + column] /= sum;
+                }
+            }
+            #pragma unroll
+            for (unsigned int column = 0; column < GLM53_HC; ++column) {
+                float sum = hc_eps;
+                #pragma unroll
+                for (unsigned int row = 0; row < GLM53_HC; ++row) {
+                    sum += sinkhorn[row * GLM53_HC + column];
+                }
+                #pragma unroll
+                for (unsigned int row = 0; row < GLM53_HC; ++row) {
+                    sinkhorn[row * GLM53_HC + column] /= sum;
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int index = 0; index < GLM53_HC * GLM53_HC; ++index) {
+            combination[(unsigned long long) token * GLM53_HC * GLM53_HC + index] =
+                __float2bfloat16(sinkhorn[index]);
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int column = tid; column < hidden_size; column += GLM53_THREADS) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (unsigned int stream = 0; stream < GLM53_HC; ++stream) {
+            sum = fmaf(
+                pre[stream],
+                streams[stream_base + (unsigned long long) stream * hidden_size + column],
+                sum);
+        }
+        collapsed[(unsigned long long) token * hidden_size + column] =
+            __float2bfloat16(sum);
+    }
+}
