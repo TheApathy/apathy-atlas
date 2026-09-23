@@ -39,6 +39,16 @@ pub(super) struct SamplingSetup {
     pub(super) top_logprobs: Option<u8>,
 }
 
+/// The Python server's sampler for deepseek_v41 (app.py / v41_engine
+/// `sample_probs`): temperature and top_p only, defaulting to 1.0 / 0.95. It
+/// reads no top_k, top_n_sigma, min_p or repetition_penalty, so those are
+/// neutral here whatever the server defaults are (serve11g looped at T=1 under
+/// the generic defaults top_k 20, top_n_sigma 1, min_p 0.08).
+/// Returns (temperature, top_k, top_p, top_n_sigma, min_p, repetition_penalty).
+fn dsv41_sampler(temperature: Option<f32>, top_p: Option<f32>) -> (f32, u32, f32, f32, f32, f32) {
+    (temperature.unwrap_or(1.0), 0, top_p.unwrap_or(0.95), 0.0, 0.0, 1.0)
+}
+
 fn tool_choice_required_for_parser(
     tools_active: bool,
     tool_choice: Option<&tool_parser::ToolChoice>,
@@ -168,6 +178,12 @@ pub(super) fn build_sampling(
     } else {
         temperature
     };
+    let (temperature, top_k, top_p, top_n_sigma, min_p, repetition_penalty) =
+        if state.dsv41 && !force_temp_zero {
+            dsv41_sampler(req.sampling.temperature, req.sampling.top_p)
+        } else {
+            (temperature, top_k, top_p, top_n_sigma, min_p, repetition_penalty)
+        };
     let dry_multiplier = if force_temp_zero {
         0.0
     } else {
@@ -221,7 +237,8 @@ pub(super) fn build_sampling(
     }
 
     // max_tokens cap when tools are active.
-    let max_tokens = if tools_active {
+    // (deepseek_v41: the Python server has no tool-turn cap.)
+    let max_tokens = if tools_active && !state.dsv41 {
         let capped = req.max_tokens.min(state.tool_max_tokens);
         if capped < req.max_tokens {
             tracing::info!(
@@ -314,7 +331,11 @@ pub(super) fn build_sampling(
     };
 
     // Timeout deadline.
-    let timeout_secs = req.timeout_secs.unwrap_or(state.request_timeout as f32);
+    // deepseek_v41: the Python server has no server-side deadline; only an
+    // explicit request `timeout` sets one.
+    let timeout_secs = req
+        .timeout_secs
+        .unwrap_or(if state.dsv41 { 0.0 } else { state.request_timeout as f32 });
     let timeout_at = if timeout_secs > 0.0 {
         Some(std::time::Instant::now() + std::time::Duration::from_secs_f32(timeout_secs))
     } else {
@@ -352,6 +373,20 @@ pub(super) fn build_sampling(
 
 #[cfg(test)]
 mod tests {
+    use super::dsv41_sampler;
+
+    /// app.py: temperature/top_p default 1.0/0.95 and nothing else truncates.
+    /// CONTROL: the generic server defaults (top_k 20, top_n_sigma 1, min_p 0.08)
+    /// are exactly what must not come out.
+    #[test]
+    fn dsv41_sampler_is_temperature_and_top_p_only() {
+        assert_eq!(dsv41_sampler(None, None), (1.0, 0, 0.95, 0.0, 0.0, 1.0));
+        assert_eq!(dsv41_sampler(Some(0.3), Some(0.5)), (0.3, 0, 0.5, 0.0, 0.0, 1.0));
+        assert_eq!(dsv41_sampler(Some(0.0), None).0, 0.0);
+        let (_, k, _, sigma, min_p, _) = dsv41_sampler(Some(1.0), Some(0.95));
+        assert_ne!((k, sigma, min_p), (20, 1.0, 0.08));
+    }
+
     use super::tool_choice_required_for_parser;
 
     use crate::tool_parser::{ToolChoice, ToolChoiceFunction};
