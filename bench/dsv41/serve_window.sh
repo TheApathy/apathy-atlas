@@ -65,4 +65,17 @@ for f in "$REQ"/*.json; do
   [ "$crc" -ne 0 ] && rc=$crc
 done
 if [ -f "$REQ/.mem" ]; then m=$(sort -n "$REQ/.mem" | head -1); [ "$m" -lt "$low" ] && low=$m; rm -f "$REQ/.mem"; fi
+# Refuse the batch when more than 1% of responses are errors (a whole arm silently failing,
+# e.g. requests routed to the wrong endpoint, must not reach a gate as "data").
+errs=$(python3 -c "
+import json,glob,sys
+fs=glob.glob(sys.argv[1]+'/*.response.json'); bad=0
+for f in fs:
+    try: r=json.load(open(f))
+    except Exception: bad+=1; continue
+    bad+= 'choices' not in r
+print(bad, len(fs))" "$REQ")
+set -- $errs
+echo "error responses: $1 of $2"
+if [ "$2" -gt 0 ] && [ $(( $1 * 100 )) -gt "$2" ]; then echo "ERROR RATE $1/$2 > 1%: BATCH REFUSED"; rc=96; fi
 end "$rc"
