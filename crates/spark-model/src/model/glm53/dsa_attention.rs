@@ -581,7 +581,7 @@ impl Glm53DsaAttentionKernels {
         dense_indexer: Glm53DsaDenseIndexerPlan,
         stream: u64,
     ) -> Result<u32> {
-        let exact_wide = glm53_exact_wide_prefill_active();
+        let exact_wide = glm53_exact_wide_prefill_active() || glm53_exact_verify_active();
         let layer_major = glm53_layer_major_prefill_active();
         let max_rows = if layer_major {
             u32::try_from(GLM53_EXL3_MAX_WIDE_ROWS)?
@@ -869,6 +869,135 @@ impl Glm53DsaAttentionKernels {
             + if layer_major { 2 } else { 2 * rows })
     }
 
+    /// Value absorption and output projection: row-local work after the
+    /// selected attention. A deferred exact verify runs it once for all rows
+    /// after the causal loop (see `with_dsa_output_deferred`).
+    #[allow(clippy::too_many_arguments)]
+    fn project_output(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: u32,
+        weights: DsaWeightsRef<'_>,
+        buffers: Glm53DsaScratchBuffers,
+        projection_scratch: Option<Glm53Exl3ProjectionScratch>,
+        output: GgmlIqBuffer,
+        stream: u64,
+    ) -> Result<u32> {
+        let q8 = buffers.q8_activation;
+        let mut launches = 0u32;
+        // Un-absorb W_vb, one head at a time, then project out.
+        if dsa_absorb_gemm_active(rows)? {
+            // Token-major strided batch: A = weighted_latent + head*512 (ld 64*512),
+            // C = unabsorbed + head*256 (ld 64*256); V_b is [N=256, K=512] per head.
+            let weight = weights
+                .exl3_absorption_bank(false)?
+                .context("GLM EXL3 DSA value absorption bank is missing")?;
+            ensure!(
+                buffers.weighted_latent_bf16.bytes
+                    >= rows as usize * HEADS as usize * LATENT as usize * 2
+                    && buffers.unabsorbed_bf16.bytes
+                        >= rows as usize * HEADS as usize * HEAD_DIM as usize * 2,
+                "GLM EXL3 DSA strided value bank extent drift"
+            );
+            spark_runtime::cublaslt::bf16_gemm_batched(
+                buffers.weighted_latent_bf16.ptr.0,
+                weight.0,
+                buffers.unabsorbed_bf16.ptr.0,
+                rows,
+                HEAD_DIM,
+                LATENT,
+                true,
+                spark_runtime::cublaslt::StridedBatch {
+                    count: i32::try_from(HEADS)?,
+                    stride_act: i64::from(LATENT),
+                    stride_weight: 2 * i64::from(HEAD_DIM) * i64::from(LATENT),
+                    stride_out: i64::from(HEAD_DIM),
+                    ld_act: i64::from(HEADS) * i64::from(LATENT),
+                    ld_out: i64::from(HEADS) * i64::from(HEAD_DIM),
+                },
+                stream,
+            )?;
+            launches += 1;
+        } else {
+        if rows > 1 {
+            self.selected.transpose_heads(
+                gpu,
+                rows,
+                LATENT,
+                true,
+                Glm53DsaHeadTransposeBuffers {
+                    input_bf16: buffers.weighted_latent_bf16,
+                    output_bf16: buffers.head_major_large_bf16,
+                },
+                stream,
+            )?;
+        }
+        let value_source = if rows == 1 {
+            buffers.weighted_latent_bf16
+        } else {
+            buffers.head_major_large_bf16
+        };
+        let value_destination = if rows == 1 {
+            buffers.unabsorbed_bf16
+        } else {
+            buffers.head_major_small_bf16
+        };
+        if let Some(weight) = weights.exl3_absorption_bank(false)? {
+            self.absorb_exl3_bank(
+                gpu,
+                false,
+                rows,
+                value_source,
+                weight,
+                value_destination,
+                stream,
+            )?;
+            launches += 1;
+        } else {
+            for head in 0..HEADS {
+                let source = Self::head_slice_rows(value_source, head, rows, LATENT)?;
+                let destination = Self::head_slice_rows(value_destination, head, rows, HEAD_DIM)?;
+                self.linear_dsa_rows(
+                    gpu,
+                    rows,
+                    weights.v_b(head)?,
+                    source,
+                    q8,
+                    destination,
+                    projection_scratch,
+                    stream,
+                )?;
+                launches += 2;
+            }
+        }
+        if rows > 1 {
+            self.selected.transpose_heads(
+                gpu,
+                rows,
+                HEAD_DIM,
+                false,
+                Glm53DsaHeadTransposeBuffers {
+                    input_bf16: buffers.head_major_small_bf16,
+                    output_bf16: buffers.unabsorbed_bf16,
+                },
+                stream,
+            )?;
+        }
+        }
+        self.linear_dsa_rows(
+            gpu,
+            rows,
+            weights.output(),
+            buffers.unabsorbed_bf16,
+            q8,
+            output,
+            projection_scratch,
+            stream,
+        )?;
+        launches += 2;
+        Ok(launches)
+    }
+
     /// Stage one DSA layer.
     #[allow(clippy::too_many_arguments)]
     pub fn stage(
@@ -938,6 +1067,7 @@ impl Glm53DsaAttentionKernels {
         cache: Glm53DsaCacheSlots,
         geometry: Glm53DsaLayerGeometry,
         output: GgmlIqBuffer,
+        prefix_snapshots: Option<GgmlIqBuffer>,
         stream: u64,
     ) -> Result<u32> {
         let exact_wide = glm53_exact_wide_prefill_active() || glm53_exact_verify_active();
@@ -1004,10 +1134,12 @@ impl Glm53DsaAttentionKernels {
         if rows > 1 && exact_wide {
             // Replay must see the same causal M1 absorption/projection arithmetic.
             // Prompt precompute is independent of speculative verification.
-            let precompute = !glm53_exact_verify_active()
-                && (layer_major
-                    || std::env::var("ATLAS_GLM53_EXACT_WIDE_DSA_PRECOMPUTE").as_deref()
-                        == Ok("1"));
+            let precompute = if glm53_exact_verify_active() {
+                verify_dsa_precompute_enabled()
+            } else {
+                layer_major
+                    || std::env::var("ATLAS_GLM53_EXACT_WIDE_DSA_PRECOMPUTE").as_deref() == Ok("1")
+            };
             geometry.validate()?;
             ensure!(
                 geometry
@@ -1031,6 +1163,7 @@ impl Glm53DsaAttentionKernels {
             } else {
                 0
             };
+            let defer_output = glm53_exact_verify_active() && verify_dsa_batch_output_enabled();
             for row in 0..rows as usize {
                 let slice = |buffer: GgmlIqBuffer, row_bytes: usize| -> Result<GgmlIqBuffer> {
                     ensure!(
@@ -1070,7 +1203,7 @@ impl Glm53DsaAttentionKernels {
                     query_validity_u8: buffers.query_validity_u8,
                     tail_validity_u8: buffers.tail_validity_u8,
                 };
-                let row_launches = if precompute {
+                let row_launches = with_dsa_output_deferred(defer_output, || if precompute {
                     self.stage_inner(
                         gpu,
                         1,
@@ -1089,7 +1222,7 @@ impl Glm53DsaAttentionKernels {
                         slice(output, HIDDEN as usize * 2)?,
                         stream,
                         DsaStatelessInputs::PrecomputedWide,
-                    )?
+                    )
                 } else {
                     self.stage_exl3_rows(
                         gpu,
@@ -1107,12 +1240,43 @@ impl Glm53DsaAttentionKernels {
                             ..geometry
                         },
                         slice(output, HIDDEN as usize * 2)?,
+                        None,
                         stream,
-                    )?
-                };
+                    )
+                })?;
                 launches = launches
                     .checked_add(row_launches)
                     .context("GLM EXL3 serial-wide DSA launch count overflow")?;
+                if let Some(snapshots) = prefix_snapshots
+                    && glm53_exact_verify_active()
+                {
+                    // Prefix commit: keep the carry as of this row (latent rows,
+                    // published pools, tail) so a partial acceptance can commit
+                    // rows 0..=row without replaying them.
+                    super::prefix_commit::dsa_snapshot_copy(
+                        gpu,
+                        &cache,
+                        super::prefix_commit::dsa_row_slot(snapshots, row)?,
+                        geometry.position,
+                        u32::try_from(row + 1)?,
+                        geometry.capacity,
+                        true,
+                        stream,
+                    )?;
+                }
+            }
+            if defer_output {
+                launches = launches
+                    .checked_add(self.project_output(
+                        gpu,
+                        rows,
+                        DsaWeightsRef::Exl3(weights),
+                        buffers,
+                        Some(projection_scratch),
+                        output,
+                        stream,
+                    )?)
+                    .context("GLM EXL3 deferred DSA output launch count overflow")?;
             }
             return Ok(launches);
         }
@@ -1937,116 +2101,19 @@ impl Glm53DsaAttentionKernels {
             )?;
         }
 
-        // Un-absorb W_vb, one head at a time, then project out.
-        if dsa_absorb_gemm_active(rows)? {
-            // Token-major strided batch: A = weighted_latent + head*512 (ld 64*512),
-            // C = unabsorbed + head*256 (ld 64*256); V_b is [N=256, K=512] per head.
-            let weight = weights
-                .exl3_absorption_bank(false)?
-                .context("GLM EXL3 DSA value absorption bank is missing")?;
-            ensure!(
-                buffers.weighted_latent_bf16.bytes
-                    >= rows as usize * HEADS as usize * LATENT as usize * 2
-                    && buffers.unabsorbed_bf16.bytes
-                        >= rows as usize * HEADS as usize * HEAD_DIM as usize * 2,
-                "GLM EXL3 DSA strided value bank extent drift"
-            );
-            spark_runtime::cublaslt::bf16_gemm_batched(
-                buffers.weighted_latent_bf16.ptr.0,
-                weight.0,
-                buffers.unabsorbed_bf16.ptr.0,
-                rows,
-                HEAD_DIM,
-                LATENT,
-                true,
-                spark_runtime::cublaslt::StridedBatch {
-                    count: i32::try_from(HEADS)?,
-                    stride_act: i64::from(LATENT),
-                    stride_weight: 2 * i64::from(HEAD_DIM) * i64::from(LATENT),
-                    stride_out: i64::from(HEAD_DIM),
-                    ld_act: i64::from(HEADS) * i64::from(LATENT),
-                    ld_out: i64::from(HEADS) * i64::from(HEAD_DIM),
-                },
-                stream,
-            )?;
-            launches += 1;
-        } else {
-        if rows > 1 {
-            self.selected.transpose_heads(
-                gpu,
-                rows,
-                LATENT,
-                true,
-                Glm53DsaHeadTransposeBuffers {
-                    input_bf16: buffers.weighted_latent_bf16,
-                    output_bf16: buffers.head_major_large_bf16,
-                },
-                stream,
-            )?;
-        }
-        let value_source = if rows == 1 {
-            buffers.weighted_latent_bf16
-        } else {
-            buffers.head_major_large_bf16
-        };
-        let value_destination = if rows == 1 {
-            buffers.unabsorbed_bf16
-        } else {
-            buffers.head_major_small_bf16
-        };
-        if let Some(weight) = weights.exl3_absorption_bank(false)? {
-            self.absorb_exl3_bank(
-                gpu,
-                false,
-                rows,
-                value_source,
-                weight,
-                value_destination,
-                stream,
-            )?;
-            launches += 1;
-        } else {
-            for head in 0..HEADS {
-                let source = Self::head_slice_rows(value_source, head, rows, LATENT)?;
-                let destination = Self::head_slice_rows(value_destination, head, rows, HEAD_DIM)?;
-                self.linear_dsa_rows(
+        if !dsa_output_deferred() {
+            launches = launches
+                .checked_add(self.project_output(
                     gpu,
                     rows,
-                    weights.v_b(head)?,
-                    source,
-                    q8,
-                    destination,
+                    weights,
+                    buffers,
                     projection_scratch,
+                    output,
                     stream,
-                )?;
-                launches += 2;
-            }
+                )?)
+                .context("GLM DSA output launch count overflow")?;
         }
-        if rows > 1 {
-            self.selected.transpose_heads(
-                gpu,
-                rows,
-                HEAD_DIM,
-                false,
-                Glm53DsaHeadTransposeBuffers {
-                    input_bf16: buffers.head_major_small_bf16,
-                    output_bf16: buffers.unabsorbed_bf16,
-                },
-                stream,
-            )?;
-        }
-        }
-        self.linear_dsa_rows(
-            gpu,
-            rows,
-            weights.output(),
-            buffers.unabsorbed_bf16,
-            q8,
-            output,
-            projection_scratch,
-            stream,
-        )?;
-        launches += 2;
 
         // Stage this token's latent row into the transaction overlay. The
         // persistent cache is untouched until the index commit accepts.
@@ -2326,6 +2393,51 @@ mod tests;
 /// strided-batched cuBLASLt BF16 GEMM over the 64 heads instead of the 16x32-tile
 /// MMA kernel (5.4 ms per launch at 2047 rows). Same bf16-in/f32-acc math,
 /// different summation order.
+/// `ATLAS_GLM53_VERIFY_DSA_PRECOMPUTE=1`: an exact verify computes the DSA
+/// layer's row-local inputs (q/kv/indexer projections, their norms, the key
+/// absorption) for all rows at once before the causal per-row loop, instead of
+/// once per row inside it. Every launch involved is row-independent with the
+/// one-row arithmetic: compressed projections take the row-exact kernel, the
+/// native BF16 indexer projections stay M=1 per row, the norms and the index
+/// head projection run one block per row, and the absorption bank's MMA rows
+/// are independent (its batched-cuBLASLt opt-in is prompt-only, rows >= 144).
+fn verify_dsa_precompute_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ATLAS_GLM53_VERIFY_DSA_PRECOMPUTE").as_deref() == Ok("1")
+    })
+}
+
+/// `ATLAS_GLM53_VERIFY_DSA_BATCH_OUTPUT=1`: inside an exact verify, the
+/// causal per-row DSA loop stops after the selected attention, and the value
+/// absorption plus output projection run once over all rows afterwards. Both
+/// are row-local: the absorption bank's MMA rows are independent, the head
+/// transposes move values, and the output projection takes the row-exact
+/// kernel (compressed) or stays M=1 per row (native).
+fn verify_dsa_batch_output_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ATLAS_GLM53_VERIFY_DSA_BATCH_OUTPUT").as_deref() == Ok("1")
+    })
+}
+
+thread_local! {
+    static DSA_OUTPUT_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn dsa_output_deferred() -> bool {
+    DSA_OUTPUT_DEFERRED.with(std::cell::Cell::get)
+}
+
+fn with_dsa_output_deferred<T>(defer: bool, operation: impl FnOnce() -> T) -> T {
+    let previous = DSA_OUTPUT_DEFERRED.with(|flag| flag.replace(defer));
+    let result = operation();
+    DSA_OUTPUT_DEFERRED.with(|flag| flag.set(previous));
+    result
+}
+
 fn dsa_absorb_gemm_active(rows: u32) -> Result<bool> {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<std::result::Result<bool, String>> = OnceLock::new();

@@ -70,13 +70,49 @@ pub struct Glm53KdaDecodeBuffers {
 
 pub struct Glm53KdaDecodeKernel {
     decode: KernelHandle,
+    decode_oop: KernelHandle,
 }
 
 impl Glm53KdaDecodeKernel {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
         Ok(Self {
             decode: gpu.kernel("glm53_kda", "atlas_glm53_kda_decode")?,
+            decode_oop: gpu.kernel("glm53_kda", "atlas_glm53_kda_decode_oop")?,
         })
+    }
+
+    /// Out-of-place recurrence: read `state_in`, write `buffers.state_f32`.
+    /// `state_in == buffers.state_f32` runs in place. Same arithmetic as
+    /// [`Self::launch`]; only the source pointer differs.
+    pub fn launch_oop(
+        &self,
+        gpu: &dyn GpuBackend,
+        plan: Glm53KdaDecodePlan,
+        state_in: GgmlIqBuffer,
+        buffers: Glm53KdaDecodeBuffers,
+        stream: u64,
+    ) -> Result<()> {
+        validate_buffers(plan, buffers)?;
+        if state_in.bytes != plan.state_bytes || state_in.ptr == DevicePtr::NULL {
+            bail!("GLM KDA decode state_in buffer is null or has the wrong extent");
+        }
+        KernelLaunch::new(gpu, self.decode_oop)
+            .grid([plan.groups, 1, 1])
+            .block([THREADS, 1, 1])
+            .arg_ptr(state_in.ptr)
+            .arg_ptr(buffers.state_f32.ptr)
+            .arg_ptr(buffers.query_bf16.ptr)
+            .arg_ptr(buffers.key_bf16.ptr)
+            .arg_ptr(buffers.value_bf16.ptr)
+            .arg_ptr(buffers.log_decay_f32.ptr)
+            .arg_ptr(buffers.beta_bf16.ptr)
+            .arg_ptr(buffers.output_bf16.ptr)
+            .arg_u32(plan.batch)
+            .arg_u32(HEADS)
+            .arg_u32(HEAD_DIM)
+            .arg_u32(HEAD_DIM)
+            .arg_f32(L2_EPS)
+            .launch(stream)
     }
 
     pub fn launch(
@@ -231,5 +267,86 @@ mod tests {
         assert_eq!(gpu.launch_count(), 0);
         kernel.launch(&gpu, plan, valid, 0).unwrap();
         assert_eq!(gpu.launch_count(), 1);
+    }
+
+    const KDA_CUDA: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../kernels/gb10/glm5.3-flash/iq3/glm53_kda.cu"
+    ));
+
+    fn oop_fixture(gpu: &MockGpuBackend) -> (Glm53KdaDecodePlan, GgmlIqBuffer, Glm53KdaDecodeBuffers) {
+        let plan = Glm53KdaDecodePlan::new(1, HEADS, HEAD_DIM, HEAD_DIM).unwrap();
+        let at = |bytes: usize| GgmlIqBuffer {
+            ptr: gpu.alloc(bytes).unwrap(),
+            bytes,
+        };
+        let buffers = Glm53KdaDecodeBuffers {
+            state_f32: at(plan.state_bytes),
+            query_bf16: at(plan.vector_bytes),
+            key_bf16: at(plan.vector_bytes),
+            value_bf16: at(plan.vector_bytes),
+            log_decay_f32: at(plan.decay_bytes),
+            beta_bf16: at(plan.beta_bytes),
+            output_bf16: at(plan.vector_bytes),
+        };
+        (plan, at(plan.state_bytes), buffers)
+    }
+
+    #[test]
+    fn out_of_place_decode_launches_once_and_refuses_a_short_source() {
+        let gpu = MockGpuBackend::new();
+        let kernel = Glm53KdaDecodeKernel::load(&gpu).unwrap();
+        let (plan, state_in, buffers) = oop_fixture(&gpu);
+        kernel.launch_oop(&gpu, plan, state_in, buffers, 7).unwrap();
+        assert_eq!(gpu.launch_count(), 1);
+        // In place (source == destination) is admitted: the one-row walk uses it.
+        kernel
+            .launch_oop(&gpu, plan, buffers.state_f32, buffers, 7)
+            .unwrap();
+        assert_eq!(gpu.launch_count(), 2);
+        let short = GgmlIqBuffer {
+            ptr: state_in.ptr,
+            bytes: state_in.bytes - 4,
+        };
+        assert!(kernel.launch_oop(&gpu, plan, short, buffers, 7).is_err());
+        let null = GgmlIqBuffer {
+            ptr: DevicePtr::NULL,
+            bytes: state_in.bytes,
+        };
+        assert!(kernel.launch_oop(&gpu, plan, null, buffers, 7).is_err());
+        assert_eq!(gpu.launch_count(), 2);
+    }
+
+    #[test]
+    fn out_of_place_decode_kernel_reads_source_once_and_admits_aliasing() {
+        let body = KDA_CUDA
+            .split("atlas_glm53_kda_decode_oop(")
+            .nth(1)
+            .expect("out-of-place decode kernel present")
+            .split("extern \"C\"")
+            .next()
+            .unwrap();
+        assert!(body.starts_with("\n        const float * state_in,\n        float * state_out,"));
+        assert!(!body.contains("__restrict__ state"));
+        assert!(body.contains("const float decayed = state_in[index] * decay[at];"));
+        assert!(body.contains("state_out[index] = decayed;"));
+        assert!(body.contains("const float updated = state_out[index] + k_values[at] * delta;"));
+        assert!(!body.contains("state[index]"));
+        // Same normalization, decay and update expressions as the in-place kernel.
+        let in_place = KDA_CUDA
+            .split("atlas_glm53_kda_decode(")
+            .nth(1)
+            .unwrap()
+            .split("extern \"C\"")
+            .next()
+            .unwrap();
+        for expression in [
+            "(q_values[column] / q_norm) * (1.0f / sqrtf(128.0f))",
+            "k_values[column] = k_values[column] / k_norm;",
+            "(__bfloat162float(value[vector_base + column]) - memory) * beta_value;",
+            "output[vector_base + column] = __float2bfloat16_rn(result);",
+        ] {
+            assert!(in_place.contains(expression) && body.contains(expression));
+        }
     }
 }

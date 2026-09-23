@@ -14,6 +14,54 @@ const SINKHORN_ITERS: u32 = 20;
 const THREADS: u32 = 256;
 const NORM_EPS: f32 = 1.0e-5;
 const HC_EPS: f32 = 1.0e-6;
+/// Token capacity of the wide-pre mixing scratch. Above this the fused kernel
+/// runs instead, which costs nothing: the fused kernel is one block per token,
+/// so it is already spread across SMs once there are many tokens. The wide
+/// split exists for the decode case, where there is exactly one.
+const MAX_MIX_TOKENS: u32 = 2048;
+
+/// `ATLAS_GLM53_HC_PRE_WIDE=1` splits `atlas_glm53_hc_pre` into a mixing pass
+/// with one block per projection and a fold pass with one block per token,
+/// instead of running the whole thing in one block per token. At decode that
+/// is 24 SMs instead of 1 for the ~1.5 MiB `function` read. Bit-exact by
+/// construction (see the kernel comment). Default off.
+pub(crate) fn parse_hc_pre_wide_flag(value: Option<&str>) -> Result<bool, &'static str> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("ATLAS_GLM53_HC_PRE_WIDE must be absent, 0, or 1"),
+    }
+}
+
+/// Process-wide scratch for the wide-pre mixing sums.
+///
+/// `Glm53Dispatcher` is rebuilt for every walk, so allocating here per instance
+/// would both leak and put a `cuMemAlloc` on the per-token path. The buffer is
+/// a fixed 192 KiB, is written in full by `pre_mix` before `pre_fold` reads it
+/// on every launch, and both kernels run in order on one stream, so a single
+/// allocation reused for the life of the process is sound.
+fn mix_scratch(gpu: &dyn GpuBackend) -> Result<DevicePtr> {
+    static SCRATCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    if let Some(raw) = SCRATCH.get() {
+        return Ok(DevicePtr(*raw));
+    }
+    let bytes = usize::try_from(MAX_MIX_TOKENS * MIX)?
+        .checked_mul(4)
+        .context("GLM mHC mix scratch overflow")?;
+    let pointer = gpu.alloc(bytes)?;
+    // A racing initializer keeps its own allocation rather than freeing one the
+    // winner may already have handed to a launch; at 192 KiB, once, that is the
+    // cheap side of the trade.
+    Ok(DevicePtr(*SCRATCH.get_or_init(|| pointer.0)))
+}
+
+fn hc_pre_wide() -> Result<bool> {
+    static WIDE: std::sync::OnceLock<Result<bool, &'static str>> = std::sync::OnceLock::new();
+    WIDE.get_or_init(|| {
+        parse_hc_pre_wide_flag(std::env::var("ATLAS_GLM53_HC_PRE_WIDE").ok().as_deref())
+    })
+    .map_err(|message| anyhow::anyhow!(message))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Glm53HyperPlan {
@@ -109,6 +157,12 @@ pub struct Glm53HyperPostBuffers {
 pub struct Glm53HyperKernels {
     expand: KernelHandle,
     pre: KernelHandle,
+    pre_mix: KernelHandle,
+    pre_fold: KernelHandle,
+    /// Scratch for the 24 unscaled mixing sums per token, written in full by
+    /// `pre_mix` and read by `pre_fold` on every wide launch, so its initial
+    /// contents are never observed. Only allocated when the flag is on.
+    mix_scratch: Option<DevicePtr>,
     post: KernelHandle,
     mean: KernelHandle,
     norm: KernelHandle,
@@ -119,6 +173,13 @@ impl Glm53HyperKernels {
         Ok(Self {
             expand: gpu.kernel("glm53_hyper", "atlas_glm53_hc_expand")?,
             pre: gpu.kernel("glm53_hyper", "atlas_glm53_hc_pre")?,
+            pre_mix: gpu.kernel("glm53_hyper", "atlas_glm53_hc_pre_mix")?,
+            pre_fold: gpu.kernel("glm53_hyper", "atlas_glm53_hc_pre_fold")?,
+            mix_scratch: if hc_pre_wide()? {
+                Some(mix_scratch(gpu)?)
+            } else {
+                None
+            },
             post: gpu.kernel("glm53_hyper", "atlas_glm53_hc_post")?,
             mean: gpu.kernel("glm53_hyper", "atlas_glm53_hc_mean")?,
             norm: gpu.kernel("glm53_hyper", "atlas_glm53_rms_norm")?,
@@ -166,6 +227,34 @@ impl Glm53HyperKernels {
         ])?;
         if hc_pre_gemm_active(plan.tokens)? && !buffers.mixed_f32.ptr.is_null() {
             return self.pre_gemm(gpu, plan, buffers, stream);
+        }
+        if let Some(mix_scratch) = self.mix_scratch.filter(|_| plan.tokens <= MAX_MIX_TOKENS) {
+            KernelLaunch::new(gpu, self.pre_mix)
+                .grid([MIX, plan.tokens, 1])
+                .block([32, 1, 1])
+                .arg_ptr(buffers.streams_f32.ptr)
+                .arg_ptr(buffers.function_f32.ptr)
+                .arg_ptr(mix_scratch)
+                .arg_u32(HIDDEN)
+                .arg_u32(HC)
+                .arg_u32(plan.tokens)
+                .launch(stream)?;
+            return KernelLaunch::new(gpu, self.pre_fold)
+                .grid([plan.tokens, 1, 1])
+                .block([THREADS, 1, 1])
+                .arg_ptr(buffers.streams_f32.ptr)
+                .arg_ptr(mix_scratch)
+                .arg_ptr(buffers.scale_f32.ptr)
+                .arg_ptr(buffers.base_f32.ptr)
+                .arg_ptr(buffers.collapsed_bf16.ptr)
+                .arg_ptr(buffers.post_bf16.ptr)
+                .arg_ptr(buffers.comb_bf16.ptr)
+                .arg_u32(HIDDEN)
+                .arg_u32(HC)
+                .arg_u32(SINKHORN_ITERS)
+                .arg_f32(NORM_EPS)
+                .arg_f32(HC_EPS)
+                .launch(stream);
         }
         KernelLaunch::new(gpu, self.pre)
             .grid([plan.tokens, 1, 1])

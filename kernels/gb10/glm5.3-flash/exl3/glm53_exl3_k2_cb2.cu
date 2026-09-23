@@ -5,3 +5,4 @@
 #include "glm53_exl3_rowexact.cuh"
 
 GLM53_EXL3_ROWEXACT_INSTANCES(2)
+GLM53_EXL3_ROWBATCH_INSTANCES(2)

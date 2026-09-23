@@ -136,10 +136,13 @@ pub struct Glm53AttentionBinding {
     pub kda_conv: Vec<Glm53KdaConvSlots>,
     pub dsa_cache: Vec<Glm53DsaCacheSlots>,
     pub geometry: Glm53DsaLayerGeometry,
+    /// `ATLAS_GLM53_PREFIX_COMMIT=1`: per-row state snapshots for a wide exact
+    /// verify, so an accepted prefix commits without a replay pass.
+    pub prefix: Option<super::prefix_commit::PrefixCommitBuffers>,
 }
 
 /// KDA ordinal of a target layer, or `None` if it is a DSA layer.
-const fn kda_ordinal(layer: usize) -> Option<usize> {
+pub(super) const fn kda_ordinal(layer: usize) -> Option<usize> {
     if layer % 4 == 3 || layer >= LAYERS {
         None
     } else {
@@ -730,6 +733,7 @@ impl<'w> Glm53Dispatcher<'w> {
                                 self.attention.geometry.capacity,
                                 self.attention.geometry.nonce,
                                 self.bound.hidden_a,
+                                self.attention.prefix,
                                 stream,
                             )
                             .map(|_| ())
@@ -774,6 +778,11 @@ impl<'w> Glm53Dispatcher<'w> {
                                 "GLM EXL3 dispatch: layer {layer} is scheduled DSA but holds KDA weights"
                             )
                         };
+                        let prefix_snapshots = self
+                            .attention
+                            .prefix
+                            .map(|prefix| prefix.dsa_layer(ordinal))
+                            .transpose()?;
                         self.dsa
                             .stage_exl3_rows(
                                 gpu,
@@ -786,6 +795,7 @@ impl<'w> Glm53Dispatcher<'w> {
                                 self.attention.dsa_cache[ordinal],
                                 self.attention.geometry,
                                 self.bound.hidden_a,
+                                prefix_snapshots,
                                 stream,
                             )
                             .map(|_| ())

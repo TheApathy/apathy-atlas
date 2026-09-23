@@ -46,6 +46,57 @@ inline __device__ void glm53_exl3_rowexact_body(EXL3_GEMM_ARGS)
     }
 }
 
+// Same contract as glm53_exl3_rowexact_body, with every row in ONE pass of the
+// pinned M=1 inner kernel, so each weight tile is read and decoded once per
+// projection instead of once per row.  Bit-identical per row by construction:
+// the Hadamard is the same per-row 128-chunk transform, the k-slice partition
+// depends only on (size_k, size_n, gridDim), each MMA output row depends only on
+// its own A row, the threadblock reduction takes the same size_m <= 8 branch
+// for every size_m in 1..=8, and the lock-ordered cross-slice reduction is
+// per element.  size_m <= 16 (one M tile) is required.
+template<
+    const int bits,
+    const int TILESIZE_M,
+    const int TILESIZE_K,
+    const int TILESIZE_N,
+    const int SH_STAGES,
+    const int FRAG_STAGES>
+inline __device__ void glm53_exl3_rowbatch_body(EXL3_GEMM_ARGS)
+{
+    auto grid = cg::this_grid();
+    const int warps_grid = gridDim.x * blockDim.x / 32;
+    const int first_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+    const int warps_row = size_k / 128;
+
+    for (int warp = first_warp; warp < size_m * warps_row; warp += warps_grid)
+    {
+        const int row = warp / warps_row;
+        const int chunk = warp % warps_row;
+        had_hf_r_128_inner<true, false>
+        (
+            A + row * size_k + chunk * 128,
+            A_had + row * size_k + chunk * 128,
+            suh + chunk * 128,
+            0.088388347648f
+        );
+    }
+
+    grid.sync();
+    exl3_gemm_kernel_inner
+    <bits, false, 2, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
+    (
+        A_had,
+        B,
+        (half*) C,
+        size_m,
+        size_k,
+        size_n,
+        locks,
+        svh
+    );
+    grid.sync();
+}
+
 #define GLM53_EXL3_ROWEXACT_INSTANCE(NAME, BITS, TILE_M, TILE_K, TILE_N, SH, FRAG) \
     extern "C" __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILE_K / 16) \
     void NAME(EXL3_GEMM_ARGS) \
@@ -59,3 +110,17 @@ inline __device__ void glm53_exl3_rowexact_body(EXL3_GEMM_ARGS)
     GLM53_EXL3_ROWEXACT_INSTANCE(glm53_exl3_rowexact_k##BITS##_s2, BITS, 16, 32, 128, 4, 3) \
     GLM53_EXL3_ROWEXACT_INSTANCE(glm53_exl3_rowexact_k##BITS##_s3, BITS, 16, 32, 256, 4, 3) \
     GLM53_EXL3_ROWEXACT_INSTANCE(glm53_exl3_rowexact_k##BITS##_s4, BITS, 16, 16, 512, 4, 3)
+
+#define GLM53_EXL3_ROWBATCH_INSTANCE(NAME, BITS, TILE_M, TILE_K, TILE_N, SH, FRAG) \
+    extern "C" __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILE_K / 16) \
+    void NAME(EXL3_GEMM_ARGS) \
+    { \
+        glm53_exl3_rowbatch_body<BITS, TILE_M, TILE_K, TILE_N, SH, FRAG> \
+        (A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh); \
+    }
+
+#define GLM53_EXL3_ROWBATCH_INSTANCES(BITS) \
+    GLM53_EXL3_ROWBATCH_INSTANCE(glm53_exl3_rowbatch_k##BITS##_s1, BITS, 16, 16, 128, 6, 5) \
+    GLM53_EXL3_ROWBATCH_INSTANCE(glm53_exl3_rowbatch_k##BITS##_s2, BITS, 16, 32, 128, 4, 3) \
+    GLM53_EXL3_ROWBATCH_INSTANCE(glm53_exl3_rowbatch_k##BITS##_s3, BITS, 16, 32, 256, 4, 3) \
+    GLM53_EXL3_ROWBATCH_INSTANCE(glm53_exl3_rowbatch_k##BITS##_s4, BITS, 16, 16, 512, 4, 3)

@@ -257,9 +257,16 @@ fn host_contract(source: &str) -> bool {
         "Glm53DsaNormProjectionKind::BiasedLayerNorm128",
         "Glm53DsaNormProjectionKind::F32IndexProjection",
     );
+    // The wide arm (ATLAS_GLM53_DSA_INDEX_PROJ_WIDE) precedes the fused arm as
+    // a guarded match arm, so each is pinned within its own bounds.
+    let wide = section(
+        launches,
+        "Glm53DsaNormProjectionKind::F32IndexProjection if index_projection_wide()?",
+        "Glm53DsaNormProjectionKind::F32IndexProjection =>",
+    );
     let projection = section(
         launches,
-        "Glm53DsaNormProjectionKind::F32IndexProjection",
+        "Glm53DsaNormProjectionKind::F32IndexProjection =>",
         "launch.launch(stream)",
     );
     source.contains("plan.validate()?;\n        validate_buffers(plan, buffers)?;")
@@ -272,6 +279,11 @@ fn host_contract(source: &str) -> bool {
             layer,
             "KernelLaunch::new(gpu,self.layer_norm).grid([plan.rows,1,1]).block([plan.threads,1,1]).arg_ptr(buffers.input_bf16.ptr).arg_ptr(buffers.weight_f32.ptr).arg_ptr(buffers.bias_f32.ptr).arg_ptr(buffers.output_bf16.ptr).arg_u32(plan.rows).arg_u32(plan.input_width).arg_f32(f32::from_bits(plan.epsilon_bits))",
             7,
+        )
+        && exact_launch(
+            wide,
+            "KernelLaunch::new(gpu,self.index_projection_wide).grid([plan.output_width,plan.rows,1]).block([plan.threads,1,1]).arg_ptr(buffers.input_bf16.ptr).arg_ptr(buffers.weight_f32.ptr).arg_ptr(buffers.output_bf16.ptr).arg_u32(plan.rows).arg_u32(plan.input_width).arg_u32(plan.output_width)",
+            6,
         )
         && exact_launch(
             projection,
@@ -291,11 +303,13 @@ fn cuda_contract(source: &str) -> bool {
         "atlas_glm53_dsa_biased_layer_norm_bf16(",
         "atlas_glm53_dsa_index_projection_f32_bf16(",
     ));
-    let projection = compact(
-        &source[source
-            .find("atlas_glm53_dsa_index_projection_f32_bf16(")
-            .unwrap()..],
-    );
+    // Bounded by the wide kernel appended after it; the wide kernel has its own
+    // source contract in tests/glm53_decode_wide_kernels.rs.
+    let projection = compact(section(
+        source,
+        "atlas_glm53_dsa_index_projection_f32_bf16(",
+        "atlas_glm53_dsa_index_projection_f32_bf16_wide(",
+    ));
     let rms_guard = "if(blockDim.x!=256U||blockDim.y!=1U||blockDim.z!=1U||gridDim.x!=rows||gridDim.y!=1U||gridDim.z!=1U||rows==0U||rows>GLM53_MAX_ROWS||(width!=GLM53_KV_RANK&&width!=GLM53_Q_RANK)||eps!=1.0e-5f){return;}";
     let layer_guard = "if(blockDim.x!=GLM53_INDEX_DIM||blockDim.y!=1U||blockDim.z!=1U||gridDim.x!=rows||gridDim.y!=1U||gridDim.z!=1U||rows==0U||rows>GLM53_MAX_ROWS||width!=GLM53_INDEX_DIM||eps!=1.0e-6f){return;}";
     let projection_guard = "if(blockDim.x!=GLM53_INDEX_HEADS||blockDim.y!=1U||blockDim.z!=1U||gridDim.x!=rows||gridDim.y!=1U||gridDim.z!=1U||rows==0U||rows>GLM53_MAX_ROWS||inner!=GLM53_HIDDEN||heads!=GLM53_INDEX_HEADS){return;}";
@@ -352,8 +366,10 @@ fn source_contract_rejects_full_host_abi_swaps_and_duplicates() {
             ".arg_u32(plan.input_width)\n                    .arg_u32(plan.rows)\n                    .arg_f32",
         ),
         (
-            ".arg_u32(plan.rows)\n                    .arg_u32(plan.input_width)\n                    .arg_u32(plan.output_width)",
-            ".arg_u32(plan.rows)\n                    .arg_u32(plan.output_width)\n                    .arg_u32(plan.input_width)",
+            // Anchored to the fused arm's grid: the wide arm carries the same
+            // argument chain, and an unanchored mutation would be ambiguous.
+            "self.index_projection)\n                    .grid([plan.rows, 1, 1])\n                    .block([plan.threads, 1, 1])\n                    .arg_ptr(buffers.input_bf16.ptr)\n                    .arg_ptr(buffers.weight_f32.ptr)\n                    .arg_ptr(buffers.output_bf16.ptr)\n                    .arg_u32(plan.rows)\n                    .arg_u32(plan.input_width)\n                    .arg_u32(plan.output_width)",
+            "self.index_projection)\n                    .grid([plan.rows, 1, 1])\n                    .block([plan.threads, 1, 1])\n                    .arg_ptr(buffers.input_bf16.ptr)\n                    .arg_ptr(buffers.weight_f32.ptr)\n                    .arg_ptr(buffers.output_bf16.ptr)\n                    .arg_u32(plan.rows)\n                    .arg_u32(plan.output_width)\n                    .arg_u32(plan.input_width)",
         ),
         (
             ".arg_ptr(buffers.bias_f32.ptr)\n                    .arg_ptr(buffers.output_bf16.ptr)",
@@ -399,8 +415,10 @@ fn source_contract_rejects_full_host_abi_swaps_and_duplicates() {
     }
     assert!(!host_contract(&mutation(
         HOST,
-        ".arg_ptr(buffers.input_bf16.ptr)\n                    .arg_ptr(buffers.weight_f32.ptr)\n                    .arg_ptr(buffers.output_bf16.ptr)\n                    .arg_u32(plan.rows)\n                    .arg_u32(plan.input_width)\n                    .arg_u32(plan.output_width)",
-        ".arg_ptr(buffers.output_bf16.ptr)\n                    .arg_ptr(buffers.weight_f32.ptr)\n                    .arg_ptr(buffers.input_bf16.ptr)\n                    .arg_u32(plan.rows)\n                    .arg_u32(plan.input_width)\n                    .arg_u32(plan.output_width)",
+        // Anchored to the fused arm's grid: the wide arm repeats this pointer
+        // chain, so the bare chain is no longer a unique mutation site.
+        "self.index_projection)\n                    .grid([plan.rows, 1, 1])\n                    .block([plan.threads, 1, 1])\n                    .arg_ptr(buffers.input_bf16.ptr)\n                    .arg_ptr(buffers.weight_f32.ptr)\n                    .arg_ptr(buffers.output_bf16.ptr)",
+        "self.index_projection)\n                    .grid([plan.rows, 1, 1])\n                    .block([plan.threads, 1, 1])\n                    .arg_ptr(buffers.output_bf16.ptr)\n                    .arg_ptr(buffers.weight_f32.ptr)\n                    .arg_ptr(buffers.input_bf16.ptr)",
     )));
 }
 

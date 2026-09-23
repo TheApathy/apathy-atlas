@@ -39,6 +39,16 @@ impl Setting {
     }
 }
 
+/// Verification keys occupy `0..294` (rows 2..=8 x MoE layers 3..=44). The
+/// scalar decode walk (rows = 1) has its own 42-entry band at `294..336`, so a
+/// one-row graph can never be confused with a verification graph and the
+/// verification key space stays exactly what it was.
+pub const VERIFY_ENTRIES: usize = 294;
+pub const SCALAR_ENTRIES: usize = 42;
+pub const ENTRIES: usize = VERIFY_ENTRIES + SCALAR_ENTRIES;
+/// `row_counts` index of the scalar band.
+pub const SCALAR_ROW_SLOT: usize = 7;
+
 #[derive(Clone, Copy)]
 pub struct Key(usize);
 impl Key {
@@ -47,6 +57,18 @@ impl Key {
             return Err("FFN graph requires verification rows2..8 and MoE layer3..44".into());
         }
         Ok(Self(((rows - 2) * 42 + layer - 3) as usize))
+    }
+
+    /// One-row decode walk key (`ATLAS_GLM53_FFN_GRAPHS_SCALAR=1`).
+    pub fn new_scalar(layer: u32) -> Result<Self, String> {
+        if !(3..=44).contains(&layer) {
+            return Err("scalar FFN graph requires MoE layer3..44".into());
+        }
+        Ok(Self(VERIFY_ENTRIES + (layer - 3) as usize))
+    }
+
+    pub fn index(self) -> usize {
+        self.0
     }
 }
 
@@ -74,22 +96,22 @@ enum Entry {
 }
 
 pub struct GraphCache {
-    entries: [Entry; 294],
+    entries: [Entry; ENTRIES],
     binding: Option<Binding>,
     poisoned: bool,
     unreclaimable: bool,
     counts: [u64; 3],
-    row_counts: [[u64; 3]; 7],
+    row_counts: [[u64; 3]; 8],
 }
 impl GraphCache {
     pub fn new() -> Self {
         Self {
-            entries: [Entry::Cold; 294],
+            entries: [Entry::Cold; ENTRIES],
             binding: None,
             poisoned: false,
             unreclaimable: false,
             counts: [0; 3],
-            row_counts: [[0; 3]; 7],
+            row_counts: [[0; 3]; 8],
         }
     }
 
@@ -97,7 +119,7 @@ impl GraphCache {
         self.counts
     }
 
-    pub fn row_counts(&self) -> [[u64; 3]; 7] {
+    pub fn row_counts(&self) -> [[u64; 3]; 8] {
         self.row_counts
     }
 

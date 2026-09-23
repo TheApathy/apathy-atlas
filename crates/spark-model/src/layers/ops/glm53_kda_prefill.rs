@@ -77,6 +77,7 @@ pub struct Glm53KdaPrefillBuffers {
 
 pub struct Glm53KdaPrefillKernel {
     prefill: KernelHandle,
+    prefill_oop: KernelHandle,
     register_resident: KernelHandle,
     register_resident_c8: KernelHandle,
     register_resident_c8_enabled: bool,
@@ -90,6 +91,7 @@ impl Glm53KdaPrefillKernel {
         let (register_resident_columns, columns_symbol) = rr_columns(columns_env.as_deref());
         Ok(Self {
             prefill: gpu.kernel("glm53_kda", "atlas_glm53_kda_prefill")?,
+            prefill_oop: gpu.kernel("glm53_kda", "atlas_glm53_kda_prefill_oop")?,
             register_resident: gpu
                 .kernel("glm53_kda", "atlas_glm53_kda_prefill_register_resident")?,
             register_resident_c8: gpu.kernel(
@@ -116,6 +118,40 @@ impl Glm53KdaPrefillKernel {
         KernelLaunch::new(gpu, self.prefill)
             .grid([plan.groups, 1, 1])
             .block([THREADS, 1, 1])
+            .arg_ptr(buffers.state_f32.ptr)
+            .arg_ptr(buffers.query_bf16.ptr)
+            .arg_ptr(buffers.key_bf16.ptr)
+            .arg_ptr(buffers.value_bf16.ptr)
+            .arg_ptr(buffers.log_decay_f32.ptr)
+            .arg_ptr(buffers.beta_bf16.ptr)
+            .arg_ptr(buffers.output_bf16.ptr)
+            .arg_u32(plan.batch)
+            .arg_u32(plan.tokens)
+            .arg_u32(HEADS)
+            .arg_u32(HEAD_DIM)
+            .arg_u32(HEAD_DIM)
+            .arg_f32(L2_EPS)
+            .launch(stream)
+    }
+
+    /// Out-of-place recurrence: token 0 reads `state_in`, every token writes
+    /// `buffers.state_f32`. Same arithmetic as [`Self::launch`].
+    pub fn launch_oop(
+        &self,
+        gpu: &dyn GpuBackend,
+        plan: Glm53KdaPrefillPlan,
+        state_in: GgmlIqBuffer,
+        buffers: Glm53KdaPrefillBuffers,
+        stream: u64,
+    ) -> Result<()> {
+        validate_buffers(plan, buffers)?;
+        if state_in.bytes != plan.state_bytes || state_in.ptr == DevicePtr::NULL {
+            bail!("GLM KDA prefill state_in buffer is null or has the wrong extent");
+        }
+        KernelLaunch::new(gpu, self.prefill_oop)
+            .grid([plan.groups, 1, 1])
+            .block([THREADS, 1, 1])
+            .arg_ptr(state_in.ptr)
             .arg_ptr(buffers.state_f32.ptr)
             .arg_ptr(buffers.query_bf16.ptr)
             .arg_ptr(buffers.key_bf16.ptr)
@@ -435,5 +471,48 @@ mod tests {
                 .is_err()
         );
         assert_eq!(gpu.launch_count(), 2);
+    }
+
+    #[test]
+    fn out_of_place_prefill_launches_and_reads_the_source_only_for_token_zero() {
+        let gpu = MockGpuBackend::new();
+        let kernel = Glm53KdaPrefillKernel::load(&gpu).unwrap();
+        let plan = Glm53KdaPrefillPlan::new(1, 4, HEADS, HEAD_DIM, HEAD_DIM).unwrap();
+        let at = |bytes: usize| GgmlIqBuffer {
+            ptr: gpu.alloc(bytes).unwrap(),
+            bytes,
+        };
+        let buffers = Glm53KdaPrefillBuffers {
+            state_f32: at(plan.state_bytes),
+            query_bf16: at(plan.vector_bytes),
+            key_bf16: at(plan.vector_bytes),
+            value_bf16: at(plan.vector_bytes),
+            log_decay_f32: at(plan.decay_bytes),
+            beta_bf16: at(plan.beta_bytes),
+            output_bf16: at(plan.vector_bytes),
+        };
+        let state_in = at(plan.state_bytes);
+        kernel.launch_oop(&gpu, plan, state_in, buffers, 7).unwrap();
+        assert_eq!(gpu.launch_count(), 1);
+        let short = GgmlIqBuffer {
+            ptr: state_in.ptr,
+            bytes: state_in.bytes - 4,
+        };
+        assert!(kernel.launch_oop(&gpu, plan, short, buffers, 7).is_err());
+        assert_eq!(gpu.launch_count(), 1);
+
+        let body = CUDA_SOURCE
+            .split("atlas_glm53_kda_prefill_oop(")
+            .nth(1)
+            .expect("out-of-place prefill kernel present")
+            .split("extern \"C\"")
+            .next()
+            .unwrap();
+        assert!(body.starts_with("\n        const float * state_in,\n        float * state_out,"));
+        assert!(!body.contains("__restrict__ state"));
+        assert!(body.contains("const float * source = (token == 0U) ? state_in : state_out;"));
+        assert!(body.contains("const float decayed = source[index] * decay[at];"));
+        assert!(body.contains("const float updated = state_out[index] + k_values[at] * delta;"));
+        assert!(!body.contains("state[index]"));
     }
 }
