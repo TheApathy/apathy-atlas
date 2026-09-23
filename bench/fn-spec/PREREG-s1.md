@@ -149,3 +149,19 @@ ALL = K5 hybrid + graph + dedup + chain + mtp-vocab 96000.
 - FNV: plain-vs-plain rows identical up to the first flip index in any flipped trial; spec
   content rows (fast-path hashes) bit-identical to plain rows at the same output index for most
   indices — if NOT bit-identical, verify is argmax-exact but not logits-exact (the DSpark bar). 50%.
+
+## s7 partial (vg4): G (K5H+graph) code_py 52.17, GV96 (+mtp-vocab 96000) 53.97 (+3.4%),
+code_rs 47.67 -> 51.41 (+7.8%). Acceptance per draft position G 0.823/0.741/0.661/0.586.
+Box heavily contended; s7 aborted before GV32 while waiting on the lock. Output flips at known
+near-tie words appeared in BOTH plain (C2 chat, C3 code_rs/think) and spec arms, at higher rate
+than this morning.
+# s8 revised — C1 V96 C2 ALL C3 ALLF C4 on vg6 (all arms log ATLAS_LOGITS_FNV).
+V96 = K5H + graph + mtp-vocab 96000 (tie fix on); ALL = V96 + dedup + chain; ALLF = ALL with the
+first-wins argmax control. Predictions as before plus: ALL vs V96 +5-12%.
+
+# s9 — pre-registered (vg7 = vg6 + GDN lazy on the Qwen4 exact rows route), C ALL C ALLZ C GATE C
+- ALLZ vs ALL: +2-4% on code (GDN sequence 5.6 ms/step, ~half is intermediate snapshot writes),
+  outputs identical. 60%. If ALLZ output differs, the lazyfinal/nosnap replay is not bit-exact with
+  the sequence kernel on this model -> keep it off.
+- GATE (throughput arbiter with a serial arm): chat >= 0.97x (switches to plain), code within 3% of
+  ALLZ after warm-up. 50% (per-request probing may cost more than it saves at 256-320 tokens).
