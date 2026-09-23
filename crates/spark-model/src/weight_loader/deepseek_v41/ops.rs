@@ -212,8 +212,7 @@ pub struct Dsv41Kernels {
     pub decode_positions: KernelHandle,
     pub ring_write: KernelHandle,
     /// attention2's fused FP8-weight GEMM (no bf16 dequant copy), used for prefill M > MM_TILE
-    /// on the shapes where it measured faster ([`fused_wins`]). [`FP8_FUSED_ENV`]`=1` only,
-    /// until the end-to-end byte test passes.
+    /// on the shapes where it measured faster ([`fused_wins`]); [`FP8_FUSED_ENV`]`=0` disables.
     pub fp8_fused: Option<Fp8Gemm>,
 }
 
@@ -222,7 +221,9 @@ pub const HC_MIX_V2_ENV: &str = "ATLAS_DSV41_HC_MIX_V2";
 /// `ATLAS_DSV41_HC_FUSED=1`: non-decode blocks run their mHC stream passes as two fused kernels.
 pub const HC_FUSED_ENV: &str = "ATLAS_DSV41_HC_FUSED";
 
-/// `ATLAS_DSV41_FP8_FUSED=1`: prefill FP8 linears on the winning shapes skip the bf16 dequant.
+/// Prefill FP8 linears on the winning shapes skip the bf16 dequant (fused v7 GEMM). ON by default
+/// (k124f, runC_2048 warm prefill: 1.512 -> 1.443 s, logits_last and 8 decode tokens byte-identical
+/// to the dequant + cuBLASLt path); `ATLAS_DSV41_FP8_FUSED=0` turns it off.
 pub const FP8_FUSED_ENV: &str = "ATLAS_DSV41_FP8_FUSED";
 
 /// ON by default (`ATLAS_DSV41_HC_SPLIT=0` turns it off): on decode-kind passes of <= 16 rows, `hc_mixes` runs as 25 x T blocks + an epilogue instead of one
@@ -306,7 +307,7 @@ impl Dsv41Kernels {
             } else {
                 None
             },
-            fp8_fused: if std::env::var(FP8_FUSED_ENV).as_deref() == Ok("1") { Some(Fp8Gemm::load(gpu)?) } else { None },
+            fp8_fused: if std::env::var(FP8_FUSED_ENV).as_deref() != Ok("0") { Some(Fp8Gemm::load(gpu)?) } else { None },
         })
     }
 }
