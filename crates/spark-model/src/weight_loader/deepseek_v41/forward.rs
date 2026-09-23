@@ -234,6 +234,8 @@ pub struct GraphState {
     /// (engram layer, rows buffer `[MAX_T, 24, 256]` f32).
     pub pre_rows: Vec<(usize, DevicePtr)>,
     graphs: std::sync::Mutex<std::collections::HashMap<(u8, usize, u64), spark_runtime::gpu::GraphHandle>>,
+    /// Graphs captured so far (a replay never adds one).
+    pub captures: std::sync::atomic::AtomicUsize,
 }
 
 /// Rows a graphed pass may carry (Decode = 1, Verify = 1 + drafts).
@@ -313,7 +315,12 @@ impl V41Forward {
             pre_rows.push((*layer, p));
         }
         hook.enable_graph(dstart)?;
-        self.graph = Some(GraphState { dstart, pre_rows, graphs: std::sync::Mutex::new(std::collections::HashMap::new()) });
+        self.graph = Some(GraphState {
+            dstart,
+            pre_rows,
+            graphs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            captures: std::sync::atomic::AtomicUsize::new(0),
+        });
         Ok(())
     }
 
@@ -771,6 +778,7 @@ impl V41Forward {
                     body?;
                     let h = graph?;
                     g.graphs.lock().expect("graph cache poisoned").insert(key, h);
+                    g.captures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     h
                 };
                 gpu.launch_graph(h, stream)?;

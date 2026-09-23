@@ -407,6 +407,14 @@ fn run_model_path(
             println!("decode ours:   {got:?}");
             println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
             println!("decode: first {agree} identical");
+            let ph = ds.phase_ms.lock().expect("phase").clone();
+            if ph.len() > 2 {
+                let med = |k: usize| { let mut v: Vec<f64> = ph[1..].iter().map(|p| p[k]).collect(); v.sort_by(f64::total_cmp); v[v.len() / 2] };
+                println!("dspark phases ms (median, warm): draft {:.2}  verify+accept {:.2}  commit(rollback+seed) {:.2}", med(0), med(1), med(2));
+            }
+            if let Some(g) = &fwd.graph {
+                println!("graph captures: {}", g.captures.load(std::sync::atomic::Ordering::Relaxed));
+            }
             println!("DONE dsv41_forward path=model dspark");
             return Ok(());
         }
@@ -439,6 +447,9 @@ fn run_model_path(
                 "decode step ms (warm, n={}): median {:.2}  min {:.2}  max {:.2}  first {:.2}",
                 w.len(), w[w.len() / 2], w[0], w[w.len() - 1], steps_ms[0]
             );
+        }
+        if let Some(g) = &fwd.graph {
+            println!("graph captures: {} over {} decode steps", g.captures.load(std::sync::atomic::Ordering::Relaxed), got.len() - 1);
         }
         println!("decode ours:   {got:?}");
         println!("decode logits fnv: {:016x}", hashes.iter().fold(0u64, |a, h| a.rotate_left(7) ^ h));

@@ -90,6 +90,8 @@ pub struct Dspark {
     /// The NEXT draft's sampling (temperature, B uniforms in [0,1)), consumed by `draft`;
     /// None = greedy (argmax) drafts.
     sampling: std::sync::Mutex<Option<(f32, [f32; B])>>,
+    /// Per-step wall ms (draft, verify+accept, commit) when `DSV41_DSPARK_PHASES=1`.
+    pub phase_ms: std::sync::Mutex<Vec<[f64; 3]>>,
     _allocs: DeviceAllocs,
 }
 
@@ -149,6 +151,7 @@ impl Dspark {
             vocab: v,
             q: a(B * v * 4)?,
             sampling: std::sync::Mutex::new(None),
+            phase_ms: std::sync::Mutex::new(Vec::new()),
             _allocs: DeviceAllocs::unowned(),
         };
         let cidx: Vec<u8> = (0..B).flat_map(|_| (0..B as i64).flat_map(|j| j.to_le_bytes())).collect();
@@ -349,11 +352,27 @@ impl Dspark {
         force_accept_all: bool,
     ) -> Result<StepOut> {
         let pos = seq.len;
-        let (drafts, mut a, am) = self.propose_verify(ops, fwd, seq, tok, hook, core, main_moe, tap, logits)?;
+        let phases = std::env::var("DSV41_DSPARK_PHASES").as_deref() == Ok("1");
+        let t0 = std::time::Instant::now();
+        // (propose_verify's two readbacks already synchronize after the draft and after accept)
+        let drafts = self.draft(ops, fwd, tok, pos, tap)?;
+        let t1 = std::time::Instant::now();
+        let mut block_ids = Vec::with_capacity(T_VERIFY);
+        block_ids.push(tok);
+        block_ids.extend_from_slice(&drafts);
+        fwd.verify(ops, seq, &block_ids, hook, core, main_moe, tap, logits)?;
+        let (mut a, am) = self.accept(ops, logits)?;
+        let t2 = std::time::Instant::now();
         if force_accept_all {
             a = B;
         }
         self.commit(ops, fwd, seq, pos, a, hook)?;
+        if phases {
+            ops.gpu.synchronize(ops.stream)?;
+            let t3 = std::time::Instant::now();
+            let ms = |x: std::time::Instant, y: std::time::Instant| (y - x).as_secs_f64() * 1e3;
+            self.phase_ms.lock().expect("phase poisoned").push([ms(t0, t1), ms(t1, t2), ms(t2, t3)]);
+        }
         let mut emitted: Vec<u32> = drafts[..a].to_vec();
         emitted.push(if force_accept_all { am[B] } else { am[a] });
         Ok(StepOut { accepted: a, emitted })
