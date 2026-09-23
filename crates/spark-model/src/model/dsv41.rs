@@ -154,6 +154,13 @@ impl Dsv41Model {
         fwd.own_allocations(shared.clone());
         fwd.vision = load_vision(store, model_dir, dims.hidden, &shared)?;
         let lanes = build_lanes(store, config, gpu, kernels, &shared, &fwd, model_dir, max_seq, max_chunk)?;
+        // Whole-step CUDA graphs for Decode/Verify passes, segmented around the engram gathers
+        // (measured full model: -3.21 ms/step, bit-identical to eager over 63 steps; see
+        // V41Forward::step_graphed). `ATLAS_DSV41_GRAPH=0` = eager.
+        if std::env::var("ATLAS_DSV41_GRAPH").as_deref() != Ok("0") {
+            fwd.enable_graphs(gpu, lanes.hook.as_ref())?;
+            tracing::info!("DeepSeek-V4.1: decode CUDA graphs ON (segmented; ATLAS_DSV41_GRAPH=0 for eager)");
+        }
         let mode = match std::env::var("ATLAS_DSV41_PREFILL").ok().as_deref() {
             None | Some("replay") => PrefillMode::Replay,
             Some("full") => {
