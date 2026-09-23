@@ -38,7 +38,7 @@ echo "memory plan: arena 71.67 + dense store 9.99 + fp32 routers 0.31 + scratch/
 
 export ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=deepseek-v4.1 ATLAS_TARGET_QUANT=cb3
 export ATLAS_DSV41_MODEL_DIR=$MODEL ATLAS_DSV41_CHUNK=512
-"$BIN" serve --model-from-path "$MODEL" --port "$PORT" --max-seq-len 8192 --max-batch-size 1 \
+"$BIN" serve --model-from-path "$MODEL" --port "$PORT" --max-seq-len "${SERVE_MAX_SEQ:-8192}" --max-batch-size 1 \
   --kv-cache-dtype bf16 > "$REQ/server.log" 2>&1 &
 srv=$!
 echo "server pid $srv"
