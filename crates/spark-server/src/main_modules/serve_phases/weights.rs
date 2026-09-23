@@ -34,6 +34,19 @@ pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
     None
 }
 
+/// Per-model "never upload" filter for the serving store. DeepSeek-V4.1's engram tables
+/// (~190 GB) are gathered from NVMe and must not be loaded — see
+/// `spark_model::weight_loader::deepseek_v41::skip_tensor_for_serving`.
+fn serving_skip(config: &ModelConfig) -> Option<spark_runtime::weights::TensorSkipFn> {
+    if config.model_type == "deepseek_v41" {
+        Some(std::sync::Arc::new(
+            spark_model::weight_loader::deepseek_v41::skip_tensor_for_serving,
+        ))
+    } else {
+        None
+    }
+}
+
 /// NVFP4 scale group size used by `QuantizedWeight`
 /// (`spark-model/src/weight_map/quantized.rs`).
 const NVFP4_GROUP: usize = 16;
@@ -292,6 +305,7 @@ pub(crate) fn load_weight_store(
             };
             loader.peak_memory_multiplier = mult;
             loader.construction_overhead_bytes = overhead.total();
+            loader.extra_skip = serving_skip(config);
             loader
                 .load(model_dir, gpu, oom_reserve_bytes)
                 .context("Failed to load model weights (fast loader)")?
@@ -308,6 +322,7 @@ pub(crate) fn load_weight_store(
         };
         loader.peak_memory_multiplier = mult;
         loader.construction_overhead_bytes = overhead.total();
+        loader.extra_skip = serving_skip(config);
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?

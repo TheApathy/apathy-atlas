@@ -91,23 +91,25 @@ fn check_embedding_and_head(store: &WeightStore) -> Result<()> {
     // Scan discovery-based so future families that adopt yet-another
     // spelling only need to appear as a new suffix here — no enumerated
     // prefix list to maintain.
+    //   `embed.weight`           — DeepSeek-V4 / V4.1 (bare, no prefix)
     const EMBED_SUFFIXES: &[&str] = &[".embed_tokens.weight", ".embeddings.weight"];
+    const EMBED_EXACTS: &[&str] = &["tok_embeddings.weight", "embed_tokens.weight", "embed.weight"];
     let has_embed = store
         .names()
-        .any(|n| n == "tok_embeddings.weight" || EMBED_SUFFIXES.iter().any(|s| n.ends_with(s)));
+        .any(|n| EMBED_EXACTS.contains(&n) || EMBED_SUFFIXES.iter().any(|s| n.ends_with(s)));
     if !has_embed {
         bail!(
-            "Pre-flight: no embedding tensor found (checked suffixes: \
-             {EMBED_SUFFIXES:?} and bare `tok_embeddings.weight`). \
-             Is this a language-model checkpoint?"
+            "Pre-flight: no embedding tensor found (checked exact: {EMBED_EXACTS:?}, \
+             suffixes: {EMBED_SUFFIXES:?}). Is this a language-model checkpoint?"
         );
     }
     // LM head is optional (tied embeddings skip it). Scan suffixes:
     //   `lm_head.weight`       — HF / Qwen / Gemma / MiniMax
     //   `output.weight`        — Mistral consolidated
+    //   `head.weight`          — DeepSeek-V4 / V4.1
     let has_head = store
         .names()
-        .any(|n| n.ends_with("lm_head.weight") || n == "output.weight");
+        .any(|n| n.ends_with("lm_head.weight") || n == "output.weight" || n == "head.weight");
     if !has_head {
         tracing::info!("Pre-flight: no dedicated LM head tensor; assuming tied embeddings.");
     }
@@ -296,4 +298,25 @@ fn check_correction_bias_shape(store: &WeightStore, config: &ModelConfig) -> Res
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_embedding_and_head;
+    use spark_runtime::gpu::DevicePtr;
+    use spark_runtime::weights::{WeightDtype, WeightStore, WeightTensor};
+
+    fn store(names: &[&str]) -> WeightStore {
+        let t = || WeightTensor { ptr: DevicePtr(0x1000), shape: vec![1], dtype: WeightDtype::BF16 };
+        WeightStore::from_map(names.iter().map(|n| (n.to_string(), t())).collect())
+    }
+
+    /// DeepSeek-V4 / V4.1 name their embedding `embed.weight` and head `head.weight`, bare.
+    #[test]
+    fn deepseek_bare_embed_is_accepted() {
+        assert!(check_embedding_and_head(&store(&["embed.weight", "head.weight", "layers.0.x"])).is_ok());
+        assert!(check_embedding_and_head(&store(&["model.embed_tokens.weight"])).is_ok());
+        // CONTROL: no embedding at all is still refused.
+        assert!(check_embedding_and_head(&store(&["head.weight", "layers.0.x"])).is_err());
+    }
 }

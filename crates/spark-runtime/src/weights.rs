@@ -68,6 +68,8 @@ impl WeightDtype {
             safetensors::Dtype::I64 => Ok(Self::Int64),
             safetensors::Dtype::F8_E4M3 => Ok(Self::FP8E4M3),
             safetensors::Dtype::F8_E8M0 => Ok(Self::FP8E8M0),
+            // Raw 1-byte container (DeepSeek-V4.1's I8-packed DSpark experts); see fast_weights.
+            safetensors::Dtype::I8 => Ok(Self::UInt8),
             other => bail!("Unsupported safetensors dtype: {other:?}"),
         }
     }

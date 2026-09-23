@@ -10,7 +10,7 @@
 
 use spark_runtime::fast_weights::FastSafetensorsLoader;
 use spark_runtime::gpu::mock::MockGpuBackend;
-use spark_runtime::weights::{SafetensorsLoader, WeightLoader};
+use spark_runtime::weights::{SafetensorsLoader, WeightDtype, WeightLoader};
 use std::io::Write;
 
 /// Build a minimal `model.safetensors` with two BF16 tensors and one U8 tensor.
@@ -72,6 +72,74 @@ fn fast_and_mmap_loaders_agree() {
         assert_eq!(bb, bn, "byte mismatch for {name}");
     }
 
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// `extra_skip` must drop a tensor from BOTH the pre-flight size sum and the upload.
+/// Pre-flight: the mock reports 120 GiB free; the reserve leaves 100 bytes of budget. All three
+/// tensors (88 bytes x 1.3) do not fit; without the 64-byte "a" (24 x 1.3) they do. CONTROL: the
+/// same loader without the skip must count "a" and fail the pre-flight.
+#[test]
+fn extra_skip_excludes_tensors_from_preflight_and_upload() {
+    let tmp = tempdir_like();
+    write_test_safetensors(&tmp);
+    let reserve = 120 * 1024 * 1024 * 1024 - 100;
+    let loader = |skip: bool| {
+        let mut l = FastSafetensorsLoader::new();
+        l.try_direct_io = false;
+        l.peak_memory_multiplier = Some(1.3);
+        if skip {
+            l.extra_skip = Some(std::sync::Arc::new(|name: &str| name == "a"));
+        }
+        l
+    };
+
+    let gpu = MockGpuBackend::new();
+    let store = loader(true).load(&tmp, &gpu, reserve).expect("skip fits the pre-flight");
+    assert_eq!(store.len(), 2);
+    assert!(store.get("a").is_err(), "skipped tensor was uploaded");
+    assert_eq!(gpu.alloc_count(), 2, "an allocation was made for the skipped tensor");
+
+    let err = loader(false).load(&tmp, &MockGpuBackend::new(), reserve).err().expect(
+        "CONTROL: without the skip the 88-byte load must exceed the 100-byte budget at 1.3x",
+    );
+    assert!(format!("{err:#}").contains("OOM pre-flight"), "unexpected error: {err:#}");
+
+    let all = loader(false).load(&tmp, &MockGpuBackend::new(), 0).expect("no reserve");
+    assert_eq!(all.len(), 3);
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// DeepSeek-V4.1's checkpoint dtypes beyond the basic set: F8_E8M0 (UE8M0 block scales) and I8
+/// (packed DSpark experts). Both loaders must accept them and agree byte for byte.
+#[test]
+fn fast_and_mmap_loaders_accept_e8m0_and_i8() {
+    let tmp = tempdir_like();
+    let s_bytes: Vec<u8> = (0..8).map(|i| 120 + i as u8).collect();
+    let p_bytes: Vec<u8> = (0..16).map(|i| (i * 17) as u8).collect();
+    let header = serde_json::json!({
+        "w.scale": { "dtype": "F8_E8M0", "shape": [2, 4], "data_offsets": [0, 8] },
+        "mtp.e": { "dtype": "I8", "shape": [16], "data_offsets": [8, 24] },
+    });
+    let header_bytes = serde_json::to_vec(&header).unwrap();
+    let mut f = std::fs::File::create(tmp.join("model.safetensors")).unwrap();
+    f.write_all(&(header_bytes.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(&header_bytes).unwrap();
+    f.write_all(&s_bytes).unwrap();
+    f.write_all(&p_bytes).unwrap();
+    f.sync_all().unwrap();
+
+    let (gb, gf) = (MockGpuBackend::new(), MockGpuBackend::new());
+    let base = SafetensorsLoader::new().load(&tmp, &gb, 0).expect("baseline load");
+    let mut fast = FastSafetensorsLoader::new();
+    fast.try_direct_io = false;
+    let new = fast.load(&tmp, &gf, 0).expect("fast load");
+    for (name, dtype) in [("w.scale", WeightDtype::FP8E8M0), ("mtp.e", WeightDtype::UInt8)] {
+        let (wb, wn) = (base.get(name).unwrap(), new.get(name).unwrap());
+        assert_eq!(wb.dtype, dtype, "{name}");
+        assert_eq!(wn.dtype, dtype, "{name}");
+        assert_eq!(gb.read_alloc(wb.ptr).unwrap(), gf.read_alloc(wn.ptr).unwrap(), "{name}");
+    }
     std::fs::remove_dir_all(&tmp).ok();
 }
 
