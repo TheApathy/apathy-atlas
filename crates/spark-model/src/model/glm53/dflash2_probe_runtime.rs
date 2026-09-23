@@ -239,7 +239,7 @@ impl Glm53Dflash2Runtime {
                 .as_mut()
                 .context("missing reference host staging")?;
             host.anchor = anchor.to_le_bytes();
-            gpu.copy_h2d_async(&host.anchor, self.anchor, stream)?;
+            gpu.copy_h2d_group_on_stream(&[spark_runtime::gpu::HostToDeviceCopy::new(&host.anchor, self.anchor)], stream)?;
             gpu.synchronize(stream)?;
             // CRITICAL: the old full-context projections and attention branch,
             // not the cached adapter with a synthetic empty retained prefix.

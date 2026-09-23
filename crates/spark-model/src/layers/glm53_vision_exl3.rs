@@ -108,7 +108,7 @@ pub fn forward_glm53_exl3_image(
         let pixels_f32 = allocations.alloc(pixels_len * 4)?;
         let pixel_bytes =
             unsafe { std::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), pixels.len() * 4) };
-        gpu.copy_h2d_async(pixel_bytes, pixels_f32.ptr, stream)?;
+        gpu.copy_h2d_group_on_stream(&[spark_runtime::gpu::HostToDeviceCopy::new(pixel_bytes, pixels_f32.ptr)], stream)?;
 
         let hidden = allocations.alloc(bytes(plan.rows, GLM53_VISION_HIDDEN)?)?;
         let norm = allocations.alloc(bytes(plan.rows, GLM53_VISION_HIDDEN)?)?;

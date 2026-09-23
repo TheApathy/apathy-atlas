@@ -381,13 +381,6 @@ pub trait GpuBackend: Send + Sync {
 
     fn synchronize(&self, stream: u64) -> Result<()>;
 
-    /// Async host-to-device copy (no stream synchronization). The caller must
-    /// keep `src` alive until the copy completes on `stream`. Default: the
-    /// synchronous copy.
-    fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, _stream: u64) -> Result<()> {
-        self.copy_h2d(src, dst)
-    }
-
     /// Get the default stream handle.
     fn default_stream(&self) -> u64;
 

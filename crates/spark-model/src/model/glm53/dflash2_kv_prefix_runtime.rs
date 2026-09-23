@@ -137,7 +137,7 @@ impl Glm53Dflash2Runtime {
                 .as_mut()
                 .context("missing owned proposal staging")?;
             host.anchor = anchor.to_le_bytes();
-            gpu.copy_h2d_async(&host.anchor, self.anchor, stream)?;
+            gpu.copy_h2d_group_on_stream(&[spark_runtime::gpu::HostToDeviceCopy::new(&host.anchor, self.anchor)], stream)?;
             gpu.synchronize(stream)?;
             let (path, status) = self.enqueue_proposal_with_projection(
                 target,

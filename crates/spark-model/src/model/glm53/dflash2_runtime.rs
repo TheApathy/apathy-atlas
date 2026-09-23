@@ -372,7 +372,7 @@ impl Glm53Dflash2Runtime {
 
     fn stage_anchor(&self, gpu: &dyn GpuBackend, anchor: u32, stream: u64) -> Result<()> {
         let bytes = anchor.to_le_bytes();
-        gpu.copy_h2d_async(&bytes, self.anchor, stream)?;
+        gpu.copy_h2d_group_on_stream(&[spark_runtime::gpu::HostToDeviceCopy::new(&bytes, self.anchor)], stream)?;
         gpu.synchronize(stream)
     }
 

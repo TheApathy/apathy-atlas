@@ -448,16 +448,6 @@ impl GpuBackend for AtlasCudaBackend {
         rc != 0 || status != 0
     }
 
-    fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, stream: u64) -> Result<()> {
-        let status = unsafe {
-            super::cuMemcpyHtoDAsync_v2(dst.0, src.as_ptr() as *const c_void, src.len(), stream)
-        };
-        if status != 0 {
-            bail!("cuMemcpyHtoDAsync_v2 failed: status {status}");
-        }
-        Ok(())
-    }
-
     fn copy_d2d_async(
         &self,
         src: DevicePtr,
