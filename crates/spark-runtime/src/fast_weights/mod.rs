@@ -428,6 +428,12 @@ fn load_shard_fast(
         let ptr = match gpu.alloc(meta.len) {
             Ok(p) => {
                 load_trace!("copier: #{idx} alloc done ({:?}), h2d start", t_tensor.elapsed());
+                if load_trace_enabled() {
+                    // Split copy_h2d's two driver calls apart when tracing: its
+                    // leading cuStreamSynchronize and the cuMemcpyHtoD itself.
+                    gpu.synchronize(gpu.default_stream())?;
+                    load_trace!("copier: #{idx} stream sync done ({:?}), memcpy start", t_tensor.elapsed());
+                }
                 gpu.copy_h2d(src, p)?;
                 load_trace!("copier: #{idx} h2d done ({:?})", t_tensor.elapsed());
                 p
