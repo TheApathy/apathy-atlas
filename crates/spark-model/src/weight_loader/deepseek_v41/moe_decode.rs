@@ -298,6 +298,20 @@ impl MoeDecode {
             .block([256, 1, 1])
             .arg_ptr(self.down)
             .arg_ptr(out)
-            .launch(stream)
+            .launch(stream)?;
+        if t > 1 && groups_log() {
+            // Diagnostic (synchronous): how many DISTINCT experts this multi-row pass read.
+            gpu.synchronize(stream)?;
+            let mut n = [0u8; 4];
+            gpu.copy_d2h(self.groups, &mut n)?;
+            eprintln!("moe_groups t={t} picks={} distinct={}", t * TOP_K, i32::from_le_bytes(n));
+        }
+        Ok(())
     }
+}
+
+/// `ATLAS_DSV41_MOE_GROUPS_LOG=1`: print the distinct-expert count of every multi-row MoE pass.
+fn groups_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_DSV41_MOE_GROUPS_LOG").as_deref() == Ok("1"))
 }

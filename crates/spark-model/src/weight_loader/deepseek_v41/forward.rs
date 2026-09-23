@@ -236,6 +236,21 @@ pub struct GraphState {
     graphs: std::sync::Mutex<std::collections::HashMap<(u8, usize, u64), spark_runtime::gpu::GraphHandle>>,
     /// Graphs captured so far (a replay never adds one).
     pub captures: std::sync::atomic::AtomicUsize,
+    /// Destroys every instantiated graph on drop (TUI model swap), when the forward owns its
+    /// allocations (served model); the driver leaves this None.
+    owner: Option<super::device_allocs::SharedGpu>,
+}
+
+impl Drop for GraphState {
+    fn drop(&mut self) {
+        let Some(gpu) = &self.owner else { return };
+        let _ = gpu.bind_to_thread();
+        for (_, h) in self.graphs.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default() {
+            if let Err(e) = gpu.destroy_graph(h) {
+                tracing::warn!("GraphState drop: destroying a decode graph failed: {e}");
+            }
+        }
+    }
 }
 
 /// Rows a graphed pass may carry (Decode = 1, Verify = 1 + drafts).
@@ -320,6 +335,7 @@ impl V41Forward {
             pre_rows,
             graphs: std::sync::Mutex::new(std::collections::HashMap::new()),
             captures: std::sync::atomic::AtomicUsize::new(0),
+            owner: self.allocs.owner(),
         });
         Ok(())
     }
