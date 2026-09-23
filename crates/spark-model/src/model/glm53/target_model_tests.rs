@@ -10,9 +10,30 @@ fn admission_refuses_by_default_and_names_both_gates() {
     if Glm53Model::bringup_escape_set() {
         panic!("{GLM53_BRINGUP_ENV} is set in the test environment; unset it");
     }
-    let refusal = format!("{:#}", Glm53Model::admit().unwrap_err());
-    assert!(refusal.contains("admission is closed"), "{refusal}");
-    assert!(refusal.contains(GLM53_BRINGUP_ENV), "{refusal}");
+    for scope in [
+        Glm53AdmissionScope::GgufTargetOnly,
+        Glm53AdmissionScope::Speculative,
+    ] {
+        let refusal = format!("{:#}", Glm53Model::admit(scope).unwrap_err());
+        assert!(refusal.contains("admission is closed"), "{refusal}");
+        assert!(refusal.contains(GLM53_BRINGUP_ENV), "{refusal}");
+        assert!(refusal.contains("capabilities are incomplete"), "{refusal}");
+    }
+}
+
+/// EXL3 target-only admission follows its recorded evidence and nothing else;
+/// speculation never rides on it.
+#[test]
+fn exl3_target_only_admission_follows_the_recorded_evidence() {
+    if Glm53Model::bringup_escape_set() {
+        panic!("{GLM53_BRINGUP_ENV} is set in the test environment; unset it");
+    }
+    let evidence_ok = Glm53TargetOnlyAdmission::current().validate().is_ok();
+    assert_eq!(
+        Glm53Model::admit(Glm53AdmissionScope::Exl3TargetOnly).is_ok(),
+        evidence_ok
+    );
+    assert!(Glm53Model::admit(Glm53AdmissionScope::Speculative).is_err());
 }
 
 /// Runtime allocation must be accounted, not discovered at `alloc` time.

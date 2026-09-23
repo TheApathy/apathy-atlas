@@ -1764,7 +1764,8 @@ impl Glm53DsaAttentionKernels {
         // nonce gate. That is a walk-level restructure; until it lands, the
         // bring-up path publishes the single current row directly. This is the
         // second documented shortcut past the receipt machinery (the first is
-        // `commit_accepted`) and is unreachable with admission closed.
+        // `commit_accepted`). It is admitted only for non-speculative EXL3
+        // serving, on the reference evidence in `target_only_admission`.
         {
             let row = u64::from(geometry.position)
                 .checked_mul(u64::from(LATENT) * 2)
