@@ -114,6 +114,8 @@ pub struct Dsv41Model {
     spec_stats: Mutex<(usize, usize)>,
     /// The input token and drafts of an uncommitted `spec_verify`.
     spec_pending: Mutex<Option<(u32, Vec<u32>)>>,
+    /// Whether the last spec_verify drew SAMPLED drafts (its q rows are valid).
+    spec_sampled: Mutex<bool>,
 }
 
 // SAFETY-adjacent: every field is either immutable after construction, behind a Mutex, or a
@@ -192,6 +194,7 @@ impl Dsv41Model {
             dspark,
             spec_stats: Mutex::new((0, 0)),
             spec_pending: Mutex::new(None),
+            spec_sampled: Mutex::new(false),
         })
     }
 
@@ -348,7 +351,7 @@ impl Model for Dsv41Model {
         self.dspark.is_some()
     }
 
-    fn spec_verify(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
+    fn spec_verify(&self, token: u32, seq: &mut SequenceState, sampling: Option<&crate::traits::SpecSampling>, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
         let ds = self.dspark.as_ref().context("dsv41 spec_verify: DSpark is not loaded")?;
         let ops = self.ops();
         let l = &self.lanes;
@@ -359,6 +362,18 @@ impl Model for Dsv41Model {
                 return Ok(None);
             }
             let ds = ds.lock().expect("dspark poisoned");
+            // Sampled drafts (T > 0): q_i = softmax(markov_logits_i / T) at the caller's uniforms.
+            let draft_sampling = match sampling {
+                Some(sp) => {
+                    ensure!(sp.draft_uniforms.len() == crate::weight_loader::deepseek_v41::dspark::B, "dsv41 spec_verify: {} draft uniforms for {} drafts", sp.draft_uniforms.len(), crate::weight_loader::deepseek_v41::dspark::B);
+                    let mut u = [0f32; crate::weight_loader::deepseek_v41::dspark::B];
+                    u.copy_from_slice(&sp.draft_uniforms);
+                    Some((sp.temperature, u))
+                }
+                None => None,
+            };
+            *self.spec_sampled.lock().expect("dsv41 spec sampled poisoned") = draft_sampling.as_ref().is_some_and(|(t, _)| *t > 0.0);
+            ds.set_draft_sampling(draft_sampling);
             let (drafts, _a, am) = ds.propose_verify(&ops, &self.fwd, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits)?;
             Ok(Some((drafts, am)))
         })?;
@@ -366,6 +381,14 @@ impl Model for Dsv41Model {
             *self.spec_pending.lock().expect("dsv41 spec pending poisoned") = Some((token, drafts.clone()));
         }
         Ok(r)
+    }
+
+    fn spec_draft_probs(&self) -> Option<DevicePtr> {
+        let sampled = *self.spec_sampled.lock().expect("dsv41 spec sampled poisoned");
+        match (&self.dspark, sampled) {
+            (Some(ds), true) => Some(ds.lock().expect("dspark poisoned").draft_probs()),
+            _ => None,
+        }
     }
 
     fn spec_commit(&self, seq: &mut SequenceState, accepted: usize, _stream: u64) -> Result<()> {

@@ -49,7 +49,7 @@ pub fn step_internal_spec(
         a.finished = true;
         return;
     }
-    let (drafts, argmax) = match model.spec_verify(a.last_token, &mut a.seq, 0) {
+    let (drafts, argmax) = match model.spec_verify(a.last_token, &mut a.seq, None, 0) {
         Ok(Some(r)) => r,
         Ok(None) => {
             step_decode_only(
