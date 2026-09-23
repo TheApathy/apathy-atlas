@@ -41,8 +41,8 @@ use super::{
     AtlasCudaBackend, cuCtxSetCurrent, cuEventCreate, cuEventDestroy_v2, cuEventRecord,
     cuGraphDestroy, cuGraphExecDestroy, cuGraphInstantiateWithFlags, cuGraphLaunch, cuMemAlloc_v2,
     cuMemAllocHost_v2, cuMemAllocManaged, cuMemFree_v2, cuMemFreeHost, cuMemGetInfo_v2,
-    cuMemcpyDtoDAsync_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyHtoDAsync_v2, cuMemsetD8Async,
-    cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture, cuStreamSynchronize,
+    cuMemcpyDtoDAsync_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyHtoDAsync_v2, cuMemsetD32Async,
+    cuMemsetD8Async, cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture, cuStreamSynchronize,
     cuStreamWaitEvent,
 };
 use crate::gpu::{
@@ -511,6 +511,14 @@ impl GpuBackend for AtlasCudaBackend {
         let status = unsafe { cuMemsetD8Async(ptr.0, value, bytes, stream) };
         if status != 0 {
             bail!("cuMemsetD8Async failed: status {status}");
+        }
+        Ok(())
+    }
+
+    fn memset_u32_async(&self, ptr: DevicePtr, value: u32, count: usize, stream: u64) -> Result<()> {
+        let status = unsafe { cuMemsetD32Async(ptr.0, value, count, stream) };
+        if status != 0 {
+            bail!("cuMemsetD32Async failed: status {status}");
         }
         Ok(())
     }
