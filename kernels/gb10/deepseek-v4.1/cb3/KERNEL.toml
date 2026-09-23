@@ -3,7 +3,22 @@
 # multiply and no add, so it is unaffected; the flag is here so the SHARED
 # kernels this target inherits from `kernels/gb10/common/` compile with the
 # same numerics as the other DeepSeek target rather than silently diverging.
-extra_nvcc_flags = ["--fmad=false"]
+#
+# `--atlas-ieee-math` (team-lead, 2026-09-23): all-models' build_target.rs
+# passes --use_fast_math to every target unless it opts out with this
+# sentinel. The D lineage DeepSeek-V4.1 was built and gated on compiles
+# IEEE (no ftz, precise div/sqrt/exp) -- every dsv41 byte-identity/KL/oracle
+# result in this port assumes that. Without the sentinel here, dsv41/port
+# would silently compile with fast math and diverge from the numbers every
+# gate in this effort is checked against. (D itself never needs this flag:
+# its build_target.rs never adds --use_fast_math at all -- confirmed by
+# code trace, not just by the flag's absence there.)
+#
+# `-DTQ_PLUS_SIGNS`: per-target KERNEL.toml does not merge the common
+# KERNEL.toml's `extra_nvcc_flags` (A's build_target.rs takes the more
+# specific KERNEL.toml as-is), so this must be repeated here for the SHARED
+# common/ kernels this target compiles against the same sign convention.
+extra_nvcc_flags = ["--fmad=false", "--atlas-ieee-math", "-DTQ_PLUS_SIGNS"]
 
 # Module-name overrides. Unlisted `.cu` files use their file stem, so
 # `cb3_reconstruct_bf16.cu` is reachable as module "cb3_reconstruct_bf16"
