@@ -168,11 +168,130 @@ fn validate_completion_input(req: &CompletionRequest) -> Result<(), Response> {
     Ok(())
 }
 
+/// The prompt ids for a completion request.
+///
+/// Exact-token prompts -- `prompt_token_ids`, or `prompt` given as token ids /
+/// token-id batches -- are prefilled verbatim: no tokenization, no think-prefix.
+/// (`prompt_token_ids` is what the DFlash hidden-capture harness uses so its
+/// hiddens align with the trainer's own input_ids.) They must be non-empty and
+/// inside the vocabulary. Text is tokenized; for thinking models without a
+/// `</think>` it gets `<think></think>\n\n` prepended to suppress think-tag
+/// leakage (the model expects it in raw completions mode), and for
+/// deepseek_v41 it is tokenized as given with BOS prepended, as the Python
+/// server does.
+fn resolve_prompt_tokens(
+    req: &CompletionRequest,
+    tokenizer: &crate::tokenizer::ChatTokenizer,
+    dsv41: bool,
+) -> Result<Vec<u32>, String> {
+    use crate::openai::CompletionPrompt;
+    let exact = match (&req.prompt_token_ids, &req.prompt) {
+        (Some(ids), _) => Some(("prompt_token_ids", ids)),
+        (None, CompletionPrompt::Tokens(ids)) => Some(("prompt", ids)),
+        (None, CompletionPrompt::Text(_)) => None,
+    };
+    if let Some((field, ids)) = exact {
+        if ids.is_empty() {
+            return Err(format!("{field} provided but empty"));
+        }
+        let vocab = tokenizer.inner().get_vocab_size(true);
+        if let Some(bad) = ids.iter().find(|&&t| t as usize >= vocab) {
+            return Err(format!(
+                "{field} contains token id {bad}, outside the vocabulary (size {vocab})"
+            ));
+        }
+        return Ok(ids.clone());
+    }
+    let CompletionPrompt::Text(text) = &req.prompt else {
+        unreachable!("token prompts returned above")
+    };
+    if dsv41 {
+        return tokenizer
+            .encode(text)
+            .map(|t| with_bos(t, tokenizer.inner().token_to_id(crate::dsv41::encoding::BOS)))
+            .map_err(|e| format!("Tokenization error: {e}"));
+    }
+    let raw_prompt = if tokenizer.supports_thinking() && !text.contains("</think>") {
+        format!("<think></think>\n\n{text}")
+    } else {
+        text.clone()
+    };
+    tokenizer
+        .encode(&raw_prompt)
+        .map_err(|e| format!("Tokenization error: {e}"))
+}
+
 /// Prepend `bos` unless the ids already start with it (app.py `add_bos`).
 fn with_bos(ids: Vec<u32>, bos: Option<u32>) -> Vec<u32> {
     match bos {
         Some(bos) if ids.first() != Some(&bos) => std::iter::once(bos).chain(ids).collect(),
         _ => ids,
+    }
+}
+
+#[cfg(test)]
+mod prompt_token_tests {
+    use super::resolve_prompt_tokens;
+    use crate::openai::CompletionRequest;
+
+    fn tokenizer() -> crate::tokenizer::ChatTokenizer {
+        crate::tokenizer::ChatTokenizer::from_model_dir(
+            std::path::Path::new("/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K"),
+            1,
+            true,
+            "deepseek_v41",
+            None,
+        )
+        .expect("checkpoint tokenizer (a missing tokenizer is a failure, not a skip)")
+    }
+
+    fn req(v: serde_json::Value) -> CompletionRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn token_prompts_prefill_exactly_those_ids() {
+        let tok = tokenizer();
+        for dsv41 in [false, true] {
+            let ids = resolve_prompt_tokens(&req(serde_json::json!({"prompt": [100, 200, 300]})), &tok, dsv41);
+            assert_eq!(ids, Ok(vec![100, 200, 300]), "dsv41={dsv41}");
+            let ids = resolve_prompt_tokens(
+                &req(serde_json::json!({"prompt": [[100, 200], [300]]})),
+                &tok,
+                dsv41,
+            );
+            assert_eq!(ids, Ok(vec![100, 200, 300]), "batches, dsv41={dsv41}");
+        }
+        // prompt_token_ids still wins over prompt
+        let ids = resolve_prompt_tokens(
+            &req(serde_json::json!({"prompt": [1, 2], "prompt_token_ids": [7, 8]})),
+            &tok,
+            false,
+        );
+        assert_eq!(ids, Ok(vec![7, 8]));
+        // CONTROL: the same ids as text go through the tokenizer (and, for a
+        // thinking model, the think prefix) -- they are not those ids.
+        let text = resolve_prompt_tokens(&req(serde_json::json!({"prompt": "100 200 300"})), &tok, false)
+            .unwrap();
+        assert_ne!(text, vec![100, 200, 300]);
+        assert_eq!(text, tok.encode("<think></think>\n\n100 200 300").unwrap());
+    }
+
+    #[test]
+    fn out_of_vocab_and_empty_token_prompts_are_refused() {
+        let tok = tokenizer();
+        let vocab = tok.inner().get_vocab_size(true) as u32;
+        let last = resolve_prompt_tokens(&req(serde_json::json!({"prompt": [vocab - 1]})), &tok, false);
+        assert_eq!(last, Ok(vec![vocab - 1]));
+        let err = resolve_prompt_tokens(&req(serde_json::json!({"prompt": [5, vocab]})), &tok, false)
+            .unwrap_err();
+        assert!(err.contains(&format!("token id {vocab}")) && err.contains("outside the vocabulary"), "{err}");
+        let err = resolve_prompt_tokens(&req(serde_json::json!({"prompt_token_ids": [vocab + 7]})), &tok, false)
+            .unwrap_err();
+        assert!(err.starts_with("prompt_token_ids contains token id"), "{err}");
+        let err = resolve_prompt_tokens(&req(serde_json::json!({"prompt_token_ids": []})), &tok, false)
+            .unwrap_err();
+        assert!(err.contains("empty"), "{err}");
     }
 }
 
@@ -205,52 +324,13 @@ pub async fn completions(
     if let Err(response) = validate_completion_input(&req) {
         return response;
     }
-    // For thinking models, prepend <think></think>\n\n to suppress think-tag
-    // leakage in raw completions mode (the model expects this prefix after
-    // training). Users who construct their own think tokens can include them
-    // in the prompt — we only add the prefix if the prompt doesn't already
-    // contain a </think> token.
-    // Exact-token bypass: when `prompt_token_ids` is provided, prefill those
-    // tokens verbatim (no tokenization, no think-prefix). Used by the DFlash
-    // hidden-capture harness so captured hiddens align to the trainer's own
-    // input_ids. Otherwise tokenize the text prompt as usual.
-    let prompt_tokens = if let Some(ref ids) = req.prompt_token_ids {
-        if ids.is_empty() {
-            return openai_error_response(
-                StatusCode::BAD_REQUEST,
-                "prompt_token_ids provided but empty".to_string(),
-            );
-        }
-        ids.clone()
-    } else if state.dsv41 {
-        // deepseek_v41: the Python server tokenizes the text as given (no
-        // think prefix) and prepends BOS unless the prompt already starts with it.
-        match state.tokenizer.encode(&req.prompt) {
-            Ok(t) => with_bos(t, state.tokenizer.inner().token_to_id(crate::dsv41::encoding::BOS)),
-            Err(e) => {
-                return openai_error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Tokenization error: {e}"),
-                );
+    let prompt_tokens =
+        match resolve_prompt_tokens(&req, &state.tokenizer, state.dsv41) {
+            Ok(ids) => ids,
+            Err(message) => {
+                return openai_error_response(StatusCode::BAD_REQUEST, message);
             }
-        }
-    } else {
-        let raw_prompt = if state.tokenizer.supports_thinking() && !req.prompt.contains("</think>")
-        {
-            format!("<think></think>\n\n{}", req.prompt)
-        } else {
-            req.prompt.clone()
         };
-        match state.tokenizer.encode(&raw_prompt) {
-            Ok(t) => t,
-            Err(e) => {
-                return openai_error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Tokenization error: {e}"),
-                );
-            }
-        }
-    };
 
     let prompt_len = prompt_tokens.len();
     if super::context_budget::admitted_total(prompt_len, req.max_tokens, state.max_seq_len)
