@@ -107,11 +107,15 @@ impl MaskGenerator<'_> {
                 }
                 let token = &sorted[i as usize].1;
 
-                // Speculative fast-accept path.
+                // Speculative fast-accept path. Deliberately does NOT update
+                // `prev_token`: the token never touches the parser, and
+                // `scan_one_token`'s LCP reuse is only sound when `prev_token`
+                // is the last token actually walked (upstream fix). Setting it
+                // here let a later merged token (e.g. "\n</arg_value>") reuse
+                // a prefix the parser never consumed and be wrongly masked.
                 if speculative
                     && self.try_speculative_accept(token, i, &spec_mask, definite_bitset.as_deref())
                 {
-                    prev_token = Some(token.clone());
                     i += 1;
                     continue;
                 }

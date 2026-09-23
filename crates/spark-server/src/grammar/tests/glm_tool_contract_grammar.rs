@@ -282,7 +282,6 @@ fn glm_tool_contract_grammar_auto_rejects_foreign_wire_after_native_trigger() {
 }
 
 #[test]
-#[ignore = "all-models xgrammar lacks upstream's intervals.rs fast-accept prev_token fix: the merged token \"\\n</arg_value>\" is wrongly masked after a fast-accepted \"\\n\" neighbour (crates/xgrammar, out of scope for this port)"]
 fn glm_tool_contract_grammar_ascii_atomic_and_cross_boundary_tokens_agree() {
     let (compiled, size) = compile(&tools(), false);
     let input = wire("inspect", " x\n");
