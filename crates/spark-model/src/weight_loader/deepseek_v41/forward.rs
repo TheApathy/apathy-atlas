@@ -708,12 +708,6 @@ impl V41Forward {
         let (gpu, stream) = (ops.gpu, ops.stream);
         // ---- host work, outside the graph
         let hashes = seq.hash.forward(ids, start, None)?;
-        for (layer, buf) in &g.pre_rows {
-            let li = if *layer == 1 { 0 } else { 1 };
-            let rows: Vec<i64> = (0..t).flat_map(|tok| hashes[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
-            let gather = &self.engram.iter().find(|(el, _)| el == layer).context("no engram gather")?.1;
-            gather.gather_rows_gpu(&rows, t, *buf, gpu, stream)?;
-        }
         let dead: Vec<u8> = engram_dead_heads(ids).into_iter().map(u8::from).collect();
         gpu.copy_h2d_async(&dead, self.scratch.engram_dead, stream)?;
         gpu.copy_h2d_async(bytemuck_u32(ids), self.ids_dev, stream)?;
@@ -725,47 +719,96 @@ impl V41Forward {
         }
         super::ops::set_decode_pass(true);
         moe.begin_pass(ids)?;
-        // ---- the graph: capture once per (kind, t, sequence), then replay
-        let key = (kind as u8, t, seq.rings[0].0);
-        let cached = g.graphs.lock().expect("graph cache poisoned").get(&key).copied();
-        super::ops::set_graph_start(Some(g.dstart));
-        let r = match cached {
-            Some(h) => hook.replay_step(kind, start, t).and_then(|_| gpu.launch_graph(h, stream)),
-            None => (|| -> Result<()> {
-                hook.begin_pass(kind, start, t)?;
-                gpu.begin_capture(stream)?;
-                let body = self.graph_body(ops, seq, t, start, kind, &g.pre_rows, core, moe, logits);
-                let graph = gpu.end_capture(stream);
-                body?;
-                let h = graph?;
-                g.graphs.lock().expect("graph cache poisoned").insert(key, h);
-                gpu.launch_graph(h, stream)
-            })(),
+        // Segments. SEGMENTED (ATLAS_DSV41_GRAPH_SEGMENTED=1): one graph per span between engram
+        // layers, each engram layer's NVMe gather issued right before ITS segment, so the host
+        // reads while the GPU runs the previous segment (eager's overlap). Otherwise one graph
+        // for the whole pass with both gathers in front of it.
+        let n = self.blocks.len();
+        let segmented = std::env::var("ATLAS_DSV41_GRAPH_SEGMENTED").as_deref() == Ok("1");
+        let mut bounds: Vec<usize> = vec![0];
+        if segmented {
+            bounds.extend(g.pre_rows.iter().map(|(l, _)| *l).filter(|&l| l > 0 && l < n));
+            bounds.sort_unstable();
+            bounds.dedup();
+        }
+        bounds.push(n);
+        let gather = |layer: usize, buf: DevicePtr| -> Result<()> {
+            let li = if layer == 1 { 0 } else { 1 };
+            let rows: Vec<i64> = (0..t).flat_map(|tok| hashes[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
+            let gth = &self.engram.iter().find(|(el, _)| *el == layer).context("no engram gather")?.1;
+            gth.gather_rows_gpu(&rows, t, buf, gpu, stream)
         };
+        if !segmented {
+            for (layer, buf) in &g.pre_rows {
+                gather(*layer, *buf)?;
+            }
+        }
+        let base_key = (kind as u8, t, seq.rings[0].0);
+        let replay = g.graphs.lock().expect("graph cache poisoned").contains_key(&(base_key.0, base_key.1, base_key.2 ^ ((bounds.len() as u64) << 56)));
+        super::ops::set_graph_start(Some(g.dstart));
+        let r = (|| -> Result<()> {
+            if replay {
+                hook.replay_step(kind, start, t)?;
+            } else {
+                hook.begin_pass(kind, start, t)?;
+            }
+            for (si, w) in bounds.windows(2).enumerate() {
+                let (lo, hi) = (w[0], w[1]);
+                if segmented {
+                    if let Some((_, buf)) = g.pre_rows.iter().find(|(l, _)| *l == lo) {
+                        gather(lo, *buf)?;
+                    }
+                }
+                // Keys: segment 0 of a (kind, t, sequence) carries the segment COUNT in the top
+                // byte, so a segmented and an unsegmented capture never alias.
+                let key = (base_key.0, base_key.1, base_key.2 ^ (((bounds.len() as u64) << 56) | ((si as u64) << 48)));
+                let h = if replay {
+                    g.graphs.lock().expect("graph cache poisoned").get(&key).copied().context("graph segment missing")?
+                } else {
+                    gpu.begin_capture(stream)?;
+                    let body = self.graph_segment(ops, seq, t, start, kind, lo..hi, &g.pre_rows, core, moe, logits);
+                    let graph = gpu.end_capture(stream);
+                    body?;
+                    let h = graph?;
+                    g.graphs.lock().expect("graph cache poisoned").insert(key, h);
+                    h
+                };
+                gpu.launch_graph(h, stream)?;
+            }
+            Ok(())
+        })();
         super::ops::set_graph_start(None);
         r?;
         seq.len = start + t;
         Ok(())
     }
 
-    /// Everything a graphed Decode/Verify pass launches, in eager order.
+    /// Layers `layers` of a graphed Decode/Verify pass, in eager order: the embed before layer 0
+    /// and the head after the last layer.
     #[allow(clippy::too_many_arguments)]
-    fn graph_body(
+    fn graph_segment(
         &self,
         ops: &Ops,
         seq: &mut V41Seq,
         t: usize,
         start: usize,
         kind: PassKind,
+        layers: std::ops::Range<usize>,
         pre: &[(usize, DevicePtr)],
         core: &dyn AttnCore,
         moe: &dyn V41RoutedMoe,
         logits: DevicePtr,
     ) -> Result<()> {
         let s = &self.scratch;
-        ops.embed(self.embed, self.ids_dev, s.x, t, self.dims.hidden)?;
-        ops.hc_expand(s.x, s.h, s.pre_mix, t, self.dims.hidden)?;
-        self.run_layers_pre(ops, seq, 0..self.blocks.len(), t, start, 0, None, Some(pre), core, moe, &Tap::off())?;
+        let last = layers.end == self.blocks.len();
+        if layers.start == 0 {
+            ops.embed(self.embed, self.ids_dev, s.x, t, self.dims.hidden)?;
+            ops.hc_expand(s.x, s.h, s.pre_mix, t, self.dims.hidden)?;
+        }
+        self.run_layers_pre(ops, seq, layers, t, start, 0, None, Some(pre), core, moe, &Tap::off())?;
+        if !last {
+            return Ok(());
+        }
         match kind {
             PassKind::Decode => super::fwd::final_logits_last_row(ops, &self.dims, s, t, self.norm, self.head, self.vocab, logits),
             _ => super::fwd::final_logits_rows(ops, &self.dims, s, t, self.norm, self.head, self.vocab, logits),
