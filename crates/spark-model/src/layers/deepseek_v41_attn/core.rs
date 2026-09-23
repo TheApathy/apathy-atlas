@@ -65,6 +65,11 @@ const CANDIDATE_BLOCK_SIZE: usize = 8;
 /// rows (`v41_ref.mm`), because cuBLAS picks its algorithm from M. Measured: with M = chunk
 /// length, re-chunking the same prompt changed L20's replay-tail top-k on 19 of 128 rows.
 const MM_TILE: usize = 16;
+/// A prefill pass (the projection kernels are keyed on this, never on M).
+fn is_prefill(st: &SeqState) -> bool {
+    !matches!(st.kind, Some(PassKind::Decode | PassKind::Verify))
+}
+
 /// `index_score_rows` tap: every this-many-th row of a pass (check_topk_overlap.py SAMPLE).
 const TAP_ROW_STRIDE: usize = 64;
 
@@ -257,6 +262,9 @@ pub struct Dsv41SparseCore {
     combine_kernel: KernelHandle,
     /// `[DECODE_MAX_T, 64, S, 2 + 512]` fp32 split partials.
     part: DevicePtr,
+    /// `ATLAS_DSV41_ATTN_LB=1`: `dsv41_sparse_attn_split_lb` (the combine fused by last-block-done,
+    /// byte-identical to split + combine) and its `[DECODE_MAX_T, 64 / 8]` u32 tickets (zeroed).
+    split_lb: Option<(KernelHandle, DevicePtr)>,
     idx: IndexKernels,
     rope_c: RopeTable,
     tail: Tail,
@@ -276,6 +284,10 @@ pub struct Dsv41SparseCore {
     own_dstart: DevicePtr,
     /// Static decode score width: `score_width(max_seq)`, the widest any pass can need.
     static_ld: usize,
+    /// Prefill projections as ONE launch (`ATLAS_DSV41_CORE_TILED=1` restores the 16-row tile
+    /// loops, A/B only): index q via the fused FP8 GEMM, ik / L20 wkv via the pinned bf16 GEMM at
+    /// M > 16 (one 16-row tile at M <= 16, ops' FP8 dense rule). Gate: runJ DIGEST unchanged.
+    fp8: Option<super::fp8_gemm::Fp8Gemm>,
     /// Owns every device allocation above; frees them when the core drops.
     allocs: DeviceAllocs,
 }
@@ -457,6 +469,14 @@ impl Dsv41SparseCore {
         };
         let own_dstart = alloc(4)?;
         let part = alloc(DECODE_MAX_T * 64 * (WINDOW + INDEX_TOPK).div_ceil(DECODE_SLICE) * (2 + HEAD_DIM) * 4)?;
+        let split_lb = if std::env::var("ATLAS_DSV41_ATTN_LB").as_deref() == Ok("1") {
+            let k = gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_split_lb").context("dsv41_sparse_attn_split_lb not in the PTX")?;
+            let tickets = alloc(DECODE_MAX_T * (64 / HEADS_PER_BLOCK) * 4)?;
+            gpu.memset(tickets, 0, DECODE_MAX_T * (64 / HEADS_PER_BLOCK) * 4)?;
+            Some((k, tickets))
+        } else {
+            None
+        };
         let tail = Tail {
             topk: [alloc(REPLAY_ROWS * INDEX_TOPK * 8)?, alloc(REPLAY_ROWS * INDEX_TOPK * 8)?],
             cand: [alloc(REPLAY_ROWS * cand_row_bytes(n_pad_max))?, alloc(REPLAY_ROWS * cand_row_bytes(n_pad_max))?],
@@ -486,6 +506,7 @@ impl Dsv41SparseCore {
             mma_kernel,
             combine_kernel,
             part,
+            split_lb,
             idx,
             rope_c: freqs_c,
             tail,
@@ -498,6 +519,7 @@ impl Dsv41SparseCore {
             static_on: std::sync::atomic::AtomicBool::new(std::env::var("ATLAS_DSV41_CORE_STATIC").as_deref() == Ok("1")),
             own_dstart,
             static_ld: n_pad_max,
+            fp8: if std::env::var("ATLAS_DSV41_CORE_TILED").as_deref() == Ok("1") { None } else { Some(super::fp8_gemm::Fp8Gemm::load(gpu)?) },
         })
     }
 
@@ -669,9 +691,7 @@ impl Dsv41SparseCore {
             self.prof.mark(ops, "compress.combine")?;
             ((start - pend) / 2, n / 2)
         } else {
-            tiled(gpu, s.pad_in, s.pad_out, a.x, s.latent, t, HIDDEN * 2, HEAD_DIM * 2, stream, |x, o| {
-                ops.linear_bf16(x, c.wkv, o, MM_TILE, HEAD_DIM, HIDDEN)
-            })?;
+            self.lin_bf16(ops, is_prefill(st), a.x, c.wkv, s.latent, t, HEAD_DIM, HIDDEN)?;
             self.prof.mark(ops, "compress.gemm_bf16")?;
             (start, t)
         };
@@ -688,9 +708,7 @@ impl Dsv41SparseCore {
             self.prof.mark(ops, "compress.norm")?;
             // The index key from the PRE-RoPE latent, straight into the cache.
             let ik = c.ik.offset(j0 * INDEX_HEAD_DIM * 2);
-            tiled(gpu, s.pad_in, s.pad_out, s.latent, ik, nj, HEAD_DIM * 2, INDEX_HEAD_DIM * 2, stream, |x, o| {
-                ops.linear_bf16(x, c.wk, o, MM_TILE, INDEX_HEAD_DIM, HEAD_DIM)
-            })?;
+            self.lin_bf16(ops, is_prefill(st), s.latent, c.wk, ik, nj, INDEX_HEAD_DIM, HEAD_DIM)?;
             self.prof.mark(ops, "compress.ik_gemm")?;
             ops.rmsnorm(ik, c.k_norm, ik, nj, INDEX_HEAD_DIM, self.eps)?;
             ops.rope_tail(ik, s.pos, &self.rope_c, nj, 1, INDEX_HEAD_DIM, false)?;
@@ -747,18 +765,14 @@ impl Dsv41SparseCore {
             iops.combine2_dev(s.kvl, s.sc, s.latent, t.div_ceil(2), HEAD_DIM, dstart)?;
             t.div_ceil(2)
         } else {
-            tiled(gpu, s.pad_in, s.pad_out, a.x, s.latent, t, HIDDEN * 2, HEAD_DIM * 2, stream, |x, o| {
-                ops.linear_bf16(x, c.wkv, o, MM_TILE, HEAD_DIM, HIDDEN)
-            })?;
+            self.lin_bf16(ops, is_prefill(st), a.x, c.wkv, s.latent, t, HEAD_DIM, HIDDEN)?;
             t
         };
         let (j0, nj) = if r == 2 { ((start - start % 2) / 2, (t + start % 2) / 2) } else { (start, t) };
         ensure!(j0 + nj <= c.rows_cap, "layer {layer}: compressed row {} past the cache ({} rows)", j0 + nj, c.rows_cap);
         ops.rmsnorm(s.latent, c.norm, s.latent, nmax, HEAD_DIM, self.eps)?;
         iops.iota_dev(s.pos, dstart, r == 2, r, nmax)?;
-        tiled(gpu, s.pad_in, s.pad_out, s.latent, s.iks, nmax, HEAD_DIM * 2, INDEX_HEAD_DIM * 2, stream, |x, o| {
-            ops.linear_bf16(x, c.wk, o, MM_TILE, INDEX_HEAD_DIM, HEAD_DIM)
-        })?;
+        self.lin_bf16(ops, is_prefill(st), s.latent, c.wk, s.iks, nmax, INDEX_HEAD_DIM, HEAD_DIM)?;
         ops.rmsnorm(s.iks, c.k_norm, s.iks, nmax, INDEX_HEAD_DIM, self.eps)?;
         ops.rope_tail(s.iks, s.pos, &self.rope_c, nmax, 1, INDEX_HEAD_DIM, false)?;
         iops.publish_rows(s.iks, c.ik, INDEX_HEAD_DIM * 2, nmax, r, t, dstart)?;
@@ -839,6 +853,19 @@ impl Dsv41SparseCore {
         Ok(())
     }
 
+    /// `out[m, n] = x[m, k] @ w[n, k]^T` bf16. The kernel is keyed on the PASS KIND, never on M
+    /// (an M switch would put a <= 16-row prefill tail on a different kernel than the same rows in
+    /// a big chunk): every prefill pass (encoder / full chunk / replay) takes ONE pinned launch at
+    /// any M; Decode/Verify keep the 16-row tile, so their rows are unchanged and T=1 == T=6. With
+    /// ATLAS_DSV41_CORE_TILED=1 (`fp8` = None) every pass takes the original tile loop.
+    #[allow(clippy::too_many_arguments)]
+    fn lin_bf16(&self, ops: &Ops, prefill: bool, x: DevicePtr, w: DevicePtr, out: DevicePtr, m: usize, n: usize, k: usize) -> Result<()> {
+        if self.fp8.is_some() && prefill {
+            return ops.linear_bf16_policy(x, k, w, out, n, m, n, k);
+        }
+        tiled(ops.gpu, self.s.pad_in, self.s.pad_out, x, out, m, k * 2, n * 2, ops.stream, |xx, o| ops.linear_bf16(xx, w, o, MM_TILE, n, k))
+    }
+
     fn index(&self, ops: &Ops, a: &CoreArgs, st: &mut SeqState, dstart: Option<DevicePtr>) -> Result<()> {
         let (layer, t, start, stream) = (a.layer, a.t, a.start, ops.stream);
         let lw = &self.layers[layer];
@@ -862,12 +889,17 @@ impl Dsv41SparseCore {
 
         // q_i = rope_c(bf16(qr @ dequant(wq_b)^T)); wts = bf16(x @ weights_proj^T) * 1/64
         self.prof.begin(ops)?;
-        ops.dequant(&w.wq_b, s.deq)?;
-        self.prof.mark(ops, "index.dequant_wq_b")?;
         let qrow = INDEX_HEADS * INDEX_HEAD_DIM * 2;
-        tiled(gpu, s.pad_in, s.pad_out, a.qr, s.qi, t, Q_LORA * 2, qrow, stream, |x, o| {
-            ops.linear_bf16(x, s.deq, o, MM_TILE, w.wq_b.n, w.wq_b.k)
-        })?;
+        if let Some(f) = &self.fp8 {
+            // The FP8 weight read directly, one launch, row-invariant at every M.
+            f.linear(gpu, a.qr, Q_LORA, &w.wq_b, s.qi, INDEX_HEADS * INDEX_HEAD_DIM, t, stream)?;
+        } else {
+            ops.dequant(&w.wq_b, s.deq)?;
+            self.prof.mark(ops, "index.dequant_wq_b")?;
+            tiled(gpu, s.pad_in, s.pad_out, a.qr, s.qi, t, Q_LORA * 2, qrow, stream, |x, o| {
+                ops.linear_bf16(x, s.deq, o, MM_TILE, w.wq_b.n, w.wq_b.k)
+            })?;
+        }
         self.prof.mark(ops, "index.q_gemm")?;
         match dstart {
             Some(d) => iops.iota_dev(s.pos, d, false, 1, t)?,
@@ -983,6 +1015,30 @@ impl Dsv41SparseCore {
         if matches!(st.kind, Some(PassKind::Decode | PassKind::Verify)) && a.t <= DECODE_MAX_T && self.split_on {
             let keys = WINDOW + if ratio == 0 { 0 } else { INDEX_TOPK };
             let splits = keys.div_ceil(DECODE_SLICE);
+            if let Some((k, tickets)) = self.split_lb {
+                return KernelLaunch::new(ops.gpu, k)
+                    .grid([a.t as u32, (64 / HEADS_PER_BLOCK) as u32, splits as u32])
+                    .block([ATTN_THREADS, 1, 1])
+                    .arg_ptr(a.q)
+                    .arg_ptr(a.ring)
+                    .arg_ptr(a.wpos)
+                    .arg_ptr(ckv)
+                    .arg_ptr(cidx)
+                    .arg_ptr(self.part)
+                    .arg_ptr(a.sink)
+                    .arg_ptr(a.out)
+                    .arg_ptr(tickets)
+                    .arg_i32(a.t as i32)
+                    .arg_i32(64)
+                    .arg_i32(HEAD_DIM as i32)
+                    .arg_i32(WINDOW as i32)
+                    .arg_i32(INDEX_TOPK as i32)
+                    .arg_i32(RING as i32)
+                    .arg_i32(a.win_lo as i32)
+                    .arg_f32(scale)
+                    .arg_i32(DECODE_SLICE as i32)
+                    .launch(ops.stream);
+            }
             KernelLaunch::new(ops.gpu, self.split_kernel)
                 .grid([a.t as u32, (64 / HEADS_PER_BLOCK) as u32, splits as u32])
                 .block([ATTN_THREADS, 1, 1])
