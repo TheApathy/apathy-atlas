@@ -752,15 +752,12 @@ impl TransformerModel {
             if proc_count == 0 {
                 return Ok(());
             }
-            let ring = dstate.ctx_ring_state()?;
-            // Idempotent: chunked prefill advances after every chunk (the
-            // next chunk's capture plans against this cursor), and the
-            // last-chunk finalizer calls this again for the same rows.
-            if ring.absolute_len == chunk_start + proc_count {
-                return Ok(());
+            if let Some(next) = dstate
+                .ctx_ring_state()?
+                .advanced_after_chunk(chunk_start, proc_count)?
+            {
+                dstate.apply_ctx_ring_state(next)?;
             }
-            let append = ring.plan_append_at(chunk_start, proc_count)?;
-            dstate.apply_ctx_ring_state(append.next)?;
         }
         Ok(())
     }
