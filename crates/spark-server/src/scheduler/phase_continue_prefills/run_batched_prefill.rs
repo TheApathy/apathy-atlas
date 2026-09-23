@@ -116,10 +116,9 @@ pub(super) fn run_batched_prefill_step(
         match sample_token(
             model,
             logits,
-            p.temperature,
-            p.top_k,
-            p.top_p,
+            &p.sampling_params(),
             &p.eos_tokens,
+            &[],
         ) {
             Ok(first) => {
                 tracing::info!(

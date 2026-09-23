@@ -345,10 +345,9 @@ pub fn step_mtp(
             let tok = match sample_token_with_grammar(
                 model,
                 logits,
-                a.temperature,
-                a.top_k,
-                a.top_p,
+                &a.sampling_params(a.temperature),
                 &[],
+                &a.output_tokens,
                 a.grammar_state.as_mut(),
             ) {
                 Ok(t) => t,

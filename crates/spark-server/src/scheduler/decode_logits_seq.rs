@@ -401,49 +401,9 @@ pub fn process_seq_logits(
     // sample_with_params_seeded takes the post-penalty argmax
     // branch instead of running the full stochastic pipeline.
     let sampling_temp = if greedy_gate { 0.0 } else { effective_temp };
-    // Advance seed per token for deterministic but varying randomness.
-    let step_seed = a.seed.map(|s| s.wrapping_add(a.output_tokens.len() as u64));
-    // Phase-gated sampler scoping (P3.1, 2026-04-25):
-    // inside the tool-call body (between `<tool_call>` and
-    // `</tool_call>`) the JSON we emit is dense with
-    // legitimate short repetitions — `":"`, `","`, key
-    // tokens — that DRY/presence_penalty/frequency_penalty
-    // would otherwise penalise, breaking schema validity.
-    // XGrammar already guarantees structural correctness
-    // here; penalties only add noise. Outside the tool
-    // body (free text + `<think>`) the full preset
-    // applies: this is where prose loops actually live.
-    let in_tool = a.inside_tool_body && !a.inside_thinking;
     let sampled = sample_with_params_history(
         f32_bytes,
-        &SamplingParams {
-            temperature: sampling_temp,
-            top_k: a.top_k,
-            top_p: a.top_p,
-            top_n_sigma: a.top_n_sigma,
-            min_p: a.min_p,
-            logit_bias: a.logit_bias.clone(),
-            repetition_penalty: if in_tool { 1.0 } else { a.repetition_penalty },
-            repetition_penalty_window: a.repetition_penalty_window,
-            presence_penalty: if in_tool { 0.0 } else { a.presence_penalty },
-            frequency_penalty: if in_tool { 0.0 } else { a.frequency_penalty },
-            lz_penalty: if a.grammar_state.is_some() {
-                0.0
-            } else {
-                a.lz_penalty
-            },
-            // DRY: same logic. Outside the tool body it
-            // remains active to dampen `<think>` fence-narration
-            // attractors. Inside the body, disabled — JSON
-            // patterns repeat and that's correct.
-            dry_multiplier: if in_tool { 0.0 } else { a.dry_multiplier },
-            dry_base: a.dry_base,
-            dry_allowed_length: a.dry_allowed_length,
-            dry_sequence_breakers: a.dry_sequence_breakers.clone(),
-            max_tokens: 0,
-            stop_token_ids: Vec::new(),
-            seed: step_seed,
-        },
+        &a.sampling_params(sampling_temp),
         &a.output_tokens,
     );
 

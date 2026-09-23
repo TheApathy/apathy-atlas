@@ -213,10 +213,9 @@ pub(super) fn continue_in_progress_prefills(
                     match sample_token(
                         model,
                         logits,
-                        p.temperature,
-                        p.top_k,
-                        p.top_p,
+                        &p.sampling_params(),
                         &p.eos_tokens,
+                        &[],
                     ) {
                         Ok(first) => {
                             tracing::info!("Two-phase prefill first token: {first}");

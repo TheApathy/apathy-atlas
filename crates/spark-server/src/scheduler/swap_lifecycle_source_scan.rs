@@ -176,8 +176,14 @@ pub(super) fn victim_selector(source: &str) -> Option<String> {
     // from the swap-out marker to EOF were machine-compared against
     // feat/tui-port and are identical (23_142 bytes); the recomputed FNV-1a of
     // the old file reproduced the old pin before the new one was taken.
-    const SOURCE_LEN: usize = 42_676;
-    const SOURCE_FNV1A: u64 = 0x1d7f1651b7c00b51;
+    //
+    // Re-pinned 2026-09-23: the ONLY change is the `sample_with_params` import
+    // dropped from the `spark_runtime::sampler` use line (the first-token path
+    // now samples with the request's full parameters and history). Machine-
+    // checked: the old file reproduced the old pin, the marker appears once,
+    // and the bytes from the swap-out marker to EOF are identical (23_142).
+    const SOURCE_LEN: usize = 42_656;
+    const SOURCE_FNV1A: u64 = 0x44324bdcad21c39f;
     if source.matches(START).count() != 1 || source.matches(END).count() != 1 {
         return None;
     }

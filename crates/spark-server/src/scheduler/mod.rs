@@ -113,7 +113,7 @@ use parking_lot::{Condvar, Mutex};
 use spark_model::traits::{EP_CMD_VERIFY_KGAMMA, EP_VERIFY_KGAMMA_ABORT, Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_spill::KvSpillManager;
-use spark_runtime::sampler::{SamplingParams, sample_with_params, sample_with_params_history};
+use spark_runtime::sampler::{SamplingParams, sample_with_params_history};
 
 use std::path::PathBuf;
 use std::sync::Arc;

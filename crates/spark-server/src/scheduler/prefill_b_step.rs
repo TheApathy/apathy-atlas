@@ -57,6 +57,7 @@ pub fn prefill_request(
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
     let grammar_state = compile_grammar_state(grammar_engine, &grammar_spec);
+    let first_params = request_sampling_params(&req);
     let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req {
         InferenceRequest::Streaming {
             prompt_tokens,
@@ -124,7 +125,7 @@ pub fn prefill_request(
         model.ep_broadcast_tokens(&prompt_tokens)?;
 
         let logits = model.prefill(&prompt_tokens, &mut seq, 0)?;
-        sample_token(model, logits, temperature, top_k, top_p, eos_tokens)
+        sample_token(model, logits, &first_params, eos_tokens, &[])
     })();
 
     let first = match prefill_result {

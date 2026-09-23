@@ -4,70 +4,121 @@
 
 use super::*;
 
-/// Re-sample verify tokens from the logits buffer when temperature > 0.
-///
-/// After `decode_verify_graphed`, the logits buffer still contains valid
-/// BF16 logits for each verified position (`[k, vocab_size]`). The CUDA
-/// graph bakes in argmax, but when the request has temperature > 0 we need
-/// stochastic sampling. This copies the logits to host and samples per
-/// position, returning the temperature-sampled tokens.
-///
-/// Falls back to `argmax_tokens` if the D2H copy fails.
-#[allow(dead_code)]
-pub fn verify_resample(model: &dyn Model, argmax_tokens: &[u32], temperature: f32) -> Vec<u32> {
-    if temperature == 0.0 {
-        return argmax_tokens.to_vec();
-    }
-    let k = argmax_tokens.len();
-    let vocab = model.vocab_size();
-    let total_bytes = k * vocab * 2;
-    let mut buf = vec![0u8; total_bytes];
-    if model
-        .copy_logits_to_host(model.logits_buffer_ptr(), &mut buf)
-        .is_err()
-    {
-        return argmax_tokens.to_vec();
-    }
-    let params = SamplingParams {
+/// A request's sampler settings for its first token, as decode applies them to every later
+/// one (`ActiveSeq::sampling_params`). The first token used to get temperature/top-k/top-p
+/// only, so logit_bias, top_n_sigma, min_p and the seed were ignored at position 0.
+/// Penalties see no history yet; they are carried so the two paths cannot drift.
+pub(super) fn request_sampling_params(req: &InferenceRequest) -> SamplingParams {
+    let temperature = match req {
+        InferenceRequest::Blocking { temperature, .. } => *temperature,
+        InferenceRequest::Streaming { temperature, .. } => *temperature,
+    };
+    SamplingParams {
         temperature,
-        top_k: 0,
-        top_p: 1.0,
-        top_n_sigma: 0.0,
-        min_p: 0.0,
-        logit_bias: Vec::new(),
-        repetition_penalty: 1.0,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-        repetition_penalty_window: 0,
-        lz_penalty: DEFAULT_LZ_PENALTY,
-        dry_multiplier: DEFAULT_DRY_MULTIPLIER,
-        dry_base: DEFAULT_DRY_BASE,
-        dry_allowed_length: DEFAULT_DRY_ALLOWED_LENGTH,
+        top_k: req.top_k(),
+        top_p: req.top_p(),
+        top_n_sigma: req.top_n_sigma(),
+        min_p: req.min_p(),
+        logit_bias: req.logit_bias().to_vec(),
+        repetition_penalty: req.repetition_penalty(),
+        repetition_penalty_window: 256,
+        presence_penalty: req.presence_penalty(),
+        frequency_penalty: req.frequency_penalty(),
+        lz_penalty: req.lz_penalty(),
+        dry_multiplier: req.dry_multiplier(),
+        dry_base: req.dry_base(),
+        dry_allowed_length: req.dry_allowed_length(),
         dry_sequence_breakers: Vec::new(),
         max_tokens: 0,
         stop_token_ids: Vec::new(),
-        seed: None,
-    };
-    (0..k)
-        .map(|i| {
-            let slice = &buf[i * vocab * 2..(i + 1) * vocab * 2];
-            sample_with_params(slice, &params)
-        })
-        .collect()
+        seed: req.seed(),
+    }
 }
 
-/// Sample one token from device logits, applying temperature/top-k/top-p if non-greedy.
+impl PrefillInProgress {
+    /// [`request_sampling_params`] for a chunked prefill's first token.
+    pub(super) fn sampling_params(&self) -> SamplingParams {
+        SamplingParams {
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            top_n_sigma: self.top_n_sigma,
+            min_p: self.min_p,
+            logit_bias: self.logit_bias.clone(),
+            repetition_penalty: self.repetition_penalty,
+            repetition_penalty_window: self.repetition_penalty_window,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            lz_penalty: self.lz_penalty,
+            dry_multiplier: self.dry_multiplier,
+            dry_base: self.dry_base,
+            dry_allowed_length: self.dry_allowed_length,
+            dry_sequence_breakers: self.dry_sequence_breakers.clone(),
+            max_tokens: 0,
+            stop_token_ids: Vec::new(),
+            seed: self.seed,
+        }
+    }
+}
+
+impl ActiveSeq {
+    /// The sampler settings for this sequence's next token at `temperature`.
+    ///
+    /// Phase-gated (P3.1, 2026-04-25): inside the tool-call body (between `<tool_call>` and
+    /// `</tool_call>`) the JSON is dense with legitimate short repetitions — `":"`, `","`,
+    /// key tokens — that DRY/presence/frequency penalties would punish, breaking schema
+    /// validity. XGrammar already guarantees the structure there, so the penalties are off;
+    /// outside the body (free text + `<think>`), where prose loops live, the full preset
+    /// applies. LZ is off whenever a grammar is active.
+    pub(super) fn sampling_params(&self, temperature: f32) -> SamplingParams {
+        let in_tool = self.inside_tool_body && !self.inside_thinking;
+        SamplingParams {
+            temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            top_n_sigma: self.top_n_sigma,
+            min_p: self.min_p,
+            logit_bias: self.logit_bias.clone(),
+            repetition_penalty: if in_tool { 1.0 } else { self.repetition_penalty },
+            repetition_penalty_window: self.repetition_penalty_window,
+            presence_penalty: if in_tool { 0.0 } else { self.presence_penalty },
+            frequency_penalty: if in_tool { 0.0 } else { self.frequency_penalty },
+            lz_penalty: if self.grammar_state.is_some() { 0.0 } else { self.lz_penalty },
+            dry_multiplier: if in_tool { 0.0 } else { self.dry_multiplier },
+            dry_base: self.dry_base,
+            dry_allowed_length: self.dry_allowed_length,
+            dry_sequence_breakers: self.dry_sequence_breakers.clone(),
+            max_tokens: 0,
+            stop_token_ids: Vec::new(),
+            // Advance the seed per token: deterministic but varying.
+            seed: self.seed.map(|s| s.wrapping_add(self.output_tokens.len() as u64)),
+        }
+    }
+}
+
+/// Whether sampling `params` after `history` can pick something other than the raw argmax
+/// even at temperature 0: a logit bias, or a penalty with history to act on.
+fn needs_sampler(params: &SamplingParams, history: &[u32]) -> bool {
+    let penalties = (params.repetition_penalty != 1.0 && params.repetition_penalty > 0.0)
+        || params.presence_penalty != 0.0
+        || params.frequency_penalty != 0.0
+        || params.lz_penalty != 0.0
+        || params.dry_multiplier != 0.0;
+    params.temperature != 0.0 || !params.logit_bias.is_empty() || (penalties && !history.is_empty())
+}
+
+/// Sample one token from device logits with the request's full sampler settings (`params`),
+/// penalties acting on `history` (the tokens generated so far).
 ///
 /// `suppress_ids`: token IDs to mask to -inf before sampling (e.g. EOS on first token).
 pub fn sample_token(
     model: &dyn Model,
     logits: DevicePtr,
-    temperature: f32,
-    top_k: u32,
-    top_p: f32,
+    params: &SamplingParams,
     suppress_ids: &[u32],
+    history: &[u32],
 ) -> Result<u32> {
-    if temperature == 0.0 && suppress_ids.is_empty() {
+    if !needs_sampler(params, history) && suppress_ids.is_empty() {
         return model.argmax_on_device(logits, 0);
     }
     let vocab_size = model.vocab_size();
@@ -95,47 +146,37 @@ pub fn sample_token(
             })
             .collect()
     };
+    Ok(sample_host_logits(&mut f32_logits, params, suppress_ids, history))
+}
+
+/// The host half of [`sample_token`]: mask `suppress_ids`, then sample with the full
+/// `params`, or take the plain argmax when nothing in them can move it.
+fn sample_host_logits(
+    f32_logits: &mut [f32],
+    params: &SamplingParams,
+    suppress_ids: &[u32],
+    history: &[u32],
+) -> u32 {
     // Suppress EOS tokens on first token by setting to -inf.
     for &id in suppress_ids {
-        if (id as usize) < vocab_size {
-            f32_logits[id as usize] = f32::NEG_INFINITY;
+        if let Some(l) = f32_logits.get_mut(id as usize) {
+            *l = f32::NEG_INFINITY;
         }
     }
-    if temperature == 0.0 {
+    if !needs_sampler(params, history) {
         // Greedy argmax over FP32
-        let best = f32_logits
+        return f32_logits
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i as u32)
             .unwrap_or(0);
-        return Ok(best);
     }
-    let f32_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
-    Ok(sample_with_params(
-        f32_bytes,
-        &SamplingParams {
-            temperature,
-            top_k,
-            top_p,
-            top_n_sigma: 0.0,
-            min_p: 0.0,
-            logit_bias: Vec::new(),
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            repetition_penalty_window: 0,
-            lz_penalty: DEFAULT_LZ_PENALTY,
-            dry_multiplier: DEFAULT_DRY_MULTIPLIER,
-            dry_base: DEFAULT_DRY_BASE,
-            dry_allowed_length: DEFAULT_DRY_ALLOWED_LENGTH,
-            dry_sequence_breakers: Vec::new(),
-            max_tokens: 0,
-            stop_token_ids: Vec::new(),
-            seed: None,
-        },
-    ))
+    // SAFETY: an f32 slice viewed as its bytes; same length in bytes, no alignment demand.
+    let f32_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, f32_logits.len() * 4)
+    };
+    sample_with_params_history(f32_bytes, params, history)
 }
 
 /// Sample one token from device logits with optional grammar constraint.
@@ -146,14 +187,13 @@ pub fn sample_token(
 pub fn sample_token_with_grammar(
     model: &dyn Model,
     logits: DevicePtr,
-    temperature: f32,
-    top_k: u32,
-    top_p: f32,
+    params: &SamplingParams,
     suppress_ids: &[u32],
+    history: &[u32],
     grammar_state: Option<&mut GrammarState>,
 ) -> Result<u32> {
     let Some(gs) = grammar_state else {
-        return sample_token(model, logits, temperature, top_k, top_p, suppress_ids);
+        return sample_token(model, logits, params, suppress_ids, history);
     };
 
     // ── Tier 3b: forced-token short-circuit (xgrammar "Coalescence") ──
@@ -183,7 +223,7 @@ pub fn sample_token_with_grammar(
     // signed i16 (which preserves the natural ordering of finite BF16
     // values) so no f32 scratch buffer is needed. Plus we apply suppress_ids
     // post-hoc since they're typically a handful of token IDs.
-    if temperature == 0.0 {
+    if !needs_sampler(params, history) {
         let bytes: &[u8] = &bf16_buf;
         let mut best_tok: u32 = 0;
         let mut best_val: i16 = i16::MIN;
@@ -247,27 +287,9 @@ pub fn sample_token_with_grammar(
     gs.apply_bitmask_to_logits(&mut f32_logits);
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
-    Ok(sample_with_params(
-        f32_bytes,
-        &SamplingParams {
-            temperature,
-            top_k,
-            top_p,
-            top_n_sigma: 0.0,
-            min_p: 0.0,
-            logit_bias: Vec::new(),
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            repetition_penalty_window: 0,
-            lz_penalty: DEFAULT_LZ_PENALTY,
-            dry_multiplier: DEFAULT_DRY_MULTIPLIER,
-            dry_base: DEFAULT_DRY_BASE,
-            dry_allowed_length: DEFAULT_DRY_ALLOWED_LENGTH,
-            dry_sequence_breakers: Vec::new(),
-            max_tokens: 0,
-            stop_token_ids: Vec::new(),
-            seed: None,
-        },
-    ))
+    Ok(sample_with_params_history(f32_bytes, params, history))
 }
+
+#[cfg(test)]
+#[path = "sample_step_tests.rs"]
+mod tests;
