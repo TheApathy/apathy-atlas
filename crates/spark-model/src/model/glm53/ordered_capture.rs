@@ -29,9 +29,13 @@ impl OrderedCapturePlan {
         context_tokens: u32,
         capacity: u32,
     ) -> Result<Self> {
+        // 1 is admitted for the prefix commit, which captures the accepted
+        // prefix of a 2..=8-row staged bank and can accept exactly one row.
+        // The projection is per row and the fence is unconditional, so a
+        // one-row plan is the same operation the loop already performs.
         ensure!(
-            (2..=8).contains(&rows),
-            "ordered capture requires 2..=8 rows"
+            (1..=8).contains(&rows),
+            "ordered capture requires 1..=8 rows"
         );
         let end = start
             .checked_add(rows)

@@ -151,6 +151,9 @@ pub struct Glm53Exl3Model {
     prepared_vision: Mutex<PreparedOwner>,
     prefill_capture_bank: Mutex<CaptureBankOwner>,
     dflash2: Mutex<Option<Glm53Dflash2Runtime>>,
+    prefix_commit: Option<super::prefix_commit::PrefixCommitBuffers>,
+    prefix_commit_allocation: DevicePtr,
+    prefix_kda_kernels: Option<super::kda_attention::Glm53KdaAttentionKernels>,
 }
 
 impl Glm53Exl3Model {
@@ -334,6 +337,27 @@ impl Glm53Exl3Model {
         gpu.memset(dflash2_argmax_allocation, 0, DFLASH2_ARGMAX_BYTES)?;
         let dflash2_argmax_kernel = gpu.kernel("glm53_kda", "atlas_glm53_argmax_bf16_rows")?;
         let (kda_states, kda_conv, dsa_cache) = Glm53Model::bind_state(&plan, arena)?;
+        let (prefix_commit_allocation, prefix_commit, prefix_kda_kernels) =
+            if super::prefix_commit::prefix_commit_enabled() {
+                use super::prefix_commit::PrefixCommitBuffers;
+                let bytes = PrefixCommitBuffers::BYTES + 256;
+                let allocation = gpu
+                    .alloc(bytes)
+                    .context("GLM prefix-commit snapshot allocation")?;
+                gpu.memset(allocation, 0, bytes)?;
+                let base = DevicePtr((allocation.0 + 255) & !255);
+                tracing::info!(
+                    "GLM prefix commit armed: {} MiB of per-row KDA/DSA snapshots",
+                    bytes / (1024 * 1024)
+                );
+                (
+                    allocation,
+                    Some(PrefixCommitBuffers::bind(base)?),
+                    Some(super::kda_attention::Glm53KdaAttentionKernels::load(gpu.as_ref())?),
+                )
+            } else {
+                (DevicePtr::NULL, None, None)
+            };
         Ok(Self {
             gpu,
             weights,
@@ -378,7 +402,158 @@ impl Glm53Exl3Model {
             prepared_vision: Mutex::new(PreparedOwner::new()),
             prefill_capture_bank: Mutex::new(CaptureBankOwner::new()),
             dflash2: Mutex::new(None),
+            prefix_commit,
+            prefix_commit_allocation,
+            prefix_kda_kernels,
         })
+    }
+
+    /// Gate diagnostic (`ATLAS_GLM53_STATE_HASH=<file>`, off by default): after
+    /// a commit, append a hash of the committed KDA conv shift register and
+    /// recurrent state of the first, a middle and the last KDA layer, keyed by
+    /// the new position. A speculative arm and a one-row walk arm must agree at
+    /// every position both reached; a wrong prefix re-stage cannot hide behind
+    /// an output that happens to match. Synchronous D2H: never time with it on.
+    pub(super) fn state_hash_probe(&self, position: u32, source: &str, stream: u64) -> Result<()> {
+        use std::hash::Hasher;
+        use std::io::Write;
+        let Some(path) = std::env::var_os("ATLAS_GLM53_STATE_HASH") else {
+            return Ok(());
+        };
+        self.gpu.synchronize(stream)?;
+        let mut line = format!("pos={position} src={source}");
+        for ordinal in [0usize, 17, 33] {
+            let state = self
+                .kda_states
+                .iter()
+                .find(|state| state.ordinal() == ordinal)
+                .context("GLM state hash: KDA ordinal missing")?;
+            for (name, buffer) in [
+                ("conv", self.kda_conv[ordinal].persistent_state_f32),
+                ("rec", state.persistent()),
+            ] {
+                let mut host = vec![0u8; buffer.bytes];
+                self.gpu.copy_d2h(buffer.ptr, &mut host)?;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                hasher.write(&host);
+                line.push_str(&format!(" o{ordinal}.{name}={:016x}", hasher.finish()));
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("GLM state hash file")?;
+        writeln!(file, "{line}").context("GLM state hash write")?;
+        Ok(())
+    }
+
+    pub(super) fn prefix_commit_active(&self) -> bool {
+        self.prefix_commit.is_some() && self.prefix_kda_kernels.is_some()
+    }
+
+    /// Commit rows `0..rows` of the `total_rows`-row exact verify staged at
+    /// `start` from the per-row snapshots: KDA recurrent state from snapshot
+    /// `rows-1`, the conv shift register by a re-stage of the accepted rows,
+    /// the DSA carry from snapshot `rows-1` (after the caller restored the
+    /// pre-verify DSA state). Then observe the accepted capture rows.
+    pub(super) fn commit_prefix_rows(
+        &self,
+        start: usize,
+        total_rows: usize,
+        rows: usize,
+        exact_verify: bool,
+        stream: u64,
+    ) -> Result<()> {
+        self.ensure_verify_healthy()?;
+        let prefix = self
+            .prefix_commit
+            .context("GLM prefix commit is not armed")?;
+        let kernels = self
+            .prefix_kda_kernels
+            .as_ref()
+            .context("GLM prefix commit KDA kernels missing")?;
+        ensure!(
+            (2..=8).contains(&total_rows) && (1..total_rows).contains(&rows),
+            "GLM prefix commit needs a proper prefix of 2..=8 staged rows"
+        );
+        let start_u32 = u32::try_from(start)?;
+        let rows_u32 = u32::try_from(rows)?;
+        let total_u32 = u32::try_from(total_rows)?;
+        ensure!(
+            self.position() == start_u32,
+            "GLM prefix commit position drift"
+        );
+        let nonce = {
+            let mut state = self.state.lock().unwrap();
+            state.nonce = state.nonce.wrapping_add(1).max(1);
+            state.nonce
+        };
+        let gpu = self.gpu.as_ref();
+        for state in &self.kda_states {
+            let snapshot = prefix.kda_row(state.ordinal(), rows - 1)?;
+            gpu.copy_d2d_async(snapshot.ptr, state.persistent().ptr, snapshot.bytes, stream)?;
+        }
+        let buffers = self.scratch.kda_buffers_rows(total_u32)?;
+        let legacy_restage =
+            std::env::var("ATLAS_GLM53_PREFIX_COMMIT_CONTROL_LEGACY_RESTAGE").as_deref() == Ok("1");
+        for (index, layer) in self.weights.layers.iter().enumerate() {
+            let crate::weight_loader::Glm53Exl3AttentionWeights::Kda(weights) = &layer.attention
+            else {
+                continue;
+            };
+            let ordinal = super::dispatch::kda_ordinal(index)
+                .context("GLM prefix commit KDA ordinal drift")?;
+            kernels.restage_conv_prefix(
+                gpu,
+                weights,
+                buffers,
+                if legacy_restage {
+                    // Gate control only: the pre-fix inputs (the shared verify
+                    // scratch, i.e. the LAST KDA layer's projections). Must fail
+                    // the state gate.
+                    let head = |b: GgmlIqBuffer| GgmlIqBuffer { ptr: b.ptr, bytes: rows * 16_384 };
+                    [head(buffers.q_proj_bf16), head(buffers.k_proj_bf16), head(buffers.v_proj_bf16)]
+                } else {
+                    [
+                        prefix.conv_input(ordinal, 0, rows)?,
+                        prefix.conv_input(ordinal, 1, rows)?,
+                        prefix.conv_input(ordinal, 2, rows)?,
+                    ]
+                },
+                total_u32,
+                rows_u32,
+                self.kda_conv[ordinal],
+                start_u32,
+                self.capacity,
+                nonce,
+                stream,
+            )?;
+        }
+        for (ordinal, cache) in self.dsa_cache.iter().enumerate() {
+            super::prefix_commit::dsa_snapshot_copy(
+                gpu,
+                cache,
+                super::prefix_commit::dsa_row_slot(prefix.dsa_layer(ordinal)?, rows - 1)?,
+                start_u32,
+                rows_u32,
+                self.capacity,
+                false,
+                stream,
+            )?;
+        }
+        self.gpu.synchronize(stream)?;
+        self.state.lock().unwrap().position = start_u32 + rows_u32;
+        self.state_hash_probe(start_u32 + rows_u32, "prefix", stream)?;
+        let mut dflash2 = self.dflash2.lock().unwrap();
+        let runtime = dflash2
+            .as_mut()
+            .context("GLM DFlash2 runtime disappeared during prefix commit")?;
+        if exact_verify {
+            runtime.observe_target_rows_ordered(self, rows_u32, stream)
+        } else {
+            runtime.observe_target_rows(self, rows_u32, stream)
+        }
     }
 
     pub fn install_dflash2(&self, root: &Path) -> Result<()> {
@@ -514,6 +689,12 @@ impl Glm53Exl3Model {
             self.gpu
                 .copy_d2d_async(staged.ptr, state.persistent().ptr, staged.bytes, stream)?;
         }
+        self.commit_conv_only(stream)
+    }
+
+    /// Conv shift-register commit alone (`ATLAS_GLM53_KDA_OOP=1` one-row walk,
+    /// whose recurrence already updated persistent state in place).
+    fn commit_conv_only(&self, stream: u64) -> Result<()> {
         for conv in &self.kda_conv {
             self.gpu.copy_d2d_async(
                 conv.staged_state_f32.ptr,
@@ -575,6 +756,7 @@ impl Glm53Exl3Model {
                     capacity: self.capacity,
                     nonce,
                 },
+                prefix: None,
             },
             &self.weights.lm_head,
             GgmlIqBuffer {
@@ -582,14 +764,57 @@ impl Glm53Exl3Model {
                 bytes: VOCAB as usize * 2,
             },
         )?;
-        for event in self.schedule.events() {
+        let graph_groups = self.ffn_graphs.eligible_scalar(self.gpu.as_ref(), stream)?;
+        let mut events = self.schedule.events().iter();
+        while let Some(event) = events.next() {
+            if graph_groups
+                && let crate::layers::Glm53TargetEvent::PostAttention { layer } = event
+                && (3..=44).contains(layer)
+            {
+                use crate::layers::{Glm53TargetEvent, Glm53TargetFfnKind};
+                ensure!(
+                    events.next()
+                        == Some(&Glm53TargetEvent::Ffn {
+                            layer: *layer,
+                            kind: Glm53TargetFfnKind::Moe
+                        })
+                        && events.next() == Some(&Glm53TargetEvent::PostFfn { layer: *layer }),
+                    "GLM FFN graph schedule group changed"
+                );
+                super::ffn_graph::with_failure_owner(
+                    || {
+                        self.ffn_graphs.execute_scalar(
+                            &dispatcher,
+                            self.gpu.as_ref(),
+                            *layer,
+                            super::ffn_graph::Binding {
+                                stream,
+                                owners: [
+                                    self.wide_workspace_allocation.0,
+                                    self.scratch_allocation.0,
+                                    self.moe_tables_allocation.0,
+                                ],
+                            },
+                        )
+                    },
+                    || self.poison_verify(stream),
+                )?;
+                continue;
+            }
             dispatcher
                 .dispatch(self.gpu.as_ref(), event, stream)
                 .with_context(|| format!("GLM EXL3 walk failed at {event:?}"))?;
         }
-        self.commit_accepted(stream)?;
+        if super::kda_attention::kda_oop_enabled() {
+            // The one-row walk ran its recurrence in place on persistent state;
+            // only the conv shift-register still needs the staged -> persistent copy.
+            self.commit_conv_only(stream)?;
+        } else {
+            self.commit_accepted(stream)?;
+        }
         self.gpu.synchronize(stream)?;
         self.state.lock().unwrap().position = position + 1;
+        self.state_hash_probe(position + 1, "walk", stream)?;
         if let Some(runtime) = self.dflash2.lock().unwrap().as_mut() {
             runtime.observe_target(self, stream)?;
         }
@@ -713,6 +938,7 @@ impl Glm53Exl3Model {
                     capacity: self.capacity,
                     nonce,
                 },
+                prefix: self.prefix_commit,
             },
             &self.weights.lm_head,
             GgmlIqBuffer {
@@ -897,8 +1123,12 @@ impl Glm53Exl3Model {
             dflash2_argmax_allocation,
             dsa_verify_backup,
             dflash2,
+            prefix_commit_allocation,
             ..
         } = this;
+        if prefix_commit_allocation != DevicePtr::NULL {
+            gpu.free(prefix_commit_allocation)?;
+        }
         let backup = dsa_verify_backup
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());

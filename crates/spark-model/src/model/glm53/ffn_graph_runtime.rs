@@ -21,13 +21,36 @@ fn environment() -> BTreeMap<OsString, OsString> {
 
 pub(super) struct FfnGraphs {
     setting: Setting,
+    scalar: bool,
     environment: BTreeMap<OsString, OsString>,
     cache: Mutex<GraphCache>,
 }
+
+/// `ATLAS_GLM53_FFN_GRAPHS_SCALAR`: extend the position-free MoE graph groups
+/// to the one-row decode walk. Strict: absent or `0` off, exactly `1` on, and
+/// it requires `ATLAS_GLM53_FFN_GRAPHS=1`.
+pub(super) fn parse_scalar_setting(value: Option<&std::ffi::OsStr>, base: bool) -> Result<bool> {
+    let on = match value {
+        None => false,
+        Some(v) if v == "0" => false,
+        Some(v) if v == "1" => true,
+        _ => anyhow::bail!("ATLAS_GLM53_FFN_GRAPHS_SCALAR must be absent or exactly 0 or 1"),
+    };
+    ensure!(
+        !on || base,
+        "ATLAS_GLM53_FFN_GRAPHS_SCALAR=1 requires ATLAS_GLM53_FFN_GRAPHS=1"
+    );
+    Ok(on)
+}
+
 impl FfnGraphs {
     pub(super) fn from_env() -> Result<Self> {
         let setting = Setting::parse(std::env::var_os("ATLAS_GLM53_FFN_GRAPHS").as_deref())
             .map_err(anyhow::Error::msg)?;
+        let scalar = parse_scalar_setting(
+            std::env::var_os("ATLAS_GLM53_FFN_GRAPHS_SCALAR").as_deref(),
+            setting.enabled(),
+        )?;
         let environment = if setting.enabled() {
             environment()
         } else {
@@ -59,14 +82,59 @@ impl FfnGraphs {
                 );
             }
             tracing::info!(
-                "GLM FFN graphs armed: exact position-free MoE groups, lazy warm/capture/replay, max_entries=294"
+                "GLM FFN graphs armed: exact position-free MoE groups, lazy warm/capture/replay, max_entries=336 scalar_walk={scalar}"
             );
         }
         Ok(Self {
             setting,
+            scalar,
             environment,
             cache: Mutex::new(GraphCache::new()),
         })
+    }
+
+    /// Whether the one-row decode walk may run its MoE groups as graphs.
+    pub(super) fn eligible_scalar(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<bool> {
+        if !self.setting.enabled() || !self.scalar {
+            return Ok(false);
+        }
+        ensure!(
+            self.environment == environment(),
+            "GLM FFN graph configuration changed after construction"
+        );
+        if glm53_layer_major_prefill_active() || glm53_exact_wide_prefill_active() {
+            return Ok(false);
+        }
+        // The target-only decode walk runs on the legacy default stream, which
+        // cannot host a graph. That is a reason to decline the graph and launch
+        // eagerly, not a reason to fail the step: the scalar walk is a valid
+        // configuration that simply gets no graph. (The wide-verify `eligible`
+        // below keeps its hard check, because its caller has already committed
+        // to a private stream and a null one there would be a real defect.)
+        if stream == 0 || gpu.stream_is_capturing(stream) {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub(super) fn execute_scalar(
+        &self,
+        dispatcher: &Glm53Dispatcher<'_>,
+        gpu: &dyn GpuBackend,
+        layer: u32,
+        binding: Binding,
+    ) -> Result<()> {
+        let key = Key::new_scalar(layer).map_err(anyhow::Error::msg)?;
+        let mut io = Adapter {
+            gpu,
+            body: Some((dispatcher, layer)),
+            stream: binding.stream,
+        };
+        self.cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FFN graph owner mutex poisoned"))?
+            .execute(key, binding, &mut io)
+            .map_err(anyhow::Error::msg)
     }
 
     pub(super) fn eligible(
@@ -179,5 +247,23 @@ impl GraphIo for Adapter<'_, '_> {
         self.gpu
             .destroy_graph(GraphHandle(graph))
             .map_err(|e| format!("{e:#}"))
+    }
+}
+
+#[cfg(test)]
+mod scalar_setting_tests {
+    use super::parse_scalar_setting;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn scalar_graphs_are_strict_default_off_and_require_the_base_flag() {
+        assert!(!parse_scalar_setting(None, false).unwrap());
+        assert!(!parse_scalar_setting(None, true).unwrap());
+        assert!(!parse_scalar_setting(Some(OsStr::new("0")), true).unwrap());
+        assert!(parse_scalar_setting(Some(OsStr::new("1")), true).unwrap());
+        assert!(parse_scalar_setting(Some(OsStr::new("1")), false).is_err());
+        for bad in ["", "true", "2", " 1"] {
+            assert!(parse_scalar_setting(Some(OsStr::new(bad)), true).is_err());
+        }
     }
 }

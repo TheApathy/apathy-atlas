@@ -364,6 +364,7 @@ fn attention_binding(gpu: &dyn GpuBackend) -> Glm53AttentionBinding {
             capacity: CAPACITY,
             nonce: 0x51D3,
         },
+        prefix: None,
     }
 }
 

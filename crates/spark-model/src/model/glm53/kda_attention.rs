@@ -64,7 +64,7 @@ use crate::layers::ops::{
     Glm53KdaDecodeKernel, Glm53KdaDecodePlan, Glm53KdaForgetBuffers, Glm53KdaForgetPlan,
     Glm53KdaKernels, Glm53KdaNormBuffers, Glm53KdaNormPlan, Glm53KdaPrefillBuffers,
     Glm53KdaPrefillKernel, Glm53KdaPrefillPlan, Glm53KdaQkvBuffers,
-    glm53_exact_wide_prefill_active, glm53_layer_major_prefill_active,
+    glm53_exact_verify_active, glm53_exact_wide_prefill_active, glm53_layer_major_prefill_active,
 };
 use crate::weight_loader::{
     Glm53Exl3KdaWeights, Glm53Exl3NativeDtype, Glm53GgufMatrix, Glm53KdaWeights,
@@ -88,6 +88,18 @@ pub const GLM53_KDA_KERNEL_LAUNCHES: u32 = 9 * 2 + 2 + 4;
 /// projections use cuBLASLt once each, followed by conv and four elementwise
 /// stages.
 pub const GLM53_EXL3_KDA_KERNEL_LAUNCHES: u32 = 2 * 3 + 5 + 2 + 4;
+
+/// `ATLAS_GLM53_KDA_OOP=1` (default off, read once): run the KDA recurrence
+/// out of place from persistent state instead of priming a scratch copy per
+/// layer. Strictly `1` enables it; anything else is off.
+pub(crate) fn kda_oop_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| kda_oop_from(std::env::var("ATLAS_GLM53_KDA_OOP").ok().as_deref()))
+}
+
+pub(crate) fn kda_oop_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
 
 /// The transactional convolution state for one layer.
 ///
@@ -538,6 +550,7 @@ impl Glm53KdaAttentionKernels {
             capacity,
             nonce,
             output,
+            None,
             stream,
         )
     }
@@ -560,6 +573,7 @@ impl Glm53KdaAttentionKernels {
         capacity: u32,
         nonce: u64,
         output: GgmlIqBuffer,
+        prefix: Option<super::prefix_commit::PrefixCommitBuffers>,
         stream: u64,
     ) -> Result<u32> {
         let max_rows = if glm53_layer_major_prefill_active() {
@@ -572,7 +586,21 @@ impl Glm53KdaAttentionKernels {
             "GLM EXL3 KDA rows must be 1..={max_rows}"
         );
         self.validate_exl3_shapes(weights)?;
-        state.prime(gpu, stream)?;
+        // ATLAS_GLM53_PREFIX_COMMIT=1 inside an exact verify: chain the one-row
+        // recurrence over the rows, keeping the state after each row in its
+        // snapshot (the last row keeps writing staged). Reads persistent
+        // directly, so no prime copy either.
+        let prefix_rows =
+            prefix.filter(|_| (2..=8).contains(&rows) && glm53_exact_verify_active());
+        // ATLAS_GLM53_KDA_OOP=1: the recurrence reads persistent state directly
+        // instead of priming a scratch copy first. rows == 1 is the committed
+        // one-row walk and advances persistent state in place (its caller
+        // skips the recurrent commit copy); rows 2..=8 write the staged scratch
+        // from persistent, keeping the speculative stage/commit protocol.
+        let oop = kda_oop_enabled() && rows <= 8;
+        if !oop && prefix_rows.is_none() {
+            state.prime(gpu, stream)?;
+        }
 
         let qkv = buffers.combined_qkv_bf16;
         self.linear_exl3_rows(
@@ -601,6 +629,22 @@ impl Glm53KdaAttentionKernels {
             )?;
         }
 
+        if let Some(prefix) = prefix_rows {
+            // Keep this layer's conv inputs: the verify scratch is shared by
+            // every KDA layer, and a prefix commit re-stages the conv shift
+            // register from them.
+            for (plane, source) in [buffers.q_proj_bf16, buffers.k_proj_bf16, buffers.v_proj_bf16]
+                .into_iter()
+                .enumerate()
+            {
+                let saved = prefix.conv_input(state.ordinal(), plane, rows as usize)?;
+                ensure!(
+                    source.bytes == saved.bytes,
+                    "GLM prefix-commit conv input extent drift"
+                );
+                gpu.copy_d2d_async(source.ptr, saved.ptr, saved.bytes, stream)?;
+            }
+        }
         let conv_weights = split_conv(&weights.conv)?;
         let exact_wide = rows > 1 && glm53_exact_wide_prefill_active();
         let batch_exact_carry = exact_wide
@@ -795,20 +839,29 @@ impl Glm53KdaAttentionKernels {
         )?;
 
         if rows == 1 {
-            self.decode.launch(
-                gpu,
-                Glm53KdaDecodePlan::new(1, HEADS, HEAD_DIM, HEAD_DIM)?,
-                Glm53KdaDecodeBuffers {
-                    state_f32: state.buffer(),
-                    query_bf16: buffers.q_conv_bf16,
-                    key_bf16: buffers.k_conv_bf16,
-                    value_bf16: buffers.v_conv_bf16,
-                    log_decay_f32: buffers.log_decay_f32,
-                    beta_bf16: buffers.beta_bf16,
-                    output_bf16: buffers.recurrent_out_bf16,
-                },
-                stream,
-            )?;
+            let decode_plan = Glm53KdaDecodePlan::new(1, HEADS, HEAD_DIM, HEAD_DIM)?;
+            let decode_buffers = |state_f32: GgmlIqBuffer| Glm53KdaDecodeBuffers {
+                state_f32,
+                query_bf16: buffers.q_conv_bf16,
+                key_bf16: buffers.k_conv_bf16,
+                value_bf16: buffers.v_conv_bf16,
+                log_decay_f32: buffers.log_decay_f32,
+                beta_bf16: buffers.beta_bf16,
+                output_bf16: buffers.recurrent_out_bf16,
+            };
+            if oop {
+                // Committed one-row walk: persistent advances in place.
+                self.decode.launch_oop(
+                    gpu,
+                    decode_plan,
+                    state.persistent(),
+                    decode_buffers(state.persistent()),
+                    stream,
+                )?;
+            } else {
+                self.decode
+                    .launch(gpu, decode_plan, decode_buffers(state.buffer()), stream)?;
+            }
         } else {
             let prefill_plan = Glm53KdaPrefillPlan::new(1, rows, HEADS, HEAD_DIM, HEAD_DIM)?;
             let prefill_buffers = Glm53KdaPrefillBuffers {
@@ -844,7 +897,51 @@ impl Glm53KdaAttentionKernels {
                     ("l2_epsilon", "1.0e-6".into()),
                 ],
             )?;
-            if rows > 8 && glm53_layer_major_prefill_active() {
+            if let Some(prefix) = prefix_rows {
+                let decode_plan = Glm53KdaDecodePlan::new(1, HEADS, HEAD_DIM, HEAD_DIM)?;
+                let slice = |buffer: GgmlIqBuffer, row: usize, per_row: usize| -> Result<GgmlIqBuffer> {
+                    ensure!(
+                        buffer.bytes == rows as usize * per_row,
+                        "GLM prefix-commit KDA row buffer extent drift"
+                    );
+                    Ok(GgmlIqBuffer {
+                        ptr: buffer.ptr.offset(row * per_row),
+                        bytes: per_row,
+                    })
+                };
+                let mut source = state.persistent();
+                for row in 0..rows as usize {
+                    let destination = if row + 1 == rows as usize {
+                        state.buffer()
+                    } else {
+                        prefix.kda_row(state.ordinal(), row)?
+                    };
+                    self.decode.launch_oop(
+                        gpu,
+                        decode_plan,
+                        source,
+                        Glm53KdaDecodeBuffers {
+                            state_f32: destination,
+                            query_bf16: slice(buffers.q_conv_bf16, row, 16_384)?,
+                            key_bf16: slice(buffers.k_conv_bf16, row, 16_384)?,
+                            value_bf16: slice(buffers.v_conv_bf16, row, 16_384)?,
+                            log_decay_f32: slice(buffers.log_decay_f32, row, 32_768)?,
+                            beta_bf16: slice(buffers.beta_bf16, row, 128)?,
+                            output_bf16: slice(buffers.recurrent_out_bf16, row, 16_384)?,
+                        },
+                        stream,
+                    )?;
+                    source = destination;
+                }
+            } else if oop {
+                self.prefill.launch_oop(
+                    gpu,
+                    prefill_plan,
+                    state.persistent(),
+                    prefill_buffers,
+                    stream,
+                )?;
+            } else if rows > 8 && glm53_layer_major_prefill_active() {
                 self.prefill.launch_register_resident(
                     gpu,
                     prefill_plan,
@@ -906,6 +1003,81 @@ impl Glm53KdaAttentionKernels {
             stream,
         )?;
         Ok(GLM53_EXL3_KDA_KERNEL_LAUNCHES)
+    }
+
+    /// Prefix commit: recompute the conv shift register after the first
+    /// `rows` rows of the staged chunk from persistent state, then commit it.
+    /// Conv output rows never depend on later rows, so this is the state the
+    /// one-row walk would have left after those rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn restage_conv_prefix(
+        &self,
+        gpu: &dyn GpuBackend,
+        weights: &Glm53Exl3KdaWeights,
+        buffers: Glm53KdaScratchBuffers,
+        saved_inputs: [GgmlIqBuffer; 3],
+        total_rows: u32,
+        rows: u32,
+        conv: Glm53KdaConvSlots,
+        position: u32,
+        capacity: u32,
+        nonce: u64,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            (1..total_rows).contains(&rows) && total_rows <= 8,
+            "GLM prefix-commit conv re-stage needs a proper prefix of 2..=8 rows"
+        );
+        let conv_weights = split_conv(&weights.conv)?;
+        let slice = |buffer: GgmlIqBuffer| -> Result<GgmlIqBuffer> {
+            ensure!(
+                buffer.bytes == total_rows as usize * 16_384,
+                "GLM prefix-commit conv buffer extent drift"
+            );
+            Ok(GgmlIqBuffer {
+                ptr: buffer.ptr,
+                bytes: rows as usize * 16_384,
+            })
+        };
+        self.conv.launch_stage(
+            gpu,
+            Glm53KdaConvPlan::new(
+                1,
+                rows,
+                capacity,
+                position,
+                position
+                    .checked_add(rows)
+                    .context("GLM prefix-commit conv position overflow")?,
+                HEADS,
+                HEAD_DIM,
+                CONV_KERNEL,
+                nonce,
+            )?,
+            Glm53KdaConvBuffers {
+                q_input_bf16: saved_inputs[0],
+                k_input_bf16: saved_inputs[1],
+                v_input_bf16: saved_inputs[2],
+                q_weight_f32: conv_weights[0],
+                k_weight_f32: conv_weights[1],
+                v_weight_f32: conv_weights[2],
+                persistent_state_f32: conv.persistent_state_f32,
+                staged_state_f32: conv.staged_state_f32,
+                q_output_bf16: slice(buffers.q_conv_bf16)?,
+                k_output_bf16: slice(buffers.k_conv_bf16)?,
+                v_output_bf16: slice(buffers.v_conv_bf16)?,
+                published_ends_u32: conv.published_ends_u32,
+                published_nonces_u64: conv.published_nonces_u64,
+                logical_lengths_u32: conv.logical_lengths_u32,
+            },
+            stream,
+        )?;
+        gpu.copy_d2d_async(
+            conv.staged_state_f32.ptr,
+            conv.persistent_state_f32.ptr,
+            conv.staged_state_f32.bytes,
+            stream,
+        )
     }
 
     fn validate_exl3_shapes(&self, weights: &Glm53Exl3KdaWeights) -> Result<()> {

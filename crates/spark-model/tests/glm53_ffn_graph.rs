@@ -129,7 +129,8 @@ fn different_rows_and_layers_warm_independently() {
     }
     assert_eq!(io.calls, vec!["body"; 294]);
     assert_eq!(cache.counts(), [294, 0, 0]);
-    assert_eq!(cache.row_counts(), [[42, 0, 0]; 7]);
+    assert_eq!(cache.row_counts()[..7], [[42, 0, 0]; 7]);
+    assert_eq!(cache.row_counts()[7], [0, 0, 0]);
 }
 
 #[test]
@@ -296,4 +297,31 @@ fn group_errors_and_panics_poison_the_model_but_success_does_not() {
         .is_err()
     );
     assert_eq!(poisoned.get(), 2);
+}
+
+#[test]
+fn scalar_band_is_disjoint_from_verification_keys() {
+    use ffn_graph::{ENTRIES, SCALAR_ROW_SLOT, VERIFY_ENTRIES};
+    assert_eq!(ENTRIES, 336);
+    for layer in 3..=44 {
+        let scalar = Key::new_scalar(layer).unwrap().index();
+        assert!((VERIFY_ENTRIES..ENTRIES).contains(&scalar));
+        assert_eq!(scalar / 42, SCALAR_ROW_SLOT);
+        for rows in 2..=8 {
+            assert_ne!(Key::new(rows, layer).unwrap().index(), scalar);
+        }
+    }
+    for layer in [0, 2, 45, u32::MAX] {
+        assert!(Key::new_scalar(layer).is_err());
+    }
+    let mut cache = GraphCache::new();
+    let mut io = Io::default();
+    for layer in 3..=44 {
+        cache
+            .execute(Key::new_scalar(layer).unwrap(), binding(), &mut io)
+            .unwrap();
+    }
+    assert_eq!(io.calls, vec!["body"; 42]);
+    assert_eq!(cache.row_counts()[SCALAR_ROW_SLOT], [42, 0, 0]);
+    assert_eq!(cache.row_counts()[..7], [[0, 0, 0]; 7]);
 }

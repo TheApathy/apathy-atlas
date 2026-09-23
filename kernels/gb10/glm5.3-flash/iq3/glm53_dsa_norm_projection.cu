@@ -149,3 +149,69 @@ atlas_glm53_dsa_index_projection_f32_bf16(
     output[(unsigned long long) row * GLM53_INDEX_HEADS + head] =
         __float2bfloat16_rn(sum);
 }
+
+// ---------------------------------------------------------------------------
+// Wide DSA index projection (ATLAS_GLM53_DSA_INDEX_PROJ_WIDE=1), bit-exact.
+//
+// `atlas_glm53_dsa_index_projection_f32_bf16` launches one block per ROW with
+// 32 threads, one thread per head. At decode rows==1, so a [32,4096]x[4096]
+// f32 GEMV -- 512 KiB of `weight` -- is computed by a SINGLE WARP on a single
+// SM, and the per-thread stride of 4096 floats means no two lanes ever share a
+// cache line. Measured on GB10: 183.1 us per launch, 11 launches per token,
+// 2.0 ms of a 66.6 ms token, against a ~0.02 ms bandwidth floor.
+//
+// Here each (row, head) gets its OWN block, so the 32 heads occupy 32 SMs, and
+// within a block the warp prefetches each tile cooperatively (coalesced) before
+// the accumulating lane walks it.
+//
+// EXACTNESS. Lane 0 performs exactly the original serial chain: columns 0..4095
+// ascending, `sum = fmaf(weight_value, input_value, sum)`, same operand order,
+// same bf16->f32 conversion of the input. Staging the operands through shared
+// memory does not change any value, and no partial sums are ever combined.
+// ---------------------------------------------------------------------------
+
+#define GLM53_INDEX_PROJ_TILE 512U
+
+extern "C" __global__ void __launch_bounds__(32, 1)
+atlas_glm53_dsa_index_projection_f32_bf16_wide(
+        const __nv_bfloat16 * __restrict__ input,
+        const float * __restrict__ weight,
+        __nv_bfloat16 * __restrict__ output,
+        unsigned int rows, unsigned int inner, unsigned int heads) {
+    if (blockDim.x != 32U || blockDim.y != 1U || blockDim.z != 1U ||
+        gridDim.x != heads || gridDim.y != rows || gridDim.z != 1U ||
+        rows == 0U || rows > GLM53_MAX_ROWS ||
+        inner != GLM53_HIDDEN || heads != GLM53_INDEX_HEADS) {
+        return;
+    }
+    const unsigned int head = blockIdx.x;
+    const unsigned int row = blockIdx.y;
+    const unsigned int lane = threadIdx.x;
+
+    __shared__ float tile_weight[GLM53_INDEX_PROJ_TILE];
+    __shared__ float tile_input[GLM53_INDEX_PROJ_TILE];
+
+    const unsigned long long input_base = (unsigned long long) row * GLM53_HIDDEN;
+    const unsigned long long weight_base = (unsigned long long) head * GLM53_HIDDEN;
+
+    float sum = 0.0f;
+    for (unsigned int tile = 0U; tile < GLM53_HIDDEN;
+         tile += GLM53_INDEX_PROJ_TILE) {
+        for (unsigned int slot = lane; slot < GLM53_INDEX_PROJ_TILE; slot += 32U) {
+            tile_weight[slot] = weight[weight_base + tile + slot];
+            tile_input[slot] =
+                __bfloat162float(input[input_base + tile + slot]);
+        }
+        __syncwarp();
+        if (lane == 0U) {
+            for (unsigned int slot = 0U; slot < GLM53_INDEX_PROJ_TILE; ++slot) {
+                sum = fmaf(tile_weight[slot], tile_input[slot], sum);
+            }
+        }
+        __syncwarp();
+    }
+    if (lane == 0U) {
+        output[(unsigned long long) row * GLM53_INDEX_HEADS + head] =
+            __float2bfloat16_rn(sum);
+    }
+}

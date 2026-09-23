@@ -163,6 +163,11 @@ impl VerifyCommitIo for PolicyTarget<'_> {
                 self.model.commit_accepted(self.stream)?;
                 self.model.gpu.synchronize(self.stream)?;
                 self.model.state.lock().unwrap().position = u32::try_from(request.start() + rows)?;
+                self.model.state_hash_probe(
+                    u32::try_from(request.start() + rows)?,
+                    "full",
+                    self.stream,
+                )?;
                 let mut dflash2 = self.model.dflash2.lock().unwrap();
                 let runtime = dflash2
                     .as_mut()
@@ -173,6 +178,16 @@ impl VerifyCommitIo for PolicyTarget<'_> {
                     runtime.observe_target_rows(self.model, rows as u32, self.stream)?;
                 }
                 Ok(())
+            })
+        } else if self.model.prefix_commit_active() {
+            timing.measure(Phase::PartialReplay, || {
+                self.model.commit_prefix_rows(
+                    request.start(),
+                    request.inputs().len(),
+                    rows,
+                    self.exact_verify,
+                    self.stream,
+                )
             })
         } else {
             timing.measure(Phase::PartialReplay, || -> Result<()> {
