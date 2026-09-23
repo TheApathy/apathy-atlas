@@ -47,12 +47,15 @@ fn wide_n(n: usize, k: usize) -> bool {
 pub struct Fp8Gemm {
     m256: KernelHandle,
     n256: KernelHandle,
+    /// `ATLAS_DSV41_FP8_V2=1`: the previous v2 kernel (A/B only; byte-identical to v7).
+    v2: Option<KernelHandle>,
 }
 
 impl Fp8Gemm {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
         let k = |name: &str| gpu.kernel(FP8_GEMM_MODULE, name).with_context(|| format!("{FP8_GEMM_MODULE}::{name} is not in the PTX"));
-        Ok(Self { m256: k("dsv41_fp8_gemm_nt_v7_m256")?, n256: k("dsv41_fp8_gemm_nt_v7_n256")? })
+        let v2 = if std::env::var("ATLAS_DSV41_FP8_V2").as_deref() == Ok("1") { Some(k("dsv41_fp8_gemm_nt_v2")?) } else { None };
+        Ok(Self { m256: k("dsv41_fp8_gemm_nt_v7_m256")?, n256: k("dsv41_fp8_gemm_nt_v7_n256")?, v2 })
     }
 
     /// `out` (row stride `ldc`) = `x` (row stride `lda`) @ dequant(`w`)^T, bf16, fp32 accumulate.
@@ -62,6 +65,22 @@ impl Fp8Gemm {
         ensure!(lda >= w.k && ldc >= w.n, "lda {lda} / ldc {ldc} too small for {}x{}", w.n, w.k);
         if m == 0 {
             return Ok(());
+        }
+        if let Some(v2) = self.v2 {
+            return KernelLaunch::new(gpu, v2)
+                .grid([(w.n / BN) as u32, m.div_ceil(128) as u32, 1])
+                .block([256, 1, 1])
+                .arg_ptr(x)
+                .arg_i32(lda as i32)
+                .arg_ptr(w.weight)
+                .arg_ptr(w.scale)
+                .arg_i32(w.k.div_ceil(32) as i32)
+                .arg_ptr(out)
+                .arg_i32(ldc as i32)
+                .arg_i32(m as i32)
+                .arg_i32(w.n as i32)
+                .arg_i32(w.k as i32)
+                .launch(stream);
         }
         // 1D L2-grouped grid: the kernel maps blockIdx.x to (m-tile, n-tile) itself.
         let (kernel, bm, bn, smem) = if wide_n(w.n, w.k) { (self.n256, 128, 256, SMEM_N256) } else { (self.m256, 256, 128, SMEM_M256) };
