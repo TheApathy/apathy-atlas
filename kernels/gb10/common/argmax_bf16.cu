@@ -57,6 +57,56 @@ extern "C" __global__ void argmax_bf16(
     }
 }
 
+// Argmax over BF16 logits with ties resolved to the HIGHEST index.
+//
+// The host greedy sampler (Rust `Iterator::max_by`) keeps the last of equal
+// maxima, so a speculative verifier whose raw argmax must equal the plain
+// greedy token has to break exact BF16 ties the same way. Same launch shape
+// as `argmax_bf16`.
+extern "C" __global__ void argmax_bf16_last_wins(
+    const __nv_bfloat16* __restrict__ logits,
+    unsigned int* __restrict__ out,
+    unsigned int n
+) {
+    __shared__ float s_val[1024];
+    __shared__ unsigned int s_idx[1024];
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int stride = blockDim.x;
+
+    float local_max = -CUDART_INF_F;
+    unsigned int local_idx = 0u;
+    bool have = false;
+
+    for (unsigned int i = tid; i < n; i += stride) {
+        float v = __bfloat162float(logits[i]);
+        if (!have || v > local_max || (v == local_max && i > local_idx)) {
+            local_max = v;
+            local_idx = i;
+            have = true;
+        }
+    }
+
+    s_val[tid] = have ? local_max : -CUDART_INF_F;
+    s_idx[tid] = local_idx;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_val[tid + s] > s_val[tid] ||
+                (s_val[tid + s] == s_val[tid] && s_idx[tid + s] > s_idx[tid])) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[0] = s_idx[0];
+    }
+}
+
 // Argmax over the elementwise sum of two BF16 vectors.
 //
 // DSpark uses this for an exact full-vocabulary greedy choice without copying

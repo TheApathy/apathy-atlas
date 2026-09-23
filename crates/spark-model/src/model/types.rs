@@ -238,6 +238,9 @@ pub struct TransformerModel {
     pub(super) w4a16_gemv_batch3_logits_kernel: KernelHandle,
     pub(super) dense_gemm_kernel: KernelHandle,
     pub(super) argmax_kernel: KernelHandle,
+    /// `argmax_bf16_last_wins` (ties -> highest index, the host greedy
+    /// sampler's rule); KernelHandle(0) where the target lacks it.
+    pub(super) argmax_last_wins_kernel: KernelHandle,
     pub(super) argmax_logits_kernel: KernelHandle, // FP32 argmax for logits
     pub(super) batched_embed_kernel: KernelHandle,
     pub(super) fill_slots_kernel: KernelHandle,

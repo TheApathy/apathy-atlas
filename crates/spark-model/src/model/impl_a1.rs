@@ -147,6 +147,9 @@ impl TransformerModel {
             gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3_logits")?;
         let dense_gemm_kernel = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let argmax_kernel = gpu.kernel("argmax", "argmax_bf16")?;
+        let argmax_last_wins_kernel = gpu
+            .kernel("argmax", "argmax_bf16_last_wins")
+            .unwrap_or(KernelHandle(0));
         let argmax_logits_kernel = gpu.kernel("argmax", "argmax_fp32")?;
         let batched_embed_kernel = if fp32_residual {
             gpu.kernel("embed_from_argmax", "batched_embed_f32")
@@ -1037,6 +1040,7 @@ impl TransformerModel {
             w4a16_gemv_batch3_logits_kernel,
             dense_gemm_kernel,
             argmax_kernel,
+            argmax_last_wins_kernel,
             argmax_logits_kernel,
             batched_embed_kernel,
             fill_slots_kernel,

@@ -1608,13 +1608,27 @@ impl TransformerModel {
             if !serial.lm_head {
                 let vocab = self.verify_lmhead_vocab() as usize;
                 let argmax_out = self.buffers.scratch();
+                // Qwen4 rows break exact BF16 ties like the host greedy
+                // sampler (highest index), so a raw verify argmax equals the
+                // token plain decode would pick.
+                let argmax_kernel = if self.config.is_qwen4_exp()
+                    && self.argmax_last_wins_kernel.0 != 0
+                    && std::env::var("ATLAS_QWEN4_VERIFY_ARGMAX_FIRST_WINS")
+                        .ok()
+                        .as_deref()
+                        != Some("1")
+                {
+                    self.argmax_last_wins_kernel
+                } else {
+                    self.argmax_kernel
+                };
                 crate::kprof!(self.gpu.as_ref(), stream, "argmax", {
                     for t in 0..k {
                         let logits_t = self.buffers.logits().offset(t * vocab * bf16);
                         let out_t = argmax_out.offset(t * 4);
                         ops::argmax_bf16(
                             self.gpu.as_ref(),
-                            self.argmax_kernel,
+                            argmax_kernel,
                             logits_t,
                             out_t,
                             vocab as u32,
