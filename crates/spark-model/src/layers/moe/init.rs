@@ -109,6 +109,18 @@ impl MoeLayer {
                 .kernel("moe_fused_batch3", "moe_expert_gate_up_shared_batch3")?,
             moe_expert_silu_down_shared_batch3: gpu
                 .kernel("moe_fused_batch3", "moe_expert_silu_down_shared_batch3")?,
+            moe_expert_gate_up_shared_dedup: [
+                gpu.kernel("moe_fused_batch3", "moe_expert_gate_up_shared_dedup_r8")
+                    .unwrap_or(KernelHandle(0)),
+                gpu.kernel("moe_fused_batch3", "moe_expert_gate_up_shared_dedup_r16")
+                    .unwrap_or(KernelHandle(0)),
+            ],
+            moe_expert_silu_down_shared_dedup: [
+                gpu.kernel("moe_fused_batch3", "moe_expert_silu_down_shared_dedup_r8")
+                    .unwrap_or(KernelHandle(0)),
+                gpu.kernel("moe_fused_batch3", "moe_expert_silu_down_shared_dedup_r16")
+                    .unwrap_or(KernelHandle(0)),
+            ],
             moe_weighted_sum_blend_batch3: gpu
                 .kernel("moe_fused_batch3", "moe_weighted_sum_blend_batch3")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,

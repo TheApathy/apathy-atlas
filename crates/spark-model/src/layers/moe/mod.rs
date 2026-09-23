@@ -96,6 +96,10 @@ pub struct MoeLayer {
     // K=3 fused MoE kernel handles
     moe_expert_gate_up_shared_batch3: KernelHandle,
     moe_expert_silu_down_shared_batch3: KernelHandle,
+    /// Expert-deduplicated twins of the batch3 kernels ([r8, r16] row caps);
+    /// KernelHandle(0) where the target's module does not carry them.
+    moe_expert_gate_up_shared_dedup: [KernelHandle; 2],
+    moe_expert_silu_down_shared_dedup: [KernelHandle; 2],
     moe_weighted_sum_blend_batch3: KernelHandle,
     w4a16_gemv_batch3: KernelHandle,
     // Sorted/grouped prefill path

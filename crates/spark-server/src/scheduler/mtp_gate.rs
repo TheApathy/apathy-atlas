@@ -219,6 +219,13 @@ pub enum ArmKind {
 /// a different numerical path; FP32 verify logits cannot feed the current
 /// host oracle. A Serial arm is always safe and must remain visible to the
 /// throughput gate while thinking.
+/// `ATLAS_MTP_THINK_SPEC=0` keeps native-MTP speculation out of `<think>`
+/// spans (they decode through the plain step). Default on.
+fn native_mtp_think_spec_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_MTP_THINK_SPEC").ok().as_deref() != Some("0"))
+}
+
 pub(crate) fn arm_allows_thinking(
     arm: ArmKind,
     primary_is_dflash: bool,
@@ -229,7 +236,12 @@ pub(crate) fn arm_allows_thinking(
         ArmKind::Serial => true,
         ArmKind::Spec { proposer_arm, .. } => {
             let is_dflash = primary_is_dflash && proposer_arm == PROPOSER_ARM_PRIMARY;
-            policy_oracle_available && (!is_dflash || dflash_spec_think)
+            policy_oracle_available
+                && if is_dflash {
+                    dflash_spec_think
+                } else {
+                    native_mtp_think_spec_enabled()
+                }
         }
     }
 }
