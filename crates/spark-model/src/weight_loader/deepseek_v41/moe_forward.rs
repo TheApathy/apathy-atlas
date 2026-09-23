@@ -37,7 +37,8 @@ use super::device_allocs::{DeviceAllocs, SharedGpu};
 use super::fwd::V41RoutedMoe;
 use super::moe_decode::{self, MAX_DECODE_T, MoeDecode};
 use super::moe::{
-    COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_DOWN_SMEM, FUSED_GATE_UP_SMEM, FUSED_GEMM_MODULE, FUSED_TILE_M,
+    COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_DOWN_M32_FN, FUSED_DOWN_M32_SMEM, FUSED_DOWN_SMEM, FUSED_GATE_UP_M32_FN, FUSED_GATE_UP_M32_SMEM,
+    FUSED_GATE_UP_SMEM, FUSED_GEMM_MODULE, FUSED_SMALL_M, FUSED_TILE_M,
     FUSED_TILE_N, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE,
     PERMUTE_KERNEL, ROUTE_TOPK_FN, SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, expert_matrices, gemm_weight_t_f32out,
     group_by_expert,
@@ -227,6 +228,8 @@ pub struct Cb3RoutedMoe {
     k_route: KernelHandle,
     k_fused_gate_up: KernelHandle,
     k_fused_down: KernelHandle,
+    k_fused_gate_up_m32: KernelHandle,
+    k_fused_down_m32: KernelHandle,
     tiles: DevicePtr,
     max_tiles: usize,
 }
@@ -329,6 +332,8 @@ impl Cb3RoutedMoe {
             k_route: gpu.kernel(COMBINE_MODULE, ROUTE_TOPK_FN)?,
             k_fused_gate_up: gpu.kernel(FUSED_GEMM_MODULE, FUSED_GATE_UP_FN)?,
             k_fused_down: gpu.kernel(FUSED_GEMM_MODULE, FUSED_DOWN_FN)?,
+            k_fused_gate_up_m32: gpu.kernel(FUSED_GEMM_MODULE, FUSED_GATE_UP_M32_FN)?,
+            k_fused_down_m32: gpu.kernel(FUSED_GEMM_MODULE, FUSED_DOWN_M32_FN)?,
             tiles,
             max_tiles,
         })
@@ -652,23 +657,28 @@ impl Cb3RoutedMoe {
         stream: u64,
     ) -> Result<()> {
         let s = &self.scratch;
-        // Every expert takes the MMA kernels. A tile's row count never changes a row's
-        // arithmetic (each output element's K loop is independent of its tile-mates), so the
-        // result is chunk-invariant; the byte test is cb3_moe_oracle_microtest --invariance.
-        let mut mma: Vec<i32> = Vec::new();
+        // Every expert takes the MMA kernels. A tile's row count (and which of the two tile
+        // shapes it lands in) never changes a row's arithmetic: each output element is the same
+        // m16n8k16 sequence over K. So the result is chunk-invariant; the byte test is
+        // cb3_moe_oracle_microtest --invariance. 128-row tiles first, then experts of <= 32
+        // rows for the 32-row kernels (a large expert's small tail stays on the 128-row
+        // kernel: sending it too measured 2% slower at T=2048).
+        let (mut mma, mut small): (Vec<i32>, Vec<i32>) = (Vec::new(), Vec::new());
         for (group, (begin, end)) in groups.iter().zip(group_rows) {
             let mut row = *begin;
             while row < *end {
                 let rows = (end - row).min(FUSED_TILE_M);
-                mma.extend_from_slice(&[row as i32, rows as i32, group.slot as i32, 0]);
+                let list = if end - begin <= FUSED_SMALL_M { &mut small } else { &mut mma };
+                list.extend_from_slice(&[row as i32, rows as i32, group.slot as i32, 0]);
                 row += rows;
             }
         }
-        let n_mma = mma.len() / 4;
-        if n_mma == 0 {
+        let (n_mma, n_small) = (mma.len() / 4, small.len() / 4);
+        if n_mma + n_small == 0 {
             return Ok(());
         }
-        ensure!(n_mma <= self.max_tiles, "{n_mma} tiles exceed the {} allocated", self.max_tiles);
+        mma.extend_from_slice(&small);
+        ensure!(n_mma + n_small <= self.max_tiles, "{} tiles exceed the {} allocated", n_mma + n_small, self.max_tiles);
         self.gpu.copy_h2d(as_bytes_i32(&mma), self.tiles)?;
 
         let [gate, up, down] = &self.matrices;
@@ -719,8 +729,19 @@ impl Cb3RoutedMoe {
                 .arg_i32(down.cols as i32)
                 .launch(stream)
         };
-        gate_up(self.k_fused_gate_up, self.tiles, n_mma, FUSED_TILE_N, 256, FUSED_GATE_UP_SMEM)?;
-        down_proj(self.k_fused_down, self.tiles, n_mma, FUSED_TILE_N, 256, FUSED_DOWN_SMEM)?;
+        let small_tiles = DevicePtr(self.tiles.0 + (n_mma * 16) as u64);
+        if n_mma > 0 {
+            gate_up(self.k_fused_gate_up, self.tiles, n_mma, FUSED_TILE_N, 256, FUSED_GATE_UP_SMEM)?;
+        }
+        if n_small > 0 {
+            gate_up(self.k_fused_gate_up_m32, small_tiles, n_small, FUSED_TILE_N, 256, FUSED_GATE_UP_M32_SMEM)?;
+        }
+        if n_mma > 0 {
+            down_proj(self.k_fused_down, self.tiles, n_mma, FUSED_TILE_N, 256, FUSED_DOWN_SMEM)?;
+        }
+        if n_small > 0 {
+            down_proj(self.k_fused_down_m32, small_tiles, n_small, FUSED_TILE_N, 256, FUSED_DOWN_M32_SMEM)?;
+        }
         Ok(())
     }
 
