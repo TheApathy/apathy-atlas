@@ -38,7 +38,7 @@ use atlas_core::config::{ExpertPack, SERVED_PACKED_KEEP, parse_config};
 use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
 use spark_model::weight_loader::deepseek_v41::fwd::V41RoutedMoe;
 use spark_model::weight_loader::deepseek_v41::moe_forward::{
-    Cb3RoutedMoe, ExpertKernel, MoeControl, ROUTER_EXPERTS, RouterF32, TOP_K,
+    Cb3RoutedMoe, ExpertKernel, Fp8Act, MoeControl, ROUTER_EXPERTS, RouterF32, TOP_K,
 };
 use spark_model::weight_loader::deepseek_v41::moe::fused_tile_height;
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops};
@@ -104,6 +104,7 @@ fn main() -> Result<()> {
     let mut dump: Option<PathBuf> = None;
     let mut kernel = ExpertKernel::Reconstruct;
     let mut leak_control = false;
+    let mut fp8_act = false;
     let mut invariance: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -115,6 +116,9 @@ fn main() -> Result<()> {
             // NEGATIVE CONTROL for the ownership check: cycles 2-6 load the arena UNOWNED (the
             // old never-free behaviour); the check must then FAIL.
             "--leak-control" => leak_control = true,
+            // OPT-IN fp8 activations (NOT exact). The oracle rel_l2 is then informational; the
+            // kernel gate is --dump of --kernel fused vs --kernel reconstruct (the emulation).
+            "--fp8-act" => fp8_act = true,
             "--invariance" => invariance = Some(args.next().context("--invariance needs SPLIT[;SPLIT]")?),
             "--kernel" => {
                 kernel = match args.next().context("--kernel needs fused|reconstruct")?.as_str() {
@@ -227,6 +231,7 @@ fn main() -> Result<()> {
     moe.set_pass_tokens(pass_ids);
     moe.set_control(control);
     moe.set_expert_kernel(kernel);
+    moe.set_fp8_act(if fp8_act { Fp8Act::All } else { Fp8Act::Off });
     println!("  expert kernel: {kernel:?}");
     if control != MoeControl::None {
         println!("  [control {control:?}] — MUST FAIL");
@@ -468,6 +473,10 @@ fn main() -> Result<()> {
             return Ok(());
         }
         bail!("CONTROL DID NOT FIRE: rel_l2 {rel:.3e} inside {floor:.0e}. This gate proves nothing.");
+    }
+    if fp8_act {
+        println!("\nFP8-ACT (not exact): rel_l2 {rel:.3e} vs the exact engine oracle, informational only.");
+        return Ok(());
     }
     ensure!(rel < TOL, "FAIL: rel_l2 {rel:.3e} exceeds the pre-registered {TOL:.0e}");
     println!("\nPASS: routed MoE matches the engine (rel_l2 {rel:.3e}).");

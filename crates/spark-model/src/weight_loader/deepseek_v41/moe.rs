@@ -273,6 +273,26 @@ pub const FUSED_DOWN_M32_FN: &str = "cb3_moe_down_m32";
 /// [`FUSED_TILE_N`], K by 128 (a pair of BK steps).
 pub const FUSED_TILE_M: usize = 128;
 pub const FUSED_TILE_N: usize = 64;
+/// OPT-IN fp8-activation MoE (`cb3/cb3_moe_q8.cu`, `ATLAS_DSV41_MOE_FP8_ACT=1`): NOT exact. The MoE
+/// input and h are e4m3 with a UE8M0 scale per row per 32 K; the GEMMs run on the block-scaled
+/// tensor core. Same tile lists as the exact kernels.
+pub const FUSED_Q8_MODULE: &str = "cb3_moe_q8";
+pub const Q8_ACT_QUANT_FN: &str = "dsv41_act_quant_e4m3";
+pub const Q8_GATE_UP_FN: &str = "cb3_moe_q8_gate_up";
+pub const Q8_DOWN_FN: &str = "cb3_moe_q8_down";
+pub const Q8_GATE_UP_M32_FN: &str = "cb3_moe_q8_gate_up_m32";
+pub const Q8_DOWN_M32_FN: &str = "cb3_moe_q8_down_m32";
+/// Reference emulation of the fp8 path on the reconstruct kernels: quantize-dequantize in place.
+pub const Q8_QDQ_FN: &str = "dsv41_qdq_e4m3_bf16";
+pub const Q8_SWIGLU_QDQ_FN: &str = "dsv41_swiglu_qdq";
+/// Dynamic shared memory of the fp8 kernels (static_asserted in the .cu).
+pub const Q8_GATE_UP_SMEM: u32 = 16_896;
+pub const Q8_DOWN_SMEM: u32 = 12_672;
+pub const Q8_GATE_UP_M32_SMEM: u32 = 10_560;
+pub const Q8_DOWN_M32_SMEM: u32 = 6_336;
+/// Environment switch for the fp8-activation path (read once, in `Cb3RoutedMoe::new`).
+pub const MOE_FP8_ACT_ENV: &str = "ATLAS_DSV41_MOE_FP8_ACT";
+
 /// Row count at or below which a whole expert takes the 32-row kernels.
 pub const FUSED_SMALL_M: usize = 32;
 

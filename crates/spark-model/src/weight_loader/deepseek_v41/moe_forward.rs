@@ -24,7 +24,7 @@
 //! before each pass. Forgetting is an ERROR, not a text-only fallback: routing image rows
 //! with the text bias changed 97 picks on runE_image and raises nothing.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::sync::{Arc, Mutex};
 
 use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed_pinned};
@@ -37,7 +37,9 @@ use super::device_allocs::{DeviceAllocs, SharedGpu};
 use super::fwd::V41RoutedMoe;
 use super::moe::{
     COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_DOWN_M32_FN, FUSED_DOWN_M32_SMEM, FUSED_DOWN_SMEM, FUSED_GATE_UP_M32_FN, FUSED_GATE_UP_M32_SMEM,
-    FUSED_GATE_UP_SMEM, FUSED_GEMM_MODULE, FUSED_SMALL_M, FUSED_TILE_M, fused_tile_height,
+    FUSED_GATE_UP_SMEM, FUSED_GEMM_MODULE, FUSED_Q8_MODULE, FUSED_SMALL_M, FUSED_TILE_M, MOE_FP8_ACT_ENV,
+    Q8_ACT_QUANT_FN, Q8_DOWN_FN, Q8_DOWN_M32_FN, Q8_DOWN_M32_SMEM, Q8_DOWN_SMEM, Q8_GATE_UP_FN, Q8_GATE_UP_M32_FN,
+    Q8_GATE_UP_M32_SMEM, Q8_GATE_UP_SMEM, Q8_QDQ_FN, Q8_SWIGLU_QDQ_FN, fused_tile_height,
     FUSED_TILE_N, Cb3Permutation, Cb3Reconstruct, MOE_PERMUTE_MODULE,
     PERMUTE_KERNEL, ROUTE_TOPK_FN, SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, expert_matrices, gemm_weight_t_f32out,
     group_by_expert,
@@ -149,6 +151,58 @@ struct Scratch {
     route_w: DevicePtr,
 }
 
+/// Which layers take the OPT-IN fp8-activation path (NOT exact). Keyed on the LAYER, never on
+/// the pass size, so a row's result does not depend on how the prompt was chunked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Fp8Act {
+    /// Exact everywhere (the default).
+    #[default]
+    Off,
+    /// Every layer.
+    All,
+    /// The CED encoder layers only (`layer < FP8_FIRST_REPLAY_LAYER`), where prefill runs whole
+    /// chunks and fp8 is faster; the replay layers (T = 128 prompt tail, where fp8 measured
+    /// slower) stay exact.
+    Encoder,
+}
+
+/// First SWA-replay layer of DeepSeek-V4.1 prefill (layers 21..39 run once over the prompt
+/// tail; model/dsv41.rs).
+pub const FP8_FIRST_REPLAY_LAYER: usize = 21;
+
+impl Fp8Act {
+    /// `ATLAS_DSV41_MOE_FP8_ACT`: unset / "0" = Off, "1" = All, "encoder" = Encoder.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(MOE_FP8_ACT_ENV).as_deref() {
+            Err(_) | Ok("0") | Ok("") => Ok(Self::Off),
+            Ok("1") => Ok(Self::All),
+            Ok("encoder") => Ok(Self::Encoder),
+            Ok(other) => bail!("{MOE_FP8_ACT_ENV}={other}: use 0, 1 or encoder"),
+        }
+    }
+
+    pub fn applies_to(self, layer: usize) -> bool {
+        match self {
+            Self::Off => false,
+            Self::All => true,
+            Self::Encoder => layer < FP8_FIRST_REPLAY_LAYER,
+        }
+    }
+}
+
+/// Kernels of the opt-in fp8-activation path (`cb3_moe_q8.cu`).
+#[derive(Clone, Copy)]
+struct Q8Kernels {
+    act_quant: KernelHandle,
+    gate_up: KernelHandle,
+    down: KernelHandle,
+    gate_up_m32: KernelHandle,
+    down_m32: KernelHandle,
+    /// Reference emulation on the reconstruct path.
+    qdq: KernelHandle,
+    swiglu_qdq: KernelHandle,
+}
+
 /// Per-pass knobs that exist for NEGATIVE CONTROLS only. Each produces finite, correctly
 /// shaped, wrong output; a gate that passes one of them is not a gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -222,6 +276,9 @@ pub struct Cb3RoutedMoe {
     k_fused_down: KernelHandle,
     k_fused_gate_up_m32: KernelHandle,
     k_fused_down_m32: KernelHandle,
+    q8: Q8Kernels,
+    /// OPT-IN, NOT EXACT: fp8 activations (see [`MOE_FP8_ACT_ENV`]). Default from the env.
+    fp8_act: Mutex<Fp8Act>,
     tiles: DevicePtr,
     max_tiles: usize,
 }
@@ -324,6 +381,16 @@ impl Cb3RoutedMoe {
             k_fused_down: gpu.kernel(FUSED_GEMM_MODULE, FUSED_DOWN_FN)?,
             k_fused_gate_up_m32: gpu.kernel(FUSED_GEMM_MODULE, FUSED_GATE_UP_M32_FN)?,
             k_fused_down_m32: gpu.kernel(FUSED_GEMM_MODULE, FUSED_DOWN_M32_FN)?,
+            q8: Q8Kernels {
+                act_quant: gpu.kernel(FUSED_Q8_MODULE, Q8_ACT_QUANT_FN)?,
+                gate_up: gpu.kernel(FUSED_Q8_MODULE, Q8_GATE_UP_FN)?,
+                down: gpu.kernel(FUSED_Q8_MODULE, Q8_DOWN_FN)?,
+                gate_up_m32: gpu.kernel(FUSED_Q8_MODULE, Q8_GATE_UP_M32_FN)?,
+                down_m32: gpu.kernel(FUSED_Q8_MODULE, Q8_DOWN_M32_FN)?,
+                qdq: gpu.kernel(FUSED_Q8_MODULE, Q8_QDQ_FN)?,
+                swiglu_qdq: gpu.kernel(FUSED_Q8_MODULE, Q8_SWIGLU_QDQ_FN)?,
+            },
+            fp8_act: Mutex::new(Fp8Act::from_env()?),
             tiles,
             max_tiles,
         })
@@ -340,6 +407,16 @@ impl Cb3RoutedMoe {
     }
 
     /// Select the expert GEMM path (A/B and gating against the reconstruct baseline).
+    /// Switch the OPT-IN fp8-activation path (NOT exact) on or off for later passes. The
+    /// default comes from `ATLAS_DSV41_MOE_FP8_ACT=1`.
+    pub fn set_fp8_act(&self, mode: Fp8Act) {
+        *self.fp8_act.lock().expect("fp8_act lock") = mode;
+    }
+
+    pub fn fp8_act(&self) -> Fp8Act {
+        *self.fp8_act.lock().expect("fp8_act lock")
+    }
+
     pub fn set_expert_kernel(&self, kernel: ExpertKernel) {
         *self.kernel.lock().expect("kernel lock") = kernel;
     }
@@ -518,19 +595,25 @@ impl Cb3RoutedMoe {
         self.gpu.copy_h2d(as_bytes_f32(&row_weight), s.row_w)?;
 
         let launch = |kernel: KernelHandle| KernelLaunch::new(self.gpu.as_ref(), kernel).block([BLOCK, 1, 1]);
-        launch(self.k_permute)
-            .grid([expanded as u32, 1, 1])
-            .arg_ptr(y)
-            .arg_ptr(s.perm)
-            .arg_ptr(s.sorted)
-            .arg_u32(hidden as u32)
-            .arg_u32(expanded as u32)
-            .launch(stream)?;
+        let fused = *self.kernel.lock().expect("kernel lock") == ExpertKernel::Fused;
+        // The fp8 fused kernels read the MoE input per TOKEN (quantized once, gathered through
+        // `sorted`), so the bf16 permute is skipped there.
+        let fp8 = self.fp8_act().applies_to(layer);
+        if !(fused && fp8) {
+            launch(self.k_permute)
+                .grid([expanded as u32, 1, 1])
+                .arg_ptr(y)
+                .arg_ptr(s.perm)
+                .arg_ptr(s.sorted)
+                .arg_u32(hidden as u32)
+                .arg_u32(expanded as u32)
+                .launch(stream)?;
+        }
 
         let residency = self.arena.layer(layer)?;
         let keep = self.arena.packed_keep();
-        if *self.kernel.lock().expect("kernel lock") == ExpertKernel::Fused {
-            self.fused_experts(residency, &groups, &plan.group_rows, stream)?;
+        if fused {
+            self.fused_experts(residency, &groups, &plan.group_rows, y, t, fp8, stream)?;
             return launch(self.k_sum)
                 .grid([t as u32, 1, 1])
                 .arg_ptr(s.down)
@@ -540,6 +623,16 @@ impl Cb3RoutedMoe {
                 .arg_u32(t as u32)
                 .arg_u32(TOP_K as u32)
                 .launch(stream);
+        }
+        // fp8 on the reconstruct path: the REFERENCE EMULATION of the fp8 kernels (quantize-
+        // dequantize the input and h; bf16 GEMMs of those values do not round).
+        if fp8 {
+            KernelLaunch::new(self.gpu.as_ref(), self.q8.qdq)
+                .block([256, 1, 1])
+                .grid([expanded as u32, 1, 1])
+                .arg_ptr(s.perm)
+                .arg_i32(hidden as i32)
+                .launch(stream)?;
         }
         let work = *self.work.lock().expect("work lock");
         let (do_reconstruct, do_gemm) = match work {
@@ -568,6 +661,20 @@ impl Cb3RoutedMoe {
             gemm_weight_t_f32out(act, s.w1, gate, rows, inter, hidden, stream)?;
             gemm_weight_t_f32out(act, s.w3, up, rows, inter, hidden, stream)?;
             let total = (rows * inter) as u32;
+            if fp8 {
+                KernelLaunch::new(self.gpu.as_ref(), self.q8.swiglu_qdq)
+                    .block([256, 1, 1])
+                    .grid([rows as u32, 1, 1])
+                    .arg_ptr(gate)
+                    .arg_ptr(up)
+                    .arg_ptr(w)
+                    .arg_ptr(h)
+                    .arg_i32(inter as i32)
+                    .arg_f32(self.swiglu_limit)
+                    .launch(stream)?;
+                gemm_weight_t_f32out(h, s.w2, down, rows, hidden, inter, stream)?;
+                continue;
+            }
             launch(self.k_swiglu)
                 .grid([total.div_ceil(BLOCK), 1, 1])
                 .arg_ptr(gate)
@@ -598,6 +705,9 @@ impl Cb3RoutedMoe {
         residency: &super::cb3_arena::Cb3LayerResidency,
         groups: &[super::moe::ExpertGroup],
         group_rows: &[(usize, usize)],
+        y: DevicePtr,
+        t: usize,
+        fp8: bool,
         stream: u64,
     ) -> Result<()> {
         let s = &self.scratch;
@@ -674,6 +784,17 @@ impl Cb3RoutedMoe {
                 .launch(stream)
         };
         let small_tiles = DevicePtr(self.tiles.0 + (n_mma * 16) as u64);
+        if fp8 {
+            return self.q8_experts(
+                &[w1_lo, w1_hi, w1_cb, w1_sc, w3_lo, w3_hi, w3_cb, w3_sc],
+                [lo_s, hi_s, cb_s, sc_s],
+                &[w2_lo, w2_hi, w2_cb, w2_sc],
+                [lo2, hi2, cb2, sc2],
+                (y, t),
+                (n_mma, n_small),
+                stream,
+            );
+        }
         if n_mma > 0 {
             gate_up(self.k_fused_gate_up, self.tiles, n_mma, FUSED_TILE_N, 256, FUSED_GATE_UP_SMEM)?;
         }
@@ -685,6 +806,87 @@ impl Cb3RoutedMoe {
         }
         if n_small > 0 {
             down_proj(self.k_fused_down_m32, small_tiles, n_small, FUSED_TILE_N, 256, FUSED_DOWN_M32_SMEM)?;
+        }
+        Ok(())
+    }
+
+    /// The OPT-IN fp8-activation expert GEMMs (NOT exact): quantize the MoE input to e4m3 once
+    /// per TOKEN (per row, per 32 K; the gate/up kernel gathers rows through `sorted`), then the block-scaled gate/up (which writes h as e4m3 + scales) and
+    /// down. The fp32 reconstruct buffers `up` / `gate` (unused on this path) hold the quantized
+    /// input and h, so the path costs no extra memory.
+    #[allow(clippy::too_many_arguments)]
+    fn q8_experts(
+        &self,
+        w13: &[DevicePtr; 8],
+        s13: [u64; 4],
+        w2: &[DevicePtr; 4],
+        s2: [u64; 4],
+        (y, t): (DevicePtr, usize),
+        (n_mma, n_small): (usize, usize),
+        stream: u64,
+    ) -> Result<()> {
+        let s = &self.scratch;
+        let (hidden, inter) = (self.hidden, self.inter);
+        let (xq, sx) = (s.up, DevicePtr(s.up.0 + (s.max_t * TOP_K * hidden) as u64));
+        let (hq, hs) = (s.gate, DevicePtr(s.gate.0 + (s.max_t * TOP_K * inter) as u64));
+        KernelLaunch::new(self.gpu.as_ref(), self.q8.act_quant)
+            .block([256, 1, 1])
+            .grid([t as u32, 1, 1])
+            .arg_ptr(y)
+            .arg_ptr(xq)
+            .arg_ptr(sx)
+            .arg_i32(hidden as i32)
+            .launch(stream)?;
+        let small_tiles = DevicePtr(self.tiles.0 + (n_mma * 16) as u64);
+        let gate_up = |kernel: KernelHandle, tiles: DevicePtr, n: usize, smem: u32| {
+            let mut l = KernelLaunch::new(self.gpu.as_ref(), kernel)
+                .block([256, 1, 1])
+                .shared_mem(smem)
+                .grid([(inter / FUSED_TILE_N) as u32, n as u32, 1])
+                .arg_ptr(xq)
+                .arg_ptr(sx)
+                .arg_ptr(s.sorted)
+                .arg_ptr(tiles);
+            for p in w13 {
+                l = l.arg_ptr(*p);
+            }
+            l.arg_u64(s13[0]).arg_u64(s13[1]).arg_u64(s13[2]).arg_u64(s13[3])
+                .arg_ptr(s.row_w)
+                .arg_ptr(hq)
+                .arg_ptr(hs)
+                .arg_i32(inter as i32)
+                .arg_i32(hidden as i32)
+                .arg_f32(self.swiglu_limit)
+                .launch(stream)
+        };
+        let down = |kernel: KernelHandle, tiles: DevicePtr, n: usize, smem: u32| {
+            let mut l = KernelLaunch::new(self.gpu.as_ref(), kernel)
+                .block([256, 1, 1])
+                .shared_mem(smem)
+                .grid([(hidden / FUSED_TILE_N) as u32, n as u32, 1])
+                .arg_ptr(hq)
+                .arg_ptr(hs)
+                .arg_ptr(tiles);
+            for p in w2 {
+                l = l.arg_ptr(*p);
+            }
+            l.arg_u64(s2[0]).arg_u64(s2[1]).arg_u64(s2[2]).arg_u64(s2[3])
+                .arg_ptr(s.down)
+                .arg_i32(hidden as i32)
+                .arg_i32(inter as i32)
+                .launch(stream)
+        };
+        if n_mma > 0 {
+            gate_up(self.q8.gate_up, self.tiles, n_mma, Q8_GATE_UP_SMEM)?;
+        }
+        if n_small > 0 {
+            gate_up(self.q8.gate_up_m32, small_tiles, n_small, Q8_GATE_UP_M32_SMEM)?;
+        }
+        if n_mma > 0 {
+            down(self.q8.down, self.tiles, n_mma, Q8_DOWN_SMEM)?;
+        }
+        if n_small > 0 {
+            down(self.q8.down_m32, small_tiles, n_small, Q8_DOWN_M32_SMEM)?;
         }
         Ok(())
     }
@@ -718,4 +920,20 @@ fn as_bytes_i32(v: &[i32]) -> &[u8] {
 fn as_bytes_f32(v: &[f32]) -> &[u8] {
     // SAFETY: as above, for f32.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FP8_FIRST_REPLAY_LAYER, Fp8Act};
+
+    #[test]
+    fn fp8_act_is_keyed_on_the_layer_only() {
+        assert!(!Fp8Act::Off.applies_to(0));
+        assert!(Fp8Act::All.applies_to(39));
+        assert!(Fp8Act::Encoder.applies_to(0));
+        assert!(Fp8Act::Encoder.applies_to(FP8_FIRST_REPLAY_LAYER - 1));
+        assert!(!Fp8Act::Encoder.applies_to(FP8_FIRST_REPLAY_LAYER));
+        assert!(!Fp8Act::Encoder.applies_to(39));
+        assert_eq!(Fp8Act::default(), Fp8Act::Off);
+    }
 }

@@ -30,7 +30,7 @@ use std::time::Instant;
 use atlas_core::config::{ExpertPack, SERVED_PACKED_KEEP, parse_config};
 use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
 use spark_model::weight_loader::deepseek_v41::moe_forward::{
-    Cb3RoutedMoe, ExpertKernel, ExpertWork, ROUTER_EXPERTS, RouterF32, TOP_K,
+    Cb3RoutedMoe, ExpertKernel, Fp8Act, ExpertWork, ROUTER_EXPERTS, RouterF32, TOP_K,
 };
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
@@ -77,6 +77,7 @@ fn main() -> Result<()> {
     let mut token_counts = vec![2048usize, 512, 64, 1];
     let (mut warmup, mut iters) = (2usize, 7usize);
     let mut production_only = false;
+    let mut fp8_act = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -89,6 +90,8 @@ fn main() -> Result<()> {
             "--iters" => iters = args.next().context("--iters")?.parse()?,
             // Time only the production forward (A/B loops, profilers): no reconstruct phases.
             "--production-only" => production_only = true,
+            // OPT-IN fp8-activation MoE (NOT exact), for timing against the exact default.
+            "--fp8-act" => fp8_act = true,
             other => bail!("unknown argument {other}"),
         }
     }
@@ -122,6 +125,7 @@ fn main() -> Result<()> {
     let pack = ExpertPack::parse(&std::fs::read_to_string(pack_dir.join("manifest.json"))?, SERVED_PACKED_KEEP)?;
     let arena = Arc::new(Cb3ExpertArena::load_one_layer(Path::new(&pack_dir), &pack, layer, &shared)?);
     let moe = Cb3RoutedMoe::new(shared.clone(), kernels, &config, arena, vec![(layer, router(layer, hidden, gpu)?)], 10.0, 1.5, max_t)?;
+    moe.set_fp8_act(if fp8_act { Fp8Act::All } else { Fp8Act::Off });
     let stream = gpu.default_stream();
     let d_in = gpu.alloc(max_t * hidden * 2)?;
     let d_out = gpu.alloc(max_t * hidden * 2)?;
