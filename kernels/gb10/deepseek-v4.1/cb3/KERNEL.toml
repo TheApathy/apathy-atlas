@@ -1,0 +1,47 @@
+[build]
+# `--fmad=false` matches deepseek-v4-flash. The CB3 reconstruct does one
+# multiply and no add, so it is unaffected; the flag is here so the SHARED
+# kernels this target inherits from `kernels/gb10/common/` compile with the
+# same numerics as the other DeepSeek target rather than silently diverging.
+#
+# `--atlas-ieee-math` (team-lead, 2026-09-23): all-models' build_target.rs
+# passes --use_fast_math to every target unless it opts out with this
+# sentinel. The D lineage DeepSeek-V4.1 was built and gated on compiles
+# IEEE (no ftz, precise div/sqrt/exp) -- every dsv41 byte-identity/KL/oracle
+# result in this port assumes that. Without the sentinel here, dsv41/port
+# would silently compile with fast math and diverge from the numbers every
+# gate in this effort is checked against.
+#
+# `-DTQ_PLUS_SIGNS`: per-target KERNEL.toml does not merge the common
+# KERNEL.toml's `extra_nvcc_flags` (A's build_target.rs takes the more
+# specific KERNEL.toml as-is), so this must be repeated here for the SHARED
+# common/ kernels this target compiles against the same sign convention.
+extra_nvcc_flags = ["--fmad=false", "--atlas-ieee-math", "-DTQ_PLUS_SIGNS"]
+
+# Module-name overrides. Unlisted `.cu` files use their file stem, so
+# `cb3_reconstruct_bf16.cu` is reachable as module "cb3_reconstruct_bf16"
+# — spelled once in `weight_loader/deepseek_v41/cb3_arena.rs` as
+# `CB3_RECONSTRUCT_MODULE`.
+#
+# Names below mirror deepseek-v4-flash so the common kernels resolve under
+# the module names the shared Rust paths already look up.
+[modules]
+e2m1_branchless = "e2m1"
+moe_permute = "moe"
+dense_gemm_bf16 = "gemm"
+dense_gemm_splitk = "gemm_splitk"
+dense_gemm_tc = "gemm_tc"
+rms_norm = "norm"
+argmax_bf16 = "argmax"
+dense_gemv_bf16 = "gemv"
+dense_gemv_fp8w = "gemv_fp8w"
+quantize_bf16_to_nvfp4 = "quantize_nvfp4"
+paged_decode_attn = "paged_decode"
+kv_cache_append = "kv_cache"
+moe_topk_sigmoid = "moe_topk_sig"
+moe_topk_sqrtsoftplus = "moe_topk_sqrt"
+moe_sorted_prefill = "moe_sorted"
+
+# DeepSeek-V4.1 vision tower: the V4-Flash-Vision kernels, symlinked from
+# deepseek-v4-flash/nvfp4 (the towers are identical; see
+# spark-model layers/deepseek_vision `load_v41`). Module names = file stems.

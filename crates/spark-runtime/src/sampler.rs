@@ -497,7 +497,7 @@ pub fn argmax_first_wins_f32(v: &[f32]) -> u32 {
 }
 
 mod sample_impl;
-pub use sample_impl::{sample_with_params_history, sample_with_params_seeded};
+pub use sample_impl::{first_max_index, sample_with_params_history, sample_with_params_seeded};
 
 /// Convenience wrapper: sample without token history (no repetition penalty).
 pub fn sample_with_params(data: &[u8], params: &SamplingParams) -> u32 {

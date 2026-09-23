@@ -416,6 +416,41 @@ pub struct ModelConfig {
     /// GLM-5-Next-only KDA, sparse indexer, FFN schedule, and stop-token ABI.
     #[serde(skip)]
     pub glm5_next: Option<Glm5NextConfig>,
+    // ---- DeepSeek V4 / V4.1 family (forward-ported from dsv41/integration) ----
+    #[serde(default)]
+    pub num_attention_heads_per_layer: Vec<usize>,
+    #[serde(skip)]
+    pub deepseek_main_rope_theta: Option<f64>,
+    #[serde(default)]
+    pub lm_head_bf16_override: Option<bool>,
+    #[serde(default)]
+    pub lm_head_fp8: bool,
+    #[serde(default)]
+    pub mlp_only_layers: Vec<usize>,
+    #[serde(default, skip_deserializing, skip_serializing)]
+    pub moe_intermediate_sizes: Vec<usize>,
+    #[serde(default, skip_deserializing, skip_serializing)]
+    pub num_experts_per_toks: Vec<usize>,
+    #[serde(default)]
+    pub o_lora_rank: usize,
+    #[serde(default)]
+    pub o_groups: usize,
+    #[serde(default)]
+    pub yarn_mscale: f32,
+    #[serde(default)]
+    pub yarn_mscale_all_dim: f32,
+    #[serde(default)]
+    pub compress_ratios: Vec<usize>,
+    #[serde(skip)]
+    pub deepseek_v4_indexer: Option<DeepSeekV4IndexerConfig>,
+    #[serde(default)]
+    pub num_hash_layers: usize,
+    #[serde(default = "default_one_f32")]
+    pub yarn_attention_factor: f32,
+    #[serde(skip)]
+    pub deepseek_vision: Option<DeepSeekVisionConfig>,
+    #[serde(default)]
+    pub adapter_max_rank: usize,
 }
 
 /// Advertised weight-quantization layout, as declared in the HF
@@ -552,6 +587,10 @@ impl ModelConfig {
 pub(crate) fn default_one() -> usize {
     1
 }
+pub(crate) fn default_one_f32() -> f32 {
+    1.0
+}
+
 pub(crate) fn default_one_f64() -> f64 {
     1.0
 }
@@ -575,6 +614,25 @@ mod methods;
 mod parsers;
 #[cfg(test)]
 mod tests;
+
+// DeepSeek-V4 / V4.1 (forward-ported from dsv41/integration).
+mod deepseek_v4_indexer;
+pub use deepseek_v4_indexer::DeepSeekV4IndexerConfig;
+mod deepseek_vision;
+pub use deepseek_vision::DeepSeekVisionConfig;
+mod deepseek_vision_layout;
+pub use deepseek_vision_layout::{
+    ImageBlock, ImageTokenType, build_deepseek_image_block, deepseek_image_block_len,
+};
+mod deepseek_vision_tokens;
+pub use deepseek_vision_tokens::{DeepSeekImageSpan, validate_deepseek_image_tokens};
+mod deepseek_v41_pack;
+pub use deepseek_v41_pack::{
+    CB3_TENSORS, Cb3Tensor, ExpertPack, MIN_PACKED_KEEP, PACK_EXPERTS, ROUTED_EXPERTS,
+    SERVED_PACKED_KEEP,
+};
+pub(crate) use parsers::parse_deepseek_v4;
+pub(crate) use parsers::parse_deepseek_v41;
 
 pub use dispatch::parse_config;
 pub use glm5_next::{Glm5NextConfig, Glm5NextIndexerType, Glm5NextMlpType};

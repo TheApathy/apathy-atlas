@@ -20,6 +20,13 @@ pub struct MoeStreamTransposeScratch {
 }
 
 pub trait TransformerLayer: Send + Sync {
+    /// `&dyn Any` downcast hook for read-only layer walks (e.g. the DSpark
+    /// γ-verify compressed-pool catch-up). Default `None`; layers that expose
+    /// per-layer state override.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Preflight the optional exact Qwen4 M16 attention path before request state changes.
     fn preflight_qwen4_attn16(
         &self,

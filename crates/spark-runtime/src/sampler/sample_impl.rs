@@ -123,12 +123,7 @@ pub fn sample_with_params_seeded(
     // penalties + logit_bias actually re-order logits, so as long as those
     // ran first, this argmax is correct AND respects caller config.
     if params.temperature <= 0.0 {
-        return raw_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+        return first_max_index(&raw_logits);
     }
     let temperature = params.temperature;
 
@@ -159,12 +154,7 @@ pub fn sample_with_params_seeded(
 
     if logits.is_empty() {
         // Fallback: if top-n-sigma filtered everything, use argmax of original
-        return raw_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+        return first_max_index(&raw_logits);
     }
 
     // ── 3. Sort descending + top-k ──
@@ -237,4 +227,20 @@ pub fn sample_with_params_seeded(
         }
     }
     probs.last().map_or(0, |p| p.0)
+}
+
+/// Greedy argmax with torch/vLLM tie-breaking: the LOWEST index among equal maxima.
+/// (`Iterator::max_by` returns the LAST of equal elements, which flipped exact bf16 ties.)
+/// NaN is never selected and never blocks a later value; all-NaN or empty returns 0.
+pub fn first_max_index(logits: &[f32]) -> u32 {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &v) in logits.iter().enumerate() {
+        if v.is_nan() {
+            continue;
+        }
+        if best.is_none_or(|(_, b)| v > b) {
+            best = Some((i, v));
+        }
+    }
+    best.map_or(0, |(i, _)| i as u32)
 }

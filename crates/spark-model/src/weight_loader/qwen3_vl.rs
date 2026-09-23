@@ -147,7 +147,7 @@ impl ModelWeightLoader for Qwen3VLWeightLoader {
         Ok(layers)
     }
 
-    fn load_embedding(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight> {
+    fn load_embedding(&self, store: &WeightStore, config: &ModelConfig, _gpu: &dyn GpuBackend) -> Result<DenseWeight> {
         let prefix = &config.weight_prefix;
         dense(store, &format!("{prefix}.embed_tokens.weight"))
     }
@@ -177,7 +177,7 @@ impl ModelWeightLoader for Qwen3VLWeightLoader {
                 return dense(store, pattern);
             }
         }
-        self.load_embedding(store, config)
+        self.load_embedding(store, config, _gpu)
     }
 
     fn load_mtp_weights(

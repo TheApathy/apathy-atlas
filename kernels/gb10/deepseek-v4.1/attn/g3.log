@@ -1,0 +1,23 @@
+T=48 NH=64 D=512 NW=128 NC=512 RING=4096 n_c=4144
+kernel vs fp32-P reference  : rel_l2=4.271e-07 worst_abs=2.980e-07
+kernel vs bf16-P reference  : rel_l2=1.401e-03 worst_abs=4.205e-04
+all-masked row (token 0)    : finite=1  max|o|=0.000e+00
+CONTROL order  (compressed-first): rel_l2=5.122e-07 vs ref, 3.453e-07 vs correct order
+CONTROL gather (sequential rows) : rel_l2=1.353e+00  -> separation 3167774x
+
+BLOCK ORDER IS NOT COVERED BY THIS GATE. Reordering moves the result
+      3.453e-07 (vs the kernel's own 4.271e-07 from the fp32 reference, and the
+      1.401e-03 that prefill_attn's bf16-P rounding already costs). Order is a
+      bit-exactness question here, not a correctness one.
+
+NOTE: the gap against the bf16-P reference is this kernel being MORE
+      accurate, not less. tools/prefill_attn.py rounds P to bf16 because
+      tl.dot needs a tensor-core dtype; this kernel's hand-rolled FMA dot
+      has no reason to pay that. DO NOT 'fix' the kernel toward the bf16-P
+      number -- that makes the port worse to make a number prettier.
+      Consequence to expect: being more accurate means DIVERGING from the
+      Python engine, and ulp differences flip MoE router decisions. So
+      end-to-end validation is on OUTPUT QUALITY, not bit-identity, and a
+      per-layer bisect is only valid up to the FIRST routing flip.
+PASS one-pass streaming gather (controls separate)
+flock_or_gate_exit=0
