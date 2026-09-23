@@ -31,10 +31,6 @@ pub const BUILTIN_YAML: &[(&str, &str)] = &[
         include_str!("builtin/qwen3.8-flash-next-offload-local.yaml"),
     ),
     ("glm5.3/glm-5.3-flash-exl3-local", include_str!("builtin/glm-5.3-flash-exl3-local.yaml")),
-    (
-        "qwen3.5/qwen3.5-27b-text-nvfp4-mtp-local",
-        include_str!("builtin/qwen3.5-27b-text-nvfp4-mtp-local.yaml"),
-    ),
     ("qwen3.6/aeon-q36-27b-full-local", include_str!("builtin/aeon-q36-27b-full-local.yaml")),
 ];
 
@@ -93,15 +89,14 @@ mod tests {
         assert_eq!(args.max_batch_size, 1);
     }
 
-    /// Every built-in renders a command line clap accepts, and the three qwen3_5/5120
-    /// checkpoints (which the auto-pick would all put on qwen3.6-27b) are pinned to their
+    /// Every built-in renders a command line clap accepts, and the two qwen3_5/5120
+    /// checkpoints (which the auto-pick would both put on qwen3.6-27b) are pinned to their
     /// own targets.
     #[test]
     fn every_builtin_builds_a_valid_serve_command_with_its_kernel_target() {
         let want = [
             ("optimized-qwen", Some("qwen3.8-27b")),
             ("Qwen3.8-Flash-Next-NVFP4-Offload", Some("qwen3.8-flash-next")),
-            ("Qwen3.5-27B-Text-NVFP4-MTP", Some("qwen3.5-27b")),
             ("AEON-Q36-27B-Full", Some("qwen3.6-27b")),
             ("GLM-5.3-Flash-exl3-2.05bpw", None),
         ];

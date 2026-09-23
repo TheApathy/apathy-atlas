@@ -62,7 +62,7 @@ fn a_recipe_without_an_atlas_block_has_no_profile() {
     assert!(parse_profile("x/y", yaml).unwrap().is_none());
 }
 
-/// Three built-ins share `qwen3_5`, so the profile must be chosen by the checkpoint's
+/// Two built-ins share `qwen3_5`, so the profile must be chosen by the checkpoint's
 /// directory. Control: a qwen3_5 checkpoint with no built-in of its own gets NO profile
 /// (the type alone is ambiguous) rather than a neighbour's environment.
 #[test]
@@ -70,9 +70,8 @@ fn qwen3_5_checkpoints_get_their_own_profile_by_directory() {
     let q38 = profile_for(Some("/home/flocka/atlas/qwen38/optimized-qwen"), "qwen3_5").unwrap();
     assert_eq!(q38.recipe_id, "qwen3.8/qwen3.8-27b-optimized-local");
     assert!(q38.env.contains_key("ATLAS_ATTN_PROJ_CUBLASLT"));
-    let q35 = profile_for(Some("/m/Qwen3.5-27B-Text-NVFP4-MTP/"), "qwen3_5").unwrap();
-    assert_eq!(q35.recipe_id, "qwen3.5/qwen3.5-27b-text-nvfp4-mtp-local");
-    assert!(q35.env.is_empty());
+    let aeon = profile_for(Some("/m/AEON-Q36-27B-Full/"), "qwen3_5").unwrap();
+    assert_eq!(aeon.recipe_id, "qwen3.6/aeon-q36-27b-full-local");
     assert!(profile_for(Some("/m/Some-Other-27B"), "qwen3_5").is_none());
     let fn_ = profile_for(Some("Qwen3.8-Flash-Next-NVFP4-Offload"), "qwen4_exp").unwrap();
     assert!(fn_.run_alone && fn_.env.contains_key("ATLAS_QWEN4_PREFILL_ATTN_FLASH"));
