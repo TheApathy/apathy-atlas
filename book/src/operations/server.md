@@ -105,7 +105,7 @@ See [Multi-GPU & EP=2](./multi-gpu.md) for the full setup, including the NCCL en
 |---|---|---|
 | `--profile` | off | Per-kernel sync + timing (disables CUDA graphs, +10% overhead) |
 | `--adaptive-sampling` | off | Entropy-gated greedy path |
-| `--default-top-n-sigma` | `1.0` | Default σ for top-n-sigma sampler |
+| `--default-top-n-sigma` | `0.0` | Default σ for top-n-sigma sampler when generation_config sets none (0 = off) |
 | `--default-min-p` | `0.0` | Default min-p |
 | `--swap-space-gb` | `3` | Disk-backed KV swap at `/tmp/atlas-swap/` |
 | `--request-timeout` | `300` | Per-request seconds, 0 disables |

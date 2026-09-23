@@ -596,12 +596,19 @@ pub struct ServeArgs {
     #[arg(long, value_name = "THRESHOLD", num_args = 0..=1, default_missing_value = "0.75")]
     pub auto_compact: Option<f32>,
 
-    /// Default top-n-sigma for sampling (filter tokens by logit z-score).
-    /// 0.0 = disabled. Recommended: 1.0 for NVFP4 models AND for agent
-    /// workloads — top-n-σ is temperature-invariant (Tang et al.,
-    /// arXiv:2411.07641) so it is more robust than top-p across the
-    /// per-phase temperature drift agentic loops induce.
-    #[arg(long, default_value_t = 1.0)]
+    /// Default top-n-sigma for sampling (filter tokens by logit z-score),
+    /// used when the model's generation_config.json does not set one.
+    /// 0.0 = disabled (the default, as in HF/vLLM). A request's own
+    /// `top_n_sigma` always wins.
+    ///
+    /// It was 1.0. Measured 2026-09-23 at each model's default sampling
+    /// (T=1, top_k=20, top_p=0.95), 18 samples per cell: Qwen3.8-27B and
+    /// Qwen3.8-Flash-Next showed 0 repetition loops with it on or off and
+    /// no quality difference (top_k=20 already truncates harder), while
+    /// DeepSeek-V4.1, whose config has no top_k/top_p, looped at T=1 with
+    /// 1.0 as its only truncation. top-n-σ is temperature-invariant (Tang
+    /// et al., arXiv:2411.07641); set 1.0 here to opt back in.
+    #[arg(long, default_value_t = 0.0)]
     pub default_top_n_sigma: f32,
 
     /// Default min-p for sampling (keep tokens with prob >= min_p * max_prob).
