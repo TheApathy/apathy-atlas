@@ -251,6 +251,19 @@ pub(crate) fn construction_overhead_bytes(config: &ModelConfig) -> ConstructionO
     }
 }
 
+/// CPU-only dry run of [`load_weight_store`]'s fast path for a single-rank serve: the tensors it
+/// would upload, after the same `serving_skip` filter (see
+/// `spark_runtime::fast_weights::FastSafetensorsLoader::plan`).
+#[cfg(unix)]
+pub(crate) fn plan_weight_store(
+    config: &ModelConfig,
+    model_dir: &Path,
+) -> Result<Vec<spark_runtime::fast_weights::PlannedTensor>> {
+    let mut loader = spark_runtime::fast_weights::FastSafetensorsLoader::new();
+    loader.extra_skip = serving_skip(config);
+    loader.plan(model_dir)
+}
+
 pub(crate) fn load_weight_store(
     args: &cli::ServeArgs,
     config: &ModelConfig,
@@ -471,4 +484,132 @@ pub(crate) fn load_dflash_donor(
         donor_dir.display(),
     );
     Ok(Some(donor))
+}
+
+/// DeepSeek-V4.1 SERVE LOAD DRY RUN (CPU only). Runs the serve load path up to the first GPU
+/// allocation and reports EVERY gap in one run, instead of one per GPU window:
+/// config, kernel target, weight plan (headers, dtypes, serving_skip, resident GB), checkpoint
+/// pre-flight, model loader dispatch, expert pack manifest, EOS + tokenizer + chat template,
+/// tool-call parser, and the tensor-name set against the `dsv41_forward` driver's.
+///   ATLAS_DSV41_MODEL_DIR=/path cargo test -p spark-server --bin spark dsv41_serve_load_dry_run -- --ignored --nocapture
+#[cfg(all(test, unix))]
+mod dsv41_dry_run {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    #[test]
+    #[ignore = "needs the DeepSeek-V4.1 checkpoint on disk; CPU only"]
+    fn dsv41_serve_load_dry_run() {
+        let dir = PathBuf::from(
+            std::env::var("ATLAS_DSV41_MODEL_DIR")
+                .unwrap_or_else(|_| "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K".into()),
+        );
+        let mut gaps: Vec<String> = Vec::new();
+        let (config, _) = super::super::config::load_model_config(&dir).expect("config.json");
+        assert_eq!(config.model_type, "deepseek_v41", "not a DeepSeek-V4.1 checkpoint");
+
+        let ptx_set = match atlas_kernels::ptx_for_config(&config.model_type, config.hidden_size) {
+            Some(p) => Some(p),
+            None => {
+                gaps.push(format!("kernel target: none for {} / {}", config.model_type, config.hidden_size));
+                None
+            }
+        };
+
+        let plan = match super::plan_weight_store(&config, &dir) {
+            Ok(p) => p,
+            Err(e) => {
+                gaps.push(format!("weight plan: {e:#}"));
+                Vec::new()
+            }
+        };
+        let bytes: usize = plan.iter().map(|t| t.bytes).sum();
+        println!("serve weight plan: {} tensors, {:.2} GB resident (DSpark {})", plan.len(), bytes as f64 / 1e9,
+            if spark_model::weight_loader::deepseek_v41::dspark_enabled() { "ON" } else { "off" });
+
+        let store = spark_runtime::weights::WeightStore::from_map(
+            plan.iter()
+                .map(|t| {
+                    (t.name.clone(), spark_runtime::weights::WeightTensor {
+                        ptr: spark_runtime::gpu::DevicePtr(0x1000),
+                        shape: t.shape.clone(),
+                        dtype: t.dtype,
+                    })
+                })
+                .collect(),
+        );
+        if let Err(e) = spark_model::preflight::preflight(&store, &config, false) {
+            gaps.push(format!("checkpoint pre-flight: {e:#}"));
+        }
+        if let Err(e) = spark_model::factory::loader_for_config(&config) {
+            gaps.push(format!("model loader dispatch: {e:#}"));
+        }
+        match std::fs::read_to_string(dir.join("k154-cb3").join("manifest.json")) {
+            Ok(m) => {
+                let keep = spark_model::weight_loader::deepseek_v41::cb3_arena::resolve_packed_keep();
+                match keep.and_then(|k| atlas_core::config::ExpertPack::parse(&m, k)) {
+                    Ok(p) => println!("expert pack: {:.2} GB resident at keep={}", p.resident_bytes() as f64 / 1e9, p.packed_keep()),
+                    Err(e) => gaps.push(format!("expert pack manifest: {e:#}")),
+                }
+            }
+            Err(e) => gaps.push(format!("expert pack manifest: {e}")),
+        }
+
+        let eos = super::super::runtime::load_eos_tokens(&dir, &config);
+        if eos.is_empty() {
+            gaps.push("eos tokens: none".into());
+        }
+        match crate::tokenizer::ChatTokenizer::from_model_dir(
+            &dir,
+            eos.first().copied().unwrap_or(0),
+            config.capabilities().supports_thinking,
+            &config.model_type,
+            Some(std::path::Path::new(".")),
+        ) {
+            Ok(_) => {}
+            Err(e) => gaps.push(format!("tokenizer / chat template: {e:#}")),
+        }
+        if let Some(ptx) = &ptx_set {
+            let cli = <crate::cli::Cli as clap::Parser>::try_parse_from([
+                "spark", "serve", "--model-from-path", dir.to_str().unwrap(),
+            ])
+            .expect("cli");
+            #[allow(irrefutable_let_patterns)]
+            let crate::cli::Command::Serve(args) = cli.command else { panic!("not a serve command") };
+            if let Err(e) = super::super::runtime::resolve_tool_call_parser(&args, ptx, &config) {
+                gaps.push(format!("tool-call parser: {e:#}"));
+            }
+        }
+
+        // The driver's upload set (dsv41_forward: no engram tables, no mtp.* unless DSpark, no
+        // vision.*). Serve must upload exactly that, plus vision.* (the tower loads in serve).
+        let mut driver = spark_runtime::fast_weights::FastSafetensorsLoader::new();
+        let dspark = spark_model::weight_loader::deepseek_v41::dspark_enabled();
+        driver.extra_skip = Some(std::sync::Arc::new(move |n: &str| {
+            n.contains(".engram.embed.") || (n.starts_with("mtp.") && !dspark) || n.starts_with("vision")
+        }));
+        match driver.plan(&dir) {
+            Ok(d) => {
+                let d: BTreeSet<String> = d.into_iter().map(|t| t.name).collect();
+                let s: BTreeSet<String> = plan.iter().map(|t| t.name.clone()).collect();
+                let missing: Vec<_> = d.difference(&s).take(10).collect();
+                let extra: Vec<_> = s.difference(&d).filter(|n| !n.starts_with("vision")).take(10).collect();
+                println!("name sets: serve {} vs driver {} (+{} vision.* in serve only)",
+                    s.len(), d.len(), s.difference(&d).filter(|n| n.starts_with("vision")).count());
+                if !missing.is_empty() {
+                    gaps.push(format!("driver loads, serve does not: {missing:?}"));
+                }
+                if !extra.is_empty() {
+                    gaps.push(format!("serve loads, driver does not (non-vision): {extra:?}"));
+                }
+            }
+            Err(e) => gaps.push(format!("driver plan: {e:#}")),
+        }
+
+        for g in &gaps {
+            println!("GAP: {g}");
+        }
+        assert!(gaps.is_empty(), "{} serve-load gap(s), listed above", gaps.len());
+        println!("DRY RUN: no gaps");
+    }
 }

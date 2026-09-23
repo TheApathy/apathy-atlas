@@ -18,6 +18,7 @@
 
 use crate::gpu::GpuBackend;
 use crate::weights::{
+    WeightDtype,
     WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
     estimate_load_bytes, evict_page_cache, parse_expert_index,
 };
@@ -142,6 +143,37 @@ impl FastSafetensorsLoader {
         } else {
             false
         }
+    }
+}
+
+/// One tensor the loader WOULD upload (see [`FastSafetensorsLoader::plan`]).
+#[derive(Debug, Clone)]
+pub struct PlannedTensor {
+    pub name: String,
+    pub dtype: WeightDtype,
+    pub shape: Vec<usize>,
+    pub bytes: usize,
+}
+
+impl FastSafetensorsLoader {
+    /// A CPU-only DRY RUN of [`WeightLoader::load`] up to its first GPU allocation: shard
+    /// resolution, every shard header parsed (so an unmapped dtype fails here exactly as in
+    /// `load`), the index / prefix / EP / `extra_skip` filters, and the tensors that would be
+    /// uploaded. No device, no data reads beyond the headers.
+    pub fn plan(&self, model_dir: &Path) -> Result<Vec<PlannedTensor>> {
+        let (shard_files, tensor_to_shard) = resolve_shards(model_dir)?;
+        let mut out = Vec::new();
+        for shard_path in &shard_files {
+            let shard_name = shard_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let mut f = File::open(shard_path).with_context(|| format!("Failed to open {}", shard_path.display()))?;
+            for t in parse_header(&mut f).with_context(|| format!("header of {}", shard_path.display()))? {
+                let routed_here = tensor_to_shard.as_ref().is_none_or(|m| m.get(&t.name).is_some_and(|s| s == shard_name));
+                if routed_here && !self.should_skip_tensor(&t.name) {
+                    out.push(PlannedTensor { name: t.name, dtype: t.dtype, shape: t.shape, bytes: t.len });
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
