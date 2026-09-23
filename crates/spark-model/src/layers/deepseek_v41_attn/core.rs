@@ -54,6 +54,10 @@ const ATTN_THREADS: u32 = 256;
 /// kernel, the rest 1 ulp (attn gate log). Used ONLY for Decode passes, so every PREFILL row
 /// stays chunk-invariant bit-for-bit.
 const DECODE_SLICE: usize = 16;
+/// The production slice for Decode AND Verify: 32 (decode k124a, 2026-09-23: step-0 KL identical,
+/// spec == plain on code/chat at verify T=2/3/4/6, spec step -4.56 ms, plain -0.4 ms).
+/// DECODE_SLICE stays the smallest allowed (it sizes the partial buffer).
+const DEFAULT_SLICE: usize = 32;
 const DECODE_MAX_T: usize = 8;
 const HIDDEN: usize = 5120;
 const Q_LORA: usize = 1280;
@@ -265,6 +269,9 @@ pub struct Dsv41SparseCore {
     /// `ATLAS_DSV41_ATTN_LB=1`: `dsv41_sparse_attn_split_lb` (the combine fused by last-block-done,
     /// byte-identical to split + combine) and its `[DECODE_MAX_T, 64 / 8]` u32 tickets (zeroed).
     split_lb: Option<(KernelHandle, DevicePtr)>,
+    /// Keys per split slice for Decode AND Verify (never keyed on T: a verify row must equal its
+    /// T=1 decode). `ATLAS_DSV41_ATTN_SLICE` overrides [`DEFAULT_SLICE`] (A/B only).
+    slice: usize,
     idx: IndexKernels,
     rope_c: RopeTable,
     tail: Tail,
@@ -468,6 +475,8 @@ impl Dsv41SparseCore {
             tap_val: alloc(16)?,
         };
         let own_dstart = alloc(4)?;
+        let slice: usize = std::env::var("ATLAS_DSV41_ATTN_SLICE").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SLICE);
+        ensure!(slice % 8 == 0 && slice >= DECODE_SLICE, "ATLAS_DSV41_ATTN_SLICE={slice}: a multiple of 8, >= {DECODE_SLICE}");
         let part = alloc(DECODE_MAX_T * 64 * (WINDOW + INDEX_TOPK).div_ceil(DECODE_SLICE) * (2 + HEAD_DIM) * 4)?;
         let split_lb = if std::env::var("ATLAS_DSV41_ATTN_LB").as_deref() == Ok("1") {
             let k = gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_split_lb").context("dsv41_sparse_attn_split_lb not in the PTX")?;
@@ -507,6 +516,7 @@ impl Dsv41SparseCore {
             combine_kernel,
             part,
             split_lb,
+            slice,
             idx,
             rope_c: freqs_c,
             tail,
@@ -1014,7 +1024,7 @@ impl Dsv41SparseCore {
         let scale = (HEAD_DIM as f32).powf(-0.5);
         if matches!(st.kind, Some(PassKind::Decode | PassKind::Verify)) && a.t <= DECODE_MAX_T && self.split_on {
             let keys = WINDOW + if ratio == 0 { 0 } else { INDEX_TOPK };
-            let splits = keys.div_ceil(DECODE_SLICE);
+            let splits = keys.div_ceil(self.slice);
             if let Some((k, tickets)) = self.split_lb {
                 return KernelLaunch::new(ops.gpu, k)
                     .grid([a.t as u32, (64 / HEADS_PER_BLOCK) as u32, splits as u32])
@@ -1036,7 +1046,7 @@ impl Dsv41SparseCore {
                     .arg_i32(RING as i32)
                     .arg_i32(a.win_lo as i32)
                     .arg_f32(scale)
-                    .arg_i32(DECODE_SLICE as i32)
+                    .arg_i32(self.slice as i32)
                     .launch(ops.stream);
             }
             KernelLaunch::new(ops.gpu, self.split_kernel)
@@ -1056,7 +1066,7 @@ impl Dsv41SparseCore {
                 .arg_i32(RING as i32)
                 .arg_i32(a.win_lo as i32)
                 .arg_f32(scale)
-                .arg_i32(DECODE_SLICE as i32)
+                .arg_i32(self.slice as i32)
                 .launch(ops.stream)?;
             return KernelLaunch::new(ops.gpu, self.combine_kernel)
                 .grid([a.t as u32, 64, 1])

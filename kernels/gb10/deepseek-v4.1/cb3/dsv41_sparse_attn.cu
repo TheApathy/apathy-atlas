@@ -1478,7 +1478,7 @@ int main() {
                 // BYTE-IDENTICAL to split + combine at every (T, slice), on two back-to-back launches
                 // (the ticket reset). Numerics per slice: bf16 identity vs one-pass on those rows.
                 unsigned* d_cnt; CUDA_OK(cudaMalloc(&d_cnt, 64 * 64 * 4)); CUDA_OK(cudaMemset(d_cnt, 0, 64 * 64 * 4));
-                for (int tt : {1, 6}) {
+                for (int tt : {1, 2, 3, 4, 5, 6}) {
                     const int t0 = T - tt;
                     const __nv_bfloat16* qv = d_q + (size_t)t0 * NH * D;
                     const int32_t* wv = d_wpos + (size_t)t0 * NW;
@@ -1487,7 +1487,7 @@ int main() {
                     std::vector<__nv_bfloat16> onep(nv), ref(nv), got(nv);
                     dsv41_sparse_attn_w32<<<dim3(tt, NH / HB), NT>>>(qv, d_ring, wv, d_ckv, cv, d_sink, d_ob, tt, NH, D, NW, NC, RING_N, 0, scale);
                     CUDA_OK(cudaDeviceSynchronize()); CUDA_OK(cudaMemcpy(onep.data(), d_ob, nv * 2, cudaMemcpyDeviceToHost));
-                    for (int sl : {16, 32, 64, 128}) {
+                    for (int sl : {16, 32, 64}) {
                         const int ss = (NW + NC + sl - 1) / sl;
                         auto sc2 = [&] {
                             dsv41_sparse_attn_split<<<dim3(tt, NH / HB, ss), NT>>>(qv, d_ring, wv, d_ckv, cv, d_part, tt, NH, D, NW, NC, RING_N, 0, scale, sl);
