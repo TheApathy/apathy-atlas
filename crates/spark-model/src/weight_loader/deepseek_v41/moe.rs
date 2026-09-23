@@ -266,14 +266,21 @@ pub const FUSED_GEMM_MODULE: &str = "cb3_moe_gemm";
 pub const FUSED_GATE_UP_FN: &str = "cb3_moe_gate_up";
 /// Down projection -> fp32 rows.
 pub const FUSED_DOWN_FN: &str = "cb3_moe_down";
-/// Rows per M tile of the fused kernels (`BM` in the .cu). N must divide by
+/// The same two kernels for tiles of at most [`FUSED_SMALL_M`] rows (two CTAs per SM).
+pub const FUSED_GATE_UP_M32_FN: &str = "cb3_moe_gate_up_m32";
+pub const FUSED_DOWN_M32_FN: &str = "cb3_moe_down_m32";
+/// Rows per M tile of the fused kernels (`TBM` in the .cu). N must divide by
 /// [`FUSED_TILE_N`], K by 128 (a pair of BK steps).
 pub const FUSED_TILE_M: usize = 128;
 pub const FUSED_TILE_N: usize = 64;
-/// Dynamic shared memory per launch of the fused CB3 kernels: one 32 KB (gate/up) or
-/// 24 KB (down) mainloop stage.
+/// Row count at or below which a whole expert takes the 32-row kernels.
+pub const FUSED_SMALL_M: usize = 32;
+/// Dynamic shared memory per launch of the fused CB3 kernels: one mainloop stage, 32 KB
+/// (gate/up) / 24 KB (down) for 128-row tiles, 20 KB / 12 KB for 32-row tiles.
 pub const FUSED_GATE_UP_SMEM: u32 = 32_768;
 pub const FUSED_DOWN_SMEM: u32 = 24_576;
+pub const FUSED_GATE_UP_M32_SMEM: u32 = 20_480;
+pub const FUSED_DOWN_M32_SMEM: u32 = 12_288;
 
 
 /// Bytes of bf16 scratch one expert's reconstruct needs, for all three matrices at once.

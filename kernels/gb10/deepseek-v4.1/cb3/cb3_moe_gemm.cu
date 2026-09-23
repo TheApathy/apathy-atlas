@@ -68,6 +68,9 @@
 //   - Each row's plane words for a PAIR of K steps (lo 32 B + hi 16 B + 4 scale bytes) loaded
 //     once into registers, prefetched two steps ahead: T=2048 27.20 -> 26.84, T=512
 //     16.57 -> 16.05, T=128 12.44 -> 12.02, T=4096 44.23 -> 43.45 (174 registers, 1 CTA/SM).
+//   - Experts of <= 32 rows on 32-row tiles (120 registers, 2 CTAs/SM): T=128 12.00 -> 11.46,
+//     T=2048 26.93 -> 26.76. Routing a large expert's <= 32-row TAIL there too was worse at
+//     large T (T=2048 +2.1%); gating the path on pass size (<= 3072 routed rows) was neutral.
 // Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
 
 #include <cstdint>
@@ -75,7 +78,6 @@
 
 namespace {
 
-constexpr int BM = 128;
 constexpr int BN = 64;
 constexpr int BK = 64;   // two scale groups per K step
 constexpr int THREADS = 256;
@@ -244,42 +246,12 @@ __device__ __forceinline__ void decode32(const Raw& r, const RowTable& t, int lo
     }
 }
 
-/// This thread's activation chunks for one K step: BM x BK / 8 = 1024 uint4 over 256 threads.
-/// This thread's activation chunks for one K step: BM x BK / 8 = 1024 uint4 over 256 threads.
-constexpr int ACT_CHUNKS = BM * (BK / 8) / THREADS;
-
-__device__ __forceinline__ void fetch_act(const __nv_bfloat16* __restrict__ act, int row_begin, int rows,
-                                          int k0, int K, uint4 (&v)[ACT_CHUNKS]) {
-#pragma unroll
-    for (int e = 0; e < ACT_CHUNKS; ++e) {
-        const int c = threadIdx.x + e * THREADS;
-        const int row = c / (BK / 8);
-        const int col = (c % (BK / 8)) * 8;
-        v[e] = row < rows
-#if CB3_ACT_LDCG
-                   // L2 only: a CTA reads each activation chunk once; keep L1 for the planes.
-                   ? __ldcg(reinterpret_cast<const uint4*>(act + (long long)(row_begin + row) * K + k0 + col))
-#else
-                   ? *reinterpret_cast<const uint4*>(act + (long long)(row_begin + row) * K + k0 + col)
-#endif
-                   : make_uint4(0, 0, 0, 0);
-    }
-}
-
 // SHARED LAYOUT. A row of a K step is BK = 64 bf16 = 128 bytes = 8 16-byte chunks, stored
 // UNPADDED with the chunk index XOR-swizzled by row % 8. ldmatrix reads 8 rows of one chunk
 // column per phase, and the decoders write 8 consecutive rows of one chunk column per
 // quarter-warp: both land on 8 different 16-byte bank groups. No padding keeps a stage at
 // 32 KB (gate/up) / 24 KB (down) instead of 36 KB.
 __device__ __forceinline__ int swz(int row, int chunk) { return row * (BK / 8) + (chunk ^ (row & 7)); }
-
-__device__ __forceinline__ void store_act(const uint4 (&v)[ACT_CHUNKS], uint4* dst) {
-#pragma unroll
-    for (int e = 0; e < ACT_CHUNKS; ++e) {
-        const int c = threadIdx.x + e * THREADS;
-        dst[swz(c / (BK / 8), c % (BK / 8))] = v[e];
-    }
-}
 
 /// Decode one row's one 32-weight scale group into chunks [4 * half, 4 * half + 4) of `row`.
 __device__ __forceinline__ void decode_group_swz(const Raw& r, const RowTable& t, int k0, uint4* dst, int row, int half) {
@@ -307,6 +279,52 @@ __device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], 
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+
+/// Tile shape per M-tile height TBM: 8 warps over TBM x BN, each warp a 32-row x WN strip.
+///   TBM = 128: 4 x 2 warps of 32 x 32 (the prefill shape).
+///   TBM =  32: 1 x 8 warps of 32 x 8, for experts (or tails) of <= 32 rows: a quarter of the
+///              accumulators, so two CTAs fit per SM, while every weight is still decoded
+///              once per (expert tile, N tile) exactly as in the large shape.
+/// An output element's HMMA sequence (same m16n8k16 instruction, same K order) is identical
+/// in both shapes, so which shape a row lands in never changes its value.
+template <int TBM>
+struct Shape {
+    static constexpr int WARPS_N = 8 / (TBM / 32);
+    static constexpr int WN = BN / WARPS_N;
+    static constexpr int NB = WN / 8;                          // n8 blocks per warp
+    static constexpr int ACT = TBM * (BK / 8) / THREADS;       // uint4 activation chunks per thread
+    static constexpr int GU_STAGE = (TBM + 2 * BN) * (BK / 8); // uint4
+    static constexpr int DN_STAGE = (TBM + BN) * (BK / 8);
+};
+
+template <int TBM>
+__device__ __forceinline__ void fetch_act(const __nv_bfloat16* __restrict__ act, int row_begin, int rows,
+                                          int k0, int K, uint4 (&v)[Shape<TBM>::ACT]) {
+#pragma unroll
+    for (int e = 0; e < Shape<TBM>::ACT; ++e) {
+        const int c = threadIdx.x + e * THREADS;
+        const int row = c / (BK / 8);
+        const int col = (c % (BK / 8)) * 8;
+        v[e] = row < rows
+#if CB3_ACT_LDCG
+                   // L2 only: a CTA reads each activation chunk once; keep L1 for the planes.
+                   ? __ldcg(reinterpret_cast<const uint4*>(act + (long long)(row_begin + row) * K + k0 + col))
+#else
+                   ? *reinterpret_cast<const uint4*>(act + (long long)(row_begin + row) * K + k0 + col)
+#endif
+                   : make_uint4(0, 0, 0, 0);
+    }
+}
+
+template <int TBM>
+__device__ __forceinline__ void store_act(const uint4 (&v)[Shape<TBM>::ACT], uint4* dst) {
+#pragma unroll
+    for (int e = 0; e < Shape<TBM>::ACT; ++e) {
+        const int c = threadIdx.x + e * THREADS;
+        dst[swz(c / (BK / 8), c % (BK / 8))] = v[e];
+    }
+}
+
 /// A fragments (two 16-row halves of this warp's 32 rows) for K sub-step kk of one stage.
 __device__ __forceinline__ void load_a(uint32_t (&a)[2][4], const uint4* s_a, int wm, int kk) {
     const int lane = threadIdx.x % 32;
@@ -314,44 +332,45 @@ __device__ __forceinline__ void load_a(uint32_t (&a)[2][4], const uint4* s_a, in
     for (int i = 0; i < 2; ++i) ldmatrix_x4(a[i], s_a + swz(wm + i * 16 + lane % 16, kk / 8 + lane / 16));
 }
 
-/// B fragments for this warp's 32 columns (four n8 blocks) of a [n][k] weight tile.
-__device__ __forceinline__ void load_b(uint32_t (&b)[2][4], const uint4* s_w, int wn, int kk) {
+/// B fragments for this warp's NB n8 blocks of a [n][k] weight tile: b[nb] = {k 0-7, k 8-15}.
+template <int NB>
+__device__ __forceinline__ void load_b(uint32_t (&b)[NB][2], const uint4* s_w, int wn, int kk) {
     const int lane = threadIdx.x % 32;
+    if constexpr (NB == 1) {
+        const uint32_t a = (uint32_t)__cvta_generic_to_shared(s_w + swz(wn + lane % 8, kk / 8 + (lane / 8) % 2));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];" : "=r"(b[0][0]), "=r"(b[0][1]) : "r"(a));
+    } else {
 #pragma unroll
-    for (int j = 0; j < 2; ++j)
-        ldmatrix_x4(b[j], s_w + swz(wn + j * 16 + lane % 8 + (lane / 16) * 8, kk / 8 + (lane / 8) % 2));
+        for (int j = 0; j < NB / 2; ++j) {
+            uint32_t r[4];
+            ldmatrix_x4(r, s_w + swz(wn + j * 16 + lane % 8 + (lane / 16) * 8, kk / 8 + (lane / 8) % 2));
+            b[2 * j][0] = r[0];
+            b[2 * j][1] = r[1];
+            b[2 * j + 1][0] = r[2];
+            b[2 * j + 1][1] = r[3];
+        }
+    }
 }
 
-// b[j] = {n-block 2j: k 0-7, k 8-15, n-block 2j+1: k 0-7, k 8-15}.
-#define ATLAS_CB3_MMA_32x32(acc, a, b)                                                   \
-    _Pragma("unroll") for (int i = 0; i < 2; ++i)                                        \
-        _Pragma("unroll") for (int j = 0; j < 2; ++j) {                                  \
-            mma_bf16(acc[i][2 * j], a[i], b[j][0], b[j][1]);                             \
-            mma_bf16(acc[i][2 * j + 1], a[i], b[j][2], b[j][3]);                         \
-        }
-
-// Stage sizes in uint4. Gate/up: [s_a BM rows | s_w1 BN rows | s_w3 BN rows].
-constexpr int ROW_U4 = BK / 8;
-constexpr int GU_STAGE = (BM + 2 * BN) * ROW_U4;  // 2048 uint4 = 32 KB
-constexpr int DN_STAGE = (BM + BN) * ROW_U4;      // 1536 uint4 = 24 KB
-
-}  // namespace
-
-// Dynamic shared memory the launcher passes: 32 KB (gate/up), 24 KB (down) — moe.rs
-// FUSED_GATE_UP_SMEM / FUSED_DOWN_SMEM. One stage on purpose: see "L1 IS THE LEVER" above.
-static_assert(GU_STAGE * 16 == 32768 && DN_STAGE * 16 == 24576, "keep moe.rs smem sizes in sync");
+template <int NB>
+__device__ __forceinline__ void mma_strip(float (&acc)[2][NB][4], const uint32_t (&a)[2][4], const uint32_t (&b)[NB][2]) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int nb = 0; nb < NB; ++nb) mma_bf16(acc[i][nb], a[i], b[nb][0], b[nb][1]);
+}
 
 /// Gate + up + SwiGLU for one (expert tile, N tile):
 ///   h[row, n] = bf16( silu(min(g, L)) * clamp(u, -L, L) * route_w[row] ),  g/u fp32.
-extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
-    const __nv_bfloat16* __restrict__ act,  // [P, K] permuted rows
-    const int4* __restrict__ tiles,         // {row_begin, rows, slot, 0}
+template <int TBM>
+__device__ __forceinline__ void gate_up_body(
+    const __nv_bfloat16* __restrict__ act, const int4* __restrict__ tiles,
     const uint8_t* w1_lo, const uint8_t* w1_hi, const uint8_t* w1_cb, const uint8_t* w1_sc,
     const uint8_t* w3_lo, const uint8_t* w3_hi, const uint8_t* w3_cb, const uint8_t* w3_sc,
     unsigned long long lo_s, unsigned long long hi_s, unsigned long long cb_s, unsigned long long sc_s,
-    const float* __restrict__ row_weight,   // [P]
-    __nv_bfloat16* __restrict__ h,          // [P, N]
-    int N, int K, float limit) {
+    const float* __restrict__ row_weight, __nv_bfloat16* __restrict__ h, int N, int K, float limit) {
+    using Sh = Shape<TBM>;
+    constexpr int NB = Sh::NB;
     extern __shared__ __align__(128) uint4 smem[];
 
     const int4 tile = tiles[blockIdx.y];
@@ -360,56 +379,53 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
     const Cb3Planes p1 = planes_for(w1_lo, w1_hi, w1_cb, w1_sc, lo_s, hi_s, cb_s, sc_s, slot);
     const Cb3Planes p3 = planes_for(w3_lo, w3_hi, w3_cb, w3_sc, lo_s, hi_s, cb_s, sc_s, slot);
 
-    // 8 warps: 4 along M x 2 along N, each a 32x32 quadrant.
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int wm = (warp / 2) * 32, wn = (warp % 2) * 32;
-    // Rows beyond `rows` are zero; a warp whose whole quadrant is padding skips the MMAs.
+    const int wm = (warp / Sh::WARPS_N) * 32, wn = (warp % Sh::WARPS_N) * Sh::WN;
+    // Rows beyond `rows` are zero; a warp whose whole strip is padding skips the MMAs.
     const bool live = wm < rows;
-    float acc_g[2][4][4], acc_u[2][4][4];
+    float acc_g[2][NB][4], acc_u[2][NB][4];
 #pragma unroll
     for (int i = 0; i < 2; ++i)
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
+        for (int j = 0; j < NB; ++j)
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc_g[i][j][e] = acc_u[i][j][e] = 0.0f;
 
-    // Thread t decodes (row t % 64, group (t / 64) % 2) of w1 (t < 128) or w3 (t >= 128).
+    // Thread t decodes group t % 2 of row (t % 128) / 2 of w1 (t < 128) or w3 (t >= 128). A
+    // row's two groups sit in adjacent lanes, so their shared plane words are one request.
     const Cb3Planes& mine = threadIdx.x < 128 ? p1 : p3;
-    const int mine_off = (threadIdx.x < 128 ? BM : BM + BN) * ROW_U4;
-    // A row's two groups go to adjacent lanes: their shared 16-byte lo word (and the hi word
-    // shared with the next K step) is one request per warp instead of one per warp pair.
+    const int mine_off = (threadIdx.x < 128 ? TBM : TBM + BN) * (BK / 8);
     const int drow = (threadIdx.x % 128) / 2;
     const int dgrp = threadIdx.x % 2;
     const long long dn = n0 + drow;
     const RowTable tab = row_table(*reinterpret_cast<const uint2*>(mine.cb + dn * 8));
     RawPair cur = fetch_pair(mine, dn, 0, K);
-    uint4 a_reg[ACT_CHUNKS];
-    fetch_act(act, row_begin, rows, 0, K, a_reg);
+    uint4 a_reg[Sh::ACT];
+    fetch_act<TBM>(act, row_begin, rows, 0, K, a_reg);
 
-    auto mma_step = [&](const uint4* st) {
-#pragma unroll
-        for (int kk = 0; kk < BK; kk += 16) {
-            uint32_t a[2][4], b1[2][4], b3[2][4];
-            load_a(a, st, wm, kk);
-            load_b(b1, st + BM * ROW_U4, wn, kk);
-            load_b(b3, st + (BM + BN) * ROW_U4, wn, kk);
-            ATLAS_CB3_MMA_32x32(acc_g, a, b1)
-            ATLAS_CB3_MMA_32x32(acc_u, a, b3)
-        }
-    };
     for (int k0 = 0; k0 < K; k0 += 2 * BK) {
         RawPair nxt = cur;
 #pragma unroll
         for (int step = 0; step < 2; ++step) {
             const int ks = k0 + step * BK;
-            store_act(a_reg, smem);
+            store_act<TBM>(a_reg, smem);
             decode_group_swz(pick(cur, step, dgrp), tab, ks + dgrp * 32, smem + mine_off, drow, dgrp);
             __syncthreads();
             // Next loads go out now and land during the MMAs: the plane pair two steps
             // ahead, the activations one step ahead.
             if (step == 0 && k0 + 2 * BK < K) nxt = fetch_pair(mine, dn, k0 + 2 * BK, K);
-            if (ks + BK < K) fetch_act(act, row_begin, rows, ks + BK, K, a_reg);
-            if (live) mma_step(smem);
+            if (ks + BK < K) fetch_act<TBM>(act, row_begin, rows, ks + BK, K, a_reg);
+            if (live) {
+#pragma unroll
+                for (int kk = 0; kk < BK; kk += 16) {
+                    uint32_t a[2][4], b1[NB][2], b3[NB][2];
+                    load_a(a, smem, wm, kk);
+                    load_b<NB>(b1, smem + TBM * (BK / 8), wn, kk);
+                    load_b<NB>(b3, smem + (TBM + BN) * (BK / 8), wn, kk);
+                    mma_strip<NB>(acc_g, a, b1);
+                    mma_strip<NB>(acc_u, a, b3);
+                }
+            }
             __syncthreads();
         }
         cur = nxt;
@@ -429,7 +445,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
             const long long prow = row_begin + row;
             const float w = row_weight[prow];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < NB; ++j) {
                 float s[2];
 #pragma unroll
                 for (int e = 0; e < 2; ++e) {
@@ -446,13 +462,14 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
 }
 
 /// Down projection for one (expert tile, N tile): out[row, n] = h[row, :] . w2[n, :], fp32.
-extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_down(
-    const __nv_bfloat16* __restrict__ h,    // [P, K]
-    const int4* __restrict__ tiles,
+template <int TBM>
+__device__ __forceinline__ void down_body(
+    const __nv_bfloat16* __restrict__ h, const int4* __restrict__ tiles,
     const uint8_t* w2_lo, const uint8_t* w2_hi, const uint8_t* w2_cb, const uint8_t* w2_sc,
     unsigned long long lo_s, unsigned long long hi_s, unsigned long long cb_s, unsigned long long sc_s,
-    float* __restrict__ out,                // [P, N]
-    int N, int K) {
+    float* __restrict__ out, int N, int K) {
+    using Sh = Shape<TBM>;
+    constexpr int NB = Sh::NB;
     extern __shared__ __align__(128) uint4 smem[];
 
     const int4 tile = tiles[blockIdx.y];
@@ -461,53 +478,50 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_down(
     const Cb3Planes p2 = planes_for(w2_lo, w2_hi, w2_cb, w2_sc, lo_s, hi_s, cb_s, sc_s, slot);
 
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int wm = (warp / 2) * 32, wn = (warp % 2) * 32;
+    const int wm = (warp / Sh::WARPS_N) * 32, wn = (warp % Sh::WARPS_N) * Sh::WN;
     const bool live = wm < rows;
-    float acc[2][4][4];
+    float acc[2][NB][4];
 #pragma unroll
     for (int i = 0; i < 2; ++i)
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
+        for (int j = 0; j < NB; ++j)
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
 
-    // Threads 0..127 decode (row t % 64, group t / 64); 128..255 only move activations.
+    // Threads 0..127 decode (group t % 2 of row t / 2); 128..255 only move activations.
     const bool decoder = threadIdx.x < BN * (BK / 32);
-    // A row's two groups go to adjacent lanes: their shared 16-byte lo word (and the hi word
-    // shared with the next K step) is one request per warp instead of one per warp pair.
     const int drow = (threadIdx.x % 128) / 2;
     const int dgrp = threadIdx.x % 2;
     const long long dn = n0 + drow;
-    constexpr int W_OFF = BM * ROW_U4;
+    constexpr int W_OFF = TBM * (BK / 8);
     RowTable tab{};
     RawPair cur{};
     if (decoder) {
         tab = row_table(*reinterpret_cast<const uint2*>(p2.cb + dn * 8));
         cur = fetch_pair(p2, dn, 0, K);
     }
-    uint4 a_reg[ACT_CHUNKS];
-    fetch_act(h, row_begin, rows, 0, K, a_reg);
+    uint4 a_reg[Sh::ACT];
+    fetch_act<TBM>(h, row_begin, rows, 0, K, a_reg);
 
-    auto mma_step = [&](const uint4* st) {
-#pragma unroll
-        for (int kk = 0; kk < BK; kk += 16) {
-            uint32_t a[2][4], b[2][4];
-            load_a(a, st, wm, kk);
-            load_b(b, st + W_OFF, wn, kk);
-            ATLAS_CB3_MMA_32x32(acc, a, b)
-        }
-    };
     for (int k0 = 0; k0 < K; k0 += 2 * BK) {
         RawPair nxt = cur;
 #pragma unroll
         for (int step = 0; step < 2; ++step) {
             const int ks = k0 + step * BK;
-            store_act(a_reg, smem);
+            store_act<TBM>(a_reg, smem);
             if (decoder) decode_group_swz(pick(cur, step, dgrp), tab, ks + dgrp * 32, smem + W_OFF, drow, dgrp);
             __syncthreads();
             if (decoder && step == 0 && k0 + 2 * BK < K) nxt = fetch_pair(p2, dn, k0 + 2 * BK, K);
-            if (ks + BK < K) fetch_act(h, row_begin, rows, ks + BK, K, a_reg);
-            if (live) mma_step(smem);
+            if (ks + BK < K) fetch_act<TBM>(h, row_begin, rows, ks + BK, K, a_reg);
+            if (live) {
+#pragma unroll
+                for (int kk = 0; kk < BK; kk += 16) {
+                    uint32_t a[2][4], b[NB][2];
+                    load_a(a, smem, wm, kk);
+                    load_b<NB>(b, smem + W_OFF, wn, kk);
+                    mma_strip<NB>(acc, a, b);
+                }
+            }
             __syncthreads();
         }
         cur = nxt;
@@ -522,7 +536,44 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_down(
             if (row >= rows) continue;
             float* dst = out + (long long)(row_begin + row) * N + n0 + wn + (lane % 4) * 2;
 #pragma unroll
-            for (int j = 0; j < 4; ++j)
+            for (int j = 0; j < NB; ++j)
                 *reinterpret_cast<float2*>(dst + j * 8) = make_float2(acc[i][j][2 * half], acc[i][j][2 * half + 1]);
         }
+}
+
+}  // namespace
+
+// Dynamic shared memory the launcher passes (moe.rs FUSED_*_SMEM): one stage on purpose, see
+// "L1 IS THE LEVER" above. 128-row tiles: 32 KB / 24 KB; 32-row tiles: 20 KB / 12 KB.
+static_assert(Shape<128>::GU_STAGE * 16 == 32768 && Shape<128>::DN_STAGE * 16 == 24576, "moe.rs sizes");
+static_assert(Shape<32>::GU_STAGE * 16 == 20480 && Shape<32>::DN_STAGE * 16 == 12288, "moe.rs sizes");
+
+#define ATLAS_CB3_GATE_UP_PARAMS                                                                          \
+    const __nv_bfloat16* __restrict__ act, const int4* __restrict__ tiles, const uint8_t* w1_lo,          \
+        const uint8_t* w1_hi, const uint8_t* w1_cb, const uint8_t* w1_sc, const uint8_t* w3_lo,           \
+        const uint8_t* w3_hi, const uint8_t* w3_cb, const uint8_t* w3_sc, unsigned long long lo_s,        \
+        unsigned long long hi_s, unsigned long long cb_s, unsigned long long sc_s,                        \
+        const float* __restrict__ row_weight, __nv_bfloat16* __restrict__ h, int N, int K, float limit
+#define ATLAS_CB3_GATE_UP_ARGS act, tiles, w1_lo, w1_hi, w1_cb, w1_sc, w3_lo, w3_hi, w3_cb, w3_sc, \
+    lo_s, hi_s, cb_s, sc_s, row_weight, h, N, K, limit
+#define ATLAS_CB3_DOWN_PARAMS                                                                             \
+    const __nv_bfloat16* __restrict__ h, const int4* __restrict__ tiles, const uint8_t* w2_lo,            \
+        const uint8_t* w2_hi, const uint8_t* w2_cb, const uint8_t* w2_sc, unsigned long long lo_s,        \
+        unsigned long long hi_s, unsigned long long cb_s, unsigned long long sc_s,                        \
+        float* __restrict__ out, int N, int K
+#define ATLAS_CB3_DOWN_ARGS h, tiles, w2_lo, w2_hi, w2_cb, w2_sc, lo_s, hi_s, cb_s, sc_s, out, N, K
+
+/// 128-row expert tiles (one CTA per SM).
+extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(ATLAS_CB3_GATE_UP_PARAMS) {
+    gate_up_body<128>(ATLAS_CB3_GATE_UP_ARGS);
+}
+extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_down(ATLAS_CB3_DOWN_PARAMS) {
+    down_body<128>(ATLAS_CB3_DOWN_ARGS);
+}
+/// <= 32-row expert tiles (two CTAs per SM).
+extern "C" __global__ void __launch_bounds__(THREADS, 2) cb3_moe_gate_up_m32(ATLAS_CB3_GATE_UP_PARAMS) {
+    gate_up_body<32>(ATLAS_CB3_GATE_UP_ARGS);
+}
+extern "C" __global__ void __launch_bounds__(THREADS, 2) cb3_moe_down_m32(ATLAS_CB3_DOWN_PARAMS) {
+    down_body<32>(ATLAS_CB3_DOWN_ARGS);
 }
