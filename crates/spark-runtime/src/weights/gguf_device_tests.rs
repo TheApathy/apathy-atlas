@@ -15,8 +15,10 @@ mod test_source_sha256;
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 const DEVICE_SOURCE: &str = include_str!("gguf/device.rs");
+// Re-pinned 2026-09-23: the only change is a doc comment's example fenced as ```text
+// (rustdoc compiled the indented line as a doctest). The old file reproduced the old pin.
 const DEVICE_SOURCE_SHA256: &str =
-    "330732f88aef8a74bb9e0fc2c215980b68ca6fbc12aced9415cfe65683c57bda";
+    "e478bd80846cac8cc16034abeedfd4a512bff8b98994b8da06ab689fcad00b46";
 const SHA256_SOURCE: &str = include_str!("gguf/sha256.rs");
 const SHA256_SOURCE_SHA256: &str =
     "bca28dccb9f28c30455190a9b9582ba0fb3b86430f9a3b76f193fb3db57c058a";
