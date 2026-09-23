@@ -48,8 +48,8 @@ fn logit_bias_is_honored_on_the_first_token() {
 /// top_n_sigma filters a token the request excluded; the old path samples it.
 #[test]
 fn top_n_sigma_is_honored_on_the_first_token() {
-    // This sampler keeps logit >= mean - n*sigma. Nine tokens at 5.0 and a probe at 3.5:
-    // mean 4.85, sigma 0.45, so 1 sigma drops the probe, which plain T=1 picks ~2.4%.
+    // Nine tokens at 5.0 and a probe at 3.5: sigma 0.45, so the 1-sigma cut (max - sigma =
+    // 4.55) drops the probe, which plain T=1 picks ~2.4% of the time.
     let mut logits = vec![5.0f32; 10];
     logits[9] = 3.5;
     let picks = |p: &SamplingParams| -> Vec<u32> {

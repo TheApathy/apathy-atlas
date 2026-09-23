@@ -82,13 +82,19 @@ fn test_sampler_with_mock() {
     assert_eq!(token, 1); // index 1 = BF16(3.0) = max
 }
 
+/// The cut is the paper's `max - n*sigma`, not `mean - n*sigma`. On [2, 1, 1, 1, 1]
+/// (mean 1.2, sigma 0.4) they keep different sets: max-based keeps only the leader
+/// (cut 1.6), the old mean-based formula (the control) keeps everything (cut 0.8).
 #[test]
-fn test_top_n_sigma_keeps_high_logits() {
-    // 5 tokens with moderate spread: [2.0, 1.0, 1.0, 1.0, 1.0]
-    // mean = 1.2, sigma ≈ 0.4
-    // Correct threshold (mean - 1*sigma) = 0.8 → keeps ALL tokens (all >= 0.8)
-    // Bug threshold (mean + 1*sigma) = 1.6 → kills tokens 1-4 (1.0 < 1.6)
+fn test_top_n_sigma_is_relative_to_the_max() {
     let logits_f32 = [2.0f32, 1.0, 1.0, 1.0, 1.0];
+    let survivors = |cut: f32| logits_f32.iter().filter(|&&x| x >= cut).count();
+    let cut = super::sample_impl::top_n_sigma_threshold(&logits_f32, 1.0).unwrap();
+    assert!((cut - 1.6).abs() < 1e-5, "{cut}");
+    assert_eq!(survivors(cut), 1);
+    let old_mean_cut = 1.2 - 0.4;
+    assert_eq!(survivors(old_mean_cut), 5, "control: the mean-based cut keeps all five");
+
     let logits: Vec<u8> = logits_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
     let params = SamplingParams {
         temperature: 1.0,
@@ -110,21 +116,20 @@ fn test_top_n_sigma_keeps_high_logits() {
         stop_token_ids: Vec::new(),
         seed: None,
     };
-    // With correct threshold (mean - sigma = 0.8), all 5 tokens survive.
-    // After softmax at temp=1: P(0)=exp(2)/Z≈0.42, P(1-4)=exp(1)/Z≈0.145 each.
-    // With 500 samples, P(never see non-zero) ≈ 0.42^500 ≈ 0. Very reliable.
-    let mut saw_non_zero = false;
-    for _ in 0..500 {
-        let token = sample_with_params(&logits, &params);
-        if token != 0 {
-            saw_non_zero = true;
-            break;
-        }
+    // Unfiltered, tokens 1-4 have ~58% between them; with the cut they never appear.
+    for seed in 0..500u64 {
+        let p = SamplingParams { seed: Some(seed), ..params.clone() };
+        assert_eq!(sample_with_params(&logits, &p), 0);
     }
-    assert!(
-        saw_non_zero,
-        "top_n_sigma=1.0 should not filter tokens above mean-sigma"
-    );
+}
+
+/// Masked (-inf) logits don't poison the statistics: the cut is taken over the finite ones.
+#[test]
+fn test_top_n_sigma_ignores_masked_logits() {
+    let masked = [2.0f32, 1.0, 1.0, 1.0, 1.0, f32::NEG_INFINITY];
+    let cut = super::sample_impl::top_n_sigma_threshold(&masked, 1.0).unwrap();
+    assert!((cut - 1.6).abs() < 1e-5, "{cut}");
+    assert_eq!(super::sample_impl::top_n_sigma_threshold(&[3.0, 3.0], 1.0), None);
 }
 
 #[test]
@@ -265,11 +270,8 @@ fn test_sample_with_params_seeded_repetition_penalty_zero_doesnt_div_by_zero() {
 
 #[test]
 fn test_top_n_sigma_filters_extreme_outliers() {
-    // Logits: [100.0, -100.0, -100.0, -100.0, -100.0]
-    // mean = -60.0, sigma ≈ 80.0
-    // threshold at n=1: mean - sigma = -140 → keeps everything
-    // threshold at n=0.5: mean - 0.5*sigma = -100 → keeps token 0 only
-    // With very tight sigma (n=0.1): mean - 0.1*sigma = -68 → kills tokens 1-4
+    // Logits: [100.0, -100.0, -100.0, -100.0, -100.0]: max 100, sigma 80, so at
+    // n=0.1 the cut is max - 0.1*sigma = 92 and kills tokens 1-4.
     let logits_f32 = [100.0f32, -100.0, -100.0, -100.0, -100.0];
     let logits: Vec<u8> = logits_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
     let params = SamplingParams {

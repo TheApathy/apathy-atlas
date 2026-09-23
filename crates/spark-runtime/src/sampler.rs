@@ -53,7 +53,7 @@ pub struct SamplingParams {
     /// 1.0 = disabled.
     pub top_p: f32,
     /// Top-n-sigma: filter tokens in logit space before temperature scaling.
-    /// Keep only tokens with logit >= mean - n*sigma. Temperature-invariant.
+    /// Keep only tokens with logit >= max - n*sigma (Tang et al.). Temperature-invariant.
     /// 0.0 = disabled. Recommended: 1.0 for NVFP4 models.
     pub top_n_sigma: f32,
     /// Min-p: keep tokens with prob >= min_p * max_prob (post-softmax).

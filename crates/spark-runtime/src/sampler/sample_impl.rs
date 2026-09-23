@@ -133,18 +133,13 @@ pub fn sample_with_params_seeded(
     let temperature = params.temperature;
 
     // ── 1. Top-n-sigma: filter noise in logit space (temperature-invariant) ──
-    // Keep tokens with logit >= mean - n*sigma. Filters NVFP4 quantization noise.
-    if top_n_sigma > 0.0 {
-        let sum: f32 = raw_logits.iter().sum();
-        let mean = sum / n as f32;
-        let var: f32 = raw_logits.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32;
-        let sigma = var.sqrt();
-        if sigma > 0.0 {
-            let threshold = mean - top_n_sigma * sigma;
-            for logit in raw_logits.iter_mut() {
-                if *logit < threshold {
-                    *logit = f32::NEG_INFINITY;
-                }
+    // Keep tokens with logit >= max - n*sigma (Tang et al., arXiv:2411.07641; vLLM).
+    if top_n_sigma > 0.0
+        && let Some(threshold) = top_n_sigma_threshold(&raw_logits, top_n_sigma)
+    {
+        for logit in raw_logits.iter_mut() {
+            if *logit < threshold {
+                *logit = f32::NEG_INFINITY;
             }
         }
     }
@@ -237,4 +232,22 @@ pub fn sample_with_params_seeded(
         }
     }
     probs.last().map_or(0, |p| p.0)
+}
+
+/// The top-n-sigma cut: `max - n*sigma` over the finite logits (a bias, grammar mask or
+/// suppression leaves -inf entries that would otherwise poison the statistics). `None` when
+/// there is nothing to cut: no finite logits, or no spread.
+///
+/// It used to be `mean - n*sigma`, which only trims the far tail; with the paper's `max`
+/// the cut is relative to the leader, which is what makes it temperature-invariant.
+pub(super) fn top_n_sigma_threshold(logits: &[f32], n: f32) -> Option<f32> {
+    let finite = || logits.iter().copied().filter(|x| x.is_finite());
+    let count = finite().count();
+    if count == 0 {
+        return None;
+    }
+    let max = finite().fold(f32::NEG_INFINITY, f32::max);
+    let mean = finite().sum::<f32>() / count as f32;
+    let sigma = (finite().map(|x| (x - mean).powi(2)).sum::<f32>() / count as f32).sqrt();
+    (sigma > 0.0).then(|| max - n * sigma)
 }
