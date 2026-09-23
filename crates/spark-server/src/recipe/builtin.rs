@@ -27,10 +27,6 @@ pub const BUILTIN_YAML: &[(&str, &str)] = &[
         include_str!("builtin/qwen3.8-27b-optimized-local.yaml"),
     ),
     (
-        "qwen3.8/qwen3.8-27b-exact-local",
-        include_str!("builtin/qwen3.8-27b-exact-local.yaml"),
-    ),
-    (
         "qwen3.8/qwen3.8-flash-next-offload-local",
         include_str!("builtin/qwen3.8-flash-next-offload-local.yaml"),
     ),

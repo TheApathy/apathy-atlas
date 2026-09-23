@@ -83,6 +83,39 @@ fn every_qualified_nvfp4_batch_uses_exact_or_serial_k1() {
             "tensor-core LM-head route is reachable without the ATLAS_LM_HEAD_TC gate"
         );
     }
+    // The same kernel reached through the `lm_head_tc_rows` helper must sit
+    // behind the same gate (directly, or via the parity predicate that
+    // requires it).
+    for (offset, _) in body.match_indices("lm_head_tc_rows(") {
+        let before = &body[..offset];
+        assert!(
+            before.contains("lm_head_tc_enabled()")
+                || before.contains("decode_tc_parity_lm_head()"),
+            "tensor-core LM-head helper is reachable without the ATLAS_LM_HEAD_TC gate"
+        );
+    }
+}
+
+/// `ATLAS_DECODE_TC_PARITY` may only move single-token decode onto the
+/// tensor-core LM head when the verify is on it too: the parity predicate must
+/// require `ATLAS_LM_HEAD_TC`, and plain decode may reach the helper only
+/// through that predicate.
+#[test]
+fn decode_tc_parity_lm_head_requires_the_verify_gate() {
+    let predicate = braced_body_after(FORWARD, "fn decode_tc_parity_lm_head(");
+    assert!(predicate.contains("decode_tc_parity_enabled()"));
+    assert!(predicate.contains("lm_head_tc_enabled()"));
+    let helper = braced_body_after(FORWARD, "fn lm_head_tc_rows(");
+    assert!(helper.contains("w4a16_gemm_n64_m32_ldb("));
+    let decode = braced_body_after(FORWARD, "pub(super) fn lm_head(");
+    if let Some(offset) = decode.find("lm_head_tc_rows(") {
+        assert!(
+            decode[..offset].contains("decode_tc_parity_lm_head()"),
+            "plain-decode LM head reaches the tensor-core route without the parity gate"
+        );
+    } else {
+        panic!("plain-decode LM head lost its parity route");
+    }
 }
 
 #[test]
