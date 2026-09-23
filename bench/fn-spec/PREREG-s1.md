@@ -99,3 +99,36 @@ verify row and commits the serial choice.
 # s5 — timing (vg1, 5 reps): C K5H C K5HG C K2G C
 - K5HG faster than K5H by 8-15% on code; outputs identical to K5H. 70%.
 - K2G faster than s4 K2 by 5-15%. 60%.
+
+## s5o O2 (K2 + serial oracle): 1512/1512 rows batch_argmax == serial_argmax, and outputs with
+serial commit: code/chat == plain, think_code == fd692dc8 (K5H's think output), NOT plain's 166af6bb.
+So the think divergence is NOT verify numerics: the spec server's own one-token decode picks
+"times" where the plain server picks "weighted". The spec server decodes eagerly; the plain
+server uses the PLE segmented graph.
+# s6 — pre-registered: E1 = plain server with ATLAS_QWEN4_PLE_SEGMENTED_GRAPHS=0 (eager decode).
+- think_code in E1 == fd692dc8/"times" (eager and graph decode differ numerically; the plain
+  GRAPH path is the odd one out, e.g. a capture-time scalar reused across lengths). 55%.
+- code/chat in E1 == plain census. 80%.
+
+## s5o/s5 outcome (vg1)
+- Oracle: O2 1512/1512, O5 2615/2615, O5G 2580/2580 verify rows batch_argmax == plain one-token
+  argmax. Verify is argmax-exact per row at K=2 and K=5, graphed or not.
+- think_code in oracle mode (serial commit + skip-repropose) still != plain and even varied
+  between reps in O5 -> the thinking defect is in the spec server's thinking path, not verify.
+- K5HG (segmented verify graph): outputs identical to K5H on all prompts; code_py 50.35 -> 52.25
+  (+3.8%), code_rs 46.20 -> 48.26 (+4.5%). Pre-registered 8-15%: MISS (launch overhead was mostly
+  overlapped; idle is syncs, not launches).
+
+# s7 (REPLACED before running; vg2 sweep cancelled) — now binary vg4 = graph + think opt-out +
+MoE dedup (ATLAS_QWEN4_MOE_DEDUP) + sync-free MTP draft chain (ATLAS_QWEN4_MTP_CHAIN).
+s7c (1 rep): DC = dedup with ATLAS_QWEN4_MOE_DEDUP_CHECK (runs both kernels every call, compares
+bytes); DCX = same + CHECK_CORRUPT (flips one byte: the checker MUST report every call).
+- DC: 0 mismatching calls. 80% (per-row expression, lane map and shuffle order are identical and
+  the target builds --fmad=false). DCX: every call reported. 97%.
+s7 timing C G C GV96 C GV32 C GD C GC C ALL C NT C, 5 reps:
+- GV96 vs G: +4-7% code (LM head 357 MB -> 138 MB per draft); GV32: +6-9% if acceptance holds.
+- GD vs G: +5-12% (MoE 26.6 ms/step in the profile, union traffic ~0.56x of per-slot).
+- GC vs G: +2-4% (8 of 16 syncs per step gone).
+- ALL: code_py >= 60 tok/s (1.45x). 50%.
+- Outputs == plain census on code/chat for every arm. 90%.
+- NT think_code == plain 166af6bb. 50%.
