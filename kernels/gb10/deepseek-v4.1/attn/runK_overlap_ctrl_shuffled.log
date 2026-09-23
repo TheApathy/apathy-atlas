@@ -1,0 +1,7 @@
+L02 TOTAL 32768 rows: overlap mean 0.09776 min 0.0000 rows<0.99 32767 | misses tie 0 near 0 real 0
+L02 PRE-REGISTERED (mean >= 0.999, no row < 0.95): FAIL
+L20 TOTAL 32768 rows: overlap mean 0.05089 min 0.0000 rows<0.99 32768 | misses tie 0 near 0 real 0
+L20 PRE-REGISTERED (mean >= 0.99, rows<0.90 <= 1% (got 100.00%), real <= 10% of classified (got 0.0% of 0) -- UNCLASSIFIED: no index_score_rows taps): FAIL
+L24 TOTAL 128 rows: overlap mean 0.01538 min 0.0039 rows<0.99 128 | misses tie 0 near 0 real 0
+L24 PRE-REGISTERED (mean >= 0.98, rows<0.90 <= 2% (got 100.00%), real <= 15% of classified (got 0.0% of 0) -- UNCLASSIFIED: no index_score_rows taps): FAIL
+TOPK OVERLAP FAIL (3)
