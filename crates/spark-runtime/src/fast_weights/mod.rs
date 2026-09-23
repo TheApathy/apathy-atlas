@@ -318,6 +318,22 @@ impl WeightLoader for FastSafetensorsLoader {
 /// ahead of the copier. Memory overhead per shard: 2 × max_tensor_bytes
 /// (rounded up to O_DIRECT alignment).
 #[allow(clippy::too_many_arguments)]
+/// `ATLAS_LOAD_TRACE=1`: one line per step and per tensor in
+/// `load_shard_fast` (filter, skip_fn, reader, alloc, H2D) with elapsed
+/// times, so a stalled load names the tensor and the step it stopped in.
+fn load_trace_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_LOAD_TRACE").ok().as_deref() == Some("1"))
+}
+
+macro_rules! load_trace {
+    ($($arg:tt)*) => {
+        if load_trace_enabled() {
+            tracing::info!(target: "atlas_load_trace", $($arg)*);
+        }
+    };
+}
+
 fn load_shard_fast(
     shard_path: &Path,
     tensor_filter: Option<&[String]>,
@@ -332,15 +348,20 @@ fn load_shard_fast(
     // is negligible and buffered I/O handles short reads cleanly.
     let mut meta_file = File::open(shard_path)
         .with_context(|| format!("Failed to open {}", shard_path.display()))?;
+    let t_shard = std::time::Instant::now();
+    load_trace!("shard {}: parse_header start", shard_path.display());
     let mut tensors = parse_header(&mut meta_file)?;
     let file_size = meta_file.metadata()?.len();
+    load_trace!("shard: header parsed, {} tensors ({:?})", tensors.len(), t_shard.elapsed());
 
     // Filter down to tensors we actually want (index filter + EP filter).
     if let Some(allow) = tensor_filter {
         let allow_set: std::collections::HashSet<&str> = allow.iter().map(|s| s.as_str()).collect();
         tensors.retain(|t| allow_set.contains(t.name.as_str()));
     }
+    load_trace!("shard: tensor_filter applied, {} tensors ({:?})", tensors.len(), t_shard.elapsed());
     tensors.retain(|t| !skip_fn(&t.name));
+    load_trace!("shard: skip_fn applied, {} tensors ({:?})", tensors.len(), t_shard.elapsed());
 
     // Per-shard heuristic: above `direct_io_tensor_cap` tensors, O_DIRECT's
     // per-tensor syscall + 4 KiB alignment overhead costs more than kernel
@@ -386,8 +407,10 @@ fn load_shard_fast(
     let _ = file_size; // retained for future use (tail-fragment buffered read)
     let reader_handle = std::thread::spawn(move || {
         for (idx, (abs_offset, len)) in tensors_for_reader.iter().enumerate() {
+            let t_read = std::time::Instant::now();
             let msg = direct_io::read_tensor_aligned(raw_fd, *abs_offset, *len, using_direct)
                 .map(|(buf, slice_start)| (idx, buf, slice_start));
+            load_trace!("reader: #{idx} {len} bytes read ({:?}) ok={}", t_read.elapsed(), msg.is_ok());
             if tx.send(msg).is_err() {
                 break; // receiver dropped
             }
@@ -400,9 +423,13 @@ fn load_shard_fast(
         let meta = &tensors[idx];
         let src = &buf.as_slice()[slice_start..slice_start + meta.len];
 
+        let t_tensor = std::time::Instant::now();
+        load_trace!("copier: #{idx} {} {} bytes alloc start", meta.name, meta.len);
         let ptr = match gpu.alloc(meta.len) {
             Ok(p) => {
+                load_trace!("copier: #{idx} alloc done ({:?}), h2d start", t_tensor.elapsed());
                 gpu.copy_h2d(src, p)?;
+                load_trace!("copier: #{idx} h2d done ({:?})", t_tensor.elapsed());
                 p
             }
             Err(_) => {
@@ -432,6 +459,7 @@ fn load_shard_fast(
         );
     }
 
+    load_trace!("shard: copier drained ({:?}), joining reader", t_shard.elapsed());
     reader_handle
         .join()
         .map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
