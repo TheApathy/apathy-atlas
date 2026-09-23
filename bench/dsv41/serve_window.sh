@@ -4,8 +4,8 @@
 # START only once the lock is held, a 100 ms MemAvailable watchdog that SIGKILLs the server
 # (by its own PID) below 6 GB, END always with rc and the low-water mark.
 # Usage: serve_window.sh <label> <port> <requests-dir>
-#   <requests-dir>/NN_name.json : POST bodies for /v1/chat/completions (or /v1/completions when the
-#                                 file name contains "completion_raw"); responses land next to them.
+#   <requests-dir>/NN_name.json : POST bodies; the endpoint follows the body ("messages" -> chat,
+#                                 "prompt" -> completions); responses land next to them.
 set -uo pipefail
 LABEL="$1"; PORT="$2"; REQ="$3"
 Q=/home/flocka/atlas/.gb10-queue; LOCK=/home/flocka/atlas/.gb10.lock
@@ -57,7 +57,13 @@ echo "server healthy after ~$((i/10)) s"
 ( while kill -0 "$srv" 2>/dev/null; do m=$(memavail); [ "$m" -lt "$ABORT_KB" ] && { echo "WATCHDOG (requests): SIGKILL $srv"; kill -9 "$srv"; }; echo "$m" >> "$REQ/.mem"; sleep 0.1; done ) &
 for f in "$REQ"/*.json; do
   case "$f" in *.response.json) continue ;; esac
-  ep=/v1/chat/completions; case "$f" in *completion_raw*) ep=/v1/completions ;; esac
+  # Endpoint from the request BODY, never the file name: "messages" -> chat, "prompt" /
+  # "prompt_token_ids" -> completions; a body with neither is refused (not sent).
+  ep=$(python3 -c "
+import json,sys
+b=json.load(open(sys.argv[1]))
+print('/v1/chat/completions' if 'messages' in b else '/v1/completions' if ('prompt' in b or 'prompt_token_ids' in b) else 'NONE')" "$f")
+  if [ "$ep" = NONE ]; then echo "REFUSED $(basename "$f"): body has neither messages nor prompt"; rc=95; continue; fi
   t0=$(date +%s.%N)
   curl -s -m 900 -H 'Content-Type: application/json' -d @"$f" "http://127.0.0.1:$PORT$ep" > "${f%.json}.response.json"; crc=$?
   t1=$(date +%s.%N)

@@ -169,13 +169,13 @@ impl Dsv41Model {
         // Whole-step CUDA graphs for Decode/Verify passes, segmented around the engram gathers
         // (measured full model: -3.21 ms/step, bit-identical to eager over 63 steps; see
         // V41Forward::step_graphed).
-        // OFF by default again (window9): a graph captured on one sequence replayed on the NEXT
-        // sequence faulted (CUDA_ERROR_ILLEGAL_ADDRESS on the second request's first plain decode,
-        // serve9 and serve9d) -- the captured nodes hold the first sequence's per-sequence buffers.
-        // Opt in with ATLAS_DSV41_GRAPH=1 until graphs re-capture (or rebind) per sequence.
-        if std::env::var("ATLAS_DSV41_GRAPH").as_deref() == Ok("1") {
+        // ON by default (window11): graphs are keyed per sequence (decode 1c2175d1c; window9's
+        // cross-sequence fault is fixed) -- serve11g / serve11gd ran 7 sequences back to back, plain
+        // and DSpark, every response text-equal to eager, +3.5..4.9% decode; the drop gate with
+        // graphs passed (window10). ATLAS_DSV41_GRAPH=0 = eager.
+        if std::env::var("ATLAS_DSV41_GRAPH").as_deref() != Ok("0") {
             fwd.enable_graphs(gpu, lanes.hook.as_ref())?;
-            tracing::info!("DeepSeek-V4.1: decode CUDA graphs ON (segmented; opt-in ATLAS_DSV41_GRAPH=1)");
+            tracing::info!("DeepSeek-V4.1: decode CUDA graphs ON (segmented; ATLAS_DSV41_GRAPH=0 for eager)");
         }
         let mode = match std::env::var("ATLAS_DSV41_PREFILL").ok().as_deref() {
             None | Some("replay") => PrefillMode::Replay,
