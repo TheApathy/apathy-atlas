@@ -3,4 +3,5 @@
 // Compile the established tensor-core online-softmax kernel for GLM vision's
 // exact 64-wide heads. A separate module avoids changing language attention.
 #define HDIM 64
-#include "../../common/inferspark_prefill.cu"
+// Upstream signature (see the vendored header), not this tree's common copy.
+#include "../iq3/glm53_inferspark_prefill_upstream.cuh"
