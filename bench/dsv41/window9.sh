@@ -34,4 +34,24 @@ L=L40.logits_last.000.bin
   echo "control runK vs 2048-tok prompt (must DIFFER): $(same $S/w9_k2048/$L $S/w9_def/$L)"
   grep -E 'WARM prefill|^prefill|this run|^decode:|tok/s\)' $I/k124_w9.log; } > $I/w9_summary.txt
 python3 $B/compare_all.py $O/runK_32k $S/w9_k2048 > $I/w9_runK_layers.txt 2>&1
+# (c) serve with decode CUDA graphs (now default in Dsv41Model): plain and DSPARK=1 (chunk auto-capped
+# to 1024). Text must EQUAL serve8 (eager, same requests) and plain == DSpark; tok/s; low-water.
+$B/serve_window.sh serve9 8900 $I/serve9 > $I/serve9.log 2>&1
+ATLAS_DSV41_DSPARK=1 $B/serve_window.sh serve9d 8900 $I/serve9d > $I/serve9d.log 2>&1
+grep -h "DSpark:\|capping the prefill chunk" $I/serve9d/server.log > $I/w9_dspark_stats.txt 2>&1
+python3 - "$I" > $I/w9_serve_cmp.txt 2>&1 <<'PY'
+import json, sys, glob, os, re
+I = sys.argv[1]
+strip = lambda s: re.sub(r'"id": "call_[0-9a-f]+"', '"id": "X"', s)
+def body(f):
+    r = json.load(open(f)); c = r["choices"][0]
+    return strip(json.dumps(c.get("text", c.get("message")), sort_keys=True)), r["usage"].get("response_token/s", 0)
+for f in sorted(glob.glob(f"{I}/serve9/*.response.json")):
+    n = os.path.basename(f)
+    try:
+        a, ta = body(f); e, te = body(f"{I}/serve8/{n}"); d, td = body(f"{I}/serve9d/{n}")
+    except Exception as ex:
+        print(n, "MISSING", ex); continue
+    print(n, "graph==eager:", a == e, "dspark==plain:", d == a, "tok/s eager %.2f graph %.2f graph+dspark %.2f" % (te, ta, td))
+PY
 echo "DONE window9 chain"
