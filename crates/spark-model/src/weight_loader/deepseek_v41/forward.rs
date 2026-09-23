@@ -726,12 +726,14 @@ impl V41Forward {
         }
         super::ops::set_decode_pass(true);
         moe.begin_pass(ids)?;
-        // Segments. SEGMENTED (ATLAS_DSV41_GRAPH_SEGMENTED=1): one graph per span between engram
+        // Segments. SEGMENTED (default): one graph per span between engram
         // layers, each engram layer's NVMe gather issued right before ITS segment, so the host
         // reads while the GPU runs the previous segment (eager's overlap). Otherwise one graph
         // for the whole pass with both gathers in front of it.
         let n = self.blocks.len();
-        let segmented = std::env::var("ATLAS_DSV41_GRAPH_SEGMENTED").as_deref() == Ok("1");
+        // Default ON (measured full model: -3.21 ms/step vs eager; one whole-pass graph only -0.8,
+        // its NVMe gathers serialised). `ATLAS_DSV41_GRAPH_SEGMENTED=0` = one graph (A/B only).
+        let segmented = std::env::var("ATLAS_DSV41_GRAPH_SEGMENTED").as_deref() != Ok("0");
         let mut bounds: Vec<usize> = vec![0];
         if segmented {
             bounds.extend(g.pre_rows.iter().map(|(l, _)| *l).filter(|&l| l > 0 && l < n));
