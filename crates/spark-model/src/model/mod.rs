@@ -35,6 +35,7 @@ pub(crate) mod impl_a3;
 pub(crate) mod impl_b1;
 pub(crate) mod impl_b2;
 pub(crate) mod impl_b3;
+pub mod dsv41;
 pub mod k16_commit_parity;
 pub(crate) mod k16_route_receipt;
 pub(crate) mod k1_stage_diag;

@@ -18,6 +18,7 @@
 // metal`) where the high-speed-swap path won't be reachable anyway.
 
 #[cfg(feature = "cuda")]
+pub mod engram_tier;
 pub mod cuda_graph;
 #[cfg(feature = "cuda")]
 pub mod cuda_min;

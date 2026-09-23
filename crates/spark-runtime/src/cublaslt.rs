@@ -13,6 +13,13 @@ use anyhow::{Result, bail};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
+// DeepSeek-V4.1 needs dtype-parameterised (bf16/fp32) GEMMs on top of this module's bf16-only
+// entry points -- see typed.rs's own doc. Ported from dsv41/integration; every symbol it
+// references via `use super::*` (the cublasLt type aliases, CUDA_R_* constants) already exists
+// below unchanged.
+mod typed;
+pub use typed::{GemmDtype, gemm_act_weight_t_typed, gemm_act_weight_t_typed_ex, gemm_act_weight_t_typed_pinned};
+
 #[allow(non_camel_case_types)]
 type cublasLtHandle_t = *mut c_void;
 #[allow(non_camel_case_types)]
