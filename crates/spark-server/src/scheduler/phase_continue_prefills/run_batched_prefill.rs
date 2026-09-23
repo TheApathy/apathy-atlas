@@ -14,7 +14,7 @@ use spark_model::traits::{Model, PrefillSlice};
 use spark_runtime::gpu::DevicePtr;
 use std::time::Instant;
 
-use super::super::sample_token;
+use super::super::sample_token_with_logprobs;
 use super::super::types::PrefillInProgress;
 
 pub(super) fn run_batched_prefill_step(
@@ -113,15 +113,17 @@ pub(super) fn run_batched_prefill_step(
             completed_indices.push((i, None));
             continue;
         }
-        match sample_token(
+        match sample_token_with_logprobs(
             model,
             logits,
             p.temperature,
             p.top_k,
             p.top_p,
             &p.eos_tokens,
+            p.top_logprobs,
         ) {
-            Ok(first) => {
+            Ok((first, first_lp)) => {
+                p.first_logprobs = first_lp;
                 tracing::info!(
                     "Batched prefill[{i}/{n}] first token: {first} (chunk_len={}, total_tokens={})",
                     chunk_lens[i],

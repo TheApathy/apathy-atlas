@@ -211,10 +211,18 @@ pub fn start_chunked_prefill(
 
     if is_last {
         // Single chunk covered the entire prompt — get first token.
-        let first = match sample_token(model, logits, temperature, top_k, top_p, eos_tokens) {
-            Ok(t) => {
+        let (first, first_lp) = match sample_token_with_logprobs(
+            model,
+            logits,
+            temperature,
+            top_k,
+            top_p,
+            eos_tokens,
+            req_top_logprobs,
+        ) {
+            Ok((t, lp)) => {
                 tracing::info!("Prefill first token: {t}");
-                t
+                (t, lp)
             }
             Err(e) => {
                 let msg = format!("sample_token failed: {e:#}");
@@ -238,7 +246,7 @@ pub fn start_chunked_prefill(
             !req_enable_thinking && think_start_token == Some(first) && !crate::dsv41::serving();
         if !spontaneous_think
             && let ResponseSink::Streaming(ref tx) = sink
-            && let Err(e) = tx.blocking_send(StreamEvent::Token(first))
+            && let Err(e) = tx.blocking_send(first_token_event(first, &first_lp))
         {
             tracing::warn!("prefill_a_step: first-token send failed (receiver dropped): {e}");
         }
@@ -317,7 +325,7 @@ pub fn start_chunked_prefill(
                 decode_start: now,
                 seed: req_seed,
                 top_logprobs: req_top_logprobs,
-                logprobs_data: Vec::new(),
+                logprobs_data: first_lp.clone().filter(|_| !spontaneous_think).into_iter().collect(),
                 timeout_at: req_timeout_at,
                 adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
             };
@@ -404,7 +412,7 @@ pub fn start_chunked_prefill(
                 decode_start: now,
                 seed: req_seed,
                 top_logprobs: req_top_logprobs,
-                logprobs_data: Vec::new(),
+                logprobs_data: first_lp.clone().filter(|_| !spontaneous_think).into_iter().collect(),
                 timeout_at: req_timeout_at,
                 adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
             }))
@@ -448,6 +456,7 @@ pub fn start_chunked_prefill(
             grammar_state,
             seed: req_seed,
             top_logprobs: req_top_logprobs,
+            first_logprobs: None,
             timeout_at: req_timeout_at,
         }))
     }

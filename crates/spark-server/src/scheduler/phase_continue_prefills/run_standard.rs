@@ -11,7 +11,7 @@ use spark_model::traits::{Model, SequenceState};
 use std::time::Instant;
 
 use super::super::decode_logits_step::process_decode_logits;
-use super::super::sample_token;
+use super::super::sample_token_with_logprobs;
 use super::super::types::{ActiveSeq, PrefillInProgress};
 
 #[allow(clippy::too_many_arguments)]
@@ -112,15 +112,17 @@ pub(super) fn run_standard_chunk_loop(
                     }
                     let _ = model.record_event(prefill_event, prefill_stream);
                     let _ = model.stream_wait_event(model.default_stream(), prefill_event);
-                    match sample_token(
+                    match sample_token_with_logprobs(
                         model,
                         result.prefill_logits,
                         p.temperature,
                         p.top_k,
                         p.top_p,
                         &p.eos_tokens,
+                        p.top_logprobs,
                     ) {
-                        Ok(first) => {
+                        Ok((first, first_lp)) => {
+                            p.first_logprobs = first_lp;
                             tracing::info!("Mixed prefill first token: {first}");
                             completed_indices.push((idx, Some(first)));
                         }
@@ -195,15 +197,17 @@ pub(super) fn run_standard_chunk_loop(
             if is_last {
                 let _ = model.record_event(prefill_event, prefill_stream);
                 let _ = model.stream_wait_event(model.default_stream(), prefill_event);
-                match sample_token(
+                match sample_token_with_logprobs(
                     model,
                     logits,
                     p.temperature,
                     p.top_k,
                     p.top_p,
                     &p.eos_tokens,
+                    p.top_logprobs,
                 ) {
-                    Ok(first) => {
+                    Ok((first, first_lp)) => {
+                        p.first_logprobs = first_lp;
                         tracing::info!("Prefill first token: {first}");
                         completed_indices.push((idx, Some(first)));
                     }

@@ -67,14 +67,32 @@ pub fn sample_token(
     top_p: f32,
     suppress_ids: &[u32],
 ) -> Result<u32> {
+    sample_token_with_logprobs(model, logits, temperature, top_k, top_p, suppress_ids, None)
+        .map(|(tok, _)| tok)
+}
+
+/// [`sample_token`] that also returns the token's logprobs when the request
+/// asked for them (`top_logprobs`). The first generated token is sampled here,
+/// from the prefill logits, so this is where its logprobs entry comes from;
+/// they are taken over the same (suppressed) distribution the token was drawn
+/// from, as the decode path does.
+pub fn sample_token_with_logprobs(
+    model: &dyn Model,
+    logits: DevicePtr,
+    temperature: f32,
+    top_k: u32,
+    top_p: f32,
+    suppress_ids: &[u32],
+    top_logprobs: Option<u8>,
+) -> Result<(u32, Option<crate::api::TokenLogprobs>)> {
     // deepseek_v41: the Python engine may end on its very first token.
     let suppress_ids = if crate::dsv41::serving() {
         &[][..]
     } else {
         suppress_ids
     };
-    if temperature == 0.0 && suppress_ids.is_empty() {
-        return model.argmax_on_device(logits, 0);
+    if temperature == 0.0 && suppress_ids.is_empty() && top_logprobs.is_none() {
+        return Ok((model.argmax_on_device(logits, 0)?, None));
     }
     let vocab_size = model.vocab_size();
     // Read logits from device. Gemma-4 dense single-token decode produces FP32
@@ -107,14 +125,17 @@ pub fn sample_token(
             f32_logits[id as usize] = f32::NEG_INFINITY;
         }
     }
+    let logprobs_of = |tok: u32| {
+        top_logprobs.map(|k| super::logprobs::extract_logprobs_from_f32(&f32_logits, tok, k as usize))
+    };
     if temperature == 0.0 {
         // Greedy argmax over FP32
         let best = spark_runtime::sampler::first_max_index(&f32_logits);
-        return Ok(best);
+        return Ok((best, logprobs_of(best)));
     }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
-    Ok(sample_with_params(
+    let tok = sample_with_params(
         f32_bytes,
         &SamplingParams {
             temperature,
@@ -136,7 +157,8 @@ pub fn sample_token(
             stop_token_ids: Vec::new(),
             seed: None,
         },
-    ))
+    );
+    Ok((tok, logprobs_of(tok)))
 }
 
 /// Sample one token from device logits with optional grammar constraint.
@@ -278,4 +300,16 @@ pub fn sample_token_with_grammar(
             seed: None,
         },
     ))
+}
+
+/// The stream event for a first generated token (with its logprobs when the
+/// request asked for them).
+pub(super) fn first_token_event(
+    tok: u32,
+    logprobs: &Option<crate::api::TokenLogprobs>,
+) -> crate::api::StreamEvent {
+    match logprobs {
+        Some(lp) => crate::api::StreamEvent::TokenWithLogprobs(tok, lp.clone()),
+        None => crate::api::StreamEvent::Token(tok),
+    }
 }

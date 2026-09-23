@@ -31,7 +31,7 @@ use std::time::Instant;
 use spark_model::traits::Model;
 
 use super::phase_promote_prefills::promote_completed_prefills;
-use super::sample_token;
+use super::sample_token_with_logprobs;
 use super::types::{ActiveSeq, PrefillInProgress};
 use crate::scheduling_policy::{ActiveSeqTiming, SchedulingPolicy};
 
@@ -210,15 +210,17 @@ pub(super) fn continue_in_progress_prefills(
                     p.chunk_offset = p.prompt_tokens.len();
                     let _ = model.record_event(prefill_event, prefill_stream);
                     let _ = model.stream_wait_event(model.default_stream(), prefill_event);
-                    match sample_token(
+                    match sample_token_with_logprobs(
                         model,
                         logits,
                         p.temperature,
                         p.top_k,
                         p.top_p,
                         &p.eos_tokens,
+                        p.top_logprobs,
                     ) {
-                        Ok(first) => {
+                        Ok((first, first_lp)) => {
+                            p.first_logprobs = first_lp;
                             tracing::info!("Two-phase prefill first token: {first}");
                             completed_indices.push((idx, Some(first)));
                         }

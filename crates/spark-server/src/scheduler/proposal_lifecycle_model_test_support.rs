@@ -43,6 +43,9 @@ pub(super) struct TestModel {
     pub(super) takes: AtomicUsize,
     /// Tokens `argmax_batch` returns; empty = the call is unexpected.
     pub(super) argmax: Mutex<Vec<u32>>,
+    /// One logits row `copy_logits_to_host` serves (as bf16); its length is
+    /// the vocab size. Empty = the call is unexpected.
+    pub(super) host_logits: Mutex<Vec<f32>>,
 }
 
 impl TestModel {
@@ -53,6 +56,7 @@ impl TestModel {
             proposals: AtomicUsize::new(0),
             takes: AtomicUsize::new(0),
             argmax: Mutex::new(Vec::new()),
+            host_logits: Mutex::new(Vec::new()),
         }
     }
 }
@@ -110,7 +114,7 @@ impl Model for TestModel {
         unreachable!()
     }
     fn vocab_size(&self) -> usize {
-        0
+        self.host_logits.lock().unwrap().len()
     }
     fn bind_gpu_to_thread(&self) -> Result<()> {
         Ok(())
@@ -118,8 +122,14 @@ impl Model for TestModel {
     fn alloc_sequence(&self) -> Result<SequenceState> {
         Ok(seq_state())
     }
-    fn copy_logits_to_host(&self, _: DevicePtr, _: &mut [u8]) -> Result<()> {
-        unreachable!()
+    fn copy_logits_to_host(&self, _: DevicePtr, out: &mut [u8]) -> Result<()> {
+        let row = self.host_logits.lock().unwrap();
+        assert!(!row.is_empty(), "unexpected copy_logits_to_host");
+        for (i, v) in row.iter().enumerate() {
+            let bits = (v.to_bits() >> 16) as u16; // exact for bf16-representable test values
+            out[i * 2..i * 2 + 2].copy_from_slice(&bits.to_le_bytes());
+        }
+        Ok(())
     }
     fn logits_buffer_ptr(&self) -> DevicePtr {
         DevicePtr::NULL

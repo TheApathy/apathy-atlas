@@ -17,7 +17,7 @@ use spark_runtime::gpu::DevicePtr;
 use std::time::Instant;
 
 use super::super::decode_logits_step::process_decode_logits;
-use super::super::sample_token;
+use super::super::sample_token_with_logprobs;
 use super::super::types::{ActiveSeq, PrefillInProgress};
 
 #[allow(clippy::too_many_arguments)]
@@ -124,15 +124,17 @@ pub(super) fn run_batched_mixed_step(
             completed_indices.push((i, None));
             continue;
         }
-        match sample_token(
+        match sample_token_with_logprobs(
             model,
             logits,
             p.temperature,
             p.top_k,
             p.top_p,
             &p.eos_tokens,
+            p.top_logprobs,
         ) {
-            Ok(first) => {
+            Ok((first, first_lp)) => {
+                p.first_logprobs = first_lp;
                 tracing::info!(
                     "Mixed-batch prefill[{i}/{n_prefill}] first token: {first} (chunk_len={}, total_tokens={})",
                     chunk_lens[i],

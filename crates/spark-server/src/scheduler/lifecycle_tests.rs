@@ -19,6 +19,13 @@ mod model_support {
         implementation::seq_state()
     }
 
+    /// A model whose (single) logits row is `row`.
+    pub(super) fn logits_model(row: Vec<f32>) -> impl spark_model::traits::Model {
+        let m = implementation::TestModel::new(Ok(Vec::new()), None);
+        *m.host_logits.lock().unwrap() = row;
+        m
+    }
+
     /// A model whose greedy decode step returns `tokens`.
     pub(super) fn greedy_model(tokens: Vec<u32>) -> impl spark_model::traits::Model {
         let m = implementation::TestModel::new(Ok(Vec::new()), None);
@@ -248,4 +255,33 @@ fn a_cancelled_sequence_stops_on_the_serial_decode_path() {
     assert_eq!(run(true), (true, 1));
     // CONTROL: without the flag the same step commits the token and continues
     assert_eq!(run(false), (false, 2));
+}
+
+/// The first generated token is sampled from the prefill logits; with
+/// `top_logprobs` requested its logprobs entry must come with it (it used to be
+/// missing, so logprobs.content had completion_tokens - 1 entries), and its
+/// stream event must carry them.
+#[test]
+fn the_first_token_gets_its_logprobs_from_the_prefill_logits() {
+    let model = model_support::logits_model(vec![0.0, 3.0, 1.0, 2.0]);
+    let null = spark_runtime::gpu::DevicePtr::NULL;
+    let (tok, lp) = sample_token_with_logprobs(&model, null, 0.0, 0, 1.0, &[], Some(2)).unwrap();
+    assert_eq!(tok, 1);
+    let lp = lp.expect("first-token logprobs");
+    assert_eq!(lp.token_id, 1);
+    assert_eq!(lp.top.iter().map(|t| t.0).collect::<Vec<_>>(), vec![1, 3]);
+    let z = [0.0f32, 3.0, 1.0, 2.0].iter().map(|v| v.exp()).sum::<f32>().ln();
+    assert!((lp.logprob - (3.0 - z)).abs() < 1e-5);
+    assert!(matches!(
+        first_token_event(tok, &Some(lp)),
+        StreamEvent::TokenWithLogprobs(1, _)
+    ));
+    // Sampled (T>0) path returns an entry for whatever it drew.
+    let (t2, lp2) = sample_token_with_logprobs(&model, null, 1.0, 0, 1.0, &[], Some(1)).unwrap();
+    assert_eq!(lp2.expect("sampled first-token logprobs").token_id, t2);
+    // CONTROL: without top_logprobs nothing is produced (and the plain event is sent),
+    // which is what every request got before -- one entry short.
+    let (_, none) = sample_token_with_logprobs(&model, null, 0.5, 0, 1.0, &[], None).unwrap();
+    assert!(none.is_none());
+    assert!(matches!(first_token_event(1, &None), StreamEvent::Token(1)));
 }
