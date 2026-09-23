@@ -330,7 +330,13 @@ pub(crate) fn swap(host: &Arc<ModelHost>, next: cli::ServeArgs) -> Result<SwapOu
     // A model with a launch profile (memory, run-alone, env) — DeepSeek-V4.1 today. Refused
     // HERE, before anything is released, only when it could never fit on this machine at all;
     // the real admission is after the release below, on the memory that is actually free.
-    let profile = super::model_profile::profile_for_model_type(&model_type);
+    let profile = super::model_profile::profile_for(
+        next.model_from_path
+            .as_deref()
+            .and_then(|p| p.to_str())
+            .or(next.model.as_deref()),
+        &model_type,
+    );
     if let Some(p) = profile.as_ref().filter(|p| p.run_alone) {
         let total = super::model_profile::mem_total_bytes()?;
         anyhow::ensure!(

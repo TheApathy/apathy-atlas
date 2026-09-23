@@ -1,0 +1,61 @@
+# Built-in recipe: GLM-5.3-Flash EXL3 2.05 bpw, target-only. all-models matrix: logits
+# bit-identical to the perf/glm-5.3-flash-prefill-20260920 tip, prefill 908 tok/s at 2047,
+# decode 14.2 tok/s. Speculation (DFlash2) is not ported and is refused at load; it measured
+# slower than target-only on this checkpoint anyway.
+recipe_version: "2"
+model: GLM-5.3-Flash-exl3-2.05bpw
+runtime: atlas
+container: local
+metadata:
+  maintainer: atlas-allmodels
+  category: agent
+  model_params: 744B
+  quantization: exl3
+  kv_dtype: bf16
+  description: |
+    GLM-5.3-Flash (KDA + DSA + mHC MoE) from the EXL3 checkpoint, with the prefill lane's
+    levers. ~86 GB resident: runs alone.
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  max_model_len: 2048
+  max_prefill_tokens: 2048
+  max_batch_size: 1
+  max_num_seqs: 1
+  oom_guard_mb: 4096
+atlas:
+  model_type: glm5_next
+  resident_gb: 89
+  headroom_gb: 10
+  run_alone: true
+  env:
+    ATLAS_GLM53_CUBLASLT_PREWARM: "1"
+    ATLAS_GLM53_EXACT_VERIFY: "1"
+    ATLAS_GLM53_EXACT_WIDE_DSA_PRECOMPUTE: "1"
+    ATLAS_GLM53_EXACT_WIDE_KDA_BATCH_COPY: "1"
+    ATLAS_GLM53_EXACT_WIDE_ROWEXACT: "1"
+    ATLAS_GLM53_EXL3_KDA_QKV_GRID_ORDER: "row-x"
+    ATLAS_GLM53_EXL3_MOE_PREFILL_DIRECT_COMBINE: "1"
+    ATLAS_GLM53_EXL3_ROUTE_PRIVATE: "1"
+    ATLAS_GLM53_EXL3_ROUTE_PRIVATE_PREFILL: "1"
+    ATLAS_GLM53_FFN_GRAPHS: "1"
+    ATLAS_GLM53_LAYER_MAJOR_PREFILL: "1"
+    ATLAS_GLM53_LAYER_MAJOR_PREFILL_ROWS: "2048"
+    ATLAS_GLM53_LAYER_MAJOR_VISION_PREFILL: "1"
+    ATLAS_GLM53_PARTIAL_WIDE_REPLAY: "1"
+    ATLAS_GLM53_PHASE_TIMING: "0"
+    ATLAS_GLM53_UNVALIDATED_BRINGUP: "1"
+    ATLAS_GLM53_VISION_FLASH_ATTN: "1"
+    ATLAS_GLM53_WIDE_PREFILL: "1"
+    ATLAS_GLM53_WIDE_PREFILL_ROWS: "8"
+    ATLAS_VISION_TIMING: "1"
+    ATLAS_GLM53_EXL3_MOE_CHUNK_ROWS: "64"
+    ATLAS_GLM53_EXL3_PREFILL_RECONSTRUCT: "1"
+    ATLAS_GLM53_EXL3_RECONSTRUCT_PRECISION: "f16"
+    ATLAS_GLM53_EXL3_RECONSTRUCT_DTYPE: "bf16"
+    ATLAS_GLM53_ROUTER_GEMM: "1"
+    ATLAS_GLM53_HC_PRE_GEMM: "1"
+    ATLAS_GLM53_DSA_ABSORB_GEMM: "1"
+    ATLAS_GLM53_KDA_CONV_FUSED: "1"
+    ATLAS_GLM53_DSA_DENSE_FAST: "1"
+    ATLAS_GLM53_HC_POST_PROMPT: "1"

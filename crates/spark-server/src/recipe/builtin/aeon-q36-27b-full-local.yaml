@@ -1,0 +1,25 @@
+# Built-in recipe: AEON-Q36-27B on its own kernel target (qwen3.6-27b). Without the pin the
+# (model_type, hidden_size) auto-pick serves every qwen3_5/5120 checkpoint on qwen3.6-27b.
+recipe_version: "2"
+model: AEON-Q36-27B-Full
+runtime: atlas
+container: local
+metadata:
+  maintainer: atlas-allmodels
+  category: chat
+  model_params: 27B
+  quantization: nvfp4
+  kv_dtype: fp8
+  description: |
+    AEON-Q36-27B, served with its tuned kernel target qwen3.6-27b.
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  kernel_target: qwen3.6-27b
+  gpu_memory_utilization: 0.5
+  kv_cache_dtype: fp8
+  max_model_len: 8192
+atlas:
+  model_type: qwen3_5
+  resident_gb: 66
+  headroom_gb: 8

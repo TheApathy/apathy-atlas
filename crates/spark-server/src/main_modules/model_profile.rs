@@ -79,18 +79,46 @@ pub(crate) fn parse_profile(recipe_id: &str, text: &str) -> Result<Option<ModelP
     }))
 }
 
-/// The built-in profile for a `model_type`, if one exists.
-pub(crate) fn profile_for_model_type(model_type: &str) -> Option<ModelProfile> {
-    crate::recipe::builtin::BUILTIN_YAML
+/// The built-in profile for the model being launched.
+///
+/// Matched by the checkpoint's directory name first (a built-in recipe's `model:`): several
+/// served checkpoints share a `model_type` (Qwen3.5-27B, AEON-27B and Qwen3.8-27B are all
+/// `qwen3_5`) but need different kernel targets and environments. Falls back to the
+/// `model_type` match only when exactly one built-in declares that type.
+pub(crate) fn profile_for(model: Option<&str>, model_type: &str) -> Option<ModelProfile> {
+    let dir_name = model
+        .map(|m| m.trim_end_matches('/'))
+        .and_then(|m| std::path::Path::new(m).file_name())
+        .and_then(|n| n.to_str());
+    let with_model: Vec<(String, ModelProfile)> = crate::recipe::builtin::BUILTIN_YAML
         .iter()
-        .filter_map(|(id, text)| match parse_profile(id, text) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("built-in recipe {id}: atlas block does not parse: {e:#}");
-                None
+        .filter_map(|(id, text)| {
+            let recipe_model = crate::recipe::Recipe::parse(*id, text).ok()?.model;
+            match parse_profile(id, text) {
+                Ok(Some(p)) => Some((recipe_model, p)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::error!("built-in recipe {id}: atlas block does not parse: {e:#}");
+                    None
+                }
             }
         })
-        .find(|p| p.model_type == model_type)
+        .collect();
+    if let Some(name) = dir_name
+        && let Some((_, p)) = with_model.iter().find(|(m, _)| m == name)
+    {
+        return Some(p.clone());
+    }
+    let mut by_type = with_model.into_iter().filter(|(_, p)| p.model_type == model_type);
+    match (by_type.next(), by_type.next()) {
+        (Some((_, p)), None) => Some(p),
+        _ => None,
+    }
+}
+
+/// The built-in profile for a `model_type`, if exactly one built-in declares it.
+pub(crate) fn profile_for_model_type(model_type: &str) -> Option<ModelProfile> {
+    profile_for(None, model_type)
 }
 
 /// `MemAvailable` from `/proc/meminfo`, in bytes. On GB10 this is the pool the GPU
