@@ -68,10 +68,17 @@ fn main() -> Result<()> {
     let mut seq = model.alloc_sequence()?;
     let ids: Vec<u32> = (0..64).map(|i| 1000 + i).collect();
     model.prefill(&ids, &mut seq, 0)?;
+    // A few decode steps so the decode CUDA graphs (default on) are captured and instantiated:
+    // their execs must be destroyed on drop too.
+    let mut tok = 1000u32;
+    for _ in 0..4 {
+        model.decode(tok, &mut seq, 0)?;
+        tok += 1;
+    }
     let loaded = settle()?;
     let dev_loaded = probe.free_memory()?;
     let took = before.saturating_sub(loaded);
-    println!("MemAvailable after load + 1 prefill: {:.2} GB (model took {:.2} GB)", loaded as f64 / 1048576.0, took as f64 / 1048576.0);
+    println!("MemAvailable after load + 1 prefill + 4 decode steps: {:.2} GB (model took {:.2} GB)", loaded as f64 / 1048576.0, took as f64 / 1048576.0);
     ensure!(took > 1024 * 1024, "the model took under 1 GB — the gate would be meaningless");
 
     if leak {

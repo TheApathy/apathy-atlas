@@ -152,6 +152,13 @@ fn spec_fail(model: &dyn Model, active: &mut Vec<ActiveSeq>, what: &str, e: anyh
     send_error(model, &mut a, &format!("{e:#}"));
 }
 
+/// `ATLAS_DSV41_CONTROL_SPEC_ACCEPT_ALL=1`: NEGATIVE CONTROL for the sampled-spec distribution
+/// gate (accepts every draft untested). Never set in serving.
+fn spec_control_accept_all() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("ATLAS_DSV41_CONTROL_SPEC_ACCEPT_ALL").as_deref() == Ok("1"))
+}
+
 const SALT_DRAFT: u64 = 0xD2AF_7001;
 const SALT_ACCEPT: u64 = 0xACCE_7002;
 const SALT_NEXT: u64 = 0x4E78_7003;
@@ -227,9 +234,19 @@ fn step_internal_spec_sampled(
     let pr: Vec<&[f32]> = p[..=k].iter().map(|v| v.as_slice()).collect();
     let qr: Vec<&[f32]> = q[..k].iter().map(|v| v.as_slice()).collect();
     let ua: Vec<f64> = (0..k).map(|i| spec_uniform(a.seed, base * 8 + i, SALT_ACCEPT)).collect();
-    let out = match speculative_accept(&pr, &qr, &drafts[..k], &ua, spec_uniform(a.seed, base * 8, SALT_NEXT)) {
-        Ok(o) => o,
-        Err(e) => return spec_fail(model, active, "accept", e),
+    let u_next = spec_uniform(a.seed, base * 8, SALT_NEXT);
+    let out = if spec_control_accept_all() {
+        // NEGATIVE CONTROL ONLY: accept every tested draft without the p/q test; the emitted
+        // distribution becomes q's, so the end-to-end distribution gate must FAIL.
+        spark_model::weight_loader::deepseek_v41::dspark_sampling::SampledAccept {
+            accepted: k,
+            next: spark_model::weight_loader::deepseek_v41::dspark_sampling::sample_weights(&p[k], u_next),
+        }
+    } else {
+        match speculative_accept(&pr, &qr, &drafts[..k], &ua, u_next) {
+            Ok(o) => o,
+            Err(e) => return spec_fail(model, active, "accept", e),
+        }
     };
     if let Err(e) = model.spec_commit(&mut a.seq, out.accepted, 0) {
         return spec_fail(model, active, "commit", e);
