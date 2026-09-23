@@ -23,34 +23,34 @@ PRODUCTION entry (i64 idx, bf16 out)            : 0/1572864 differ from bf16(fp3
 PRODUCTION entry (i64 idx, bf16 out) window-only: 0/1572864 differ from bf16(fp32 kernel) | CTRL other mode: 1538579 differ
 PRODUCTION entry w32 (i32 wpos, i64 idx, bf16) : 0/1572864 differ from bf16(fp32 kernel)
 SPLIT-KV decode entry (S=20 x 32 keys + combine): 502/1572864 bf16 differ from bf16(one-pass) (99.9681% identical), vs fp32 ref rel_l2=1.664e-03 | CTRL last split dropped: 1527399 differ
-T=1 latency (GPU-lock held, nothing else running): one-pass 527.7 us
-    split SLICE=64 (S=10,  80 CTAs) + combine 86.1 us (6.1x)  [split alone 83.9, combine alone 4.1]
-    split SLICE=32 (S=20, 160 CTAs) + combine 87.8 us (6.0x)  [split alone 82.8, combine alone 5.1]
-    split SLICE=16 (S=40, 320 CTAs) + combine 81.9 us (6.4x)  [split alone 73.7, combine alone 6.2]
-    split SLICE= 8 (S=80, 640 CTAs) + combine 92.4 us (5.7x)  [split alone 75.8, combine alone 10.2]
-    T=1 SLICE= 16 (S=40): split+combine 81.9 us | split_lb 102.8 us (0.80x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9634% identical
-    T=1 SLICE= 32 (S=20): split+combine 86.9 us | split_lb 99.1 us (0.88x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9756% identical
-    T=1 SLICE= 64 (S=10): split+combine 88.0 us | split_lb 99.2 us (0.89x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9634% identical
-    T=2 SLICE= 16 (S=40): split+combine 158.0 us | split_lb 171.7 us (0.92x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9771% identical
-    T=2 SLICE= 32 (S=20): split+combine 145.1 us | split_lb 156.0 us (0.93x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9863% identical
-    T=2 SLICE= 64 (S=10): split+combine 162.9 us | split_lb 170.7 us (0.95x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9771% identical
-    T=3 SLICE= 16 (S=40): split+combine 224.9 us | split_lb 242.1 us (0.93x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9746% identical
-    T=3 SLICE= 32 (S=20): split+combine 205.3 us | split_lb 213.1 us (0.96x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9797% identical
-    T=3 SLICE= 64 (S=10): split+combine 202.8 us | split_lb 212.9 us (0.95x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9746% identical
-    T=4 SLICE= 16 (S=40): split+combine 315.4 us | split_lb 317.5 us (0.99x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9725% identical
-    T=4 SLICE= 32 (S=20): split+combine 282.7 us | split_lb 287.0 us (0.98x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9733% identical
-    T=4 SLICE= 64 (S=10): split+combine 277.1 us | split_lb 284.9 us (0.97x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9718% identical
-    T=5 SLICE= 16 (S=40): split+combine 423.2 us | split_lb 410.7 us (1.03x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9707% identical
-    T=5 SLICE= 32 (S=20): split+combine 341.0 us | split_lb 349.7 us (0.98x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9725% identical
-    T=5 SLICE= 64 (S=10): split+combine 348.7 us | split_lb 358.5 us (0.97x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9725% identical
-    T=6 SLICE= 16 (S=40): split+combine 611.6 us | split_lb 593.2 us (1.03x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9710% identical
-    T=6 SLICE= 32 (S=20): split+combine 411.7 us | split_lb 415.7 us (0.99x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9730% identical
-    T=6 SLICE= 64 (S=10): split+combine 391.1 us | split_lb 399.7 us (0.98x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9720% identical
-MMA prefill entry: 2736/1572864 bf16 differ from bf16(one-pass) (99.8260% identical); vs fp32 ref: mma 1.664e-03 (bf16-rounded one-pass 1.664e-03) | CTRL compressed rows dropped: 1538577 differ | T=48: one-pass 3.039 ms, mma 0.172 ms (17.7x)
-MMA64 prefill entry (64 heads/CTA): 0/1572864 differ from mma16 (must be 0) | T=48: 0.139 ms (1.23x mma16)
-MMA32H prefill entry (32 heads/CTA): 0/1572864 differ from mma16 (must be 0) | T=48: 0.141 ms (1.22x mma16)
+T=1 latency (GPU-lock held, nothing else running): one-pass 525.7 us
+    split SLICE=64 (S=10,  80 CTAs) + combine 86.1 us (6.1x)  [split alone 83.1, combine alone 4.1]
+    split SLICE=32 (S=20, 160 CTAs) + combine 87.6 us (6.0x)  [split alone 82.9, combine alone 5.5]
+    split SLICE=16 (S=40, 320 CTAs) + combine 82.0 us (6.4x)  [split alone 75.0, combine alone 6.4]
+    split SLICE= 8 (S=80, 640 CTAs) + combine 91.5 us (5.7x)  [split alone 75.8, combine alone 10.2]
+    T=1 SLICE= 16 (S=40): split+combine 81.9 us | split_lb 100.3 us (0.82x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9634% identical
+    T=1 SLICE= 32 (S=20): split+combine 87.8 us | split_lb 97.9 us (0.90x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9756% identical
+    T=1 SLICE= 64 (S=10): split+combine 88.3 us | split_lb 98.3 us (0.90x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9634% identical
+    T=2 SLICE= 16 (S=40): split+combine 154.1 us | split_lb 171.7 us (0.90x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9771% identical
+    T=2 SLICE= 32 (S=20): split+combine 144.9 us | split_lb 153.9 us (0.94x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9863% identical
+    T=2 SLICE= 64 (S=10): split+combine 159.9 us | split_lb 170.8 us (0.94x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9771% identical
+    T=3 SLICE= 16 (S=40): split+combine 221.8 us | split_lb 244.7 us (0.91x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9746% identical
+    T=3 SLICE= 32 (S=20): split+combine 204.3 us | split_lb 213.0 us (0.96x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9797% identical
+    T=3 SLICE= 64 (S=10): split+combine 203.7 us | split_lb 212.9 us (0.96x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9746% identical
+    T=4 SLICE= 16 (S=40): split+combine 331.1 us | split_lb 324.6 us (1.02x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9725% identical
+    T=4 SLICE= 32 (S=20): split+combine 281.9 us | split_lb 291.6 us (0.97x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9733% identical
+    T=4 SLICE= 64 (S=10): split+combine 275.1 us | split_lb 286.1 us (0.96x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9718% identical
+    T=5 SLICE= 16 (S=40): split+combine 433.8 us | split_lb 427.3 us (1.02x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9707% identical
+    T=5 SLICE= 32 (S=20): split+combine 342.4 us | split_lb 348.2 us (0.98x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9725% identical
+    T=5 SLICE= 64 (S=10): split+combine 349.2 us | split_lb 358.3 us (0.97x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9725% identical
+    T=6 SLICE= 16 (S=40): split+combine 597.5 us | split_lb 588.5 us (1.02x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9710% identical
+    T=6 SLICE= 32 (S=20): split+combine 407.2 us | split_lb 412.0 us (0.99x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9730% identical
+    T=6 SLICE= 64 (S=10): split+combine 396.4 us | split_lb 403.4 us (0.98x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9720% identical
+MMA prefill entry: 2736/1572864 bf16 differ from bf16(one-pass) (99.8260% identical); vs fp32 ref: mma 1.664e-03 (bf16-rounded one-pass 1.664e-03) | CTRL compressed rows dropped: 1538577 differ | T=48: one-pass 3.037 ms, mma 0.187 ms (16.3x)
+MMA64 prefill entry (64 heads/CTA): 0/1572864 differ from mma16 (must be 0) | T=48: 0.129 ms (1.45x mma16)
+MMA32H prefill entry (32 heads/CTA): 0/1572864 differ from mma16 (must be 0) | T=48: 0.140 ms (1.33x mma16)
 FA16H prefill entry: 0/1572864 differ from mma16 (must be 0) | CTRL scale*(1+2^-10): 6226 differ (must be > 0) | T=48: 0.206 ms (0.68x mma32h)
-FA32H prefill entry: 0/1572864 differ from mma16 (must be 0) | CTRL scale*(1+2^-10): 6226 differ (must be > 0) | T=48: 0.136 ms (1.04x mma32h)
-PIPE mma16p (ldmatrix.trans PV, cp.async gather)PIPE mma32p (ldmatrix.trans PV, cp.async gather)PROBE T=672 mma32h with every K gather on ONE hot row: 1.704 ms vs 1.949 ms real (1.14x) -- gather share of the time
-T=672 (fixture x14): mma32h 1.949 ms (43.4 TF/s) | fa16h 3.562 ms (0.55x) | fa32h 2.217 ms (0.88x) | mma16p 3.390 ms (0.57x) | mma32p 2.033 ms (0.96x, 41.6 TF/s)
+FA32H prefill entry: 0/1572864 differ from mma16 (must be 0) | CTRL scale*(1+2^-10): 6226 differ (must be > 0) | T=48: 0.136 ms (1.03x mma32h)
+PIPE mma16p (ldmatrix.trans PV, cp.async gather)PIPE mma32p (ldmatrix.trans PV, cp.async gather)PROBE T=672 mma32h with every K gather on ONE hot row: 1.662 ms vs 1.907 ms real (1.15x) -- gather share of the time
+T=672 (fixture x14): mma32h 1.907 ms (44.3 TF/s) | fa16h 3.435 ms (0.56x) | fa32h 2.212 ms (0.86x) | mma16p 3.360 ms (0.57x) | mma32p 2.022 ms (0.94x, 41.8 TF/s)
 PASS one-pass streaming gather (controls separate)

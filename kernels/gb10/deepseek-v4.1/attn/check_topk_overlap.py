@@ -3,7 +3,12 @@
 """Per-layer TOP-K OVERLAP of an Atlas run against a Python oracle capture (runK_32k: the first
 capture where top-512 truly prunes -- ~16K compressed positions at L2, 32K at L20+).
 
-    check_topk_overlap.py <oracle ref dir> <atlas tap dir> [layers=2,20,24]
+    check_topk_overlap.py <oracle ref dir> <atlas tap dir> [layers=2,20,24] [out dir=.]
+
+Outputs (exact-row lists) go to [out dir], never into the tap dirs (the oracle dir is root-owned).
+A capture that writes the SAME tap twice per forward (the Python kernel-attention path emits every
+topk twice, byte-identical) is de-duplicated: consecutive byte-identical occurrences collapse to one,
+and the count must then equal the layer's n_c occurrences (else the run is refused as misaligned).
 
 Both dirs hold `L{ll}.topk.{occ:03}.bin` = [t, 512] int64, -1 padded (occurrences in pass order:
 L2/L20 = the encoder chunks then decode steps; L24 = the replay then decode steps). Per layer and
@@ -49,6 +54,23 @@ def occurrences(d, layer, name):
         occ += 1
 
 
+def topk_occurrences(d, layer):
+    """topk taps with consecutive byte-identical duplicates collapsed; checked against n_c."""
+    raw = occurrences(d, layer, "topk")
+    out, dup = [], 0
+    for p in raw:
+        if out and os.path.getsize(p) == os.path.getsize(out[-1]) and open(p, "rb").read() == open(out[-1], "rb").read():
+            dup += 1
+            continue
+        out.append(p)
+    n_nc = len(occurrences(d, layer, "n_c"))
+    if dup:
+        print(f"  {d}: L{layer:02d} {dup} byte-identical duplicate topk taps collapsed ({len(raw)} -> {len(out)}; n_c taps {n_nc})")
+    if n_nc and len(out) != n_nc:
+        raise SystemExit(f"{d}: L{layer:02d} has {len(out)} distinct topk taps but {n_nc} n_c taps -- misaligned, refusing")
+    return out
+
+
 def classify(score_row, ours_row, miss):
     valid = ours_row[ours_row >= 0]
     kth = score_row[valid].min() if len(valid) else np.inf
@@ -67,9 +89,11 @@ def classify(score_row, ours_row, miss):
 def main():
     ref, ours = sys.argv[1], sys.argv[2]
     layers = [int(x) for x in (sys.argv[3] if len(sys.argv) > 3 else "2,20,24").split(",")]
+    outdir = sys.argv[4] if len(sys.argv) > 4 else "."
+    os.makedirs(outdir, exist_ok=True)
     fail = 0
     for l in layers:
-        ro, oo = occurrences(ref, l, "topk"), occurrences(ours, l, "topk")
+        ro, oo = topk_occurrences(ref, l), topk_occurrences(ours, l)
         if not ro or not oo:
             print(f"L{l:02d}: oracle {len(ro)} / atlas {len(oo)} topk occurrences -- MISSING")
             fail += 1
@@ -126,7 +150,7 @@ def main():
             n_cls = kinds["tie"] + kinds["near"] + kinds["real"]
             if kinds.get("pool"):
                 print(f"    of the real misses, {kinds['pool']} lie OUTSIDE our candidate pool (inherited from L20), {kinds['real'] - kinds['pool']} inside it")
-            ex_path = os.path.join(ours, f"L{l:02d}.exact_topk_rows.txt")
+            ex_path = os.path.join(outdir, f"L{l:02d}.exact_topk_rows.txt")
             with open(ex_path, "w") as f:
                 for occ, rows in exact_rows:
                     f.write(f"{occ} " + " ".join(map(str, rows.tolist())) + "\n")

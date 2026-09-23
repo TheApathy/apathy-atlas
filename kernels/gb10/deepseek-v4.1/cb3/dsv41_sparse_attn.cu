@@ -558,7 +558,9 @@ __device__ __forceinline__ void sparse_attn_mma_hg_body(
     const int g = lane >> 2, q = lane & 3;
 
     __shared__ __align__(16) __nv_bfloat16 ks[TK][DMAX + KPAD];
-    __shared__ float spart[HGPC][MWARPS][MH][TK];
+    // Row stride TK + 8: the partial stores went 4-way bank-conflicted at TK (ncu: 30% of shared
+    // store wavefronts); 24 is 2-way for the stores and the softmax reads. Layout only.
+    __shared__ float spart[HGPC][MWARPS][MH][TK + 8];
     __shared__ __align__(16) __nv_bfloat16 ph[ROWS][TK + KPAD], pl[ROWS][TK + KPAD];
     __shared__ float mrow[ROWS], lrow[ROWS], arow[ROWS];
     __shared__ int vld[TK];
@@ -720,8 +722,9 @@ __device__ __forceinline__ void sparse_attn_mma_hg_body(
         const int dim = wq * 128 + nt * 8 + 2 * q;
         __nv_bfloat16* o0 = O + ((size_t)t * NH + h0) * D + dim;
         __nv_bfloat16* o1 = O + ((size_t)t * NH + h1) * D + dim;
-        o0[0] = __float2bfloat16_rn(acc[nt][0] / d0); o0[1] = __float2bfloat16_rn(acc[nt][1] / d0);
-        o1[0] = __float2bfloat16_rn(acc[nt][2] / d1); o1[1] = __float2bfloat16_rn(acc[nt][3] / d1);
+        // One 4-byte store per pair (ncu: the 2-byte stores used 8 of 32 bytes per sector).
+        *reinterpret_cast<__nv_bfloat162*>(o0) = __halves2bfloat162(__float2bfloat16_rn(acc[nt][0] / d0), __float2bfloat16_rn(acc[nt][1] / d0));
+        *reinterpret_cast<__nv_bfloat162*>(o1) = __halves2bfloat162(__float2bfloat16_rn(acc[nt][2] / d1), __float2bfloat16_rn(acc[nt][3] / d1));
     }
 }
 
