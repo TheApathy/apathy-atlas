@@ -41,6 +41,13 @@ L=L40.logits_last.000.bin
   echo "runK taps written: $(ls $S/w11_ktaps 2>/dev/null | grep -c topk) topk files, $(ls $S/w11_ktaps 2>/dev/null | grep -c index_score_rows) index_score_rows files"
   echo "runK (this build) vs oracle: $(python3 $B/logits_vs_oracle.py $O/runK_32k/$L $S/w11_ktaps/$L)"
   grep -E 'WARM prefill|this run' $I/k124_w11.log; } > $I/w11_summary.txt
+# serve TTFT on the 2048-token prompt (4 identical requests; 1 is cold) vs the driver's warm prefill
+$B/serve_window.sh serve11t 8900 $I/serve11t > $I/serve11t.log 2>&1
+python3 -c "
+import json,glob
+for f in sorted(glob.glob('$I/serve11t/*.response.json')):
+    u=json.load(open(f)).get('usage',{}); print('serve TTFT', f.split('/')[-1], u.get('prompt_tokens'), u.get('time_to_first_token_ms'), 'ms')
+" >> $I/w11_summary.txt 2>&1
 ATLAS_DSV41_DSPARK=1 ATLAS_DSV41_CHUNK=2048 $B/serve_window.sh serve11d 8900 $I/serve11d > $I/serve11d.log 2>&1
 low=$(awk '/^low-water MemAvailable:/ {print $3}' $I/serve11d.log)
 echo "DSpark chunk-2048 low-water: ${low:-?} GB" >> $I/w11_summary.txt

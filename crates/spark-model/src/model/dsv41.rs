@@ -238,15 +238,19 @@ impl Dsv41Model {
         let (l, m) = (&self.lanes, self.mode);
         self.with_seq(seq.slot_idx, |s| {
             ensure!(s.len == start, "dsv41 prefill: sequence holds {} positions, chunk starts at {start}", s.len);
-            for chunk in tokens.chunks(self.fwd.max_chunk) {
-                self.fwd.prefill_chunk(&ops, s, chunk, m, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap)?;
-            }
             if last {
-                self.fwd.finish_prefill(&ops, s, m, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits)?;
+                // The SAME entry the driver measures (V41Forward::prefill): its chunk loop, the engram
+                // prefetch overlap, then the replay + head. Serve and driver prefill must not diverge.
+                self.fwd.prefill(&ops, s, tokens, m, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits)?;
                 // The drafter ring from the replay rows (the last tail_rows prompt positions).
                 if let Some(ds) = &self.dspark {
                     let rows = s.tail_rows;
                     ds.lock().expect("dspark poisoned").seed(&ops, &self.fwd, rows, s.len - rows)?;
+                }
+            } else {
+                // A non-final piece of a prompt the scheduler split: encoder chunks only.
+                for chunk in tokens.chunks(self.fwd.max_chunk) {
+                    self.fwd.prefill_chunk(&ops, s, chunk, m, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap)?;
                 }
             }
             Ok(())
