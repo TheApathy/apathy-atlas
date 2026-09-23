@@ -17,7 +17,9 @@ use super::*;
 /// full per-position pipeline pick (`verify_pick_all_with_pipeline`, the MTP verify basis), and
 /// the next token is picked by the normal decode path.
 pub fn internal_spec_eligible(a: &ActiveSeq, model: &dyn Model) -> bool {
-    (a.temperature == 0.0 || crate::scheduler::decode_logits_seq::force_temp_zero_enabled())
+    // Greedy: any grammar (drafts are checked against the pipeline pick). Sampled: no grammar
+    // (the p rows would need the matcher advanced along the drafts).
+    (spec_greedy(a) || a.grammar_state.is_none())
         && a.top_logprobs.is_none()
         && !a.suppress_tool_call
         && !a.disable_mtp
@@ -48,6 +50,19 @@ pub fn step_internal_spec(
         tracing::error!("EP broadcast internal-spec token: {e:#}");
         a.finished = true;
         return;
+    }
+    if !spec_greedy(a) {
+        return step_internal_spec_sampled(
+            model,
+            active,
+            verify_ctx,
+            think_end_token,
+            think_start_token,
+            code_fence_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            adaptive_sampling,
+        );
     }
     let (drafts, argmax) = match model.spec_verify(a.last_token, &mut a.seq, None, 0) {
         Ok(Some(r)) => r,
@@ -104,6 +119,128 @@ pub fn step_internal_spec(
         tool_call_end_token,
         adaptive_sampling,
     );
+}
+
+fn spec_greedy(a: &ActiveSeq) -> bool {
+    a.temperature == 0.0 || crate::scheduler::decode_logits_seq::force_temp_zero_enabled()
+}
+
+/// A uniform in [0, 1) for speculative sampling. Seeded requests derive it from the same
+/// per-position seed as plain sampling (`seed + output position`), salted per use (draft /
+/// accept / next), so a seeded run reproduces; unseeded requests use a process-wide stream.
+fn spec_uniform(seed: Option<u64>, pos: usize, salt: u64) -> f64 {
+    fn splitmix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    let bits = match seed {
+        Some(s) => splitmix(splitmix(s.wrapping_add(pos as u64)) ^ salt),
+        None => {
+            static STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+            splitmix(STATE.fetch_add(0x9E37_79B9_7F4A_7C15, std::sync::atomic::Ordering::Relaxed) ^ t ^ salt)
+        }
+    };
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
+fn spec_fail(model: &dyn Model, active: &mut Vec<ActiveSeq>, what: &str, e: anyhow::Error) {
+    tracing::error!("internal speculation (sampled) {what}: {e:#}");
+    let mut a = active.remove(0);
+    send_error(model, &mut a, &format!("{e:#}"));
+}
+
+const SALT_DRAFT: u64 = 0xD2AF_7001;
+const SALT_ACCEPT: u64 = 0xACCE_7002;
+const SALT_NEXT: u64 = 0x4E78_7003;
+
+/// Sampled (temperature > 0) internal speculation: the model samples drafts from its own q, then
+/// speculative rejection sampling against p = each verify row's full sampler distribution
+/// (pipeline + temperature/top-k/top-p/min-p, the same distribution plain sampling draws from), so
+/// emitted tokens are distributed exactly as plain sampling. Acceptance ends before any
+/// structural id; the token after the accepted drafts is the rule's residual / p sample.
+#[allow(clippy::too_many_arguments)]
+fn step_internal_spec_sampled(
+    model: &dyn Model,
+    active: &mut Vec<ActiveSeq>,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    think_end_token: Option<u32>,
+    think_start_token: Option<u32>,
+    code_fence_token: Option<u32>,
+    tool_call_start_token: Option<u32>,
+    tool_call_end_token: Option<u32>,
+    adaptive_sampling: bool,
+) {
+    use spark_model::weight_loader::deepseek_v41::dspark_sampling::speculative_accept;
+    let a = &mut active[0];
+    let base = a.output_tokens.len();
+    const B: usize = 5;
+    let sampling = spark_model::traits::SpecSampling {
+        temperature: a.temperature,
+        draft_uniforms: (0..B).map(|i| spec_uniform(a.seed, base * 8 + i, SALT_DRAFT) as f32).collect(),
+    };
+    let drafts = match model.spec_verify(a.last_token, &mut a.seq, Some(&sampling), 0) {
+        Ok(Some((d, _))) => d,
+        Ok(None) => {
+            // Too close to max_seq: one plain sampled step.
+            return step_decode_only(
+                model,
+                active,
+                think_end_token,
+                think_start_token,
+                code_fence_token,
+                tool_call_start_token,
+                tool_call_end_token,
+                adaptive_sampling,
+            );
+        }
+        Err(e) => return spec_fail(model, active, "verify", e),
+    };
+    let vocab = model.vocab_size();
+    let b = drafts.len();
+    let mut rows = vec![0u8; (b + 1) * vocab * 2];
+    if let Err(e) = model.copy_logits_to_host(model.logits_buffer_ptr(), &mut rows) {
+        return spec_fail(model, active, "verify rows D2H", e);
+    }
+    let q_ptr = match model.spec_draft_probs() {
+        Some(p) => p,
+        None => return spec_fail(model, active, "draft probs", anyhow::anyhow!("sampled spec_verify returned no q rows")),
+    };
+    let mut qb = vec![0u8; b * vocab * 4];
+    if let Err(e) = model.copy_logits_to_host(q_ptr, &mut qb) {
+        return spec_fail(model, active, "draft probs D2H", e);
+    }
+    let q: Vec<Vec<f32>> = qb.chunks_exact(vocab * 4).map(|r| r.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()).collect();
+    let p: Vec<Vec<f32>> = rows
+        .chunks_exact(vocab * 2)
+        .map(|r| crate::scheduler::verify_pipeline_helper::verify_row_distribution(r, false, vocab, a, verify_ctx))
+        .collect();
+    let structural = |t: u32| {
+        a.eos_tokens.contains(&t)
+            || [think_end_token, think_start_token, tool_call_start_token, tool_call_end_token, tool_response_hard_stop()]
+                .contains(&Some(t))
+    };
+    // Acceptance may not pass a structural draft: test only the prefix before the first one.
+    let k = drafts.iter().position(|&d| structural(d)).unwrap_or(b);
+    let pr: Vec<&[f32]> = p[..=k].iter().map(|v| v.as_slice()).collect();
+    let qr: Vec<&[f32]> = q[..k].iter().map(|v| v.as_slice()).collect();
+    let ua: Vec<f64> = (0..k).map(|i| spec_uniform(a.seed, base * 8 + i, SALT_ACCEPT)).collect();
+    let out = match speculative_accept(&pr, &qr, &drafts[..k], &ua, spec_uniform(a.seed, base * 8, SALT_NEXT)) {
+        Ok(o) => o,
+        Err(e) => return spec_fail(model, active, "accept", e),
+    };
+    if let Err(e) = model.spec_commit(&mut a.seq, out.accepted, 0) {
+        return spec_fail(model, active, "commit", e);
+    }
+    for &tok in drafts[..out.accepted].iter().chain(std::iter::once(&out.next)) {
+        emit_token(a, tok, None);
+        a.last_token = tok;
+        if a.finished {
+            return;
+        }
+    }
 }
 
 pub fn step_self_spec(
@@ -568,4 +705,35 @@ pub fn truncate_drafts_at_grammar_boundary(gs: &mut GrammarState, drafts: &[u32]
         );
     }
     accepted
+}
+
+#[cfg(test)]
+mod internal_spec_tests {
+    use super::*;
+
+    #[test]
+    fn spec_uniforms_reproduce_per_seed_and_differ_per_use() {
+        let draw = |seed| (0..40).map(|i| spec_uniform(seed, i, SALT_DRAFT)).collect::<Vec<_>>();
+        let a = draw(Some(7));
+        assert_eq!(a, draw(Some(7)), "same seed, same stream");
+        assert_ne!(a, draw(Some(8)), "another seed, another stream");
+        assert!(a.iter().all(|&u| (0.0..1.0).contains(&u)));
+        // Positions and salts give distinct uniforms (no reuse across draft / accept / next).
+        let mut all: Vec<u64> = Vec::new();
+        for pos in 0..40 {
+            for salt in [SALT_DRAFT, SALT_ACCEPT, SALT_NEXT] {
+                all.push(spec_uniform(Some(7), pos, salt).to_bits());
+            }
+        }
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "every (position, salt) draws its own uniform");
+        // Unseeded draws are not constant.
+        let u: Vec<f64> = (0..8).map(|_| spec_uniform(None, 0, SALT_DRAFT)).collect();
+        assert!(u.windows(2).any(|w| w[0] != w[1]));
+        // Mean of 20k seeded draws ~ 0.5 (a constant stream would fail this).
+        let m: f64 = (0..20_000).map(|i| spec_uniform(Some(3), i, SALT_ACCEPT)).sum::<f64>() / 20_000.0;
+        assert!((m - 0.5).abs() < 0.01, "mean {m}");
+    }
 }
