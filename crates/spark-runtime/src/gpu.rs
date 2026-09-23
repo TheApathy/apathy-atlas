@@ -381,9 +381,10 @@ pub trait GpuBackend: Send + Sync {
 
     fn synchronize(&self, stream: u64) -> Result<()>;
 
-    /// Stream-ordered host-to-device copy with no stream synchronization. `src` is
-    /// pageable: CUDA stages it before `cuMemcpyHtoDAsync` returns, so the borrow may end
-    /// when this returns. Default: the synchronous copy.
+    /// Host-to-device copy issued on `stream` from a pageable `src`. CUDA stages the source
+    /// before `cuMemcpyHtoDAsync` returns, so the borrow may end on return, but a pageable
+    /// copy is not truly async (it synchronizes implicitly) and shares the stall class of
+    /// the Flash-Next load hang. Prefer pinned staging. Default: the synchronous copy.
     fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, _stream: u64) -> Result<()> {
         self.copy_h2d(src, dst)
     }
