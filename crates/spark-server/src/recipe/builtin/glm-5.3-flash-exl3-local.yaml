@@ -41,7 +41,9 @@ atlas:
     ATLAS_GLM53_FFN_GRAPHS: "1"
     ATLAS_GLM53_LAYER_MAJOR_PREFILL: "1"
     ATLAS_GLM53_LAYER_MAJOR_PREFILL_ROWS: "2048"
-    ATLAS_GLM53_LAYER_MAJOR_VISION_PREFILL: "1"
+    # Needs the DFlash2 capture, which is not installed target-only: with it on,
+    # every image request fails "layer-major capture requires installed DFlash2".
+    ATLAS_GLM53_LAYER_MAJOR_VISION_PREFILL: "0"
     ATLAS_GLM53_PARTIAL_WIDE_REPLAY: "1"
     ATLAS_GLM53_PHASE_TIMING: "0"
     ATLAS_GLM53_UNVALIDATED_BRINGUP: "1"

@@ -483,6 +483,9 @@ mod tests {
             "/../../kernels/gb10/glm5.3-flash/exl3/glm53_vision_flash_attention.cu"
         ));
         assert!(source.contains("#define HDIM 64"));
-        assert!(source.contains("../../common/inferspark_prefill.cu"));
+        // Upstream's kernel signature, vendored GLM-local: this tree's common
+        // inferspark_prefill takes two extra parameters the launcher never passes.
+        assert!(source.contains("../iq3/glm53_inferspark_prefill_upstream.cuh"));
+        assert!(!source.contains("../../common/inferspark_prefill.cu"));
     }
 }

@@ -64,6 +64,22 @@ fn decode_image(data_uri: &str) -> Result<DynamicImage> {
     image::load_from_memory_with_format(&bytes, fmt).context("image decode failed")
 }
 
+/// GLM-5.3's resize, from its pinned processor (perf/glm-5.3-flash-prefill-20260920):
+/// cap the longer side at `MAX_DIM`, never upscale except to guarantee 16 post-merge
+/// image tokens (one token spans a 2x2 block of 14x14 patches, hence 16 * 28 * 28
+/// pixels). The Qwen path's MIN_DIM upscale doubled GLM's image tokens (117 -> 237
+/// prompt tokens for a 336x224 image) against the branch it was ported from.
+fn glm_target_size(orig_h: u32, orig_w: u32, grid_unit: u32) -> (u32, u32) {
+    const MIN_PIXELS: f32 = (16 * 28 * 28) as f32;
+    let area = (orig_h as f32) * (orig_w as f32);
+    let dim_scale = (MAX_DIM as f32) / (orig_h.max(orig_w) as f32);
+    let min_scale = (MIN_PIXELS / area).sqrt();
+    let scale = dim_scale.min(1.0).max(min_scale);
+    let target_h = ((orig_h as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
+    let target_w = ((orig_w as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
+    (target_h, target_w)
+}
+
 /// Compute the target (H, W) so that:
 /// - Longer side is in `[MIN_DIM, MAX_DIM]` (auto-upscale tiny images).
 /// - Both sides are multiples of `grid_unit = patch_size × spatial_merge_size`.
@@ -116,7 +132,11 @@ pub fn preprocess_image(data_uri: &str, vcfg: &VisionConfig) -> Result<(Vec<f32>
     let (orig_w, orig_h) = (img.width(), img.height());
 
     let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
-    let (th, tw) = target_size(orig_h, orig_w, grid_unit);
+    let (th, tw) = if vcfg.model_type == "glm5_next_vision" {
+        glm_target_size(orig_h, orig_w, grid_unit)
+    } else {
+        target_size(orig_h, orig_w, grid_unit)
+    };
 
     // Resize with CatmullRom — closest BICUBIC match in the `image` crate,
     // matching HF's `Qwen2VLImageProcessor` which uses PIL resample=3 (BICUBIC).
@@ -239,4 +259,19 @@ mod tests {
         assert_eq!(GLM53_STD, [0.268_629_55, 0.261_302_6, 0.275_777_1]);
         assert_ne!(GLM53_MEAN, SIGLIP_MEAN);
     }
+
+    #[test]
+    fn glm53_resize_matches_its_processor() {
+        // No upscale for an image already above the 16-token floor (the Qwen
+        // path would upscale 336x224 toward MIN_DIM).
+        assert_eq!(glm_target_size(224, 336, 28), (224, 336));
+        // The floor: a tiny image grows to exactly 16 merged tokens.
+        let (h, w) = glm_target_size(20, 20, 28);
+        assert_eq!((h, w), (112, 112));
+        assert_eq!((h / 14) * (w / 14) / 4, 16);
+        // Cap: longer side limited to MAX_DIM.
+        let (h, w) = glm_target_size(2000, 3000, 28);
+        assert!(h.max(w) <= MAX_DIM + 28);
+    }
 }
+
