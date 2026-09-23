@@ -13,8 +13,12 @@ pub struct CompletionRequest {
     /// Optional, as on the DeepSeek-V4.1 Python server (which ignores it).
     #[serde(default)]
     pub model: String,
+    /// OpenAI's four `prompt` shapes: a string, an array of strings (joined),
+    /// an array of token ids, or an array of token-id arrays (concatenated,
+    /// as the string array is joined). Token prompts are prefilled exactly,
+    /// like `prompt_token_ids`.
     #[serde(default, deserialize_with = "deserialize_prompt")]
-    pub prompt: String,
+    pub prompt: CompletionPrompt,
     /// Optional raw prompt token IDs. When present, bypasses tokenization
     /// AND the think-prefix injection — the model prefills exactly these
     /// tokens. Used by the DFlash drafter-retrain hidden-capture harness so
@@ -54,20 +58,121 @@ pub struct CompletionRequest {
     pub seed: Option<u64>,
 }
 
-/// Accept `prompt` as a string or array of strings (joined).
-fn deserialize_prompt<'de, D>(d: D) -> Result<String, D::Error>
+/// A `/v1/completions` prompt: text to tokenize, or token ids to prefill as given.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompletionPrompt {
+    Text(String),
+    Tokens(Vec<u32>),
+}
+
+impl Default for CompletionPrompt {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+/// Parse OpenAI's `prompt`: a string, an array of strings (joined), an array
+/// of token ids, or an array of token-id arrays (concatenated). An empty array
+/// (or an empty batch) and anything else is refused with a message naming it.
+fn deserialize_prompt<'de, D>(d: D) -> Result<CompletionPrompt, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum RawPrompt {
-        Str(String),
-        Arr(Vec<String>),
+    use serde::de::Error;
+    let v = serde_json::Value::deserialize(d)?;
+    parse_prompt(&v).map_err(D::Error::custom)
+}
+
+fn parse_prompt(v: &serde_json::Value) -> Result<CompletionPrompt, String> {
+    use serde_json::Value;
+    let token = |t: &Value| -> Result<u32, String> {
+        t.as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| format!("prompt token ids must be non-negative integers, got {t}"))
+    };
+    match v {
+        Value::String(s) => Ok(CompletionPrompt::Text(s.clone())),
+        Value::Array(items) if items.is_empty() => {
+            Err("prompt must not be an empty array".to_string())
+        }
+        Value::Array(items) => match &items[0] {
+            Value::String(_) => items
+                .iter()
+                .map(|s| {
+                    s.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("prompt array mixes strings with {s}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|parts| CompletionPrompt::Text(parts.join(""))),
+            Value::Array(_) => {
+                let mut ids = Vec::new();
+                for batch in items {
+                    let Some(batch) = batch.as_array() else {
+                        return Err(format!("prompt token batches must be arrays, got {batch}"));
+                    };
+                    if batch.is_empty() {
+                        return Err("prompt token batches must not be empty".to_string());
+                    }
+                    for t in batch {
+                        ids.push(token(t)?);
+                    }
+                }
+                Ok(CompletionPrompt::Tokens(ids))
+            }
+            _ => items
+                .iter()
+                .map(token)
+                .collect::<Result<Vec<_>, _>>()
+                .map(CompletionPrompt::Tokens),
+        },
+        other => Err(format!(
+            "prompt must be a string, an array of strings, an array of token ids or an array of token-id arrays, got {other}"
+        )),
     }
-    match RawPrompt::deserialize(d)? {
-        RawPrompt::Str(s) => Ok(s),
-        RawPrompt::Arr(v) => Ok(v.join("")),
+}
+
+#[cfg(test)]
+mod prompt_shape_tests {
+    use super::{CompletionPrompt, CompletionRequest};
+    use serde_json::json;
+
+    fn prompt(v: serde_json::Value) -> Result<CompletionPrompt, String> {
+        serde_json::from_value::<CompletionRequest>(json!({"prompt": v}))
+            .map(|r| r.prompt)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn the_four_openai_prompt_shapes_parse() {
+        assert_eq!(prompt(json!("hi")), Ok(CompletionPrompt::Text("hi".into())));
+        assert_eq!(prompt(json!(["a", "b"])), Ok(CompletionPrompt::Text("ab".into())));
+        assert_eq!(prompt(json!([1, 2, 3])), Ok(CompletionPrompt::Tokens(vec![1, 2, 3])));
+        assert_eq!(
+            prompt(json!([[1, 2], [3]])),
+            Ok(CompletionPrompt::Tokens(vec![1, 2, 3]))
+        );
+        // absent prompt is the empty text, as before
+        let r: CompletionRequest = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(r.prompt, CompletionPrompt::Text(String::new()));
+    }
+
+    #[test]
+    fn invalid_prompt_shapes_are_refused_with_a_reason() {
+        for (v, why) in [
+            (json!([]), "empty array"),
+            (json!([[1], []]), "batches must not be empty"),
+            (json!([1, -2]), "non-negative integers"),
+            (json!([1, 2.5]), "non-negative integers"),
+            (json!([1, 4294967296u64]), "non-negative integers"),
+            (json!(["a", 1]), "mixes strings"),
+            (json!([[1], 2]), "batches must be arrays"),
+            (json!(7), "must be a string"),
+            (json!({"x": 1}), "must be a string"),
+        ] {
+            let err = prompt(v.clone()).expect_err(&v.to_string());
+            assert!(err.contains(why), "{v}: {err}");
+        }
     }
 }
 
