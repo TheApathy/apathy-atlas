@@ -73,6 +73,9 @@ pub(super) struct PrefillInProgress {
     pub grammar_state: Option<GrammarState>,
     pub seed: Option<u64>,
     pub top_logprobs: Option<u8>,
+    /// Logprobs of the first generated token, sampled from the last prefill
+    /// chunk's logits (set when that token is sampled; `top_logprobs` only).
+    pub first_logprobs: Option<crate::api::TokenLogprobs>,
     pub timeout_at: Option<Instant>,
 }
 

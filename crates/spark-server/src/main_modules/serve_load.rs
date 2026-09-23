@@ -1009,6 +1009,31 @@ pub(crate) fn load_model(
     // Tool call parser resolution: CLI > MODEL.toml > defaults table.
     let tool_call_parser = serve_phases::resolve_tool_call_parser(&args, &ptx_set, &config)?;
 
+    // deepseek_v41 image input: the preprocessing geometry from config.json's
+    // vision_config. A checkpoint without one serves text only. Fallible, so
+    // it runs before the scheduler spawn below.
+    let dsv41 = config.model_type == "deepseek_v41";
+    let dsv41_vision = if dsv41 {
+        let raw: serde_json::Value =
+            serde_json::from_str(&config_json).context("config.json is not JSON")?;
+        match raw.get("vision_config") {
+            Some(_) => Some(
+                crate::dsv41::vision::VisionConfig::from_config_json(&raw)
+                    .context("deepseek_v41 vision_config")?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
+    // Every load, so a swap away from deepseek_v41 turns its bans off again.
+    crate::dsv41::repetition::configure(dsv41);
+    crate::dsv41::set_serving(dsv41);
+    if dsv41 {
+        // Resolve the JPEG decoder now so its version (or the fallback) is in the startup log.
+        let _ = crate::dsv41::turbojpeg::available();
+    }
+
     // Moved into the scheduler thread; `None` leaves the gate disarmed.
     let scheduler_mtp_gate = args.mtp_gate.clone();
     // Spawn only after every fallible load step above has succeeded: a `?`
@@ -1070,10 +1095,12 @@ pub(crate) fn load_model(
         tokenizer,
         model_name,
         max_seq_len: args.max_seq_len,
-        yarn_context: config.yarn_factor > 0.0,
+        yarn_context: serve_phases::text_only_yarn_context(&config),
         max_batch_size,
         request_tx,
         vision_config: config.vision.clone(),
+        dsv41,
+        dsv41_vision,
         default_temperature,
         default_top_k,
         default_top_p,

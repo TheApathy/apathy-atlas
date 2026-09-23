@@ -8,6 +8,46 @@ use std::path::Path;
 
 pub(super) const TEMPLATE_OVERRIDE_DIR: &str = "jinja-templates";
 
+/// HF's chat-template `tojson`: `json.dumps(x, ensure_ascii=False, indent=None,
+/// separators=None, sort_keys=False)`, the same keywords accepted (and an
+/// `indent` positional, as Jinja's own filter takes).
+fn hf_tojson(
+    value: &minijinja::Value,
+    indent: Option<minijinja::Value>,
+    kwargs: minijinja::value::Kwargs,
+) -> std::result::Result<minijinja::Value, minijinja::Error> {
+    use minijinja::{Error, ErrorKind};
+    let bad = |m: String| Error::new(ErrorKind::InvalidOperation, m);
+    let indent = match kwargs.get::<Option<minijinja::Value>>("indent")?.or(indent) {
+        None => None,
+        Some(v) if v.is_none() || v.is_undefined() => None,
+        // Python: an int n is n spaces (n <= 0 -> newlines only), a str is used as is.
+        Some(v) => Some(match v.as_str() {
+            Some(s) => s.to_string(),
+            None => {
+                let n = i64::try_from(v.clone())
+                    .map_err(|_| bad(format!("tojson: indent must be an int or str, got {v}")))?;
+                " ".repeat(n.max(0) as usize)
+            }
+        }),
+    };
+    let separators = match kwargs.get::<Option<Vec<String>>>("separators")? {
+        None => None,
+        Some(s) if s.len() == 2 => Some((s[0].clone(), s[1].clone())),
+        Some(s) => return Err(bad(format!("tojson: separators must be a pair, got {s:?}"))),
+    };
+    let opts = crate::pyjson::DumpOpts {
+        ensure_ascii: kwargs.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false),
+        indent,
+        separators,
+        sort_keys: kwargs.get::<Option<bool>>("sort_keys")?.unwrap_or(false),
+    };
+    kwargs.assert_all_used()?;
+    let json = serde_json::to_value(value)
+        .map_err(|e| bad(format!("tojson: value is not JSON-serialisable: {e}")))?;
+    Ok(minijinja::Value::from_safe_string(crate::pyjson::dumps_with(&json, &opts)))
+}
+
 /// Resolve the template source without letting the stale dense-Qwen override
 /// hide a newer checkpoint contract.  Qwen3.5/3.6 retain the override (and
 /// therefore their established prompt bytes); a dense `qwen3_5` checkpoint
@@ -68,6 +108,13 @@ pub(super) fn build_jinja_env(chat_template: &str) -> Result<minijinja::Environm
     env.add_filter("split_last", |s: String, sep: String| -> String {
         s.rsplit(&sep).next().unwrap_or("").to_string()
     });
+    // HF transformers replaces Jinja's `tojson` with `json.dumps(x,
+    // ensure_ascii=False, indent=None, separators=None, sort_keys=False)`
+    // (chat_template_utils._compile_jinja_template), so tool schemas render
+    // in the request's key order with `", "`/`": "` separators. minijinja's
+    // built-in is compact and escapes HTML characters; templates were written
+    // against HF's.
+    env.add_filter("tojson", hf_tojson);
 
     // F76 (2026-04-29): bridge Python-style `.items()` / `.keys()` /
     // `.values()` methods on Maps to the corresponding minijinja
@@ -358,14 +405,8 @@ pub(super) fn convert_python_jinja_to_minijinja(template: &str) -> String {
     // .split('<think>')[0] → | split_first('<think>')
     t = t.replace(".split('<think>')[0]", " | split_first('<think>')");
 
-    // `tojson(ensure_ascii=False)` → `tojson` (minijinja has no kwargs).
-    // MiniMax M2's template renders tools with `tool.function |
-    // tojson(ensure_ascii=False)`. minijinja rejects unknown kwargs
-    // (and ensure_ascii=False is the Python default for non-ASCII
-    // passthrough, which minijinja's tojson does by default anyway).
-    // Strip the kwarg so the filter call type-checks.
-    t = t.replace("tojson(ensure_ascii=False)", "tojson");
-    t = t.replace("tojson(ensure_ascii=True)", "tojson");
+    // `tojson(ensure_ascii=...)`, `tojson(indent=...)` etc. are handled by the
+    // registered HF-compatible `tojson` filter (`hf_tojson`), kwargs included.
 
     // messages[1:] — minijinja 2.x supports slice syntax natively
 
@@ -422,5 +463,45 @@ mod embedded_template_tests {
         assert_eq!(raw, on_disk);
         assert!(load_openai_template("qwen3_5_moe", None).is_some());
         assert!(load_override_template("no_such_model_type", None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod hf_tojson_tests {
+    use super::build_jinja_env;
+
+    fn render(tmpl: &str) -> String {
+        let x: serde_json::Value = serde_json::from_str(
+            r#"{"type": "function", "function": {"name": "f", "description": "<é>", "parameters": {"type": "object", "properties": {"b": {"type": "integer"}, "a": {"type": "number", "default": 1.5}}}}}"#,
+        )
+        .unwrap();
+        let env = build_jinja_env(tmpl).unwrap();
+        let t = env.get_template("chat").unwrap();
+        t.render(minijinja::context! { x => minijinja::Value::from_serialize(&x) })
+            .unwrap()
+    }
+
+    /// Expected strings are CPython `json.dumps` with HF's tojson defaults.
+    #[test]
+    fn tojson_is_hf_json_dumps() {
+        assert_eq!(
+            render("{{ x | tojson }}"),
+            r#"{"type": "function", "function": {"name": "f", "description": "<é>", "parameters": {"type": "object", "properties": {"b": {"type": "integer"}, "a": {"type": "number", "default": 1.5}}}}}"#
+        );
+        assert_eq!(
+            render("{{ x.function.parameters | tojson(ensure_ascii=True, indent=2) }}"),
+            "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"b\": {\n      \"type\": \"integer\"\n    },\n    \"a\": {\n      \"type\": \"number\",\n      \"default\": 1.5\n    }\n  }\n}"
+        );
+        assert_eq!(render("{{ x.function.description | tojson(ensure_ascii=True) }}"), r#""<\u00e9>""#);
+        assert_eq!(
+            render("{{ x.function.parameters.properties | tojson(sort_keys=True, separators=[',', ':']) }}"),
+            r#"{"a":{"default":1.5,"type":"number"},"b":{"type":"integer"}}"#
+        );
+        // CONTROL: minijinja's built-in tojson (what ran before) is compact and
+        // escapes '<' -- it must not be what this environment renders.
+        let builtin = minijinja::Environment::new()
+            .render_str("{{ x | tojson }}", minijinja::context! { x => "<é>" })
+            .unwrap();
+        assert_ne!(builtin, render("{{ x.function.description | tojson }}"));
     }
 }

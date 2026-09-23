@@ -12,10 +12,11 @@
 //! Fixtures in `tests/fixtures/dsv41/` are generated from the Python code by
 //! `scripts/dsv41_parity/gen_fixtures.py`; `tests` compares against them.
 
+pub(crate) mod bicubic;
 pub mod encoding;
 pub mod grammar;
 pub mod parse;
-pub mod pyjson;
+pub(crate) use crate::pyjson;
 pub mod repetition;
 pub mod request;
 pub mod turbojpeg;
@@ -25,3 +26,21 @@ pub mod vision;
 mod tests;
 #[cfg(test)]
 mod tests_grammar;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// Set on every model load (a swap away turns it off again).
+static SERVING: AtomicBool = AtomicBool::new(false);
+
+/// Record whether the loaded model is deepseek_v41. The scheduler reads
+/// [`serving`] to switch off the generic generation heuristics the Python
+/// engine does not have (reflection suppression, think-loop watchdog, EOS
+/// suppression, forced `</think>`, catastrophic-loop stop, ...).
+pub fn set_serving(on: bool) {
+    SERVING.store(on, Ordering::Relaxed);
+}
+
+/// Whether the loaded model is deepseek_v41 (see [`set_serving`]).
+pub fn serving() -> bool {
+    SERVING.load(Ordering::Relaxed)
+}

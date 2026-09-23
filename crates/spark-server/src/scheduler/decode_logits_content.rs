@@ -165,7 +165,9 @@ where
     a.think_just_ended = false;
 
     // Repeated structured JSON inside grammar/tool bodies is legitimate.
-    let catastrophic_loop = a.content_tokens >= CATASTROPHIC_LOOP_MIN_TOKENS as u32
+    // Not for deepseek_v41 (the Python engine has only its cycle breaker).
+    let catastrophic_loop = !crate::dsv41::serving()
+        && a.content_tokens >= CATASTROPHIC_LOOP_MIN_TOKENS as u32
         && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
         && detect_catastrophic_content_loop(&a.output_tokens);
     let configured_loop = loop_watchdog_enabled

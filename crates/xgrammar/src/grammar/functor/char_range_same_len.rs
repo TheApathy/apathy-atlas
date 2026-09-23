@@ -60,7 +60,7 @@ pub fn add_same_length_range(
                 .add_edge(from, tmin, byte_min[3] as i16, byte_min[3] as i16);
             add_same_length_range(fsm, tmin, to, min & 0x00FF_FFFF, 0x00BF_BFBF);
         } else {
-            byte_min[3] -= 1;
+            byte_min[3] = byte_min[3].wrapping_sub(1);
         }
         if (max & 0x00FF_FFFF) != 0xBFBFBF {
             let tmax = fsm.add_state();
@@ -68,7 +68,7 @@ pub fn add_same_length_range(
                 .add_edge(from, tmax, byte_max[3] as i16, byte_max[3] as i16);
             add_same_length_range(fsm, tmax, to, 0x0080_8080, max & 0x00FF_FFFF);
         } else {
-            byte_max[3] += 1;
+            byte_max[3] = byte_max[3].wrapping_add(1);
         }
         if byte_max[3] as i16 - byte_min[3] as i16 > 1 {
             let m1 = fsm.add_state();
@@ -99,7 +99,7 @@ pub fn add_same_length_range(
                 .add_edge(from, tmin, byte_min[2] as i16, byte_min[2] as i16);
             add_same_length_range(fsm, tmin, to, min & 0x00FFFF, 0x00BFBF);
         } else {
-            byte_min[2] -= 1;
+            byte_min[2] = byte_min[2].wrapping_sub(1);
         }
         if (max & 0x00FFFF) != 0xBFBF {
             let tmax = fsm.add_state();
@@ -107,7 +107,7 @@ pub fn add_same_length_range(
                 .add_edge(from, tmax, byte_max[2] as i16, byte_max[2] as i16);
             add_same_length_range(fsm, tmax, to, 0x8080, max & 0x00FFFF);
         } else {
-            byte_max[2] += 1;
+            byte_max[2] = byte_max[2].wrapping_add(1);
         }
         if byte_max[2] as i16 - byte_min[2] as i16 > 1 {
             let m1 = fsm.add_state();
@@ -136,7 +136,7 @@ pub fn add_same_length_range(
             .add_edge(from, tmin, byte_min[1] as i16, byte_min[1] as i16);
         add_same_length_range(fsm, tmin, to, min & 0x00FF, 0x00BF);
     } else {
-        byte_min[1] -= 1;
+        byte_min[1] = byte_min[1].wrapping_sub(1);
     }
     if (max & 0x00FF) != 0xBF {
         let tmax = fsm.add_state();
@@ -144,7 +144,7 @@ pub fn add_same_length_range(
             .add_edge(from, tmax, byte_max[1] as i16, byte_max[1] as i16);
         add_same_length_range(fsm, tmax, to, 0x0080, max & 0x00FF);
     } else {
-        byte_max[1] += 1;
+        byte_max[1] = byte_max[1].wrapping_add(1);
     }
     if byte_max[1] as i16 - byte_min[1] as i16 > 1 {
         let m1 = fsm.add_state();

@@ -11,15 +11,15 @@ fn the_deepseek_v41_profile_carries_the_measured_numbers() {
     let p = dsv41();
     assert_eq!(p.recipe_id, "deepseek/deepseek-v4.1-flash-next");
     assert!(p.run_alone);
-    assert_eq!(p.resident_gb, 85.0);
+    assert_eq!(p.resident_gb, 88.0);
     assert_eq!(p.dspark_extra_gb, 8.0);
     assert_eq!(p.headroom_gb, 16.0);
     assert_eq!(p.env.get("ATLAS_DSV41_PACKED_KEEP").map(String::as_str), Some("124"));
     assert_eq!(p.env.get("ATLAS_DSV41_DSPARK").map(String::as_str), Some("0"));
     assert_eq!(p.env.get("ATLAS_DSV41_CHUNK").map(String::as_str), Some("2048"));
-    // 85 + 16 = 101 GB without DSpark, 109 with it.
-    assert_eq!(p.required_bytes(false), 101_000_000_000);
-    assert_eq!(p.required_bytes(true), 109_000_000_000);
+    // 88 + 16 = 104 GB without DSpark, 112 with it.
+    assert_eq!(p.required_bytes(false), 104_000_000_000);
+    assert_eq!(p.required_bytes(true), 112_000_000_000);
 }
 
 #[test]

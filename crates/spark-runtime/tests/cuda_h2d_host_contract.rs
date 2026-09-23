@@ -206,7 +206,11 @@ fn cuda_override_uses_one_sync_and_blocking_members() {
     assert!(GPU_TRAIT.contains("pub struct PinnedHostSlice<'a>"));
     assert!(!GPU_TRAIT.contains("pub fn PinnedHostSlice"));
     assert!(!GPU_TRAIT.contains("fn free_host_pinned("));
-    assert!(!GPU_TRAIT.contains("fn copy_h2d_async("));
+    // `copy_h2d_async` is allowed back for DeepSeek-V4.1's per-step uploads (a stream sync
+    // plus blocking copy per step would cost decode speed). It is sound on a borrowed
+    // pageable slice: CUDA stages pageable H2D sources before cuMemcpyHtoDAsync returns.
+    // It must stay a plain pass-through, never a deferred copy from `src`.
+    assert!(GPU_TRAIT.contains("fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, _stream: u64)"));
 }
 
 #[test]

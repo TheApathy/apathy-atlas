@@ -381,6 +381,13 @@ pub trait GpuBackend: Send + Sync {
 
     fn synchronize(&self, stream: u64) -> Result<()>;
 
+    /// Stream-ordered host-to-device copy with no stream synchronization. `src` is
+    /// pageable: CUDA stages it before `cuMemcpyHtoDAsync` returns, so the borrow may end
+    /// when this returns. Default: the synchronous copy.
+    fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, _stream: u64) -> Result<()> {
+        self.copy_h2d(src, dst)
+    }
+
     /// Get the default stream handle.
     fn default_stream(&self) -> u64;
 

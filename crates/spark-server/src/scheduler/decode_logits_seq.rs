@@ -50,7 +50,8 @@ pub fn process_seq_logits(
 
     // F1: Reflection token suppression during thinking.
     // Penalize "wait", "however", "actually" etc. to prevent circular reasoning.
-    if a.inside_thinking {
+    // Not for deepseek_v41: the Python engine samples its thinking unaltered.
+    if a.inside_thinking && !crate::dsv41::serving() {
         for &rid in reflection_suppress_ids {
             if (rid as usize) < f32_logits.len() {
                 f32_logits[rid as usize] -= 10.0;
@@ -176,7 +177,8 @@ pub fn process_seq_logits(
 
     // After thinking is done, suppress the </think> token to prevent
     // degenerate loops where the model generates hundreds of </think>.
-    if a.think_ended {
+    // Not for deepseek_v41: the Python engine masks neither think token.
+    if a.think_ended && !crate::dsv41::serving() {
         if let Some(end_tok) = think_end_token {
             let end_idx = end_tok as usize;
             if end_idx < f32_logits.len() {
@@ -350,6 +352,12 @@ pub fn process_seq_logits(
     {
         gs.apply_bitmask_to_logits(&mut f32_logits);
     }
+
+    // deepseek_v41: the Python engine's cycle breaker / no-repeat-ngram bans
+    // (a no-op for every other model). Python applies them after the
+    // penalties; a -inf ban survives every penalty and bias, so applying it
+    // before the sampler's penalty stage is the same distribution.
+    crate::dsv41::repetition::apply(&mut f32_logits, &a.output_tokens);
 
     // F72 (byte-level partial-trigger anchor) was removed — see
     // F73 / fix42. The sampler-side anchor hung the server in

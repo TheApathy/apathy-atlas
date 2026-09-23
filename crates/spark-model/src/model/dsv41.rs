@@ -137,7 +137,7 @@ impl Dsv41Model {
     pub fn new(
         config: &ModelConfig,
         store: &WeightStore,
-        gpu: Box<dyn GpuBackend>,
+        gpu: SharedGpu,
         model_dir: &std::path::Path,
         max_seq: usize,
         max_chunk: usize,
@@ -146,7 +146,7 @@ impl Dsv41Model {
         // Nothing is leaked: every owner of device memory (the forward's scratch/tables, each
         // sequence's rings, the logits, the MoE, the arena) holds an Arc to the backend and frees
         // on drop, so dropping the model returns its device memory (TUI model swap).
-        let shared: SharedGpu = std::sync::Arc::from(gpu);
+        let shared: SharedGpu = gpu;
         let gpu: &dyn GpuBackend = shared.as_ref();
         let dims = V41Dims::from_config(config)?;
         let kernels_owned = Dsv41Kernels::load(gpu)?;

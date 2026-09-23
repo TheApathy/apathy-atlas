@@ -118,8 +118,31 @@ pub fn sample_token(
     suppress_ids: &[u32],
     history: &[u32],
 ) -> Result<u32> {
-    if !needs_sampler(params, history) && suppress_ids.is_empty() {
-        return model.argmax_on_device(logits, 0);
+    sample_token_with_logprobs(model, logits, params, suppress_ids, history, None)
+        .map(|(tok, _)| tok)
+}
+
+/// [`sample_token`] that also returns the token's logprobs when the request
+/// asked for them (`top_logprobs`). The first generated token is sampled here,
+/// from the prefill logits, so this is where its logprobs entry comes from;
+/// they are taken over the same (suppressed) distribution the token was drawn
+/// from, as the decode path does.
+pub fn sample_token_with_logprobs(
+    model: &dyn Model,
+    logits: DevicePtr,
+    params: &SamplingParams,
+    suppress_ids: &[u32],
+    history: &[u32],
+    top_logprobs: Option<u8>,
+) -> Result<(u32, Option<crate::api::TokenLogprobs>)> {
+    // deepseek_v41: the Python engine may end on its very first token.
+    let suppress_ids = if crate::dsv41::serving() {
+        &[][..]
+    } else {
+        suppress_ids
+    };
+    if !needs_sampler(params, history) && suppress_ids.is_empty() && top_logprobs.is_none() {
+        return Ok((model.argmax_on_device(logits, 0)?, None));
     }
     let vocab_size = model.vocab_size();
     // Read logits from device. Gemma-4 dense single-token decode produces FP32
@@ -146,7 +169,10 @@ pub fn sample_token(
             })
             .collect()
     };
-    Ok(sample_host_logits(&mut f32_logits, params, suppress_ids, history))
+    let tok = sample_host_logits(&mut f32_logits, params, suppress_ids, history);
+    let logprobs = top_logprobs
+        .map(|k| super::logprobs::extract_logprobs_from_f32(&f32_logits, tok, k as usize));
+    Ok((tok, logprobs))
 }
 
 /// The host half of [`sample_token`]: mask `suppress_ids`, then sample with the full
@@ -290,6 +316,18 @@ pub fn sample_token_with_grammar(
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
     Ok(sample_with_params_history(f32_bytes, params, history))
+}
+
+/// The stream event for a first generated token (with its logprobs when the
+/// request asked for them).
+pub(super) fn first_token_event(
+    tok: u32,
+    logprobs: &Option<crate::api::TokenLogprobs>,
+) -> crate::api::StreamEvent {
+    match logprobs {
+        Some(lp) => crate::api::StreamEvent::TokenWithLogprobs(tok, lp.clone()),
+        None => crate::api::StreamEvent::Token(tok),
+    }
 }
 
 #[cfg(test)]

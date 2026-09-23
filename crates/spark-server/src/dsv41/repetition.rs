@@ -14,7 +14,7 @@
 //!
 //! Both see only generated tokens, not the prompt, as in Python.
 
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 pub const CYCLE_REPEATS: usize = 4;
 pub const CYCLE_MAX_PERIOD: usize = 16;
@@ -62,9 +62,16 @@ pub struct Config {
     pub no_repeat_ngram: usize,
 }
 
-static CONFIG: OnceLock<Config> = OnceLock::new();
+const OFF: Config = Config {
+    cycle_break: false,
+    no_repeat_ngram: 0,
+};
 
-/// Called once at startup with whether the served model is deepseek_v41.
+// Not a OnceLock: a model swap re-runs `configure`, and a server that swaps
+// from deepseek_v41 to another model must stop banning its tokens.
+static CONFIG: RwLock<Config> = RwLock::new(OFF);
+
+/// Called on every model load with whether the served model is deepseek_v41.
 /// Reads the same environment variables as the Python engine.
 pub fn configure(model_is_dsv41: bool) {
     let cfg = Config {
@@ -79,7 +86,8 @@ pub fn configure(model_is_dsv41: bool) {
             0
         },
     };
-    if CONFIG.set(cfg).is_ok() && model_is_dsv41 {
+    *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = cfg;
+    if model_is_dsv41 {
         tracing::info!(
             "deepseek_v41 repetition controls: cycle_break={} no_repeat_ngram={}",
             cfg.cycle_break,
@@ -88,12 +96,20 @@ pub fn configure(model_is_dsv41: bool) {
     }
 }
 
+/// Whether [`apply`] can ban anything. The scheduler's GPU-argmax fast path
+/// never sees host logits, so while this is true it must take the host path.
+pub fn active() -> bool {
+    let cfg = *CONFIG.read().unwrap_or_else(|e| e.into_inner());
+    cfg.cycle_break || cfg.no_repeat_ngram > 0
+}
+
 /// Ban, in place, what the Python engine would ban at this step. Returns
 /// true when anything was banned. A no-op unless [`configure`] enabled it.
 pub fn apply(logits: &mut [f32], history: &[u32]) -> bool {
-    let Some(cfg) = CONFIG.get() else {
+    let cfg = *CONFIG.read().unwrap_or_else(|e| e.into_inner());
+    if !cfg.cycle_break && cfg.no_repeat_ngram == 0 {
         return false;
-    };
+    }
     let mut hit = false;
     let mut ban = |t: u32| {
         if let Some(l) = logits.get_mut(t as usize) {

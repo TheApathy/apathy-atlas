@@ -25,7 +25,7 @@ use base64::Engine;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbImage};
 use serde_json::Value;
 
-use crate::deepseek_vision_preprocess::{bicubic, round_bf16};
+use super::bicubic::{self, round_bf16};
 
 pub const IMAGE_SENTINEL_ID: u32 = 129264;
 pub const IMAGE_PAD_ID: u32 = 129265;

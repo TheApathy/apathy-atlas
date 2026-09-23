@@ -23,10 +23,11 @@ use std::sync::Arc;
 use crate::AppState;
 use crate::dsv41::parse::{OutputRouter, ParsedCall, Phase};
 use crate::dsv41::request;
-use crate::ir::{self, StreamDelta};
+use crate::openai::{ChatCompletionRequest, ChatMessage};
 use crate::tokenizer::ChatTokenizer;
+use crate::tool_parser::{FunctionCall, ToolCall};
 
-use super::chat::prepare::PreparedChat;
+use super::chat::PreparedChat;
 use super::compact::openai_error_response_with_param;
 
 #[allow(clippy::result_large_err)]
@@ -34,14 +35,36 @@ fn bad_request(message: String, param: Option<&str>) -> Response {
     openai_error_response_with_param(StatusCode::BAD_REQUEST, message, param, None)
 }
 
-/// `prepare_chat_prompt` for deepseek_v41: render from the raw OpenAI body.
+/// app.py's engine headroom beyond prompt + max_tokens (`context_margin`).
+const CONTEXT_MARGIN: usize = 8;
+/// app.py budgets every image at this many tokens, whatever its real span.
+const TOKENS_PER_IMAGE: usize = 1024;
+
+/// app.py's context admission: `prompt_ids` is the rendered prompt BEFORE
+/// image expansion. Returns the max_tokens ceiling app.py clamps to, or its
+/// error message (both are 400 `context_length_exceeded`).
+fn context_budget(prompt_len: usize, images: usize, max_ctx: usize) -> Result<usize, String> {
+    let bound = prompt_len + TOKENS_PER_IMAGE * images;
+    if images > 0 && bound + CONTEXT_MARGIN >= max_ctx {
+        return Err("image-expanded prompt exceeds the engine context".into());
+    }
+    if prompt_len + CONTEXT_MARGIN >= max_ctx {
+        return Err(format!(
+            "prompt has {prompt_len} tokens, engine context is {max_ctx}"
+        ));
+    }
+    Ok(max_ctx - bound - CONTEXT_MARGIN)
+}
+
+/// The chat prompt for deepseek_v41, rendered from the raw OpenAI body, and
+/// the max_tokens ceiling app.py applies for it.
 #[allow(clippy::result_large_err)]
 pub(crate) fn prepare(
     state: &Arc<AppState>,
-    req: &ir::ChatRequest,
-) -> Result<PreparedChat, Response> {
-    let Some(body) = req.raw_openai_body.as_deref() else {
-        // The Anthropic and Responses adapters lower their own wire format and
+    req: &ChatCompletionRequest,
+) -> Result<(PreparedChat, usize), Response> {
+    let Some(body) = req.raw_body.as_deref() else {
+        // The Anthropic and Responses adapters build their own request and
         // never carry an OpenAI body. The Python server has neither surface.
         return Err(bad_request(
             "deepseek_v41 is served on /v1/chat/completions and /v1/completions only".into(),
@@ -54,6 +77,15 @@ pub(crate) fn prepare(
         .tokenizer
         .encode(&rendered.prompt)
         .map_err(|e| bad_request(format!("Tokenization error: {e}"), None))?;
+    let max_tokens_cap = context_budget(text_ids.len(), rendered.images.len(), state.max_seq_len)
+        .map_err(|message| {
+            openai_error_response_with_param(
+                StatusCode::BAD_REQUEST,
+                message,
+                None,
+                Some("context_length_exceeded"),
+            )
+        })?;
     let (prompt_tokens, image_pixels) = if rendered.images.is_empty() {
         (text_ids, Vec::new())
     } else {
@@ -67,7 +99,7 @@ pub(crate) fn prepare(
         rendered.effort,
         rendered.grammar_tools.as_ref().map_or(0, Vec::len),
     );
-    Ok(PreparedChat {
+    let prepared = PreparedChat {
         // Tools reach the prompt through the renderer, so "active" only
         // means a parser is configured and the request carries tools.
         tools_active: state.tool_call_parser.is_some() && rendered.grammar_tools.is_some(),
@@ -78,7 +110,8 @@ pub(crate) fn prepare(
         // The Python engine has no thinking budget: reasoning may use the
         // whole max_tokens. `None` keeps the forced-</think> injector disarmed.
         thinking_budget: None,
-    })
+    };
+    Ok((prepared, max_tokens_cap))
 }
 
 /// Opt-in switch for `/v1/debug/prompt`: only an explicit `1`/`true` enables it.
@@ -90,7 +123,7 @@ fn debug_prompt_enabled(env: Option<&str>) -> bool {
 /// `/v1/` auth gate, and disabled unless `ATLAS_DSV41_DEBUG_PROMPT=1`. Renders a chat request
 /// to the prompt text and ids without generating. deepseek_v41 only.
 pub async fn debug_prompt(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    crate::main_modules::model_host::CurrentModel(state): crate::main_modules::model_host::CurrentModel,
     body: axum::body::Bytes,
 ) -> Response {
     use axum::response::IntoResponse;
@@ -173,33 +206,26 @@ fn expand_images(
     Ok((ids, pixels))
 }
 
-fn to_ir_calls(calls: Vec<ParsedCall>) -> Vec<ir::message::ToolCall> {
+/// app.py's call objects: the arguments string exactly as the parser produced
+/// it (the strict parser can yield non-JSON text, which a Python client
+/// receives verbatim too).
+fn to_tool_calls(calls: Vec<ParsedCall>) -> Vec<ToolCall> {
     calls
         .into_iter()
-        .map(|c| {
-            let arguments = serde_json::from_str(&c.arguments).unwrap_or_else(|e| {
-                // The strict parser concatenates `string="false"` values
-                // verbatim, so malformed JSON can reach here exactly as it
-                // reaches a Python client. The IR carries a Value; keep the
-                // text rather than invent an empty object.
-                tracing::warn!(
-                    "deepseek_v41 tool call {} has non-JSON arguments ({e})",
-                    c.name
-                );
-                serde_json::Value::String(c.arguments.clone())
-            });
-            ir::message::ToolCall {
-                id: tool_call_id(),
+        .map(|c| ToolCall {
+            id: tool_call_id(),
+            call_type: "function".into(),
+            function: FunctionCall {
                 name: c.name,
-                arguments,
-            }
+                arguments: c.arguments,
+            },
         })
         .collect()
 }
 
 /// `"call_" + uuid4().hex[:24]`, as app.py mints them.
 fn tool_call_id() -> String {
-    let hex: String = crate::ids::uuid_v4()
+    let hex: String = crate::openai::uuid_v4()
         .chars()
         .filter(|c| *c != '-')
         .take(24)
@@ -207,15 +233,14 @@ fn tool_call_id() -> String {
     format!("call_{hex}")
 }
 
-/// Blocking choice for deepseek_v41 from the raw output tokens.
+/// One blocking choice's message and finish reason, from the raw output tokens.
 pub(crate) fn blocking_choice(
     tok: &ChatTokenizer,
     output_tokens: &[u32],
     finish_reason: &str,
     enable_thinking: bool,
     stop_strings: &[String],
-    choice_idx: usize,
-) -> ir::Choice {
+) -> (ChatMessage, String) {
     let tokens = if finish_reason == "stop" {
         output_tokens
             .split_last()
@@ -242,16 +267,27 @@ pub(crate) fn blocking_choice(
     } else {
         Some(router.content.clone())
     };
-    ir::Choice {
-        index: choice_idx,
+    let message = ChatMessage {
+        role: "assistant".into(),
+        // app.py sends `reasoning_content` only, and only in thinking mode.
+        reasoning_content: enable_thinking.then(|| router.reasoning.clone()),
+        reasoning: None,
         content,
-        reasoning: enable_thinking.then(|| router.reasoning.clone()),
-        tool_calls: to_ir_calls(calls),
+        tool_calls: (!calls.is_empty()).then(|| to_tool_calls(calls)),
+        annotations: None,
         refusal: None,
-        finish_reason: ir::FinishReason::from(reason.as_str()),
-        matched_stop: None,
-        logprobs: None,
-    }
+    };
+    (message, reason)
+}
+
+/// One streamed piece of a deepseek_v41 reply, before wire encoding.
+#[derive(Debug, Clone)]
+pub(crate) enum Delta {
+    Reasoning(String),
+    Content(String),
+    /// A complete call (app.py sends each call whole, once, at the end).
+    ToolCall { index: usize, call: ToolCall },
+    Finish(String),
 }
 
 /// Streaming state: app.py's IncrementalDetokenizer + OutputRouter.
@@ -308,23 +344,17 @@ impl StreamState {
         full.get(prev.len()..).unwrap_or_default().to_string()
     }
 
-    fn deltas(events: Vec<(Phase, String)>) -> Vec<StreamDelta> {
+    fn deltas(events: Vec<(Phase, String)>) -> Vec<Delta> {
         events
             .into_iter()
             .map(|(phase, text)| match phase {
-                Phase::Reasoning => StreamDelta::Reasoning {
-                    text,
-                    token_ids: Vec::new(),
-                },
-                _ => StreamDelta::Content {
-                    text,
-                    token_ids: Vec::new(),
-                },
+                Phase::Reasoning => Delta::Reasoning(text),
+                _ => Delta::Content(text),
             })
             .collect()
     }
 
-    pub(crate) fn on_token(&mut self, tok: &ChatTokenizer, id: u32) -> Vec<StreamDelta> {
+    pub(crate) fn on_token(&mut self, tok: &ChatTokenizer, id: u32) -> Vec<Delta> {
         if self.router.stopped || id == self.eos {
             return Vec::new();
         }
@@ -338,12 +368,7 @@ impl StreamState {
         out
     }
 
-    pub(crate) fn on_done(
-        &mut self,
-        tok: &ChatTokenizer,
-        finish_reason: String,
-        usage: ir::Usage,
-    ) -> Vec<StreamDelta> {
+    pub(crate) fn on_done(&mut self, tok: &ChatTokenizer, finish_reason: String) -> Vec<Delta> {
         let mut out = Vec::new();
         if !self.router.stopped {
             let tail = self.detok_flush(tok);
@@ -363,35 +388,18 @@ impl StreamState {
             // held back and is silently lost); send it, so stream and blocking
             // agree. A deliberate deviation, recorded in PARITY.md.
             if !held.is_empty() {
-                out.push(StreamDelta::Content {
-                    text: held,
-                    token_ids: Vec::new(),
-                });
+                out.push(Delta::Content(held));
             }
         } else {
             reason = "tool_calls".into();
-            for (index, call) in to_ir_calls(calls).into_iter().enumerate() {
-                out.push(StreamDelta::ToolCallStart {
-                    index,
-                    id: call.id,
-                    name: call.name,
-                });
-                let fragment = match call.arguments {
-                    serde_json::Value::String(s) => s,
-                    v => v.to_string(),
-                };
-                out.push(StreamDelta::ToolCallArgs {
-                    index,
-                    fragment,
-                    token_ids: Vec::new(),
-                });
-            }
+            out.extend(
+                to_tool_calls(calls)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call)| Delta::ToolCall { index, call }),
+            );
         }
-        out.push(StreamDelta::Finish {
-            reason: ir::FinishReason::from(reason.as_str()),
-            usage,
-            token_ids: Vec::new(),
-        });
+        out.push(Delta::Finish(reason));
         out
     }
 }
@@ -415,27 +423,14 @@ mod tests {
 
     fn tokenizer(fx: &serde_json::Value) -> ChatTokenizer {
         let dir = fx["meta"]["model_dir"].as_str().unwrap();
-        ChatTokenizer::from_model_dir(
-            std::path::Path::new(dir),
-            1,
-            true,
-            "deepseek_v41",
-            None,
-            false,
-        )
-        .expect("checkpoint tokenizer (a missing tokenizer is a failure, not a skip)")
+        ChatTokenizer::from_model_dir(std::path::Path::new(dir), 1, true, "deepseek_v41", None)
+            .expect("checkpoint tokenizer (a missing tokenizer is a failure, not a skip)")
     }
 
-    fn calls(v: &[ir::message::ToolCall]) -> serde_json::Value {
+    fn calls(v: &[ToolCall]) -> serde_json::Value {
         serde_json::Value::Array(
             v.iter()
-                .map(|c| {
-                    let args = match &c.arguments {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => crate::dsv41::pyjson::dumps(other),
-                    };
-                    serde_json::json!({"name": c.name, "arguments": args})
-                })
+                .map(|c| serde_json::json!({"name": c.function.name, "arguments": c.function.arguments}))
                 .collect(),
         )
     }
@@ -451,34 +446,29 @@ mod tests {
             let want = &c["server"];
             let mut ids = tok.encode(c["text"].as_str().unwrap()).unwrap();
             ids.push(1); // EOS, as the scheduler reports a "stop" finish
-            let choice = blocking_choice(&tok, &ids, "stop", thinking, &[], 0);
+            let (message, reason) = blocking_choice(&tok, &ids, "stop", thinking, &[]);
+            let got_calls = message.tool_calls.clone().unwrap_or_default();
             assert_eq!(
-                choice.content.clone().unwrap_or_default(),
+                message.content.clone().unwrap_or_default(),
                 want["content"].as_str().unwrap(),
                 "{name}: content"
             );
             if thinking {
                 assert_eq!(
-                    choice.reasoning.as_deref(),
+                    message.reasoning_content.as_deref(),
                     want["reasoning"].as_str(),
                     "{name}: reasoning"
                 );
+            } else {
+                assert_eq!(message.reasoning_content, None, "{name}: no reasoning field");
             }
-            assert_eq!(
-                calls(&choice.tool_calls),
-                want["tool_calls"],
-                "{name}: calls"
-            );
-            let want_reason = if choice.tool_calls.is_empty() {
+            assert_eq!(calls(&got_calls), want["tool_calls"], "{name}: calls");
+            let want_reason = if got_calls.is_empty() {
                 "stop"
             } else {
                 "tool_calls"
             };
-            assert_eq!(
-                choice.finish_reason,
-                ir::FinishReason::from(want_reason),
-                "{name}: finish"
-            );
+            assert_eq!(reason, want_reason, "{name}: finish");
 
             let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut st = StreamState::new(&tok, thinking, Vec::new(), flag);
@@ -486,18 +476,18 @@ mod tests {
             for &id in &ids {
                 deltas.extend(st.on_token(&tok, id));
             }
-            deltas.extend(st.on_done(&tok, "stop".into(), ir::Usage::default()));
-            let (mut reasoning, mut content, mut names, mut args) =
-                (String::new(), String::new(), vec![], vec![]);
+            deltas.extend(st.on_done(&tok, "stop".into()));
+            let (mut reasoning, mut content, mut streamed) = (String::new(), String::new(), vec![]);
             let mut finish = None;
             for d in deltas {
                 match d {
-                    StreamDelta::Reasoning { text, .. } => reasoning.push_str(&text),
-                    StreamDelta::Content { text, .. } => content.push_str(&text),
-                    StreamDelta::ToolCallStart { name, .. } => names.push(name),
-                    StreamDelta::ToolCallArgs { fragment, .. } => args.push(fragment),
-                    StreamDelta::Finish { reason, .. } => finish = Some(reason),
-                    other => panic!("{name}: unexpected {other:?}"),
+                    Delta::Reasoning(text) => reasoning.push_str(&text),
+                    Delta::Content(text) => content.push_str(&text),
+                    Delta::ToolCall { index, call } => {
+                        assert_eq!(index, streamed.len(), "{name}: call index");
+                        streamed.push(call);
+                    }
+                    Delta::Finish(reason) => finish = Some(reason),
                 }
             }
             assert_eq!(
@@ -512,32 +502,47 @@ mod tests {
                     "{name}: streamed reasoning"
                 );
             }
-            let got: Vec<serde_json::Value> = names
-                .iter()
-                .zip(&args)
-                .map(|(n, a)| serde_json::json!({"name": n, "arguments": a}))
-                .collect();
-            let want_calls: Vec<serde_json::Value> = want["tool_calls"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|w| {
-                    // the stream sends the IR Value re-serialised compactly
-                    let a = w["arguments"].as_str().unwrap();
-                    let a = serde_json::from_str::<serde_json::Value>(a)
-                        .map_or(a.to_string(), |v| v.to_string());
-                    serde_json::json!({"name": w["name"], "arguments": a})
-                })
-                .collect();
-            assert_eq!(got, want_calls, "{name}: streamed calls");
-            assert_eq!(
-                finish,
-                Some(ir::FinishReason::from(want_reason)),
-                "{name}: streamed finish"
-            );
+            // The arguments go out exactly as app.py sends them.
+            assert_eq!(calls(&streamed), want["tool_calls"], "{name}: streamed calls");
+            assert_eq!(finish.as_deref(), Some(want_reason), "{name}: streamed finish");
             checked += 1;
         }
         assert!(checked >= 15);
+    }
+
+    /// app.py rejects when prompt + 1024/image + 8 >= max_context, and clamps
+    /// max_tokens to the rest. Boundary on both sides, text and images.
+    #[test]
+    fn context_budget_matches_app_py_boundary() {
+        let max = 10_000;
+        // text only: the last admitted prompt leaves exactly 1 token
+        assert_eq!(context_budget(max - 9, 0, max), Ok(1));
+        assert!(context_budget(max - 8, 0, max).is_err());
+        assert!(context_budget(max - 1, 0, max).is_err());
+        assert!(context_budget(max, 0, max).is_err());
+        assert!(context_budget(max + 1, 0, max).is_err());
+        assert_eq!(context_budget(100, 0, max), Ok(max - 108));
+        // one image counts 1024 whatever its size
+        assert_eq!(context_budget(max - 1033, 1, max), Ok(1));
+        assert_eq!(
+            context_budget(max - 1032, 1, max),
+            Err("image-expanded prompt exceeds the engine context".into())
+        );
+        assert!(context_budget(max - 1024 - 1, 1, max).is_err());
+        assert!(context_budget(max - 1024, 1, max).is_err());
+        assert!(context_budget(max - 1024 + 1, 1, max).is_err());
+        assert_eq!(
+            context_budget(max + 1, 0, max),
+            Err(format!("prompt has {} tokens, engine context is {max}", max + 1))
+        );
+    }
+
+    #[test]
+    fn tool_call_ids_look_like_apps() {
+        let id = tool_call_id();
+        assert_eq!(id.len(), "call_".len() + 24, "{id}");
+        assert!(id.starts_with("call_"));
+        assert!(id[5..].chars().all(|c| c.is_ascii_hexdigit()), "{id}");
     }
 
     #[test]
@@ -567,9 +572,9 @@ mod tests {
         let mut ids = tok.encode(case["text"].as_str().unwrap()).unwrap();
         ids.push(1);
         // "length" is the path that does not strip a trailing stop token
-        let kept = blocking_choice(&tok, &ids, "length", false, &[], 0);
+        let (kept, _) = blocking_choice(&tok, &ids, "length", false, &[]);
         assert_ne!(kept.content.as_deref(), case["server"]["content"].as_str());
-        let cut = blocking_choice(&tok, &ids, "stop", false, &[], 0);
+        let (cut, _) = blocking_choice(&tok, &ids, "stop", false, &[]);
         assert_eq!(cut.content.as_deref(), case["server"]["content"].as_str());
     }
 }

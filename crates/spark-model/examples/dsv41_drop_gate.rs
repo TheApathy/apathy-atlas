@@ -64,7 +64,7 @@ fn main() -> Result<()> {
     let dev_before = probe.free_memory()?;
     println!("MemAvailable before model: {:.2} GB (store resident: {:.2} GB)", before as f64 / 1048576.0, store.total_bytes() as f64 / 1e9);
 
-    let model = Dsv41Model::new(&config, &store, Box::new(gpu), Path::new(MODEL_DIR), 8192, 512)?;
+    let model = Dsv41Model::new(&config, &store, std::sync::Arc::new(gpu), Path::new(MODEL_DIR), 8192, 512)?;
     let mut seq = model.alloc_sequence()?;
     let ids: Vec<u32> = (0..64).map(|i| 1000 + i).collect();
     model.prefill(&ids, &mut seq, 0)?;

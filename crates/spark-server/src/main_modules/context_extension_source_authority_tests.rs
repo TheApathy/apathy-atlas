@@ -122,15 +122,28 @@ const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b3657
 // MACHINE-checked: the guard block extracted before and after is identical
 // (sha256 faf1696a...), the three anchors appear once each, and `git diff
 // -U0` matches ZERO lines against admission|max_seq_len|context_extension|ensure!.
-const SERVE_LOAD_SHA256: &str = "8d41ee286825dd4c767389719cb2021425f162227b1beea9d90df7ba0057788d";
+// Re-pinned 2026-09-23 for the DeepSeek-V4.1 port (dsv41/port-chat): three
+// hunks, none on a context-extension path -- a deepseek_v41 block before the
+// scheduler spawn (vision_config parse, repetition::configure, set_serving,
+// the libturbojpeg probe), `yarn_context` computed by
+// serve_phases::text_only_yarn_context instead of inline, and two AppState
+// fields (`dsv41`, `dsv41_vision`). The guard block and anchors are unchanged.
+// Re-pinned 2026-09-23 (NINTH time) for cand/dsv41-tui (the above on top of all-models).
+// MACHINE-checked on the merged file: guard block identical (sha256 faf1696a...), the three
+// anchors once each, and `git diff -U0` vs all-models matches ZERO lines against
+// admission|max_seq_len|context_extension|ensure! in serve_load.rs, serve_phases/mod.rs
+// and serve_phases/build.rs (build.rs is unchanged).
+const SERVE_LOAD_SHA256: &str = "2ec27a7f9f87b1a0f8603c4e628d5a168abb461ff91a208df8da1bf64e7d3ed7";
 // Re-pinned 2026-09-22 for integrate/all-models: the ONLY change is the
 // `weights::{..}` re-export gaining `load_dflash_donor` (phaseA-a1's DFlash
 // donor loader, now called from `load_model`), rustfmt-wrapped onto three
 // lines. `git diff feat/tui-port` over this file is exactly that one hunk.
 // Re-pinned again 2026-09-22 for the GLM-5.3 port: `mod target_store;` and
 // the `TargetStoreLoadPlan` re-export (GLM GGUF load planning). Nothing else.
+// Re-pinned 2026-09-23 for the DeepSeek-V4.1 port: `mod vision_context;` and
+// its `text_only_yarn_context` re-export (the Static-YaRN image gate). Nothing else.
 const SERVE_PHASES_SHA256: &str =
-    "c09f946989ac4f713001ba8bd0977faf6d088ccd57114fa518bbed88e8e3ed22";
+    "0651c2cecd7e87a3cddf952f66d23463259667c18ab8d9dc657b1d736f8264d3";
 // Re-pinned 2026-09-22 for fix/swap-reclaim: the ONLY change is build_model's
 // `gpu` parameter, Box<dyn GpuBackend> -> Arc<dyn GpuBackend>. No admission
 // line moved (the zero-match `git diff -U0` check above covers this file).

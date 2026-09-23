@@ -300,3 +300,43 @@ fn server_default_not_merged_when_request_explicit() {
     assert!(req.chat_template_kwargs.is_none());
     assert!(req.resolve_thinking(false).0);
 }
+
+/// DeepSeek-V4.1 sends a numeric effort (`"reasoning_effort": 90`), which the
+/// Python server accepts. The typed parse used to reject it with "Invalid
+/// request JSON" before the model's resolver ran (serve2, request 04).
+#[test]
+fn integer_reasoning_effort_parses() {
+    let body = || serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+    let mut b = body();
+    b["reasoning_effort"] = serde_json::json!(90);
+    let req: ChatCompletionRequest = serde_json::from_value(b).unwrap();
+    assert_eq!(req.reasoning_effort.as_deref(), Some("90"));
+    let mut b = body();
+    b["reasoning"] = serde_json::json!({"effort": 33});
+    assert!(serde_json::from_value::<ChatCompletionRequest>(b).is_ok());
+    // strings are unchanged
+    let mut b = body();
+    b["reasoning_effort"] = serde_json::json!("high");
+    let req: ChatCompletionRequest = serde_json::from_value(b).unwrap();
+    assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+}
+
+/// CONTROL: other types are still refused, so the widening is not "anything goes".
+#[test]
+fn non_string_non_integer_effort_is_refused() {
+    for bad in [serde_json::json!(true), serde_json::json!(0.5), serde_json::json!({"x": 1})] {
+        let mut b = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        b["reasoning_effort"] = bad.clone();
+        assert!(serde_json::from_value::<ChatCompletionRequest>(b).is_err(), "{bad} accepted");
+    }
+}
+
+/// A chat request with no `model` parses (production accepts it and ignores the field).
+#[test]
+fn missing_model_field_parses() {
+    let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+    let req: ChatCompletionRequest = serde_json::from_value(body).expect("no model field");
+    assert_eq!(req.model, "");
+    // CONTROL: a malformed field is still an error
+    assert!(serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({"messages": 5})).is_err());
+}

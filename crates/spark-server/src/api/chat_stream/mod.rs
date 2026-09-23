@@ -20,6 +20,7 @@
 //! - `handle_error` — Error arm
 
 mod ctx;
+mod dsv41;
 mod handle_done;
 mod handle_error;
 mod handle_token;
@@ -217,6 +218,43 @@ pub(crate) async fn chat_completions_stream(
         f44_cache_active,
     };
 
+    if state.dsv41 {
+        let mut st = crate::api::dsv41::StreamState::new(
+            &state.tokenizer,
+            enable_thinking,
+            ctx.stop_strings.clone(),
+            cancel_flag.clone(),
+        );
+        let token_stream = ReceiverStream::new(token_rx).flat_map(move |event| {
+            let events = match event {
+                StreamEvent::Token(tok) | StreamEvent::TokenWithLogprobs(tok, _) => {
+                    dsv41::on_token(&mut st, &ctx, tok)
+                }
+                StreamEvent::Done {
+                    finish_reason,
+                    prompt_tokens: _,
+                    completion_tokens,
+                    time_to_first_token_ms,
+                    decode_time_ms,
+                    reasoning_tokens,
+                    cached_prompt_tokens,
+                } => dsv41::on_done(
+                    &mut st,
+                    &ctx,
+                    finish_reason,
+                    completion_tokens,
+                    time_to_first_token_ms,
+                    decode_time_ms,
+                    reasoning_tokens,
+                    cached_prompt_tokens,
+                ),
+                StreamEvent::Error(msg) => handle_error::handle_error(&ctx, msg),
+            };
+            futures::stream::iter(events)
+        });
+        return Ok(sse_response(role_json, token_stream));
+    }
+
     let mut stream_state = StreamState::new(tools_active, enable_thinking, cancel_flag.clone());
 
     let token_stream = ReceiverStream::new(token_rx).flat_map(move |event| {
@@ -247,14 +285,23 @@ pub(crate) async fn chat_completions_stream(
         futures::stream::iter(events)
     });
 
-    // Prepend role chunk, append [DONE] sentinel
+    Ok(sse_response(role_json, token_stream))
+}
+
+/// Prepend the role chunk and append the `[DONE]` sentinel.
+fn sse_response(
+    role_json: String,
+    token_stream: impl futures::Stream<Item = Result<Event, std::convert::Infallible>>
+        + Send
+        + 'static,
+) -> Response {
     let role_event = futures::stream::once(async move { Ok(Event::default().data(role_json)) });
     let done_event = futures::stream::once(async {
         Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
     });
     let full_stream = role_event.chain(token_stream).chain(done_event);
 
-    Ok(Sse::new(full_stream)
+    Sse::new(full_stream)
         .keep_alive(KeepAlive::default())
-        .into_response())
+        .into_response()
 }

@@ -32,7 +32,8 @@ defaults:
 # Atlas extension block, read by `main_modules::model_profile` (Recipe::parse ignores it).
 atlas:
   model_type: deepseek_v41
-  resident_gb: 85
+  # 85 GB measured + ~1.5 GB shared-expert residency (dsv41/shared) + replay headroom.
+  resident_gb: 88
   dspark_extra_gb: 8
   headroom_gb: 16
   run_alone: true
