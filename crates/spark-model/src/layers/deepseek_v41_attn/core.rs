@@ -30,7 +30,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
-use super::index::{CandidateMask, INDEX_HEAD_DIM, INDEX_HEADS, INDEX_TOPK, IndexKernels, IndexOps, score_width};
+use super::index::{CandidateMask, INDEX_HEAD_DIM, INDEX_HEADS, INDEX_TOPK, IndexKernels, IndexOps, cand_row_bytes, score_rows_per_block, score_width};
 use crate::weight_loader::deepseek_v41::attn_block::{AttnCore, CoreArgs, RING, WINDOW};
 use crate::weight_loader::deepseek_v41::device_allocs::{DeviceAllocs, SharedGpu};
 use crate::weight_loader::deepseek_v41::forward::{PassHook, PassKind};
@@ -65,10 +65,11 @@ const CANDIDATE_BLOCK_SIZE: usize = 8;
 /// length, re-chunking the same prompt changed L20's replay-tail top-k on 19 of 128 rows.
 const MM_TILE: usize = 16;
 
-/// Bytes of the ONE fp32 score scratch all index layers share: `[max_chunk, n_pad(max_seq)]`.
-/// Layers >= 20 run at ratio 1, so `n_c` reaches `max_seq`.
+/// Bytes of the ONE fp32 score scratch all index layers share: `[rows, n_pad(max_seq)]`, rows =
+/// [`score_rows_per_block`] (the whole chunk up to ~200K context; 224 rows at 1M). Layers >= 20 run
+/// at ratio 1, so `n_c` reaches `max_seq`.
 pub fn score_scratch_bytes(max_chunk: usize, max_seq: usize) -> usize {
-    max_chunk * score_width(max_seq) * 4
+    score_rows_per_block(max_chunk, max_seq) * score_width(max_seq) * 4
 }
 
 /// Run `gemm(x_tile, out_tile)` over `m` rows in MM_TILE-row tiles; the tail tile is zero-padded
@@ -183,6 +184,8 @@ struct Scratch {
     wts: DevicePtr,
     score: DevicePtr,
     score_bytes: usize,
+    /// Rows the score/block scratch holds: the indexer walks a chunk in blocks of this many.
+    score_rows: usize,
     cand: DevicePtr,
     blocks: DevicePtr,
     pad_in: DevicePtr,
@@ -322,11 +325,16 @@ impl Dsv41SparseCore {
         let mma_kernel = if std::env::var("ATLAS_DSV41_ATTN_MMA").as_deref() == Ok("0") {
             None
         } else {
-            let name = match hpc {
-                16 => "dsv41_sparse_attn_mma",
-                32 => "dsv41_sparse_attn_mma32h",
-                64 => "dsv41_sparse_attn_mma64",
-                o => anyhow::bail!("ATLAS_DSV41_ATTN_HPC={o}: use 16, 32 or 64"),
+            // ATLAS_DSV41_ATTN_FA=1: the FA2-style restructure (softmax in registers, 2 syncs per
+            // tile), byte-identical to the mma entries by construction (attn gate). 16/32 only.
+            let fa = std::env::var("ATLAS_DSV41_ATTN_FA").as_deref() == Ok("1");
+            let name = match (hpc, fa) {
+                (16, false) => "dsv41_sparse_attn_mma",
+                (32, false) => "dsv41_sparse_attn_mma32h",
+                (64, false) => "dsv41_sparse_attn_mma64",
+                (16, true) => "dsv41_sparse_attn_fa16h",
+                (32, true) => "dsv41_sparse_attn_fa32h",
+                (o, _) => anyhow::bail!("ATLAS_DSV41_ATTN_HPC={o}: use 16, 32 or 64 (16 or 32 with ATLAS_DSV41_ATTN_FA=1)"),
             };
             Some((gpu.kernel(ATTN_MODULE, name).with_context(|| format!("{name} not in the PTX"))?, hpc))
         };
@@ -404,6 +412,13 @@ impl Dsv41SparseCore {
 
         let n_pad_max = score_width(max_seq);
         let score_bytes = score_scratch_bytes(max_chunk, max_seq);
+        // ATLAS_DSV41_SCORE_ROWS: GATE ONLY -- force smaller row blocks to prove blocking changes no
+        // byte (runJ digest A/B). Never larger than the budget allows.
+        let score_rows = match std::env::var("ATLAS_DSV41_SCORE_ROWS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(r) => r.clamp(DECODE_MAX_T, score_rows_per_block(max_chunk, max_seq)),
+            None => score_rows_per_block(max_chunk, max_seq),
+        };
+        ensure!(score_rows >= DECODE_MAX_T, "score blocks of {score_rows} rows cannot hold a decode pass");
         let row = HEAD_DIM * 4;
         let s = Scratch {
             xf: alloc(max_chunk * HIDDEN * 4)?,
@@ -417,8 +432,9 @@ impl Dsv41SparseCore {
             wts: alloc(max_chunk * INDEX_HEADS * 4)?,
             score: alloc(score_bytes)?,
             score_bytes,
-            cand: alloc(max_chunk * n_pad_max)?,
-            blocks: alloc(max_chunk * n_pad_max.div_ceil(CANDIDATE_BLOCK_SIZE) * 4)?,
+            score_rows,
+            cand: alloc(max_chunk * cand_row_bytes(n_pad_max))?,
+            blocks: alloc(score_rows * n_pad_max.div_ceil(CANDIDATE_BLOCK_SIZE) * 4)?,
             pad_in: alloc(MM_TILE * HIDDEN * 4)?,
             pad_out: alloc(MM_TILE * INDEX_HEADS * INDEX_HEAD_DIM * 4)?,
             iks: alloc(DECODE_MAX_T * INDEX_HEAD_DIM * 2)?,
@@ -427,15 +443,19 @@ impl Dsv41SparseCore {
         let part = alloc(DECODE_MAX_T * 64 * (WINDOW + INDEX_TOPK).div_ceil(DECODE_SLICE) * (2 + HEAD_DIM) * 4)?;
         let tail = Tail {
             topk: [alloc(REPLAY_ROWS * INDEX_TOPK * 8)?, alloc(REPLAY_ROWS * INDEX_TOPK * 8)?],
-            cand: [alloc(REPLAY_ROWS * n_pad_max)?, alloc(REPLAY_ROWS * n_pad_max)?],
+            cand: [alloc(REPLAY_ROWS * cand_row_bytes(n_pad_max))?, alloc(REPLAY_ROWS * cand_row_bytes(n_pad_max))?],
             cand_cap: n_pad_max,
         };
         tracing::info!(
-            "dsv41 sparse core: {:.2} GB device (score scratch {:.1} MB = [{max_chunk}, {n_pad_max}] fp32; \
+            "dsv41 sparse core: {:.2} GB device (score scratch {:.1} MB = [{score_rows}, {n_pad_max}] fp32; \
              ckv/ik for max_seq {max_seq})",
             total.get() as f64 / 1e9,
             score_bytes as f64 / 1e6
         );
+        if std::env::var("ATLAS_DSV41_GEMM_F32_V1").as_deref() == Ok("1") {
+            // A/B arm only: the compressor's prefill projections back on the 64x64 GEMM.
+            super::index::GEMM_F32_V1.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if std::env::var("ATLAS_DSV41_GEMV_F32").as_deref() == Ok("0") {
             // A/B arm only: the ratio-2 compressor's small-M projections back on the 64x64 GEMM.
             super::index::GEMV_F32_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -579,7 +599,7 @@ impl Dsv41SparseCore {
         gpu.copy_d2d(ik, c.ik, rows * INDEX_HEAD_DIM * 2)?;
         let mut st = self.st.lock().expect("core state poisoned");
         let cur = st.tail.cur;
-        gpu.copy_d2d(cand, self.tail.cand[cur], tail_rows * cand_ld)?;
+        gpu.copy_d2d(cand, self.tail.cand[cur], tail_rows * cand_row_bytes(cand_ld))?;
         gpu.memset(self.tail.topk[cur], 0xFF, REPLAY_ROWS * INDEX_TOPK * 8)?;
         st.tail = TailState { cur, rows: tail_rows, ld: cand_ld };
         st.published = Some((c.ckv, c.ik, rows, c.ratio));
@@ -809,7 +829,7 @@ impl Dsv41SparseCore {
         }
         // Static: one fixed width; the kernels stop at score_width(n_c) for the start they read.
         let n_pad = if dstart.is_some() { self.static_ld } else { score_width(n_c) };
-        ensure!(t * n_pad * 4 <= s.score_bytes, "score [{t}, {n_pad}] exceeds the scratch");
+        ensure!(t.min(s.score_rows) * n_pad * 4 <= s.score_bytes, "score [{}, {n_pad}] exceeds the scratch", t.min(s.score_rows));
 
         // q_i = rope_c(bf16(qr @ dequant(wq_b)^T)); wts = bf16(x @ weights_proj^T) * 1/64
         self.prof.begin(ops)?;
@@ -840,22 +860,38 @@ impl Dsv41SparseCore {
             Some((mask, ld)) if layer > CANDIDATE_SOURCE_LAYER => Some(CandidateMask { mask, ld }),
             _ => None,
         };
-        match dstart {
-            Some(d) => iops.score_dev(s.qi, ik, s.wts, cand_in, s.score, t, n_pad, d, ratio)?,
-            None => iops.score(s.qi, ik, s.wts, cand_in, s.score, t, rows, n_pad, start, ratio)?,
-        }
-        self.prof.mark(ops, "index.score")?;
-        if layer == CANDIDATE_SOURCE_LAYER {
-            match dstart {
-                Some(d) => iops.select_candidates_dev(s.score, s.blocks, s.cand, t, n_pad, d, ratio, CANDIDATE_TOPK_BLOCKS, CANDIDATE_BLOCK_SIZE)?,
-                None => iops.select_candidates(s.score, s.blocks, s.cand, t, n_pad, start, ratio, CANDIDATE_TOPK_BLOCKS, CANDIDATE_BLOCK_SIZE)?,
+        let is_src = layer == CANDIDATE_SOURCE_LAYER;
+        if let Some(d) = dstart {
+            // Static decode/verify: t <= DECODE_MAX_T <= score_rows, one block.
+            iops.score_dev(s.qi, ik, s.wts, cand_in, s.score, t, n_pad, d, ratio)?;
+            self.prof.mark(ops, "index.score")?;
+            if is_src {
+                iops.select_candidates_dev(s.score, s.blocks, s.cand, t, n_pad, d, ratio, CANDIDATE_TOPK_BLOCKS, CANDIDATE_BLOCK_SIZE)?;
+                self.prof.mark(ops, "index.candidates")?;
             }
-            st.cand = Some((s.cand, n_pad));
-            self.prof.mark(ops, "index.candidates")?;
+            iops.topk_dev(s.score, w.topk, t, n_pad, d, ratio)?;
+        } else {
+            // Row blocks of score_rows: score, candidates and top-k are all per row (row r's
+            // compress_lens comes from its absolute position start + r0 + r), so blocking changes
+            // no byte; it bounds the scratch at long context.
+            for r0 in (0..t).step_by(s.score_rows) {
+                let r = s.score_rows.min(t - r0);
+                let cand_b = cand_in.map(|c| CandidateMask { mask: c.mask.offset(r0 * cand_row_bytes(c.ld)), ld: c.ld });
+                iops.score(s.qi.offset(r0 * qrow), ik, s.wts.offset(r0 * INDEX_HEADS * 4), cand_b, s.score, r, rows, n_pad, start + r0, ratio)?;
+                self.prof.mark(ops, "index.score")?;
+                if is_src {
+                    let cand_out = s.cand.offset(r0 * cand_row_bytes(n_pad));
+                    iops.select_candidates(s.score, s.blocks, cand_out, r, n_pad, start + r0, ratio, CANDIDATE_TOPK_BLOCKS, CANDIDATE_BLOCK_SIZE)?;
+                    self.prof.mark(ops, "index.candidates")?;
+                }
+                iops.topk(s.score, w.topk.offset(r0 * INDEX_TOPK * 8), r, n_pad, n_c)?;
+                if r0 + r < t {
+                    self.prof.mark(ops, "index.topk")?;
+                }
+            }
         }
-        match dstart {
-            Some(d) => iops.topk_dev(s.score, w.topk, t, n_pad, d, ratio)?,
-            None => iops.topk(s.score, w.topk, t, n_pad, n_c)?,
+        if is_src {
+            st.cand = Some((s.cand, n_pad));
         }
         st.topk = Some(w.topk);
         self.prof.mark(ops, "index.topk")?;
@@ -881,15 +917,18 @@ impl Dsv41SparseCore {
         let (src, dst) = (tl.cur, 1 - tl.cur);
         let (tk, cd) = (&self.tail.topk, &self.tail.cand);
         // Older rows were scored against fewer columns: pad with 0, as _rep_tail pads False.
-        gpu.memset_async(cd[dst], 0, REPLAY_ROWS * n_pad, stream)?;
+        // Bit rows (cand_row_bytes): a narrower older row's bits are its leading blocks, and the
+        // zeroed rest reads as "not a candidate", exactly as the byte form padded False.
+        let (old_rb, new_rb) = (cand_row_bytes(tl.ld), cand_row_bytes(n_pad));
+        gpu.memset_async(cd[dst], 0, REPLAY_ROWS * new_rb, stream)?;
         if keep > 0 {
             let from = tl.rows - keep;
             gpu.copy_d2d_async(tk[src].offset(from * INDEX_TOPK * 8), tk[dst], keep * INDEX_TOPK * 8, stream)?;
-            gpu.copy_d2d_2d_async(cd[src].offset(from * tl.ld), tl.ld, cd[dst], n_pad, tl.ld, keep, stream)?;
+            gpu.copy_d2d_2d_async(cd[src].offset(from * old_rb), old_rb, cd[dst], new_rb, old_rb, keep, stream)?;
         }
         let from = t - take;
         gpu.copy_d2d_async(topk.offset(from * INDEX_TOPK * 8), tk[dst].offset(keep * INDEX_TOPK * 8), take * INDEX_TOPK * 8, stream)?;
-        gpu.copy_d2d_2d_async(self.s.cand.offset(from * n_pad), n_pad, cd[dst].offset(keep * n_pad), n_pad, n_pad, take, stream)?;
+        gpu.copy_d2d_2d_async(self.s.cand.offset(from * new_rb), new_rb, cd[dst].offset(keep * new_rb), new_rb, new_rb, take, stream)?;
         *tl = TailState { cur: dst, rows: keep + take, ld: n_pad };
         Ok(())
     }
@@ -1176,5 +1215,7 @@ mod tests {
     fn score_scratch_is_one_chunk_by_the_widest_row() {
         assert_eq!(score_scratch_bytes(512, 8192), 512 * 8192 * 4);
         assert_eq!(score_scratch_bytes(512, 8193), 512 * 8704 * 4);
+        // 1M context: row blocks, not the chunk -- under the 1 GiB budget at any chunk.
+        assert_eq!(score_scratch_bytes(3968, 1 << 20), 224 * (1 << 20) * 4);
     }
 }

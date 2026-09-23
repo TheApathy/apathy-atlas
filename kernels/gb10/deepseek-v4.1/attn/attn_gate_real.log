@@ -24,12 +24,15 @@ PRODUCTION entry (i64 idx, bf16 out)            : 0/4849664 differ from bf16(fp3
 PRODUCTION entry (i64 idx, bf16 out) window-only: 0/4849664 differ from bf16(fp32 kernel) | CTRL other mode: 4809958 differ
 PRODUCTION entry w32 (i32 wpos, i64 idx, bf16) : 0/4849664 differ from bf16(fp32 kernel)
 SPLIT-KV decode entry (S=20 x 32 keys + combine): 733/4849664 bf16 differ from bf16(one-pass) (99.9849% identical), vs fp32 ref rel_l2=1.663e-03 | CTRL last split dropped: 2667024 differ
-T=1 latency (GPU-lock held, nothing else running): one-pass 523.8 us
-    split SLICE=64 (S=10,  80 CTAs) + combine 87.9 us (6.0x)  [split alone 83.2, combine alone 4.1]
-    split SLICE=32 (S=20, 160 CTAs) + combine 88.9 us (5.9x)  [split alone 82.7, combine alone 5.8]
-    split SLICE=16 (S=40, 320 CTAs) + combine 81.9 us (6.4x)  [split alone 73.7, combine alone 6.2]
-    split SLICE= 8 (S=80, 640 CTAs) + combine 91.0 us (5.8x)  [split alone 78.4, combine alone 10.2]
-MMA prefill entry: 4819/4849664 bf16 differ from bf16(one-pass) (99.9006% identical); vs fp32 ref: mma 1.663e-03 (bf16-rounded one-pass 1.663e-03) | CTRL compressed rows dropped: 4809961 differ | T=148: one-pass 8.235 ms, mma 0.476 ms (17.3x)
-MMA64 prefill entry (64 heads/CTA): 0/4849664 differ from mma16 (must be 0) | T=148: 0.479 ms (0.99x mma16)
-MMA32H prefill entry (32 heads/CTA): 0/4849664 differ from mma16 (must be 0) | T=148: 0.442 ms (1.08x mma16)
+T=1 latency (GPU-lock held, nothing else running): one-pass 532.9 us
+    split SLICE=64 (S=10,  80 CTAs) + combine 88.0 us (6.1x)  [split alone 85.1, combine alone 4.1]
+    split SLICE=32 (S=20, 160 CTAs) + combine 89.2 us (6.0x)  [split alone 82.2, combine alone 7.6]
+    split SLICE=16 (S=40, 320 CTAs) + combine 84.3 us (6.3x)  [split alone 73.8, combine alone 6.8]
+    split SLICE= 8 (S=80, 640 CTAs) + combine 91.9 us (5.8x)  [split alone 75.9, combine alone 10.2]
+MMA prefill entry: 4819/4849664 bf16 differ from bf16(one-pass) (99.9006% identical); vs fp32 ref: mma 1.663e-03 (bf16-rounded one-pass 1.663e-03) | CTRL compressed rows dropped: 4809961 differ | T=148: one-pass 8.287 ms, mma 0.479 ms (17.3x)
+MMA64 prefill entry (64 heads/CTA): 0/4849664 differ from mma16 (must be 0) | T=148: 0.499 ms (0.96x mma16)
+MMA32H prefill entry (32 heads/CTA): 0/4849664 differ from mma16 (must be 0) | T=148: 0.453 ms (1.06x mma16)
+FA16H prefill entry: 0/4849664 differ from mma16 (must be 0) | CTRL scale*(1+2^-10): 1662993 differ (must be > 0) | T=148: 0.621 ms (0.73x mma32h)
+FA32H prefill entry: 0/4849664 differ from mma16 (must be 0) | CTRL scale*(1+2^-10): 1662993 differ (must be > 0) | T=148: 0.464 ms (0.98x mma32h)
+PIPE mma16p (ldmatrix.trans PV, cp.async gather)PIPE mma32p (ldmatrix.trans PV, cp.async gather)T=2072 (fixture x14): mma32h 5.527 ms (47.2 TF/s) | fa16h 10.536 ms (0.52x) | fa32h 6.575 ms (0.84x) | mma16p 10.292 ms (0.54x) | mma32p 5.956 ms (0.93x, 43.8 TF/s)
 PASS one-pass streaming gather (controls separate)
