@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use atlas_core::config::parse_config;
 use spark_model::layers::deepseek_v41_attn::core::{Dsv41SparseCore, HEAD_DIM, REPLAY_ROWS};
-use spark_model::layers::deepseek_v41_attn::index::INDEX_TOPK;
+use spark_model::layers::deepseek_v41_attn::index::{INDEX_TOPK, pack_cand};
 use spark_model::weight_loader::deepseek_v41::attn_block::{AttnCore, CoreArgs, window_positions};
 use spark_model::weight_loader::deepseek_v41::forward::{PassHook, PassKind};
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops, RopeSpec, bytemuck_i32};
@@ -82,7 +82,7 @@ fn main() -> Result<()> {
     let ld = cand_in.len() / REPLAY_ROWS;
     let start = rows - REPLAY_ROWS; // ratio 1: rows == prompt length
     println!("run {run}: prompt {rows} tokens, replay rows {start}..{rows}, candidate width {ld}");
-    core.gate_seed_replay(g, up(&ckv)?, up(&tap(24, "ik")?)?, rows, up(&cand_in)?, ld, REPLAY_ROWS)?;
+    core.gate_seed_replay(g, up(&ckv)?, up(&tap(24, "ik")?)?, rows, up(&pack_cand(&cand_in, REPLAY_ROWS, ld)?)?, ld, REPLAY_ROWS)?;
     ensure!(tap(28, "cand_in")? == cand_in, "L24 and L28 must see the same replay candidate pool");
 
     let wpos = up(bytemuck_i32(&window_positions(start, REPLAY_ROWS)))?;
@@ -96,7 +96,7 @@ fn main() -> Result<()> {
             let ik = tap(24, "ik")?;
             let mut shifted = ik[128 * 2..].to_vec();
             shifted.extend(vec![0u8; 128 * 2]);
-            core.gate_seed_replay(g, up(&ckv)?, up(&shifted)?, rows, up(&cand_in)?, ld, REPLAY_ROWS)?;
+            core.gate_seed_replay(g, up(&ckv)?, up(&shifted)?, rows, up(&pack_cand(&cand_in, REPLAY_ROWS, ld)?)?, ld, REPLAY_ROWS)?;
         }
         core.begin_pass(PassKind::Replay, start, REPLAY_ROWS)?;
         for l in [24usize, 28] {

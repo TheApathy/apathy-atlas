@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use atlas_core::config::parse_config;
 use spark_model::layers::deepseek_v41_attn::core::{Dsv41SparseCore, HEAD_DIM, REPLAY_ROWS};
-use spark_model::layers::deepseek_v41_attn::index::INDEX_TOPK;
+use spark_model::layers::deepseek_v41_attn::index::{INDEX_TOPK, cand_row_bytes, unpack_cand};
 use spark_model::weight_loader::deepseek_v41::attn_block::{AttnCore, CoreArgs};
 use spark_model::weight_loader::deepseek_v41::forward::{PassHook, PassKind};
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops, RopeSpec, bytemuck_i32};
@@ -28,7 +28,11 @@ use spark_runtime::weights::{SafetensorsLoader, WeightLoader};
 
 const MODEL_DIR: &str = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K";
 const REF_ROOT: &str = "/home/flocka/atlas/DSV41_PORT/oracle/ref";
-const MAX_SEQ: usize = 8192;
+/// `ATLAS_GATE_MAX_SEQ` (e.g. 1048576) runs the same gate on the long-context layout: score row
+/// blocks, the full-width static decode score, 1M-row caches. The results must not change.
+fn max_seq() -> usize {
+    std::env::var("ATLAS_GATE_MAX_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(8192)
+}
 const QROW: usize = 64 * HEAD_DIM * 2;
 
 fn i64s(b: &[u8]) -> Vec<i64> {
@@ -85,12 +89,26 @@ impl G<'_> {
     }
 }
 
+/// FNV-1a over every top-k row, attention output and replay-tail mask the gate downloads, in
+/// order: two runs that differ in no byte print the same DIGEST (the score-row-block A/B).
+static DIGEST: std::sync::Mutex<u64> = std::sync::Mutex::new(0xcbf29ce484222325);
+fn digest(b: &[u8]) {
+    let mut h = DIGEST.lock().unwrap();
+    for &x in b {
+        *h = (*h ^ u64::from(x)).wrapping_mul(0x100000001b3);
+    }
+}
+
 /// (rows whose top-k differs, attention bf16-exact share, rel_l2) for one core call vs capture.
 fn score(g: &G, core: &Dsv41SparseCore, l: usize, occ: usize, t: usize, out: DevicePtr) -> Result<(usize, f64, f64)> {
-    let tk = i64s(&g.down(core.current_topk().context("no topk")?, t * INDEX_TOPK * 8)?);
+    let tk_b = g.down(core.current_topk().context("no topk")?, t * INDEX_TOPK * 8)?;
+    digest(&tk_b);
+    let tk = i64s(&tk_b);
     let want = i64s(&g.tap(l, "topk", occ)?);
     let bad = (0..t).filter(|r| tk[r * INDEX_TOPK..(r + 1) * INDEX_TOPK] != want[r * INDEX_TOPK..(r + 1) * INDEX_TOPK]).count();
-    let o = u16s(&g.down(out, t * QROW)?);
+    let o_b = g.down(out, t * QROW)?;
+    digest(&o_b);
+    let o = u16s(&o_b);
     let w = u16s(&g.tap(l, "attn_o_pre_inverse_rope", occ)?);
     let ex = o.iter().zip(&w).filter(|(a, b)| a == b).count() as f64 / w.len() as f64;
     let (mut n, mut d) = (0.0, 0.0);
@@ -123,7 +141,7 @@ fn main() -> Result<()> {
     }));
     let store = loader.load(Path::new(MODEL_DIR), gpu.as_ref(), 0)?;
     let spec = RopeSpec { dim: 64, original_seq_len: 65536, base: 160000.0, factor: 16.0, beta_fast: 32.0, beta_slow: 1.0 };
-    let core = Dsv41SparseCore::load_prefix(&(gpu.clone() as spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu), &store, &config, MAX_SEQ, 512, spec.upload(gpu.as_ref(), MAX_SEQ + 8)?, 37)?;
+    let core = Dsv41SparseCore::load_prefix(&(gpu.clone() as spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu), &store, &config, max_seq(), 512, spec.upload(gpu.as_ref(), max_seq() + 8)?, 37)?;
     let out = gpu.alloc(512 * QROW)?;
     let mut fail = 0usize;
 
@@ -146,7 +164,8 @@ fn main() -> Result<()> {
         let (tk, cand, ld, rows) = core.replay_tail();
         let want = g.tap(24, "cand_in", 0)?;
         let wld = want.len() / REPLAY_ROWS;
-        let got = g.down(cand, rows * ld)?;
+        let got = unpack_cand(&g.down(cand, rows * cand_row_bytes(ld))?, rows, ld);
+        digest(&got);
         let mut diff = 0usize;
         for r in 0..REPLAY_ROWS {
             for c in 0..wld {
@@ -210,6 +229,7 @@ fn main() -> Result<()> {
     println!("DECODE total: {} top-k rows differ over {} layer-steps (band: at most 1 per step, at ties); worst attention {:.4}", worst.0, steps * 6, worst.1);
     fail += usize::from(worst.0 > steps);
 
+    println!("DIGEST {:016x} (score row blocks: ATLAS_DSV41_SCORE_ROWS={})", *DIGEST.lock().unwrap(), std::env::var("ATLAS_DSV41_SCORE_ROWS").unwrap_or_else(|_| "default".into()));
     ensure!(fail == 0, "RUNJ GATE FAIL ({fail})");
     println!("RUNJ GATE PASS");
     Ok(())

@@ -1,0 +1,18 @@
+DeepSeek-V4 YaRN parameters: factor=16.0, beta_fast=32.0, beta_slow=1.0, original_max_pos=65536, mscale=0.0, mscale_all_dim=0.0
+prompt state built: 1044 positions
+D0 dynamic with the fp32 GEMV OFF vs ON: top-k differs on 0/48, attention on 0/48 (first: -); caches identical: true
+S  static, own device start: top-k differs on 0/48 layer-passes, attention on 0/48 (first: -); caches identical: true
+G  one graph, replayed 7x at moving starts: top-k differs on 0/48, attention on 0/48 (first: -); caches identical: true
+CONTROL graph with the start FROZEN at 1044: top-k differs on 42/48, attention on 42/48 (first: Decode s1 T1 L02); caches identical: false (must differ)
+V  verify T=3/2/5 + rollbacks, static vs dynamic: top-k differs on 0/24, attention on 0/24 (first: -); caches identical: true
+F  M=1: GEMV byte-identical to GEMM: true | GEMM 282 us, GEMV 66 us (4.3x)
+F  M=2: GEMV byte-identical to GEMM: true | GEMM 283 us, GEMV 70 us (4.1x)
+F  M=6: GEMV byte-identical to GEMM: true | GEMM 287 us, GEMV 81 us (3.6x)
+F  M=8: GEMV byte-identical to GEMM: true | GEMM 293 us, GEMV 74 us (3.9x)
+F  M=16: GEMV byte-identical to GEMM: true | GEMM 287 us, GEMV 96 us (3.0x)
+F  CONTROL one flipped input bit: output differs: true (must)
+F  prefill M=17: GEMM v2 byte-identical to v1: true | v1 0.349 ms, v2 0.288 ms (1.21x, 0.3 TF/s)
+F  prefill M=128: GEMM v2 byte-identical to v1: true | v1 0.680 ms, v2 0.398 ms (1.71x, 1.7 TF/s)
+F  prefill M=512: GEMM v2 byte-identical to v1: true | v1 0.677 ms, v2 0.422 ms (1.61x, 6.4 TF/s)
+F  prefill M=2048: GEMM v2 byte-identical to v1: true | v1 1.681 ms, v2 1.022 ms (1.64x, 10.5 TF/s)
+CORE STATIC GATE PASS

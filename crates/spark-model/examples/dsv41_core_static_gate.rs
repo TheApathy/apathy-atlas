@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use atlas_core::config::parse_config;
 use spark_model::layers::deepseek_v41_attn::core::{Dsv41SparseCore, HEAD_DIM, REPLAY_ROWS};
-use spark_model::layers::deepseek_v41_attn::index::{GEMV_F32_OFF, INDEX_HEAD_DIM, INDEX_TOPK, IndexKernels, IndexOps};
+use spark_model::layers::deepseek_v41_attn::index::{GEMM_F32_V1, GEMV_F32_OFF, INDEX_HEAD_DIM, INDEX_TOPK, IndexKernels, IndexOps};
 use std::sync::atomic::Ordering;
 use spark_model::weight_loader::deepseek_v41::attn_block::{AttnCore, CoreArgs};
 use spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu;
@@ -41,7 +41,11 @@ use spark_runtime::weights::{SafetensorsLoader, WeightLoader};
 
 const MODEL_DIR: &str = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K";
 const REF_ROOT: &str = "/home/flocka/atlas/DSV41_PORT/oracle/ref";
-const MAX_SEQ: usize = 8192;
+/// `ATLAS_GATE_MAX_SEQ` (e.g. 1048576) runs the same gate on the long-context layout: score row
+/// blocks, the full-width static decode score, 1M-row caches. The results must not change.
+fn max_seq() -> usize {
+    std::env::var("ATLAS_GATE_MAX_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(8192)
+}
 const QROW: usize = 64 * HEAD_DIM * 2;
 const PROMPT: usize = 1044;
 const STEPS: usize = 8;
@@ -228,7 +232,7 @@ fn main() -> Result<()> {
     }));
     let store = loader.load(Path::new(MODEL_DIR), gpu.as_ref(), 0)?;
     let spec = RopeSpec { dim: 64, original_seq_len: 65536, base: 160000.0, factor: 16.0, beta_fast: 32.0, beta_slow: 1.0 };
-    let core = Dsv41SparseCore::load_prefix(&(gpu.clone() as SharedGpu), &store, &config, MAX_SEQ, 512, spec.upload(gpu.as_ref(), MAX_SEQ + 8)?, 37)?;
+    let core = Dsv41SparseCore::load_prefix(&(gpu.clone() as SharedGpu), &store, &config, max_seq(), 512, spec.upload(gpu.as_ref(), max_seq() + 8)?, 37)?;
     core.set_static_decode(false);
 
     // ---- prompt state: encoder chunks at L2/L20, replay at L24..36 (all dynamic)
@@ -398,6 +402,30 @@ fn main() -> Result<()> {
         println!("F  CONTROL one flipped input bit: output differs: {} (must)", gc != g1);
         fail += usize::from(gc == g1);
         GEMV_F32_OFF.store(false, Ordering::Relaxed);
+
+        // PREFILL M: the 128x64 register-blocked GEMM (v2) vs the 64x64 original (v1).
+        let mmax = 2048usize;
+        let (pa_h, pa, pc) = (rnd(mmax * k), gpu.alloc(mmax * k * 4)?, gpu.alloc(mmax * n * 4)?);
+        gpu.copy_h2d(&pa_h, pa)?;
+        let prun = |m: usize, v1: bool| -> Result<(Vec<u8>, f64)> {
+            GEMM_F32_V1.store(v1, Ordering::Relaxed);
+            iops.gemm_f32(pa, b, pc, m, n, k)?;
+            let out = g.down(pc, m * n * 4)?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..10 {
+                iops.gemm_f32(pa, b, pc, m, n, k)?;
+            }
+            gpu.synchronize(stream)?;
+            Ok((out, t0.elapsed().as_secs_f64() * 1e3 / 10.0))
+        };
+        for m in [17usize, 128, 512, 2048] {
+            let (o2, t2) = prun(m, false)?;
+            let (o1, t1) = prun(m, true)?;
+            let tf = 2.0 * (m * n * k) as f64 / (t2 * 1e9);
+            println!("F  prefill M={m}: GEMM v2 byte-identical to v1: {} | v1 {t1:.3} ms, v2 {t2:.3} ms ({:.2}x, {tf:.1} TF/s)", o2 == o1, t1 / t2);
+            fail += usize::from(o2 != o1);
+        }
+        GEMM_F32_V1.store(false, Ordering::Relaxed);
     }
 
     ensure!(fail == 0, "CORE STATIC GATE FAIL ({fail})");

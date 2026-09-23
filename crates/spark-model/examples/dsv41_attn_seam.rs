@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use atlas_core::config::parse_config;
 use spark_model::layers::deepseek_v41_attn::core::{Dsv41SparseCore, HEAD_DIM, REPLAY_ROWS};
-use spark_model::layers::deepseek_v41_attn::index::INDEX_TOPK;
+use spark_model::layers::deepseek_v41_attn::index::{INDEX_TOPK, cand_row_bytes, unpack_cand};
 use spark_model::weight_loader::deepseek_v41::attn_block::{AttnCore, CoreArgs, window_positions};
 use spark_model::weight_loader::deepseek_v41::forward::{PassHook, PassKind};
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops, RopeSpec, bytemuck_i32};
@@ -225,7 +225,7 @@ fn main() -> Result<()> {
     }
     {
         let (cand, ld) = core.current_candidates().context("L20 candidates")?;
-        let got = dev.down(cand, CHUNK * ld)?;
+        let got = unpack_cand(&dev.down(cand, CHUNK * cand_row_bytes(ld))?, CHUNK, ld);
         let want = cap.tap(20, "cand_out", 1)?;
         let diff = got.iter().zip(&want).filter(|(g, w)| (**g != 0) != (**w != 0)).count();
         println!("L20 chunk 1: candidates differ {diff}/{} (ld {ld})", want.len());
