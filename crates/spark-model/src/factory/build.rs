@@ -74,9 +74,9 @@ pub fn build_model(
         // Window6: 2048-token chunks 814 -> 1334 tok/s vs 512 (byte-identical). ATLAS_DSV41_CHUNK
         // overrides the whole policy with one fixed chunk.
         let explicit = std::env::var("ATLAS_DSV41_CHUNK").ok().and_then(|v| v.parse::<usize>().ok());
-        // Scratch is sized for 3968 (the core's RING - WINDOW cap); a prefill uses it only for
-        // prompts >= forward::LONG_PROMPT tokens and 2048-token chunks below that (window10:
-        // 8192-token prompt 1791 vs 1712 tok/s, byte-identical; costs ~1.5 GB of low-water).
+        // Scratch is sized for 3968 (the core's RING - WINDOW cap); a prefill splits a prompt into
+        // the fewest equal chunks of at most that (forward::balanced_chunk_len; window10: 8192-token
+        // prompt 1791 vs 1712 tok/s at 2048, byte-identical; costs ~1.5 GB of low-water).
         let mut max_chunk = explicit.unwrap_or(3968).min(max_seq_len);
         // Pre-registered (lead, window7): DSpark's drafter adds 7.93 GB; with it, chunk 2048
         // measured a 22 GB MemAvailable low-water (serve8d) < the 24 GB bar, so DSpark caps the

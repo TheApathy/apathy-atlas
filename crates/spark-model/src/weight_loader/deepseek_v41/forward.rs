@@ -37,10 +37,24 @@ use crate::layers::deepseek_v41_engram::{
 /// every run.
 pub const ENGRAM_DEBUG_ENV: &str = "ATLAS_DSV41_ENGRAM_DEBUG";
 
-/// Prompts at least this long prefill in `max_chunk` pieces; shorter ones in [`SHORT_CHUNK`].
+/// Legacy policy only: prompts at least this long prefill in `max_chunk` pieces; shorter ones in
+/// [`SHORT_CHUNK`].
 pub const LONG_PROMPT: usize = 6144;
-/// The chunk for prompts under [`LONG_PROMPT`] tokens (window8: faster than 3968 at 4096 tokens).
+/// Legacy policy only: the chunk for prompts under [`LONG_PROMPT`] tokens.
 pub const SHORT_CHUNK: usize = 2048;
+/// Balanced chunks are rounded up to a multiple of this.
+pub const CHUNK_ALIGN: usize = 128;
+/// A/B controls, read per prefill: `legacy` = the old [`LONG_PROMPT`]/[`SHORT_CHUNK`] rule, a
+/// number N = fixed chunks of min(N, max_chunk). Unset or `balanced` = [`balanced_chunk_len`].
+pub const CHUNK_POLICY_ENV: &str = "ATLAS_DSV41_CHUNK_POLICY";
+
+/// The fewest chunks of at most `max_chunk` that cover `n` tokens, sized equally (rounded up to
+/// [`CHUNK_ALIGN`]) so there is no tiny tail re-paying the per-chunk costs: 8192 at 3968 is
+/// 2816+2816+2560, not 3968+3968+256; 4096 is 2048+2048, not 3968+128.
+pub fn balanced_chunk_len(n: usize, max_chunk: usize) -> usize {
+    let pieces = n.div_ceil(max_chunk).max(1);
+    n.div_ceil(pieces).next_multiple_of(CHUNK_ALIGN).min(max_chunk)
+}
 
 fn engram_debug() -> bool {
     std::env::var(ENGRAM_DEBUG_ENV).is_ok()
@@ -855,7 +869,7 @@ impl V41Forward {
         logits: DevicePtr,
     ) -> Result<()> {
         ensure!(!ids.is_empty(), "empty prompt");
-        let chunk_len = self.prefill_chunk_len(ids.len());
+        let chunk_len = self.prefill_chunk_len(ids.len())?;
         let prefetch = !self.engram.is_empty() && std::env::var("ATLAS_DSV41_ENGRAM_PREFETCH").as_deref() != Ok("0");
         if !prefetch {
             for chunk in ids.chunks(chunk_len) {
@@ -953,12 +967,19 @@ impl V41Forward {
         Ok(())
     }
 
-    /// The chunk a whole-prompt prefill of `n` tokens uses (window10, 8192-token prompt: chunk 3968
-    /// 1791 vs chunk 2048 1712 tok/s, logits byte-identical; on a 2048-4096 prompt 3968 lost to
-    /// 2048): `max_chunk` for prompts of at least [`LONG_PROMPT`] tokens, else at most
-    /// [`SHORT_CHUNK`]. Output does not depend on it (chunk invariance).
-    pub fn prefill_chunk_len(&self, n: usize) -> usize {
-        if n >= LONG_PROMPT { self.max_chunk } else { self.max_chunk.min(SHORT_CHUNK) }
+    /// The chunk a whole-prompt prefill of `n` tokens uses: [`balanced_chunk_len`] (window10,
+    /// 8192-token prompt: chunk 3968 1791 vs chunk 2048 1712 tok/s; on 4096, 3968+128 lost to
+    /// 2048+2048 -- the tail re-pays the per-chunk costs). [`CHUNK_POLICY_ENV`]`=legacy` restores
+    /// the fixed rule. Output does not depend on it (chunk invariance).
+    pub fn prefill_chunk_len(&self, n: usize) -> Result<usize> {
+        Ok(match std::env::var(CHUNK_POLICY_ENV).as_deref() {
+            Err(_) | Ok("balanced") => balanced_chunk_len(n, self.max_chunk),
+            Ok("legacy") => if n >= LONG_PROMPT { self.max_chunk } else { self.max_chunk.min(SHORT_CHUNK) },
+            Ok(v) => match v.parse::<usize>() {
+                Ok(c) if c > 0 => c.min(self.max_chunk),
+                _ => anyhow::bail!("{CHUNK_POLICY_ENV}={v}: expected balanced, legacy or a chunk size"),
+            },
+        })
     }
 
     /// Compute every chunk's engram hashes up front (cheap, CPU-only, must be sequential --
@@ -969,7 +990,7 @@ impl V41Forward {
         let mut start = seq.len;
         let mut hashes_by_start = Vec::new();
         let mut jobs: Vec<(usize, usize, Vec<i64>)> = Vec::new();
-        for chunk in ids.chunks(self.prefill_chunk_len(ids.len())) {
+        for chunk in ids.chunks(self.prefill_chunk_len(ids.len())?) {
             let t = chunk.len();
             let hashes = seq.hash.forward(chunk, start, None)?;
             for &(l, _) in &self.engram {
@@ -1189,5 +1210,32 @@ impl V41AttentionBlock for AttnAdapter<'_> {
             self.core,
             self.tap,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::balanced_chunk_len;
+
+    #[test]
+    fn balanced_chunk_len_splits_evenly_with_no_tiny_tail() {
+        assert_eq!(balanced_chunk_len(8192, 3968), 2816);
+        assert_eq!(balanced_chunk_len(4096, 3968), 2048);
+        assert_eq!(balanced_chunk_len(6144, 3968), 3072);
+        assert_eq!(balanced_chunk_len(16384, 3968), 3328);
+        assert_eq!(balanced_chunk_len(1024, 3968), 1024);
+        assert_eq!(balanced_chunk_len(8192, 2048), 2048);
+        assert_eq!(balanced_chunk_len(1, 1024), 128);
+    }
+
+    #[test]
+    fn balanced_chunk_len_uses_the_fewest_chunks_within_the_cap() {
+        for max in [1000, 1024, 2048, 3968] {
+            for n in 1..20_000 {
+                let c = balanced_chunk_len(n, max);
+                assert!(c >= 1 && c <= max, "n {n} max {max}: chunk {c}");
+                assert_eq!(n.div_ceil(c), n.div_ceil(max), "n {n} max {max}: chunk {c}");
+            }
+        }
     }
 }

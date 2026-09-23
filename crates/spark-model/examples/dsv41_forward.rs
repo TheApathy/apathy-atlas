@@ -241,6 +241,82 @@ impl PassHook for NoHook {
 /// attention core and the routed MoE teacher-forced from an all-layer capture (runH).
 /// Validates the orchestration end to end before the lanes' halves exist.
 #[allow(clippy::too_many_arguments)]
+/// `--policy-sweep LENS:POLICIES:REPS` (e.g. `3072,8192:2048,legacy,balanced:3`): one load, then
+/// for every length n the prompt cycled to n tokens is prefilled under each chunk policy
+/// (`forward::CHUNK_POLICY_ENV`). Pass 0 taps each policy into `<tap_dir>/n<n>_<policy>`; passes
+/// 1..=REPS are timed, policies interleaved so drift hits every arm alike.
+struct PolicySweep {
+    lens: Vec<usize>,
+    policies: Vec<String>,
+    reps: usize,
+}
+
+impl PolicySweep {
+    fn parse(v: &str) -> Result<Self> {
+        let parts: Vec<&str> = v.split(':').collect();
+        ensure!(parts.len() == 3, "--policy-sweep LENS:POLICIES:REPS, got {v}");
+        let lens = parts[0].split(',').map(|t| t.parse::<usize>().context("length")).collect::<Result<Vec<_>>>()?;
+        let policies: Vec<String> = parts[1].split(',').map(String::from).collect();
+        ensure!(!lens.is_empty() && !policies.is_empty(), "--policy-sweep needs lengths and policies");
+        Ok(Self { lens, policies, reps: parts[2].parse().context("reps")? })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_policy_sweep(
+    ops: &Ops,
+    fwd: &V41Forward,
+    dims: &V41Dims,
+    base_ids: &[u32],
+    sw: &PolicySweep,
+    tap_base: Option<&Path>,
+    hook: &dyn PassHook,
+    core: &dyn AttnCore,
+    moe: &dyn V41RoutedMoe,
+    logits: DevicePtr,
+    vocab: usize,
+) -> Result<()> {
+    use spark_model::weight_loader::deepseek_v41::forward::CHUNK_POLICY_ENV;
+    for &n in &sw.lens {
+        let ids: Vec<u32> = base_ids.iter().copied().cycle().take(n).collect();
+        let mut times: Vec<Vec<f64>> = vec![Vec::new(); sw.policies.len()];
+        for pass in 0..=sw.reps {
+            for (pi, pol) in sw.policies.iter().enumerate() {
+                // SAFETY: single-threaded here; prefill's worker threads are joined between passes.
+                unsafe { std::env::set_var(CHUNK_POLICY_ENV, pol) };
+                let tap = match (pass, tap_base) {
+                    (0, Some(d)) => Tap::to_dir(d.join(format!("n{n}_{pol}")), Vec::new())?,
+                    _ => Tap::off(),
+                };
+                let mut seq = V41Seq::new(ops.gpu, dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?;
+                ops.gpu.synchronize(ops.stream)?;
+                let t0 = std::time::Instant::now();
+                fwd.prefill(ops, &mut seq, &ids, PrefillMode::Replay, hook, core, moe, &tap, logits)?;
+                ops.gpu.synchronize(ops.stream)?;
+                let dt = t0.elapsed().as_secs_f64();
+                if pass == 0 {
+                    tap.bf16(ops, "logits_last", 40, logits, &[vocab])?;
+                    ops.gpu.synchronize(ops.stream)?;
+                } else {
+                    times[pi].push(dt);
+                }
+                seq.free(ops.gpu)?;
+                println!("sweep {} tokens policy {pol} chunk {} pass {pass}: {dt:.3}s = {:.1} tok/s", ids.len(), fwd.prefill_chunk_len(ids.len())?, ids.len() as f64 / dt);
+            }
+        }
+        for (pi, pol) in sw.policies.iter().enumerate() {
+            let mut v = times[pi].clone();
+            v.sort_by(f64::total_cmp);
+            if let Some(&med) = v.get(v.len() / 2) {
+                println!("SWEEP {} tokens policy {pol}: median {:.1} tok/s over {} passes (min {:.1}, max {:.1})", ids.len(), ids.len() as f64 / med, v.len(), ids.len() as f64 / v[v.len() - 1], ids.len() as f64 / v[0]);
+            }
+        }
+    }
+    unsafe { std::env::remove_var(CHUNK_POLICY_ENV) };
+    println!("DONE dsv41_forward path=model policy-sweep");
+    Ok(())
+}
+
 fn run_model_path(
     store: &spark_runtime::weights::WeightStore,
     ops: &Ops,
@@ -258,6 +334,7 @@ fn run_model_path(
     force_decode: bool,
     warm_prefill: bool,
     splits: Vec<Vec<usize>>,
+    policy_sweep: Option<PolicySweep>,
 ) -> Result<()> {
     let shared_dyn: spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu = gpu.clone();
     spark_model::model::dsv41::log_run_identity("driver", ops.stream);
@@ -313,6 +390,9 @@ fn run_model_path(
     };
     let mut seq = V41Seq::new(ops.gpu, &dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?;
     let logits = ops.gpu.alloc(spark_model::weight_loader::deepseek_v41::ops::MM_TILE * config.vocab_size * 2)?;
+    if let Some(sw) = &policy_sweep {
+        return run_policy_sweep(ops, &fwd, &dims, ids, sw, tap_base.as_deref(), hook, core, moe, logits, config.vocab_size);
+    }
     // --split: the SAME prompt prefilled under several chunkings, each into <tap_dir>/split_<i>
     // with a fresh sequence, for the chunk-invariance check. Then return.
     if !splits.is_empty() {
@@ -542,6 +622,7 @@ fn main() -> Result<()> {
     let mut decode_n = 0usize;
     let mut force_decode = false;
     let mut warm_prefill = false;
+    let mut policy_sweep: Option<PolicySweep> = None;
     let mut splits: Vec<Vec<usize>> = Vec::new();
     let mut engram_live = false;
     let mut engram_feed_h = false;
@@ -588,6 +669,7 @@ fn main() -> Result<()> {
             "--decode" => decode_n = args.next().context("--decode")?.parse()?,
             "--force-decode" => force_decode = true,
             "--warm-prefill" => warm_prefill = true,
+            "--policy-sweep" => policy_sweep = Some(PolicySweep::parse(&args.next().context("--policy-sweep")?)?),
             // --chunk N: prefill chunk (and every chunk-sized scratch) instead of the capture's.
             "--chunk" => chunk_override = Some(args.next().context("--chunk")?.parse()?),
             // --tile-prompt K: the capture's prompt repeated K times (speed/memory/identity only:
@@ -692,7 +774,7 @@ fn main() -> Result<()> {
     let stream = gpu.default_stream();
     let ops = Ops { gpu: gpu.as_ref(), k: &kernels, stream };
     if model_path {
-        return run_model_path(&store, &ops, &config, dims, &ref_dir, &ids, &chunks, n_layers, tap_dir, Arc::clone(&gpu), moe_real, attn_real, decode_n, force_decode, warm_prefill, splits);
+        return run_model_path(&store, &ops, &config, dims, &ref_dir, &ids, &chunks, n_layers, tap_dir, Arc::clone(&gpu), moe_real, attn_real, decode_n, force_decode, warm_prefill, splits, policy_sweep);
     }
     let blocks: Vec<V41BlockWeights> = (0..n_layers).map(|l| V41BlockWeights::load(&store, l, &dims, &ops)).collect::<Result<_>>()?;
     let largest = blocks
