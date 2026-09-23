@@ -192,70 +192,69 @@ pub(super) fn build_jinja_env(chat_template: &str) -> Result<minijinja::Environm
     Ok(env)
 }
 
-/// Try loading an override template from jinja-templates/{model_type}.jinja.
-pub(super) fn load_override_template(model_type: &str, repo_root: Option<&Path>) -> Option<String> {
-    // Check relative to repo root (Docker: /build, dev: /workspace/atlas)
-    let candidates = [
-        repo_root.map(|r| {
-            r.join(TEMPLATE_OVERRIDE_DIR)
-                .join(format!("{model_type}.jinja"))
-        }),
-        Some(std::path::PathBuf::from(TEMPLATE_OVERRIDE_DIR).join(format!("{model_type}.jinja"))),
-    ];
-    for candidate in candidates.into_iter().flatten() {
+/// The repo's `jinja-templates/` compiled into the binary, as `(relative path, text)`.
+///
+/// The override lookup used to be relative to the process CWD only, so the template a model
+/// served depended on where `spark` was launched from: from a checkout that has
+/// `glm5_next.jinja`, GLM-5.3 got the Atlas template (native image triplet), and from anywhere
+/// else it got the checkpoint's text-only one, which renders images as a refusal. Same binary,
+/// different prompts. The embedded copy is the last fallback, so an explicit directory still
+/// wins and a checkout still overrides (for template development).
+const EMBEDDED_TEMPLATES: &[(&str, &str)] = &[
+    ("gemma4.jinja", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../jinja-templates/gemma4.jinja"))),
+    ("glm5_next.jinja", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../jinja-templates/glm5_next.jinja"))),
+    ("mistral.jinja", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../jinja-templates/mistral.jinja"))),
+    ("nemotron_h.jinja", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../jinja-templates/nemotron_h.jinja"))),
+    ("qwen3_5.jinja", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../jinja-templates/qwen3_5.jinja"))),
+    ("qwen3_5_moe.jinja", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../jinja-templates/qwen3_5_moe.jinja"))),
+    (
+        "openai/qwen3_5_moe.jinja",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../jinja-templates/openai/qwen3_5_moe.jinja")),
+    ),
+];
+
+/// Candidate override files for `rel` (e.g. `qwen3_5.jinja`, `openai/x.jinja`):
+/// `$ATLAS_TEMPLATE_DIR`, then `<repo_root>/jinja-templates`, then `./jinja-templates`.
+fn override_candidates(rel: &str, repo_root: Option<&Path>) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(dir) = std::env::var_os("ATLAS_TEMPLATE_DIR") {
+        out.push(std::path::PathBuf::from(dir).join(rel));
+    }
+    if let Some(r) = repo_root {
+        out.push(r.join(TEMPLATE_OVERRIDE_DIR).join(rel));
+    }
+    out.push(std::path::PathBuf::from(TEMPLATE_OVERRIDE_DIR).join(rel));
+    out
+}
+
+/// Read the first existing override for `rel`, else the embedded copy.
+fn read_override(rel: &str, repo_root: Option<&Path>) -> Option<(String, String)> {
+    for candidate in override_candidates(rel, repo_root) {
         if candidate.exists() {
             match std::fs::read_to_string(&candidate) {
-                Ok(raw) => {
-                    let converted = convert_python_jinja_to_minijinja(&raw);
-                    tracing::info!(
-                        "Using override Jinja template from {} ({} chars)",
-                        candidate.display(),
-                        converted.len(),
-                    );
-                    return Some(converted);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read override template {}: {e}",
-                        candidate.display()
-                    );
-                }
+                Ok(raw) => return Some((raw, candidate.display().to_string())),
+                Err(e) => tracing::warn!("Failed to read override template {}: {e}", candidate.display()),
             }
         }
     }
-    None
+    EMBEDDED_TEMPLATES
+        .iter()
+        .find(|(name, _)| *name == rel)
+        .map(|(name, text)| ((*text).to_string(), format!("<embedded>/jinja-templates/{name}")))
+}
+
+/// Try loading an override template from jinja-templates/{model_type}.jinja.
+pub(super) fn load_override_template(model_type: &str, repo_root: Option<&Path>) -> Option<String> {
+    let (raw, from) = read_override(&format!("{model_type}.jinja"), repo_root)?;
+    let converted = convert_python_jinja_to_minijinja(&raw);
+    tracing::info!("Using override Jinja template from {from} ({} chars)", converted.len());
+    Some(converted)
 }
 
 /// Try loading an OpenAI-variant template from jinja-templates/openai/{model_type}.jinja.
 pub(super) fn load_openai_template(model_type: &str, repo_root: Option<&Path>) -> Option<String> {
-    let candidates = [
-        repo_root.map(|r| {
-            r.join(TEMPLATE_OVERRIDE_DIR)
-                .join("openai")
-                .join(format!("{model_type}.jinja"))
-        }),
-        Some(
-            std::path::PathBuf::from(TEMPLATE_OVERRIDE_DIR)
-                .join("openai")
-                .join(format!("{model_type}.jinja")),
-        ),
-    ];
-    for candidate in candidates.into_iter().flatten() {
-        if candidate.exists() {
-            match std::fs::read_to_string(&candidate) {
-                Ok(raw) => {
-                    return Some(convert_python_jinja_to_minijinja(&raw));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read OpenAI template {}: {e}",
-                        candidate.display()
-                    );
-                }
-            }
-        }
-    }
-    None
+    read_override(&format!("openai/{model_type}.jinja"), repo_root)
+        .map(|(raw, _)| convert_python_jinja_to_minijinja(&raw))
 }
 
 /// Load template from tokenizer_config.json in the model directory.
@@ -400,5 +399,28 @@ mod template_selection_tests {
         );
         assert_eq!(selected, "qwen36-established-override");
         assert!(!is_qwen38);
+    }
+}
+
+#[cfg(test)]
+mod embedded_template_tests {
+    use super::*;
+
+    /// Tests run with CWD = crates/spark-server, which has no jinja-templates/: the
+    /// override must still come from the embedded copy, byte-identical to the repo file.
+    /// Control: a model type with no override file gets none.
+    #[test]
+    fn overrides_resolve_without_a_checkout_in_cwd() {
+        assert!(!std::path::Path::new(TEMPLATE_OVERRIDE_DIR).exists());
+        let (raw, from) = read_override("glm5_next.jinja", None).expect("embedded glm5_next");
+        assert!(from.starts_with("<embedded>"), "{from}");
+        let on_disk = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../jinja-templates/glm5_next.jinja"
+        ))
+        .unwrap();
+        assert_eq!(raw, on_disk);
+        assert!(load_openai_template("qwen3_5_moe", None).is_some());
+        assert!(load_override_template("no_such_model_type", None).is_none());
     }
 }
