@@ -10,7 +10,7 @@
 
 use spark_runtime::fast_weights::FastSafetensorsLoader;
 use spark_runtime::gpu::mock::MockGpuBackend;
-use spark_runtime::weights::{SafetensorsLoader, WeightLoader};
+use spark_runtime::weights::{SafetensorsLoader, WeightDtype, WeightLoader};
 use std::io::Write;
 
 /// Build a minimal `model.safetensors` with two BF16 tensors and one U8 tensor.
@@ -107,6 +107,39 @@ fn extra_skip_excludes_tensors_from_preflight_and_upload() {
 
     let all = loader(false).load(&tmp, &MockGpuBackend::new(), 0).expect("no reserve");
     assert_eq!(all.len(), 3);
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// DeepSeek-V4.1's checkpoint dtypes beyond the basic set: F8_E8M0 (UE8M0 block scales) and I8
+/// (packed DSpark experts). Both loaders must accept them and agree byte for byte.
+#[test]
+fn fast_and_mmap_loaders_accept_e8m0_and_i8() {
+    let tmp = tempdir_like();
+    let s_bytes: Vec<u8> = (0..8).map(|i| 120 + i as u8).collect();
+    let p_bytes: Vec<u8> = (0..16).map(|i| (i * 17) as u8).collect();
+    let header = serde_json::json!({
+        "w.scale": { "dtype": "F8_E8M0", "shape": [2, 4], "data_offsets": [0, 8] },
+        "mtp.e": { "dtype": "I8", "shape": [16], "data_offsets": [8, 24] },
+    });
+    let header_bytes = serde_json::to_vec(&header).unwrap();
+    let mut f = std::fs::File::create(tmp.join("model.safetensors")).unwrap();
+    f.write_all(&(header_bytes.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(&header_bytes).unwrap();
+    f.write_all(&s_bytes).unwrap();
+    f.write_all(&p_bytes).unwrap();
+    f.sync_all().unwrap();
+
+    let (gb, gf) = (MockGpuBackend::new(), MockGpuBackend::new());
+    let base = SafetensorsLoader::new().load(&tmp, &gb, 0).expect("baseline load");
+    let mut fast = FastSafetensorsLoader::new();
+    fast.try_direct_io = false;
+    let new = fast.load(&tmp, &gf, 0).expect("fast load");
+    for (name, dtype) in [("w.scale", WeightDtype::FP8E8M0), ("mtp.e", WeightDtype::UInt8)] {
+        let (wb, wn) = (base.get(name).unwrap(), new.get(name).unwrap());
+        assert_eq!(wb.dtype, dtype, "{name}");
+        assert_eq!(wn.dtype, dtype, "{name}");
+        assert_eq!(gb.read_alloc(wb.ptr).unwrap(), gf.read_alloc(wn.ptr).unwrap(), "{name}");
+    }
     std::fs::remove_dir_all(&tmp).ok();
 }
 
