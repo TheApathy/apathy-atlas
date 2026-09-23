@@ -146,6 +146,9 @@ pub trait PassHook {
 
 /// Per-sequence state this module owns. (ckv / ik / pending belong to the attention lane.)
 pub struct V41Seq {
+    /// Unique per allocation (process-wide): CUDA graphs bake this sequence's buffers in and
+    /// are keyed by it, so a new sequence never replays a graph captured on a freed one.
+    pub id: u64,
     /// One window ring per layer, `[RING, 512]` bf16, slot = pos % RING.
     pub rings: Vec<DevicePtr>,
     pub hash: EngramHashState,
@@ -195,7 +198,9 @@ impl V41Seq {
                 Ok(r)
             })
             .collect::<Result<Vec<_>>>()?;
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             rings,
             hash,
             len: 0,
@@ -255,7 +260,8 @@ pub struct V41Forward {
 
 /// CUDA-graph state: the device start scalar, the engram rows gathered BEFORE the graph (the
 /// NVMe gather is host work and cannot be captured), and one instantiated graph per
-/// (pass kind, rows, sequence) -- the rings baked into a graph belong to one sequence.
+/// (pass kind, rows, sequence) -- the rings baked into a graph belong to one sequence, so the
+/// first pass of a new sequence destroys every graph of the previous one.
 pub struct GraphState {
     pub dstart: DevicePtr,
     /// (engram layer, rows buffer `[MAX_T, 24, 256]` f32).
@@ -263,6 +269,8 @@ pub struct GraphState {
     graphs: std::sync::Mutex<std::collections::HashMap<(u8, usize, u64), spark_runtime::gpu::GraphHandle>>,
     /// Graphs captured so far (a replay never adds one).
     pub captures: std::sync::atomic::AtomicUsize,
+    /// The `V41Seq::id` the cached graphs were captured on.
+    seq_id: std::sync::Mutex<Option<u64>>,
     /// Destroys every instantiated graph on drop (TUI model swap), when the forward owns its
     /// allocations (served model); the driver leaves this None.
     owner: Option<super::device_allocs::SharedGpu>,
@@ -362,6 +370,7 @@ impl V41Forward {
             pre_rows,
             graphs: std::sync::Mutex::new(std::collections::HashMap::new()),
             captures: std::sync::atomic::AtomicUsize::new(0),
+            seq_id: std::sync::Mutex::new(None),
             owner: self.allocs.owner(),
         });
         Ok(())
@@ -920,7 +929,26 @@ impl V41Forward {
                 gather(*layer, *buf)?;
             }
         }
-        let base_key = (kind as u8, t, seq.rings[0].0);
+        // A new sequence: its rings/tails are different buffers (or the SAME addresses reused by
+        // the allocator for different roles), so no graph of the previous one may be replayed.
+        // NEGATIVE CONTROL ONLY: ATLAS_DSV41_CONTROL_GRAPH_KEEP_STALE=1 keeps and replays them.
+        let keep_stale = std::env::var("ATLAS_DSV41_CONTROL_GRAPH_KEEP_STALE").as_deref() == Ok("1");
+        {
+            let mut cur = g.seq_id.lock().expect("graph seq poisoned");
+            if *cur != Some(seq.id) {
+                if !keep_stale {
+                    let old = std::mem::take(&mut *g.graphs.lock().expect("graph cache poisoned"));
+                    if !old.is_empty() {
+                        gpu.synchronize(stream)?;
+                        for (_, h) in old {
+                            gpu.destroy_graph(h)?;
+                        }
+                    }
+                }
+                *cur = Some(seq.id);
+            }
+        }
+        let base_key = (kind as u8, t, if keep_stale { 0 } else { seq.id });
         let replay = g.graphs.lock().expect("graph cache poisoned").contains_key(&(base_key.0, base_key.1, base_key.2 ^ ((bounds.len() as u64) << 56)));
         super::ops::set_graph_start(Some(g.dstart));
         let r = (|| -> Result<()> {
