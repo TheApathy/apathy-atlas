@@ -1250,12 +1250,8 @@ pub fn ssm_reset_async_enabled() -> bool {
 }
 
 /// `ATLAS_DFLASH_CAPTURE_STRIDED=1`: DFlash prefill hidden capture uses one
-/// strided-copy kernel per captured layer instead of one D2D copy per row.
-///
-/// NO CALLERS since the phaseA-a1 merge — this gate currently does nothing.
-/// It is `pub`, so it is public API and `dead_code` does not fire on it; the
-/// same regression is documented in full on `strided_copy_rows_kernel`
-/// (`model/types.rs`), which is where the build would otherwise have failed.
+/// strided-copy kernel per ring span per captured layer instead of one D2D
+/// copy per row (`impl_b3.rs`).
 pub fn dflash_capture_strided_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_DFLASH_CAPTURE_STRIDED").ok().as_deref() == Some("1"))

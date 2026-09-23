@@ -600,7 +600,7 @@ impl TransformerModel {
         // DFlash drafter-retrain teacher-forced hidden capture (default-OFF).
         // No-op unless ATLAS_DUMP_CTX_HIDDEN is set. Dumps the full-sequence
         // 5-layer NVFP4 hiddens now resident in ctx_hidden_acc.
-        self.dump_ctx_hidden_after_prefill(seq, tokens)?;
+        self.dump_ctx_hidden_after_prefill(seq, tokens, stream)?;
 
         Ok(self.decode_logits_ptr())
     }

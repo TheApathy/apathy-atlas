@@ -2,8 +2,6 @@
 # measured configuration (P35 levers + cuBLASLt projections) and the DFlash2 drafter.
 # integrate/all-models matrix: prefill 1713 tok/s at 2048 tokens, decode 25.7 tok/s,
 # greedy chat sha-identical to the perf/qwen38-27b-prefill-20260920 tip.
-# perf/q38-prefill (2026-09-23, warm median of 3, first request per size excluded):
-# prefill 1764 tok/s at 2048, 1395 tok/s at 8192 with the strided DFlash capture.
 recipe_version: "2"
 model: optimized-qwen
 runtime: atlas
@@ -16,9 +14,9 @@ metadata:
   kv_dtype: nvfp4
   description: |
     Qwen3.8-27B NVFP4 on its own kernel target (qwen3.8-27b, not the qwen3.6 auto-pick), with
-    the exact prefill levers and the v3 drafter (gamma 8). FAST: ATLAS_FFN_TC/SSM_PROJ_TC/
-    LM_HEAD_TC on. Speculation is greedy-approximate: differs from plain decode on bf16
-    near-ties (see qwen3.8-27b-exact-local for a byte-identical, slower alternative).
+    the exact prefill levers and the v3 drafter (gamma 8). Same as qwen3.8-27b-optimized-local
+    but with ATLAS_FFN_TC/ATLAS_SSM_PROJ_TC/ATLAS_LM_HEAD_TC off: speculation byte-identical to
+    plain decode, ~45-65% slower (q38-spec-correct measured 30.7 MinHeap / 17.9 coding tok/s).
 defaults:
   port: 8888
   host: 0.0.0.0
@@ -46,9 +44,9 @@ atlas:
   resident_gb: 66
   headroom_gb: 8
   env:
-    ATLAS_FFN_TC: "1"
-    ATLAS_SSM_PROJ_TC: "1"
-    ATLAS_LM_HEAD_TC: "1"
+    ATLAS_FFN_TC: "0"
+    ATLAS_SSM_PROJ_TC: "0"
+    ATLAS_LM_HEAD_TC: "0"
     ATLAS_LM_HEAD_T: "1"
     ATLAS_ACCEPT_FAST_ARGMAX: "1"
     ATLAS_E2M1_GEMM: "0"
@@ -80,7 +78,6 @@ atlas:
     ATLAS_ATTN_QKV_SPLITK: "4"
     ATLAS_DFLASH_DRAFT_SPLITK: "8"
     ATLAS_DFLASH_PREFILL_PIPE: "1"
-    ATLAS_DFLASH_CAPTURE_STRIDED: "1"
     ATLAS_SSM_PREFILL_PACK: "1"
     ATLAS_SSM_PREFILL_CONV_L2: "0"
     ATLAS_GDN_PREFILL_GATECACHE: "1"

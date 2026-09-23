@@ -423,7 +423,45 @@ impl TransformerModel {
                 }
             }
         };
+        let strided = crate::layers::dflash_capture_strided_enabled()
+            && self.strided_copy_rows_kernel.0 != 0;
         for span in append.write.spans() {
+            if strided {
+                // One strided copy per span: rows are consecutive physical
+                // slots, so the destination stride is exactly one slot. The
+                // per-row offset check below is kept for the span's ends,
+                // which bound every row in between.
+                let first_abs = chunk_start + span.linear_slot;
+                let last_abs = first_abs + span.slot_count - 1;
+                let offset_of = |abs| {
+                    crate::layers::dflash_head::ring_window::accumulator_capture_offset(
+                        abs,
+                        slot_idx,
+                        dstate.ctx_capacity,
+                        dstate.ctx_slot_bytes,
+                        h * bf16,
+                    )
+                };
+                let dst_offset = offset_of(first_abs)?;
+                anyhow::ensure!(
+                    dst_offset / dstate.ctx_slot_bytes == span.physical_slot
+                        && offset_of(last_abs)? / dstate.ctx_slot_bytes
+                            == span.physical_slot + span.slot_count - 1,
+                    "DFlash capture plan and byte offset disagree"
+                );
+                crate::layers::ops::strided_copy_rows(
+                    self.gpu.as_ref(),
+                    self.strided_copy_rows_kernel,
+                    src_base.offset(span.linear_slot * source_stride * bf16),
+                    acc_base.offset(dst_offset),
+                    span.slot_count as u32,
+                    (h * bf16) as u32,
+                    (source_stride * bf16) as u64,
+                    dstate.ctx_slot_bytes as u64,
+                    stream,
+                )?;
+                continue;
+            }
             for local in 0..span.slot_count {
                 let source_row = span.linear_slot + local;
                 let physical_slot = span.physical_slot + local;
@@ -726,8 +764,9 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// After prefill completes, advance the seq's DFlash `ctx_len` to
-    /// `chunk_start + proc_count` so the drafter sees all captured prompt
+    /// After a prefill chunk, advance the seq's DFlash `ctx_len` to
+    /// `chunk_start + proc_count`: the next chunk's capture plans its ring
+    /// writes against this cursor, and the drafter sees all captured prompt
     /// positions on the first propose() call.
     pub(super) fn update_dflash_ctx_len_after_prefill(
         &self,
@@ -751,9 +790,14 @@ impl TransformerModel {
             if proc_count == 0 {
                 return Ok(());
             }
-            let append = dstate
-                .ctx_ring_state()?
-                .plan_append_at(chunk_start, proc_count)?;
+            let ring = dstate.ctx_ring_state()?;
+            // Idempotent: chunked prefill advances after every chunk (the
+            // next chunk's capture plans against this cursor), and the
+            // last-chunk finalizer calls this again for the same rows.
+            if ring.absolute_len == chunk_start + proc_count {
+                return Ok(());
+            }
+            let append = ring.plan_append_at(chunk_start, proc_count)?;
             dstate.apply_ctx_ring_state(append.next)?;
         }
         Ok(())
@@ -789,6 +833,7 @@ impl TransformerModel {
         &self,
         seq: &mut crate::traits::SequenceState,
         tokens: &[u32],
+        stream: u64,
     ) -> Result<()> {
         let path = match crate::model::env_diag::dump_ctx_hidden_path() {
             Some(p) => p,
@@ -826,6 +871,10 @@ impl TransformerModel {
             return Ok(());
         }
 
+        // The capture copies run on the prefill stream; `copy_d2h` only
+        // drains the default stream, so without this the dump can read
+        // slots whose copies are still queued.
+        self.gpu.synchronize(stream)?;
         let resident_start = ring.resident_start();
         let gather = ring.plan_gather(resident_start, n)?;
         let slot_bytes = n_capture

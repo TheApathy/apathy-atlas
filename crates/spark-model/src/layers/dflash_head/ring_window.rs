@@ -130,22 +130,28 @@ fn plan_spans(absolute_start: usize, rows: usize, capacity: usize) -> Result<Rin
             "ring capacity and row count must be non-zero",
         ));
     }
-    if rows > capacity {
-        return Err(RingPlanError("chunk exceeds ring capacity"));
-    }
-    let physical_slot = absolute_start % capacity;
-    let first_count = rows.min(capacity - physical_slot);
-    let second_count = rows - first_count;
+    // A chunk wider than the ring keeps only its last `capacity` rows: the
+    // earlier ones would be overwritten by later rows of the same chunk, and
+    // the ring holds a window, so nothing may read them. The plan skips them
+    // (`linear_slot` starts at `dropped`) instead of writing them twice.
+    let dropped = rows.saturating_sub(capacity);
+    let kept = rows - dropped;
+    let physical_slot = absolute_start
+        .checked_add(dropped)
+        .ok_or(RingPlanError("absolute chunk start overflowed"))?
+        % capacity;
+    let first_count = kept.min(capacity - physical_slot);
+    let second_count = kept - first_count;
     Ok(RingSpanPlan {
         spans: [
             RingSpan {
                 physical_slot,
-                linear_slot: 0,
+                linear_slot: dropped,
                 slot_count: first_count,
             },
             RingSpan {
                 physical_slot: 0,
-                linear_slot: first_count,
+                linear_slot: dropped + first_count,
                 slot_count: second_count,
             },
         ],
