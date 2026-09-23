@@ -1,0 +1,64 @@
+DeepSeek-V4 YaRN parameters: factor=16.0, beta_fast=32.0, beta_slow=1.0, original_max_pos=65536, mscale=0.0, mscale_all_dim=0.0
+ENCODER L02 chunk 0 (S=0, T=512): topk 0/512 rows differ; attention bit-exact 0.9954 rel 1.34e-4
+ENCODER L20 chunk 0 (S=0, T=512): topk 0/512 rows differ; attention bit-exact 0.9991 rel 8.52e-5
+ENCODER L02 chunk 1 (S=512, T=512): topk 0/512 rows differ; attention bit-exact 0.9947 rel 1.51e-4
+ENCODER L20 chunk 1 (S=512, T=512): topk 1/512 rows differ; attention bit-exact 0.9986 rel 1.39e-4
+ENCODER L02 chunk 2 (S=1024, T=20): topk 0/20 rows differ; attention bit-exact 0.9949 rel 1.39e-4
+ENCODER L20 chunk 2 (S=1024, T=20): topk 0/20 rows differ; attention bit-exact 0.9988 rel 1.16e-4
+REPLAY TAIL (108 rows of chunk 2 + 20 of chunk 3, widths 1024/1536): 128 rows; candidates differ 0/196608 vs L24.cand_in; topk 1/128 rows vs L20's chunk rows
+REPLAY L24 (own tail): topk 1/128 rows differ; attention bit-exact 0.9982 rel 1.47e-4
+REPLAY L28 (own tail): topk 0/128 rows differ; attention bit-exact 0.9990 rel 1.09e-4
+REPLAY L32 (own tail): topk 0/128 rows differ; attention bit-exact 0.9990 rel 1.10e-4
+REPLAY L36 (own tail): topk 0/128 rows differ; attention bit-exact 0.9989 rel 9.86e-5
+DECODE step 0 (pos 1044) L02: topk 0/1 differ; attention bit-exact 0.9955 rel 1.90e-4 (win_lo 0)
+DECODE step 0 (pos 1044) L20: topk 0/1 differ; attention bit-exact 0.9989 rel 7.26e-5 (win_lo 0)
+DECODE step 0 (pos 1044) L24: topk 0/1 differ; attention bit-exact 0.9997 rel 3.70e-5 (win_lo 0)
+DECODE step 0 (pos 1044) L28: topk 0/1 differ; attention bit-exact 0.9984 rel 1.15e-4 (win_lo 0)
+DECODE step 0 (pos 1044) L32: topk 0/1 differ; attention bit-exact 0.9992 rel 6.77e-5 (win_lo 0)
+DECODE step 0 (pos 1044) L36: topk 0/1 differ; attention bit-exact 0.9975 rel 4.75e-5 (win_lo 0)
+DECODE step 1 (pos 1045) L02: topk 0/1 differ; attention bit-exact 0.9960 rel 1.24e-4 (win_lo 0)
+DECODE step 1 (pos 1045) L20: topk 0/1 differ; attention bit-exact 0.9987 rel 4.56e-5 (win_lo 0)
+DECODE step 1 (pos 1045) L24: topk 0/1 differ; attention bit-exact 0.9999 rel 5.40e-7 (win_lo 0)
+DECODE step 1 (pos 1045) L28: topk 0/1 differ; attention bit-exact 0.9987 rel 4.99e-5 (win_lo 0)
+DECODE step 1 (pos 1045) L32: topk 0/1 differ; attention bit-exact 0.9990 rel 7.91e-5 (win_lo 0)
+DECODE step 1 (pos 1045) L36: topk 0/1 differ; attention bit-exact 0.9976 rel 1.25e-4 (win_lo 0)
+DECODE step 2 (pos 1046) L02: topk 0/1 differ; attention bit-exact 0.9949 rel 1.27e-4 (win_lo 0)
+DECODE step 2 (pos 1046) L20: topk 0/1 differ; attention bit-exact 0.9973 rel 9.18e-5 (win_lo 0)
+DECODE step 2 (pos 1046) L24: topk 0/1 differ; attention bit-exact 0.9998 rel 4.87e-5 (win_lo 0)
+DECODE step 2 (pos 1046) L28: topk 0/1 differ; attention bit-exact 0.9977 rel 8.06e-5 (win_lo 0)
+DECODE step 2 (pos 1046) L32: topk 0/1 differ; attention bit-exact 0.9984 rel 1.17e-4 (win_lo 0)
+DECODE step 2 (pos 1046) L36: topk 0/1 differ; attention bit-exact 0.9912 rel 2.13e-4 (win_lo 0)
+DECODE step 3 (pos 1047) L02: topk 0/1 differ; attention bit-exact 0.9951 rel 1.02e-4 (win_lo 0)
+DECODE step 3 (pos 1047) L20: topk 0/1 differ; attention bit-exact 0.9980 rel 8.78e-5 (win_lo 0)
+DECODE step 3 (pos 1047) L24: topk 0/1 differ; attention bit-exact 0.9996 rel 4.81e-5 (win_lo 0)
+DECODE step 3 (pos 1047) L28: topk 0/1 differ; attention bit-exact 0.9978 rel 5.20e-5 (win_lo 0)
+DECODE step 3 (pos 1047) L32: topk 0/1 differ; attention bit-exact 0.9983 rel 5.79e-5 (win_lo 0)
+DECODE step 3 (pos 1047) L36: topk 0/1 differ; attention bit-exact 0.9971 rel 1.20e-4 (win_lo 0)
+DECODE step 4 (pos 1048) L02: topk 0/1 differ; attention bit-exact 0.9939 rel 1.39e-4 (win_lo 0)
+DECODE step 4 (pos 1048) L20: topk 0/1 differ; attention bit-exact 0.9967 rel 7.72e-5 (win_lo 0)
+DECODE step 4 (pos 1048) L24: topk 0/1 differ; attention bit-exact 0.9993 rel 2.51e-5 (win_lo 0)
+DECODE step 4 (pos 1048) L28: topk 0/1 differ; attention bit-exact 0.9943 rel 1.62e-4 (win_lo 0)
+DECODE step 4 (pos 1048) L32: topk 0/1 differ; attention bit-exact 0.9982 rel 5.80e-5 (win_lo 0)
+DECODE step 4 (pos 1048) L36: topk 0/1 differ; attention bit-exact 0.9828 rel 3.84e-4 (win_lo 0)
+DECODE step 5 (pos 1049) L02: topk 0/1 differ; attention bit-exact 0.9954 rel 9.76e-5 (win_lo 0)
+DECODE step 5 (pos 1049) L20: topk 0/1 differ; attention bit-exact 0.9975 rel 9.43e-5 (win_lo 0)
+DECODE step 5 (pos 1049) L24: topk 0/1 differ; attention bit-exact 0.9995 rel 6.79e-5 (win_lo 0)
+DECODE step 5 (pos 1049) L28: topk 0/1 differ; attention bit-exact 0.9966 rel 9.78e-5 (win_lo 0)
+DECODE step 5 (pos 1049) L32: topk 0/1 differ; attention bit-exact 0.9987 rel 5.09e-5 (win_lo 0)
+DECODE step 5 (pos 1049) L36: topk 0/1 differ; attention bit-exact 0.9908 rel 1.71e-4 (win_lo 0)
+DECODE step 6 (pos 1050) L02: topk 0/1 differ; attention bit-exact 0.9939 rel 1.83e-4 (win_lo 0)
+DECODE step 6 (pos 1050) L20: topk 0/1 differ; attention bit-exact 0.9980 rel 7.51e-5 (win_lo 0)
+DECODE step 6 (pos 1050) L24: topk 0/1 differ; attention bit-exact 0.9994 rel 5.29e-5 (win_lo 0)
+DECODE step 6 (pos 1050) L28: topk 0/1 differ; attention bit-exact 0.9975 rel 8.12e-5 (win_lo 0)
+DECODE step 6 (pos 1050) L32: topk 0/1 differ; attention bit-exact 0.9987 rel 3.38e-5 (win_lo 0)
+DECODE step 6 (pos 1050) L36: topk 0/1 differ; attention bit-exact 0.9881 rel 2.47e-4 (win_lo 0)
+DECODE step 7 (pos 1051) L02: topk 0/1 differ; attention bit-exact 0.9925 rel 2.55e-4 (win_lo 0)
+DECODE step 7 (pos 1051) L20: topk 0/1 differ; attention bit-exact 0.9980 rel 1.78e-4 (win_lo 0)
+DECODE step 7 (pos 1051) L24: topk 0/1 differ; attention bit-exact 0.9994 rel 1.47e-5 (win_lo 0)
+DECODE step 7 (pos 1051) L28: topk 0/1 differ; attention bit-exact 0.9980 rel 3.93e-5 (win_lo 0)
+DECODE step 7 (pos 1051) L32: topk 0/1 differ; attention bit-exact 0.9988 rel 6.62e-5 (win_lo 0)
+DECODE step 7 (pos 1051) L36: topk 0/1 differ; attention bit-exact 0.9914 rel 2.01e-4 (win_lo 0)
+CTRL DECODE window positions shifted by one: best attention bit-exact over 48 layer-steps 0.4672 (must collapse)
+DECODE total: 0 top-k rows differ over 48 layer-steps (band: at most 1 per step, at ties); worst attention 0.9828
+DIGEST 6997e45b775f6480 (score row blocks: ATLAS_DSV41_SCORE_ROWS=default; tail split none)
+RUNJ GATE PASS
