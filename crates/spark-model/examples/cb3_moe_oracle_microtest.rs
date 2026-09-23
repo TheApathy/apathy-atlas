@@ -107,8 +107,7 @@ fn main() -> Result<()> {
     let mut dump: Option<PathBuf> = None;
     let mut rows: Option<(usize, usize)> = None;
     let mut kernel = ExpertKernel::Reconstruct;
-    let mut gemv_max: Option<usize> = None;
-    let mut gemv_pass_t: Option<usize> = None;
+    let mut leak_control = false;
     let mut invariance: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -122,9 +121,10 @@ fn main() -> Result<()> {
                 rows = Some((a.parse()?, b.parse()?));
             }
             "--dump" => dump = Some(args.next().context("--dump needs a path")?.into()),
-            "--gemv-pass-t" => gemv_pass_t = Some(args.next().context("--gemv-pass-t")?.parse()?),
+            // NEGATIVE CONTROL for the ownership check: cycles 2-6 load the arena UNOWNED (the
+            // old never-free behaviour); the check must then FAIL.
+            "--leak-control" => leak_control = true,
             "--invariance" => invariance = Some(args.next().context("--invariance needs SPLIT[;SPLIT]")?),
-            "--gemv-max-rows" => gemv_max = Some(args.next().context("--gemv-max-rows")?.parse()?),
             "--kernel" => {
                 kernel = match args.next().context("--kernel needs fused|reconstruct")?.as_str() {
                     "fused" => ExpertKernel::Fused,
@@ -208,6 +208,39 @@ fn main() -> Result<()> {
     let kernels = Dsv41Kernels::load(gpu)?;
     let pack_dir = PathBuf::from(MODEL_DIR).join("k154-cb3");
     let pack = ExpertPack::parse(&std::fs::read_to_string(pack_dir.join("manifest.json"))?, SERVED_PACKED_KEEP)?;
+    // ONE-TIME STATE, measured by name before the MoE exists: the cuBLASLt handle + its 64 MB
+    // workspace + the library's lazily loaded kernels, created by the first GEMM. The warm-up
+    // uses the router's exact shape and the pinned entry point, so it only pre-pays that cost
+    // (the pinned algorithm is chosen at the reference M, not at this call's M).
+    let one_time_cublas = {
+        let before = gpu.free_memory()? as i64;
+        let a = gpu.alloc(hidden * 4)?;
+        let w = gpu.alloc(ROUTER_EXPERTS * hidden * 4)?;
+        let o = gpu.alloc(ROUTER_EXPERTS * 4)?;
+        gpu.memset_async(a, 0, hidden * 4, gpu.default_stream())?;
+        gpu.memset_async(w, 0, ROUTER_EXPERTS * hidden * 4, gpu.default_stream())?;
+        spark_runtime::cublaslt::gemm_act_weight_t_typed_pinned(
+            a.0, hidden as u32, w.0, o.0, ROUTER_EXPERTS as u32, 1, ROUTER_EXPERTS as u32, hidden as u32,
+            spark_runtime::cublaslt::GemmDtype::F32, spark_runtime::cublaslt::GemmDtype::F32, true,
+            spark_model::weight_loader::deepseek_v41::moe_forward::ROUTER_REF_M, gpu.default_stream(),
+        )?;
+        gpu.synchronize(gpu.default_stream())?;
+        for p in [a, w, o] {
+            gpu.free(p)?;
+        }
+        before - gpu.free_memory()? as i64
+    };
+    println!("  one-time state: cuBLASLt handle + workspace + library load = {:.3} GB (retained by design)", one_time_cublas as f64 / 1e9);
+    // Second named one-time item: the router is read from its shard with std::fs::read, which
+    // leaves the shard in page cache — and free_memory on GB10 is system-wide unified memory.
+    // Pre-read it once here so the cycles below see a warm cache, and report what it cost.
+    let one_time_page_cache = {
+        let before = gpu.free_memory()? as i64;
+        let warm = router_from_checkpoint(layer, hidden, gpu)?;
+        gpu.free(warm.gate_w)?;
+        before - gpu.free_memory()? as i64
+    };
+    println!("  one-time state: router shard read into page cache = {:.3} GB (reclaimable, not device-owned)", one_time_page_cache as f64 / 1e9);
     let free_before = gpu.free_memory()? as i64;
     let arena = Arc::new(Cb3ExpertArena::load_one_layer(&pack_dir, &pack, layer, &shared)?);
     let router = router_from_checkpoint(layer, hidden, gpu)?;
@@ -219,13 +252,7 @@ fn main() -> Result<()> {
     println!("  expert path: {}", if decode_path { "DECODE (GPU routing + CB3 GEMV)" } else { "reconstruct + cuBLASLt" });
     moe.set_control(control);
     moe.set_expert_kernel(kernel);
-    if let Some(t) = gemv_pass_t {
-        moe.set_gemv_pass_t(t);
-    }
-    if let Some(rows) = gemv_max {
-        moe.set_gemv_max_rows(rows);
-    }
-    println!("  expert kernel: {kernel:?}, gemv_max_rows {gemv_max:?}");
+    println!("  expert kernel: {kernel:?}");
     if control != MoeControl::None {
         println!("  [control {control:?}] — MUST FAIL");
     }
@@ -347,30 +374,74 @@ fn main() -> Result<()> {
         }
         moe.set_pass_tokens(pass_ids);
         println!("  CHUNK INVARIANCE: {}", if all_identical { "BYTE-IDENTICAL" } else { "DIFFERS" });
-        if control == MoeControl::None && gemv_pass_t.is_none() {
+        // Only the production path must be invariant; `--kernel reconstruct` (cuBLASLt per
+        // expert, M = its row count) is the control that is expected to DIFFER.
+        if control == MoeControl::None && kernel == ExpertKernel::Fused {
             ensure!(all_identical, "the routed MoE is not chunk-invariant");
         }
     }
 
-    // OWNERSHIP CHECK on the real driver: the MoE and the arena free on drop. The arena is
-    // 1.79 GB and the MoE scratch is sized by T, so "most of it came back" is a real check;
-    // the control is the loaded state (free memory must have DROPPED by >= the arena first).
+    // OWNERSHIP CHECK on the real driver. Cycle 1 also pays process-global one-time costs
+    // (cuBLASLt handle + 64 MB workspace + its lazily loaded kernels), which are NOT a leak, so
+    // the leak test is REPEATED cycles: load 1.79 GB + scratch, run a pass, drop — cycles 2 and
+    // 3 must each return >= 95% of what they took, and free memory must not drift between
+    // cycles. (free_memory on GB10 is system-wide unified memory, so other processes add noise;
+    // the thresholds are loose on purpose and the numbers are printed either way.)
     let free_loaded = gpu.free_memory()? as i64;
     drop(moe); // frees the scratch, tiles and router weights; the arena goes with its last Arc
     let free_after = gpu.free_memory()? as i64;
-    let taken = free_before - free_loaded;
-    let returned = free_after - free_loaded;
+    let (taken, returned) = (free_before - free_loaded, free_after - free_loaded);
     println!(
-        "  ownership: load took {:.3} GB, drop returned {:.3} GB ({:.1}%)",
+        "  ownership cycle 1: load took {:.3} GB, drop returned {:.3} GB ({:.1}%) — includes one-time global state",
         taken as f64 / 1e9,
         returned as f64 / 1e9,
         100.0 * returned as f64 / taken.max(1) as f64
     );
     ensure!(taken >= 1_700_000_000, "loading one layer took only {taken} bytes — the check cannot see a leak");
-    ensure!(
-        returned as f64 >= 0.95 * taken as f64,
-        "dropping the MoE returned only {returned} of {taken} bytes — something still owns device memory"
+    // Cycles 2..=6. BAND (ruled by the lead from 6 runs of noise data, before any new run):
+    // over cycles 3-6, |cumulative drift| <= 0.2 GB AND mean returned >= 99%. free_memory on
+    // GB10 is system-wide unified memory and moves +-0.1 GB per cycle with other processes, so
+    // a per-cycle band of 0.05 GB failed non-leaking runs in BOTH directions; a real leak here
+    // is -1.8 GB per cycle (-7.2 GB cumulative), > 30x outside this band.
+    let mut prev_after = free_after;
+    let (mut cum_drift, mut returned_pct): (i64, Vec<f64>) = (0, Vec::new());
+    for cycle in 2..=6 {
+        let before = gpu.free_memory()? as i64;
+        let arena = Arc::new(if leak_control {
+            Cb3ExpertArena::load_one_layer_unowned(&pack_dir, &pack, layer, gpu)?
+        } else {
+            Cb3ExpertArena::load_one_layer(&pack_dir, &pack, layer, &shared)?
+        });
+        let router = router_from_checkpoint(layer, hidden, gpu)?;
+        let again = Cb3RoutedMoe::new(shared.clone(), kernels, &config, arena, vec![(layer, router)], limit, route_scale, tokens)?;
+        again.set_pass_tokens(pass_ids);
+        again.forward(&Ops { gpu, k: &kernels, stream }, layer, d_in, d_out, tokens)?;
+        gpu.synchronize(stream)?;
+        let loaded = gpu.free_memory()? as i64;
+        drop(again);
+        let after = gpu.free_memory()? as i64;
+        let (took, gave, drift) = (before - loaded, after - loaded, after - prev_after);
+        println!(
+            "  ownership cycle {cycle}: took {:.3} GB, returned {:.3} GB ({:.1}%), drift vs previous cycle {:+.3} GB",
+            took as f64 / 1e9,
+            gave as f64 / 1e9,
+            100.0 * gave as f64 / took.max(1) as f64,
+            drift as f64 / 1e9
+        );
+        ensure!(took >= 1_700_000_000, "cycle {cycle} took only {took} bytes — the check cannot see a leak");
+        if cycle >= 3 {
+            cum_drift += drift;
+            returned_pct.push(100.0 * gave as f64 / took.max(1) as f64);
+        }
+        prev_after = after;
+    }
+    let mean_returned = returned_pct.iter().sum::<f64>() / returned_pct.len() as f64;
+    println!(
+        "  ownership band (cycles 3-6): cumulative drift {:+.3} GB (|.| <= 0.2), mean returned {mean_returned:.1}% (>= 99)",
+        cum_drift as f64 / 1e9
     );
+    ensure!(cum_drift.abs() <= 200_000_000, "cycles 3-6: cumulative drift {cum_drift} bytes — memory accumulates");
+    ensure!(mean_returned >= 99.0, "cycles 3-6: mean returned {mean_returned:.1}% < 99%");
 
     if control != MoeControl::None {
         let floor = TOL * MIN_SEPARATION;

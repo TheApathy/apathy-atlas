@@ -76,6 +76,7 @@ fn main() -> Result<()> {
     let mut layer = 2usize;
     let mut token_counts = vec![2048usize, 512, 64, 1];
     let (mut warmup, mut iters) = (2usize, 7usize);
+    let mut production_only = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -86,6 +87,8 @@ fn main() -> Result<()> {
             }
             "--warmup" => warmup = args.next().context("--warmup")?.parse()?,
             "--iters" => iters = args.next().context("--iters")?.parse()?,
+            // Time only the production forward (A/B loops, profilers): no reconstruct phases.
+            "--production-only" => production_only = true,
             other => bail!("unknown argument {other}"),
         }
     }
@@ -99,7 +102,17 @@ fn main() -> Result<()> {
     let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)?;
     let ids: Vec<i64> = manifest["token_ids"].as_array().context("ids")?.iter().filter_map(|v| v.as_i64()).collect();
     let max_t = *token_counts.iter().max().context("no token counts")?;
-    ensure!(max_t <= captured, "{run} L{layer:02} has {captured} captured rows, asked for {max_t}");
+    ensure!(ids.len() >= captured, "{run}: {} token ids for {captured} rows", ids.len());
+    // Beyond the capture, tile its rows (and their token ids) so a larger chunk can be timed:
+    // every expert sees proportionally more rows, which is what a longer prefill chunk does.
+    let (moe_in, ids) = if max_t > captured {
+        println!("{run} L{layer:02}: {captured} captured rows, TILED to {max_t} (routing repeats)");
+        let row = hidden * 2;
+        let tiled: Vec<u8> = (0..max_t).flat_map(|r| moe_in[(r % captured) * row..(r % captured + 1) * row].iter().copied()).collect();
+        (tiled, (0..max_t).map(|r| ids[r % captured]).collect::<Vec<i64>>())
+    } else {
+        (moe_in, ids)
+    };
 
     let backend = Arc::new(AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?);
     let shared: spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu = backend.clone();
@@ -141,6 +154,12 @@ fn main() -> Result<()> {
             }
             Ok(median(samples))
         };
+        if production_only {
+            moe.set_expert_kernel(ExpertKernel::Fused);
+            let full = time(&mut || spark_model::weight_loader::deepseek_v41::fwd::V41RoutedMoe::forward(&moe, &Ops { gpu, k: &kernels, stream }, layer, d_in, d_out, t))?;
+            println!("{t:>5} PRODUCTION {full:.2} ms/layer -> {:.2} us/token", 1e3 * full / t as f64);
+            continue;
+        }
         let scores_ms = time(&mut || moe.scores(layer, d_in, t, stream).map(|_| ()))?;
         let scores = moe.scores(layer, d_in, t, stream)?;
         let route_ms = time(&mut || moe.route(layer, &scores, t).map(|_| ()))?;
@@ -194,33 +213,6 @@ fn main() -> Result<()> {
             experts as f64 * bf16_bytes / 1e9,
         );
     }
-    // GEMV cut-over sweep on the production forward, every T, rounds interleaved.
-    for &t in &token_counts {
-        moe.set_pass_tokens(&ids[..t]);
-        moe.set_expert_kernel(ExpertKernel::Fused);
-        let routing = moe.route_device(layer, d_in, t, stream)?;
-        let cuts = [0usize, 2, 4, 8, 16, 32, 64];
-        let mut best: Vec<Vec<f64>> = vec![Vec::new(); cuts.len()];
-        for _round in 0..3 {
-            for (i, &cut) in cuts.iter().enumerate() {
-                moe.set_gemv_max_rows(cut);
-                let mut samples = Vec::new();
-                for j in 0..warmup + iters {
-                    gpu.synchronize(stream)?;
-                    let start = Instant::now();
-                    moe.forward_routed(layer, d_in, d_out, t, &routing, stream)?;
-                    gpu.synchronize(stream)?;
-                    if j >= warmup {
-                        samples.push(start.elapsed().as_secs_f64() * 1e3);
-                    }
-                }
-                best[i].push(median(samples));
-            }
-        }
-        let line: Vec<String> = cuts.iter().zip(&best).map(|(c, v)| format!("{c}:{:.2}", median(v.clone()))).collect();
-        println!("GEMV cut sweep T={t} (experts ms, cut:median-of-3-rounds): {}", line.join("  "));
-    }
-    moe.set_gemv_max_rows(spark_model::weight_loader::deepseek_v41::moe_forward::DEFAULT_GEMV_MAX_ROWS);
     let _ = ROUTER_EXPERTS;
     println!("DONE");
     drop(moe);
