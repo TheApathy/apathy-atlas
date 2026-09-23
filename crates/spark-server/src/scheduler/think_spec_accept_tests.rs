@@ -902,9 +902,11 @@ fn f2_run_resets_on_unconfident_position() {
     a.thinking_tokens = 400;
     a.consecutive_confident = 7;
     let sup = [SUPPRESS];
-    // Flat-ish row: two near-equal logits → top-1 prob ≈ 0.5 < 0.95.
-    // `verified` has a single row, so position 0 is the bonus row.
-    let rows = [row_with(1, &[(0, 8.0)])];
+    // Flat-ish row: two near-equal logits → top-1 prob ≈ 0.52 < 0.95.
+    // `verified` has a single row, so position 0 is the bonus row. Token 0 is
+    // a hair below token 1 (bf16 7.90625 vs 8.0) so the argmax is 1 without
+    // relying on tie-breaking (greedy now takes the FIRST of equal maxima).
+    let rows = [row_with(1, &[(0, 7.9)])];
     let out = dflash_thinking_accept(
         &mut a,
         &[1],
@@ -913,8 +915,7 @@ fn f2_run_resets_on_unconfident_position() {
         serve_rows(&rows),
         no_snapshot,
     );
-    // argmax ties resolve to the LAST max under the plain sampler
-    // (`max_by` keeps later elements) — target is 1, matching the draft.
+    // target is 1, matching the draft.
     assert_eq!(out.num_accepted, 0); // i+1 >= verified.len() → bonus row
     assert_eq!(out.bonus, Some(1));
     assert_eq!(

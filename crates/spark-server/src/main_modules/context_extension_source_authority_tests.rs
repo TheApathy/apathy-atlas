@@ -110,15 +110,22 @@ const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b3657
 // builders as their position capacity). NOTE for reviewers: the GLM builders
 // do not take the ContextAdmissionReceipt — GLM (NoPE DSA + KDA) is not a
 // RoPE-extension target, and config.json's max_position_embeddings is 1M.
-const SERVE_LOAD_SHA256: &str = "1f09702f3a8e573a291f8a36dc9ea3e0c67999af59cedbd557d4f9f6fcfbaf02";
+// Re-pinned 2026-09-23 for the DeepSeek-V4.1 port (dsv41/port-chat): three
+// hunks, none on a context-extension path -- a deepseek_v41 block before the
+// scheduler spawn (vision_config parse, repetition::configure, set_serving,
+// the libturbojpeg probe), `yarn_context` computed by
+// serve_phases::text_only_yarn_context instead of inline, and two AppState
+// fields (`dsv41`, `dsv41_vision`). The guard block and anchors are unchanged.
+const SERVE_LOAD_SHA256: &str = "1a6f84623442b60e71903b79b52eb2a8770c9e196c63994adbaea3848a96792d";
 // Re-pinned 2026-09-22 for integrate/all-models: the ONLY change is the
 // `weights::{..}` re-export gaining `load_dflash_donor` (phaseA-a1's DFlash
 // donor loader, now called from `load_model`), rustfmt-wrapped onto three
 // lines. `git diff feat/tui-port` over this file is exactly that one hunk.
 // Re-pinned again 2026-09-22 for the GLM-5.3 port: `mod target_store;` and
 // the `TargetStoreLoadPlan` re-export (GLM GGUF load planning). Nothing else.
-const SERVE_PHASES_SHA256: &str =
-    "c09f946989ac4f713001ba8bd0977faf6d088ccd57114fa518bbed88e8e3ed22";
+// Re-pinned 2026-09-23 for the DeepSeek-V4.1 port: `mod vision_context;` and
+// its `text_only_yarn_context` re-export (the Static-YaRN image gate). Nothing else.
+const SERVE_PHASES_SHA256: &str = "0651c2cecd7e87a3cddf952f66d23463259667c18ab8d9dc657b1d736f8264d3";
 const BUILD_SHA256: &str = "63b5663ef0880e17d3725ec8833b6d82c20ef45567bc6cfbd41a8136c2005f3e";
 
 const INITIAL: [u32; 8] = [
