@@ -18,6 +18,9 @@ cuda = [
     "spark-runtime/cuda",
     "spark-storage/cuda",
     "spark-comm/cuda",
+    # Served DeepSeek-V4.1 (`model::dsv41`) builds its engram hash state from the
+    # checkpoint's tokenizer.json at alloc_sequence.
+    "engram-tokenizer",
 ]
 metal = [
     "atlas-core/metal",
