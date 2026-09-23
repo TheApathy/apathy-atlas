@@ -54,6 +54,10 @@ const ATTN_THREADS: u32 = 256;
 /// kernel, the rest 1 ulp (attn gate log). Used ONLY for Decode passes, so every PREFILL row
 /// stays chunk-invariant bit-for-bit.
 const DECODE_SLICE: usize = 16;
+/// The production slice for Decode AND Verify: 32 (decode k124a, 2026-09-23: step-0 KL identical,
+/// spec == plain on code/chat at verify T=2/3/4/6, spec step -4.56 ms, plain -0.4 ms).
+/// DECODE_SLICE stays the smallest allowed (it sizes the partial buffer).
+const DEFAULT_SLICE: usize = 32;
 const DECODE_MAX_T: usize = 8;
 const HIDDEN: usize = 5120;
 const Q_LORA: usize = 1280;
@@ -266,7 +270,7 @@ pub struct Dsv41SparseCore {
     /// byte-identical to split + combine) and its `[DECODE_MAX_T, 64 / 8]` u32 tickets (zeroed).
     split_lb: Option<(KernelHandle, DevicePtr)>,
     /// Keys per split slice for Decode AND Verify (never keyed on T: a verify row must equal its
-    /// T=1 decode). `ATLAS_DSV41_ATTN_SLICE` (16 default; 32/64 = the KL-arm candidates).
+    /// T=1 decode). `ATLAS_DSV41_ATTN_SLICE` overrides [`DEFAULT_SLICE`] (A/B only).
     slice: usize,
     idx: IndexKernels,
     rope_c: RopeTable,
@@ -471,7 +475,7 @@ impl Dsv41SparseCore {
             tap_val: alloc(16)?,
         };
         let own_dstart = alloc(4)?;
-        let slice: usize = std::env::var("ATLAS_DSV41_ATTN_SLICE").ok().and_then(|v| v.parse().ok()).unwrap_or(DECODE_SLICE);
+        let slice: usize = std::env::var("ATLAS_DSV41_ATTN_SLICE").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SLICE);
         ensure!(slice % 8 == 0 && slice >= DECODE_SLICE, "ATLAS_DSV41_ATTN_SLICE={slice}: a multiple of 8, >= {DECODE_SLICE}");
         let part = alloc(DECODE_MAX_T * 64 * (WINDOW + INDEX_TOPK).div_ceil(DECODE_SLICE) * (2 + HEAD_DIM) * 4)?;
         let split_lb = if std::env::var("ATLAS_DSV41_ATTN_LB").as_deref() == Ok("1") {
