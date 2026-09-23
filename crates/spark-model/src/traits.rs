@@ -245,4 +245,4 @@ impl SequenceState {
 /// single-thread invariant — do NOT share `&dyn Model` across threads.
 mod model;
 mod sequence_state_init;
-pub use model::{EP_CMD_VERIFY_KGAMMA, EP_VERIFY_KGAMMA_ABORT, Model};
+pub use model::{EP_CMD_VERIFY_KGAMMA, EP_VERIFY_KGAMMA_ABORT, Model, SpecSampling};
