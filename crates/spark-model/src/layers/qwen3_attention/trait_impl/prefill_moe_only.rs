@@ -66,7 +66,15 @@ impl Qwen3AttentionLayer {
             None
         };
         let attn32 = exact_attn16 && qwen4_prefill_moe::attn16::core32_selected()?;
-        if crate::layers::qwen4_fast_proj::selection()?.attn {
+        // The fast full-row attention needs a 16-row-multiple chunk of at most
+        // 2048 rows. Any other chunk (a 33-token chat prompt, a tail chunk)
+        // takes the row-ordered path below instead of failing the request:
+        // with the selector on, every prompt whose length was not a multiple
+        // of 16 used to error out.
+        if crate::layers::qwen4_fast_proj::selection()?.attn
+            && num_tokens.is_multiple_of(16)
+            && num_tokens <= 2048
+        {
             anyhow::ensure!(
                 exact_hyper && exact_qkv16 && exact_o16 && exact_attn16,
                 "{} attn requires HC_EXACT, ATTN_QKV16, ATTN_O16 and ATTN_CORE16",
