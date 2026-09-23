@@ -305,3 +305,124 @@ fn typed_impl(
         }
     }
 }
+
+/// `cublasLtMatmulHeuristicResult_t` is 96 bytes: the 64-byte algo, workspace size, state,
+/// waves count and 4 reserved ints.
+const HEURISTIC_RESULT_BYTES: usize = 96;
+
+unsafe extern "C" {
+    fn cublasLtMatmulAlgoConfigGetAttribute(
+        algo: *const c_void,
+        attr: u32,
+        buf: *mut c_void,
+        size: usize,
+        written: *mut usize,
+    ) -> i32;
+}
+
+/// Autotune support for [`gemm_act_weight_t_typed_pinned`]: up to `max` heuristic candidates
+/// (no split-K) for a shape at M = `ref_m`, best-ranked first, each as the blob the pinned path
+/// stores. Index 0 is what the pinned path picks on its own.
+#[allow(clippy::too_many_arguments)]
+pub fn pinned_candidates(
+    n: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    in_dtype: GemmDtype,
+    out_dtype: GemmDtype,
+    ref_m: u32,
+    max: usize,
+) -> Result<Vec<[u8; 128]>> {
+    let ctx = ctx()?;
+    let (ti, to) = (in_dtype.cuda(), out_dtype.cuda());
+    let mut results = vec![0u8; max * HEURISTIC_RESULT_BYTES];
+    let mut returned: i32 = 0;
+    unsafe {
+        let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
+        chk(cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F), "DescCreate")?;
+        let (ta, tb) = (CUBLAS_OP_T, CUBLAS_OP_N);
+        chk(cublasLtMatmulDescSetAttribute(desc, DESC_TRANSA, &ta as *const i32 as *const c_void, 4), "TRANSA")?;
+        chk(cublasLtMatmulDescSetAttribute(desc, DESC_TRANSB, &tb as *const i32 as *const c_void, 4), "TRANSB")?;
+        let mut la: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut lb: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut ld_: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        chk(cublasLtMatrixLayoutCreate(&mut la, ti, k as u64, n as u64, k as i64), "LayoutA")?;
+        chk(cublasLtMatrixLayoutCreate(&mut lb, ti, k as u64, ref_m as u64, lda as i64), "LayoutB")?;
+        chk(cublasLtMatrixLayoutCreate(&mut ld_, to, n as u64, ref_m as u64, ldc as i64), "LayoutD")?;
+        let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
+        chk(cublasLtMatmulPreferenceCreate(&mut pref), "PrefCreate")?;
+        let ws_size = ctx.ws_size;
+        chk(
+            cublasLtMatmulPreferenceSetAttribute(pref, PREF_MAX_WORKSPACE_BYTES, &ws_size as *const usize as *const c_void, std::mem::size_of::<usize>()),
+            "PrefWorkspace",
+        )?;
+        let mask: u32 = 0;
+        chk(
+            cublasLtMatmulPreferenceSetAttribute(pref, PREF_REDUCTION_SCHEME_MASK, &mask as *const u32 as *const c_void, std::mem::size_of::<u32>()),
+            "PrefReductionScheme",
+        )?;
+        let h = cublasLtMatmulAlgoGetHeuristic(
+            ctx.handle, desc, la, lb, ld_, ld_, pref, max as i32, results.as_mut_ptr() as *mut c_void, &mut returned,
+        );
+        cublasLtMatmulPreferenceDestroy(pref);
+        cublasLtMatrixLayoutDestroy(la);
+        cublasLtMatrixLayoutDestroy(lb);
+        cublasLtMatrixLayoutDestroy(ld_);
+        cublasLtMatmulDescDestroy(desc);
+        chk(h, "AlgoGetHeuristic")?;
+    }
+    Ok(results
+        .chunks_exact(HEURISTIC_RESULT_BYTES)
+        .take(returned.max(0) as usize)
+        .map(|r| {
+            let mut blob = [0u8; 128];
+            blob[..HEURISTIC_RESULT_BYTES].copy_from_slice(r);
+            blob
+        })
+        .collect())
+}
+
+/// Replace the algorithm [`gemm_act_weight_t_typed_pinned`] uses for a shape (autotune A/B).
+#[allow(clippy::too_many_arguments)]
+pub fn set_pinned_algo(
+    n: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    in_dtype: GemmDtype,
+    out_dtype: GemmDtype,
+    no_split_k: bool,
+    ref_m: u32,
+    algo: [u8; 128],
+) -> Result<()> {
+    let key = (n, k, lda, ldc, in_dtype.cuda(), out_dtype.cuda(), no_split_k, ref_m);
+    pinned_algos().lock().map_err(|_| anyhow::anyhow!("pinned algos poisoned"))?.insert(key, algo);
+    Ok(())
+}
+
+/// The algorithm's config (id, tile, stages, split-K, reduction, swizzle, custom option, inner
+/// shape, cluster shape) as `name=value` pairs, for logs and pin tables.
+pub fn describe_algo(algo: &[u8; 128]) -> String {
+    const ATTRS: [(&str, u32); 9] = [
+        ("id", 0), ("tile", 1), ("splitk", 2), ("red", 3), ("swz", 4), ("custom", 5), ("stages", 6), ("inner", 7), ("cluster", 8),
+    ];
+    let ws = u64::from_le_bytes(algo[64..72].try_into().expect("8 bytes"));
+    let mut s = String::new();
+    for (name, attr) in ATTRS {
+        // Size query first (null buffer): the call rejects a size that is not the attribute's.
+        let mut size = 0usize;
+        let a = algo.as_ptr() as *const c_void;
+        if unsafe { cublasLtMatmulAlgoConfigGetAttribute(a, attr, std::ptr::null_mut(), 0, &mut size) } != 0 || size == 0 || size > 8 {
+            continue;
+        }
+        let mut v: u64 = 0;
+        let mut written = 0usize;
+        let st = unsafe { cublasLtMatmulAlgoConfigGetAttribute(a, attr, &mut v as *mut u64 as *mut c_void, size, &mut written) };
+        if st == 0 {
+            s.push_str(&format!("{name}={v} "));
+        }
+    }
+    s.push_str(&format!("ws={ws}"));
+    s
+}

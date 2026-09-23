@@ -171,6 +171,10 @@ required-features = ["cuda", "gpu-examples"]
 name = "dsv41_shared_bench"
 required-features = ["cuda", "gpu-examples"]
 
+[[example]]
+name = "dsv41_gemm_tune"
+required-features = ["cuda", "gpu-examples"]
+
 # DeepSeek-V4.1 vision tower vs the production vision.py, stage by stage, with
 # an exact unfold-layout check and a `--control` that must separate.
 [[example]]

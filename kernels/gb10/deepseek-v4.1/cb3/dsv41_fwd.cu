@@ -382,6 +382,11 @@ extern "C" __global__ void dsv41_hc_fused_v2(
         x[(size_t)t * D + d] = __float2bfloat16(bf(norm_w[d]) * (bf(x[(size_t)t * D + d]) * rs));
 }
 
+// REJECTED (window k124hc, 2026-09-23): a token-tiled v2 (4 tokens per block, each fn element
+// loaded once per tile instead of once per token, cutting the fn stream through L2 from ~680 GB to
+// ~170 GB per 8192-token prefill). Byte-identical to v2 at 3072 and 8192 (h taps + logits; a
+// per-tile norm-bug control differed) but FLAT: 8192 warm 1957.5 -> 1950.1 tok/s, PROF mhc+norm
+// 484 -> 462 ms (noise). The per-token fn re-read through L2 is not what mhc+norm costs.
 // ── fused mHC v3: the token's h row held in shared memory across the stages ──
 // dsv41_hc_fused_v2 reads h from global memory three times (post, mixes, pre). v3 keeps the row
 // ([HC, D] bf16 = 40 KB at D = 5120) in shared memory: post writes it to both, mixes and pre read

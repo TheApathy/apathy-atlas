@@ -143,3 +143,17 @@ pub fn gemm_act_weight_t_typed_pinned(
 pub fn register_stream_workspace(_stream: u64) -> anyhow::Result<()> {
     unreachable!("cublaslt::register_stream_workspace is cuda-only (not built for metal)")
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn pinned_candidates(_n: u32, _k: u32, _lda: u32, _ldc: u32, _in_dtype: GemmDtype, _out_dtype: GemmDtype, _ref_m: u32, _max: usize) -> Result<Vec<[u8; 128]>> {
+    unreachable!("cublaslt::pinned_candidates is cuda-only (not built for metal)")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn set_pinned_algo(_n: u32, _k: u32, _lda: u32, _ldc: u32, _in_dtype: GemmDtype, _out_dtype: GemmDtype, _no_split_k: bool, _ref_m: u32, _algo: [u8; 128]) -> Result<()> {
+    unreachable!("cublaslt::set_pinned_algo is cuda-only (not built for metal)")
+}
+
+pub fn describe_algo(_algo: &[u8; 128]) -> String {
+    unreachable!("cublaslt::describe_algo is cuda-only (not built for metal)")
+}

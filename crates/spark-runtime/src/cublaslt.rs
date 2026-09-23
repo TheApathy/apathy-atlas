@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 mod fp8;
 pub use fp8::{fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_rowwise};
 mod typed;
-pub use typed::{GemmDtype, gemm_act_weight_t_typed, gemm_act_weight_t_typed_ex, gemm_act_weight_t_typed_pinned, register_stream_workspace};
+pub use typed::{GemmDtype, gemm_act_weight_t_typed, gemm_act_weight_t_typed_ex, gemm_act_weight_t_typed_pinned, register_stream_workspace, pinned_candidates, set_pinned_algo, describe_algo};
 
 #[allow(non_camel_case_types)]
 type cublasLtHandle_t = *mut c_void;
