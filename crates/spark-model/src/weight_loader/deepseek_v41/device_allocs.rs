@@ -58,6 +58,11 @@ impl DeviceAllocs {
         self.ptrs.is_empty()
     }
 
+    /// The owning backend handle, if any (for owners of non-allocation resources, e.g. graphs).
+    pub fn owner(&self) -> Option<SharedGpu> {
+        self.owner.clone()
+    }
+
     pub fn is_owned(&self) -> bool {
         self.owner.is_some()
     }
