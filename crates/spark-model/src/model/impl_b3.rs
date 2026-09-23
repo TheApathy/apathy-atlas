@@ -795,6 +795,7 @@ impl TransformerModel {
         &self,
         seq: &mut crate::traits::SequenceState,
         tokens: &[u32],
+        stream: u64,
     ) -> Result<()> {
         let path = match crate::model::env_diag::dump_ctx_hidden_path() {
             Some(p) => p,
@@ -832,6 +833,10 @@ impl TransformerModel {
             return Ok(());
         }
 
+        // The capture copies run on the prefill stream; `copy_d2h` only
+        // drains the default stream, so without this the dump can read
+        // slots whose copies are still queued.
+        self.gpu.synchronize(stream)?;
         let resident_start = ring.resident_start();
         let gather = ring.plan_gather(resident_start, n)?;
         let slot_bytes = n_capture

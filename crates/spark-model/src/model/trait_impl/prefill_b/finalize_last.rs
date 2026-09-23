@@ -283,7 +283,7 @@ impl TransformerModel {
         // finalizer of the CHUNKED prefill path (the scheduler's default path
         // when max_prefill_tokens>0), so ctx_hidden_acc is fully populated for
         // all prompt positions here. `tokens` is the full prompt.
-        self.dump_ctx_hidden_after_prefill(seq, tokens)?;
+        self.dump_ctx_hidden_after_prefill(seq, tokens, stream)?;
 
         // MTP last-K prefill: replay the last K prompt-tail target hidden
         // states through the MTP head so its self-attention sees recent
