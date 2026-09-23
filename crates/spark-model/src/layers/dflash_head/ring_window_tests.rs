@@ -361,3 +361,53 @@ fn head_keeping_plan_is_caught_by_the_ring_replay() {
     let (reference, _) = fill_in_chunks(8192, 4096, 4096);
     assert_ne!(ring, reference);
 }
+
+/// Chunked prefill protocol: every capture layer of a chunk plans with
+/// `plan_append_at(chunk_start)`, then the chunk's end advances the ring.
+fn chunked_prefill(total: usize, chunk: usize, advance_every_chunk: bool) -> Result<RingState> {
+    let mut state = RingState::new(MAX_ABSOLUTE_CONTEXT, 4096)?;
+    let mut start = 0;
+    while start < total {
+        let rows = chunk.min(total - start);
+        for _capture_layer in 0..8 {
+            state.plan_append_at(start, rows)?;
+        }
+        let last = start + rows == total;
+        if advance_every_chunk || last {
+            if let Some(next) = state.advanced_after_chunk(start, rows)? {
+                state = next;
+            }
+            // The last-chunk finalizer repeats the advance: a no-op.
+            assert_eq!(state.advanced_after_chunk(start, rows)?, None);
+        }
+        start += rows;
+    }
+    Ok(state)
+}
+
+#[test]
+fn multi_chunk_prefill_needs_the_ring_advanced_after_every_chunk() {
+    for (total, chunk) in [(7000, 4096), (10000, 8192), (12288, 2048), (4096, 4096)] {
+        let state = chunked_prefill(total, chunk, true).unwrap();
+        assert_eq!(state.absolute_len, total);
+        assert_eq!(state.resident_len, total.min(4096));
+    }
+    // Control: advancing only after the last chunk (the old behaviour) fails
+    // chunk 2's capture with the error seen in production.
+    let err = chunked_prefill(7000, 4096, false).unwrap_err();
+    assert_eq!(err.to_string(), "append start does not match absolute cursor");
+    // A single chunk never needed the per-chunk advance.
+    assert!(chunked_prefill(3000, 4096, false).is_ok());
+}
+
+#[test]
+fn prefill_forward_advances_the_ring_after_every_chunk() {
+    let forward = include_str!("../../model/trait_impl/prefill_b/forward_layers.rs");
+    let body = &forward[forward.find("fn prefill_b_forward_layers(").unwrap()..];
+    assert!(
+        body.contains("self.update_dflash_ctx_len_after_prefill(seq, effective_seq_len_start, proc_count)?"),
+        "prefill_b_forward_layers must advance the DFlash ring after each chunk"
+    );
+    let prefill = include_str!("../../model/impl_b3.rs");
+    assert!(prefill.contains(".advanced_after_chunk(chunk_start, proc_count)?"));
+}

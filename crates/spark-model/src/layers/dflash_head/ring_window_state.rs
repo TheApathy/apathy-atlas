@@ -86,6 +86,24 @@ impl RingState {
         Ok(AppendPlan { write, next })
     }
 
+    /// The state after a prefill chunk of `rows` rows at `absolute_start`,
+    /// or `None` when the cursor is already there. Chunked prefill advances
+    /// after every chunk (the next chunk's capture plans against this cursor)
+    /// and the last-chunk finalizer repeats the call for the same rows.
+    pub(crate) fn advanced_after_chunk(
+        &self,
+        absolute_start: usize,
+        rows: usize,
+    ) -> Result<Option<RingState>> {
+        let end = absolute_start
+            .checked_add(rows)
+            .ok_or(RingPlanError("absolute chunk end overflowed"))?;
+        if rows == 0 || self.absolute_len == end {
+            return Ok(None);
+        }
+        Ok(Some(self.plan_append_at(absolute_start, rows)?.next))
+    }
+
     /// Plan an append only when the caller's absolute cursor is exact.
     pub(crate) fn plan_append_at(&self, absolute_start: usize, rows: usize) -> Result<AppendPlan> {
         if absolute_start != self.absolute_len {
