@@ -421,3 +421,60 @@ mod qwen38_template_option_tests {
         assert_eq!(qwen38_reasoning_effort("future-rung"), None);
     }
 }
+
+/// Tool-prompt key-order probe (ignored; run by hand). Renders a tools request
+/// the way the chat path does (`serde_json::to_value(ToolDefinition)` into the
+/// Jinja template) and writes the prompt ids and text to
+/// `$ATLAS_PROBE_OUT`, for comparison with HF `apply_chat_template`.
+/// Inputs: `ATLAS_PROBE_MODEL_DIR`, `ATLAS_PROBE_MODEL_TYPE`, `ATLAS_PROBE_REQUEST`
+/// (an OpenAI chat body with string contents and `tools`).
+#[cfg(test)]
+mod tool_order_probe {
+    use super::ChatTokenizer;
+
+    #[test]
+    #[ignore]
+    fn render_tools_request_for_hf_comparison() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} unset"));
+        let dir = std::path::PathBuf::from(var("ATLAS_PROBE_MODEL_DIR"));
+        // With ATLAS_PROBE_REPO_ROOT the repo's jinja-templates/ override (what
+        // production serves) is used; without it, the checkpoint's template.
+        let root = std::env::var("ATLAS_PROBE_REPO_ROOT").ok().map(std::path::PathBuf::from);
+        let tok = ChatTokenizer::from_model_dir(
+            &dir,
+            0,
+            true,
+            &var("ATLAS_PROBE_MODEL_TYPE"),
+            root.as_deref(),
+        )
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(var("ATLAS_PROBE_REQUEST")).unwrap())
+                .unwrap();
+        // What `serde_json::to_value(ToolDefinition)` produces on the chat path:
+        // {type, function: {name, description?, parameters?}}.
+        let tools: Vec<serde_json::Value> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let f = &t["function"];
+                let mut func = serde_json::Map::new();
+                func.insert("name".into(), f["name"].clone());
+                for k in ["description", "parameters"] {
+                    if let Some(v) = f.get(k) {
+                        func.insert(k.into(), v.clone());
+                    }
+                }
+                serde_json::json!({"type": t["type"], "function": func})
+            })
+            .collect();
+        let messages: Vec<serde_json::Value> = serde_json::from_value(body["messages"].clone()).unwrap();
+        let ids = tok
+            .apply_chat_template_openai_with_options(&messages, Some(&tools), true, false, None, None)
+            .unwrap();
+        let text = tok.decode_with_special(&ids).unwrap();
+        let out = serde_json::json!({"ids": ids, "text": text});
+        std::fs::write(var("ATLAS_PROBE_OUT"), out.to_string()).unwrap();
+    }
+}

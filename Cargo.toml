@@ -38,7 +38,11 @@ cudarc = { version = "0.19", features = ["driver", "nvrtc", "cuda-version-from-b
 
 # Serialization (HF config.json)
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order`: keep JSON object keys in insertion/declaration order
+# (IndexMap, not BTreeMap), as Python's json.dumps and HF transformers'
+# `tojson` do. Tool schemas in chat-template prompts and DeepSeek-V4.1's
+# encoding.py port depend on it.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # Error handling
 thiserror = "2"

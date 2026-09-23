@@ -16,7 +16,7 @@ pub(crate) mod bicubic;
 pub mod encoding;
 pub mod grammar;
 pub mod parse;
-pub mod pyjson;
+pub(crate) use crate::pyjson;
 pub mod repetition;
 pub mod request;
 pub mod turbojpeg;
