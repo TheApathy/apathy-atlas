@@ -58,7 +58,9 @@ def classify(score_row, ours_row, miss):
         margin = float(kth - s)
         rank = int((score_row > s).sum())
         kind = "tie" if margin == 0 else ("near" if margin <= abs(kth) * 2.0 ** -16 else "real")
-        res.append((kind, rank, margin))
+        # pool: OUR score is -inf = the index lies outside our candidate pool (inherited from L20);
+        # still a 'real' miss for the pre-registered band, reported as its own subset.
+        res.append((kind, rank, margin, bool(np.isneginf(s))))
     return res
 
 
@@ -77,6 +79,7 @@ def main():
         kinds = {"tie": 0, "near": 0, "real": 0}
         reals = []
         all_ov = []
+        exact_rows = []
         for occ, (rp, op) in enumerate(zip(ro, oo)):
             R, O = load_i64(rp), load_i64(op)
             if R.shape != O.shape:
@@ -91,6 +94,7 @@ def main():
                 else:
                     ov[r] = len(np.intersect1d(rv, ovv, assume_unique=True)) / len(rv)
             all_ov.append(ov)
+            exact_rows.append((occ, np.where(ov == 1)[0]))
             line = (f"  L{l:02d} occ {occ:3d} t={len(R):5d} valid/row={int((R >= 0).sum(1).mean()):3d}: overlap mean {ov.mean():.5f} "
                     f"min {ov.min():.4f} | rows<0.99 {int((ov < 0.99).sum())} | exact {int((ov == 1).sum())}/{len(R)}")
             sp = os.path.join(ours, f"L{l:02d}.index_score_rows.{occ:03d}.bin")
@@ -99,16 +103,19 @@ def main():
                 n_s = (len(R) + SAMPLE - 1) // SAMPLE
                 srows = srows.reshape(n_s, -1)
                 c = {"tie": 0, "near": 0, "real": 0}
+                pool = 0
                 for i in range(n_s):
                     r = i * SAMPLE
                     miss = np.setdiff1d(R[r][R[r] >= 0], O[r][O[r] >= 0])
-                    for kind, rank, margin in classify(srows[i], O[r], miss):
+                    for kind, rank, margin, outside in classify(srows[i], O[r], miss):
                         c[kind] += 1
+                        pool += outside
                         if kind == "real":
                             reals.append((occ, r, rank, margin))
                 for k in c:
                     kinds[k] += c[k]
-                line += f" | sampled-row misses: tie {c['tie']} near {c['near']} real {c['real']}"
+                kinds["pool"] = kinds.get("pool", 0) + pool
+                line += f" | sampled-row misses: tie {c['tie']} near {c['near']} real {c['real']} (outside our pool {pool})"
             print(line)
         if all_ov:
             ov = np.concatenate(all_ov)
@@ -116,7 +123,14 @@ def main():
                   f"| misses tie {kinds['tie']} near {kinds['near']} real {kinds['real']}")
             for occ, r, rank, margin in reals[:20]:
                 print(f"    real miss: occ {occ} row {r}: our rank {rank} (512 kept), margin {margin:.3e}")
-            n_cls = sum(kinds.values())
+            n_cls = kinds["tie"] + kinds["near"] + kinds["real"]
+            if kinds.get("pool"):
+                print(f"    of the real misses, {kinds['pool']} lie OUTSIDE our candidate pool (inherited from L20), {kinds['real'] - kinds['pool']} inside it")
+            ex_path = os.path.join(ours, f"L{l:02d}.exact_topk_rows.txt")
+            with open(ex_path, "w") as f:
+                for occ, rows in exact_rows:
+                    f.write(f"{occ} " + " ".join(map(str, rows.tolist())) + "\n")
+            print(f"    rows whose top-k is EXACT, per occurrence: {ex_path}")
             real_share = kinds["real"] / n_cls if n_cls else 0.0
             low = (ov < 0.90).mean()
             if l == 2:
