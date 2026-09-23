@@ -161,6 +161,12 @@ pub struct CoreArgs {
 /// fed from a capture in the driver.
 pub trait AttnCore {
     fn run(&self, ops: &Ops, a: &CoreArgs) -> Result<()>;
+
+    /// Dump the core's internal state for `layer` after `run` (e.g. the index top-k) when
+    /// `tap` is enabled. Default: nothing.
+    fn taps(&self, _ops: &Ops, _tap: &Tap, _layer: usize, _t: usize) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// `[T, 128]` window positions: `pos - 127 .. pos`, -1 below 0 (`Model._window_positions`).
@@ -231,6 +237,9 @@ pub fn attention(
             &CoreArgs { layer: l, x, qr: s.qr, q: s.q, ring, wpos: s.wpos, win_lo, sink: w.attn_sink, t, start, out: s.o },
         )
     })?;
+    if tap.enabled() {
+        core.taps(ops, tap, l, t)?;
+    }
     tap.bf16(ops, "attn_o_pre_inverse_rope", l, s.o, &[t, N_HEADS, HEAD_DIM])?;
     attn_output(ops, w, s, wscratch, rope, t, out, tap)
 }
