@@ -81,6 +81,9 @@
 //     at 128). A first cut of the 2 x 4 down_m32 was WRONG (rel_l2 0.70) yet passed the chunk
 //     invariance check, which compares chunkings with each other: only the byte-cmp and
 //     rel_l2 gates catch a kernel that is wrong the same way in every chunking.
+//   - BK = 128 (four groups per step, two independent decodes per thread, half the barriers;
+//     64 / 48 KB stages): +5.8% at 2048, +9.2% at 4096, +1.4% at 128. Same as every larger-
+//     smem variant before it: on GB10 the smaller stage wins over fewer barriers or more ILP.
 // Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
 
 #include <cstdint>
