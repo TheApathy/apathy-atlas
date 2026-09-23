@@ -23,7 +23,16 @@ defaults:
   kv_cache_dtype: nvfp4
   kv_high_precision_layers: 0
   max_model_len: 12288
-  max_prefill_tokens: 8192
+  # Must not exceed ATLAS_DFLASH_CTX_WINDOW (below): each prefill call is
+  # chunked at exactly this size (server log: "ssm_prefill_chunk=N" tracks
+  # max_prefill_tokens 1:1), and DFlash's context-cache ring is sized to
+  # ATLAS_DFLASH_CTX_WINDOW. A chunk larger than the ring fails closed with
+  # "chunk exceeds ring capacity" (dflash_head/ring_window.rs:134) — this is
+  # per-CHUNK, not a hard cap on total conversation length; max_model_len
+  # above (12288) is unaffected, the ring wraps across multiple chunks.
+  # Previously 8192 here vs ctx_window 4096 below: any single turn over
+  # 4096 tokens crashed the request. Confirmed in a follow-up window: 2026-09-23.
+  max_prefill_tokens: 4096
   max_batch_size: 1
   max_num_seqs: 1
   mtp_vocab: 96000
