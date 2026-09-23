@@ -234,6 +234,18 @@ pub fn ssm_proj_tc_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_SSM_PROJ_TC").ok().as_deref() == Some("1"))
 }
 
+/// `ATLAS_DECODE_TC_PARITY=1`: route single-token decode through the SAME
+/// tensor-core kernels the K=γ verify uses when a REFREEZE switch
+/// (`ATLAS_SSM_PROJ_TC`, `ATLAS_FFN_TC`, `ATLAS_LM_HEAD_TC`) moves verify off
+/// the K1-exact family. Those kernels are row-independent (an M=1 call
+/// computes row 0 exactly as it would inside an M=16 verify), so plain decode
+/// and speculative decode produce identical greedy output at TC speed.
+/// Inert unless the matching REFREEZE switch is also on. Default off.
+pub fn decode_tc_parity_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_DECODE_TC_PARITY").ok().as_deref() == Some("1"))
+}
+
 /// Diagnostic-only: force every row of the batched SSM QKVZ projection
 /// through the same NVFP4 GEMV used by single-token decode.  This is a
 /// losslessness bisection switch, not a serving optimization.
@@ -1870,6 +1882,10 @@ impl FfnComponent {
             // falls back to `forward` when the sparse kernels are missing.
             Self::Dense(d) => match ctx.self_spec_sparse_draft {
                 Some(thresh) => d.forward_draft_sparse(input, ctx, thresh, stream),
+                None if d.decode_tc_parity_route() => {
+                    d.forward_kgamma(input, ctx, 1, stream)?;
+                    Ok(ctx.buffers.moe_output())
+                }
                 None => d.forward(input, ctx, stream),
             },
             Self::None => Ok(input),
