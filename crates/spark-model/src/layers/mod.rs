@@ -241,9 +241,89 @@ pub fn ssm_proj_tc_enabled() -> bool {
 /// computes row 0 exactly as it would inside an M=16 verify), so plain decode
 /// and speculative decode produce identical greedy output at TC speed.
 /// Inert unless the matching REFREEZE switch is also on. Default off.
+///
+/// Engages only once [`configure_decode_tc_parity`] has recorded a verify
+/// width inside the tensor-core window ([`rows_in_tc_verify_window`]): a
+/// verify outside it takes different kernels, which a single-row decode
+/// cannot mirror, so parity fails closed rather than claiming identity.
 pub fn decode_tc_parity_enabled() -> bool {
-    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| std::env::var("ATLAS_DECODE_TC_PARITY").ok().as_deref() == Some("1"))
+    DECODE_TC_PARITY_ENGAGED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Verify widths (rows = drafts + 1) served by the REFREEZE tensor-core
+/// routes that `ATLAS_DECODE_TC_PARITY` mirrors. The SSM qkvz/out split-K
+/// routes engage from 4 rows and the batched FFN from 4 rows (2 and 3 have
+/// their own fused kernels); every m32 tile (FFN, LM head, split-K) covers at
+/// most 32 rows, above which the FFN switches to the wide m128 route. The
+/// verify dispatch and the decode parity gate both read these, so the two
+/// cannot drift apart.
+pub const TC_VERIFY_MIN_ROWS: usize = 4;
+pub const TC_VERIFY_MAX_ROWS: usize = 32;
+
+/// Whether a verify of `rows` rows runs the tensor-core routes parity mirrors.
+pub const fn rows_in_tc_verify_window(rows: usize) -> bool {
+    rows >= TC_VERIFY_MIN_ROWS && rows <= TC_VERIFY_MAX_ROWS
+}
+
+/// Pure engagement rule behind [`decode_tc_parity_enabled`].
+pub const fn decode_tc_parity_engaged(requested: bool, verify_rows: Option<usize>) -> bool {
+    match verify_rows {
+        Some(rows) => requested && rows_in_tc_verify_window(rows),
+        None => false,
+    }
+}
+
+/// Set per model load by [`configure_decode_tc_parity`]; `false` until then,
+/// so a load path that never configures it fails closed.
+static DECODE_TC_PARITY_ENGAGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record the configured speculative verify width (γ + 1; `None` without a
+/// drafter) at every model load, before the first decode — a model swap
+/// re-runs it with the new recipe's environment. Returns whether decode
+/// parity is engaged. A requested parity that cannot hold is refused loudly.
+pub fn configure_decode_tc_parity(verify_rows: Option<usize>) -> bool {
+    let requested = std::env::var("ATLAS_DECODE_TC_PARITY").ok().as_deref() == Some("1");
+    let engaged = decode_tc_parity_engaged(requested, verify_rows);
+    DECODE_TC_PARITY_ENGAGED.store(engaged, std::sync::atomic::Ordering::Relaxed);
+    if requested && !engaged {
+        tracing::warn!(
+            verify_rows = ?verify_rows,
+            min = TC_VERIFY_MIN_ROWS,
+            max = TC_VERIFY_MAX_ROWS,
+            "ATLAS_DECODE_TC_PARITY=1 DISABLED: the speculative verify width is outside the \
+             tensor-core window (or no drafter is loaded), so plain decode stays on the K1 \
+             kernels and speculative output is NOT guaranteed identical to plain decode"
+        );
+    } else if engaged {
+        tracing::info!(
+            verify_rows = ?verify_rows,
+            "ATLAS_DECODE_TC_PARITY engaged: plain decode shares the verify tensor-core kernels"
+        );
+    }
+    engaged
+}
+
+#[cfg(test)]
+#[path = "decode_tc_parity_tests.rs"]
+mod decode_tc_parity_tests;
+
+/// Once-per-process loud report of a verify whose width fell outside the
+/// tensor-core window while parity is engaged (e.g. a grammar-truncated
+/// draft window). That step's rows take other kernels, so it may not match
+/// plain decode.
+pub fn note_verify_rows_for_decode_tc_parity(rows: usize) {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    if decode_tc_parity_enabled() && !rows_in_tc_verify_window(rows) {
+        REPORTED.call_once(|| {
+            tracing::error!(
+                rows,
+                "ATLAS_DECODE_TC_PARITY: a {rows}-row verify is outside the tensor-core window \
+                 [{TC_VERIFY_MIN_ROWS}, {TC_VERIFY_MAX_ROWS}]; its rows are not bit-identical \
+                 to plain decode (reported once)"
+            );
+        });
+    }
 }
 
 /// Diagnostic-only: force every row of the batched SSM QKVZ projection

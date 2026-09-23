@@ -98,6 +98,11 @@ pub(crate) fn effective_draft_width(trained_drafts: usize) -> usize {
     )
 }
 
+/// DFlash verify width (drafts + 1 rows) at the current launch/runtime cap.
+pub fn effective_verify_rows(trained_drafts: usize) -> usize {
+    effective_draft_width(trained_drafts) + 1
+}
+
 #[cfg(test)]
 mod effective_draft_width_tests {
     use super::resolve_effective_draft_width;

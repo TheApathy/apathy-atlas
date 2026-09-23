@@ -3510,7 +3510,7 @@ impl DenseFfnLayer {
         // 32 < n <= 256 through `w4a16_gemm_t_m128` (y-tiled; at M=136 two
         // weight reads still beat legacy's 3 sweeps x overfetch). Requires
         // the m128 kernel — the m16 kernel's small-M window is NOT widened.
-        let wide_m128 = n > 32
+        let wide_m128 = n as usize > crate::layers::TC_VERIFY_MAX_ROWS
             && n <= 256
             && crate::layers::ffn_kgamma_wide_enabled()
             && crate::layers::ffn_kgamma_m128_enabled()
@@ -3518,7 +3518,7 @@ impl DenseFfnLayer {
             && (crate::layers::ffn_m16_transposed_enabled()
                 || crate::layers::tc_nvfp4_m16_enabled())
             && self.has_transposed_ffn();
-        let m16_path = (n <= 32
+        let m16_path = (n as usize <= crate::layers::TC_VERIFY_MAX_ROWS
             && (crate::layers::ffn_m16_transposed_enabled()
                 || crate::layers::tc_nvfp4_m16_enabled())
             && self.has_transposed_ffn())
@@ -3568,7 +3568,7 @@ impl DenseFfnLayer {
         // M_TILE=32 shapes don't cover wide M).
         // ATLAS_FFN_KGAMMA_M32=0 opts out for bisection.
         let m32_path = m128_path
-            && n <= 32
+            && n as usize <= crate::layers::TC_VERIFY_MAX_ROWS
             && self.w4a16_gemm_t_m32_n64.0 != 0
             && std::env::var("ATLAS_FFN_KGAMMA_M32").ok().as_deref() != Some("0");
 
