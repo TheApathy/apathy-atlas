@@ -382,6 +382,113 @@ extern "C" __global__ void dsv41_hc_fused_v2(
         x[(size_t)t * D + d] = __float2bfloat16(bf(norm_w[d]) * (bf(x[(size_t)t * D + d]) * rs));
 }
 
+// ── fused mHC v3: the token's h row held in shared memory across the stages ──
+// dsv41_hc_fused_v2 reads h from global memory three times (post, mixes, pre). v3 keeps the row
+// ([HC, D] bf16 = 40 KB at D = 5120) in shared memory: post writes it to both, mixes and pre read
+// it from shared. The 25 sums still go through block_sum's exact tree, in 5 batches of 5 (a
+// smaller scratch that keeps the block under 48 KB of static shared memory; each sum's pairings
+// are unchanged). Every value is BIT-IDENTICAL to v2 / the separate kernels. D <= DSV41_DMAX.
+#define DSV41_DMAX 5120
+#define DSV41_SUM_BATCH 5
+extern "C" __global__ void __launch_bounds__(DSV41_BLOCK) dsv41_hc_fused_v3(
+    const __nv_bfloat16* __restrict__ ya, const __nv_bfloat16* __restrict__ yb,
+    const float* __restrict__ post_in, const float* __restrict__ comb_in,
+    __nv_bfloat16* h,
+    const float* __restrict__ fn, const float* __restrict__ scale, const float* __restrict__ base,
+    float* pre_o, float* __restrict__ post_o, float* __restrict__ comb_o,
+    const float* side_pre, const __nv_bfloat16* __restrict__ norm_w,
+    __nv_bfloat16* x, const unsigned D, const unsigned iters,
+    const float eps, const float hc_eps) {
+    __shared__ __nv_bfloat16 hs[DSV41_HC * DSV41_DMAX];
+    __shared__ float red[DSV41_SUM_BATCH][DSV41_BLOCK];
+    __shared__ float sums[DSV41_NSUM];
+    __shared__ float mix[DSV41_NMIX];
+    const unsigned t = blockIdx.x, tid = threadIdx.x;
+    const unsigned R = DSV41_HC * D;
+    __nv_bfloat16* ht = h + (size_t)t * R;
+    if (ya != nullptr) {
+        const float* po = post_in + t * DSV41_HC;
+        const float* cb = comb_in + t * DSV41_HC * DSV41_HC;
+        for (unsigned d = tid; d < D; d += DSV41_BLOCK) {
+            const size_t yi = (size_t)t * D + d;
+            const float yv = yb != nullptr ? bf(__float2bfloat16(bf(ya[yi]) + bf(yb[yi]))) : bf(ya[yi]);
+            float r[DSV41_HC];
+#pragma unroll
+            for (unsigned i = 0; i < DSV41_HC; ++i) r[i] = bf(ht[i * D + d]);
+#pragma unroll
+            for (unsigned j = 0; j < DSV41_HC; ++j) {
+                float acc = po[j] * yv;
+#pragma unroll
+                for (unsigned i = 0; i < DSV41_HC; ++i) acc += cb[i * DSV41_HC + j] * r[i];
+                const __nv_bfloat16 o = __float2bfloat16(acc);
+                ht[j * D + d] = o;
+                hs[j * D + d] = o;
+            }
+        }
+    } else {
+        for (unsigned k = tid; k < R; k += DSV41_BLOCK) hs[k] = ht[k];
+    }
+    __syncthreads();
+    // mixes: dsv41_hc_mixes' per-thread accumulation, reading the row from shared memory
+    float acc[DSV41_NMIX];
+#pragma unroll
+    for (int m = 0; m < DSV41_NMIX; ++m) acc[m] = 0.f;
+    float ss = 0.f;
+    for (unsigned k = tid; k < R; k += DSV41_BLOCK) {
+        const float v = bf(hs[k]);
+        ss += v * v;
+#pragma unroll
+        for (int m = 0; m < DSV41_NMIX; ++m) acc[m] += v * fn[(size_t)m * R + k];
+    }
+    // 25 sums (24 dots + ss) through block_sum's tree, DSV41_SUM_BATCH at a time
+    const unsigned warp = tid / 32, lane = tid % 32;
+#pragma unroll
+    for (int b0 = 0; b0 < DSV41_NSUM; b0 += DSV41_SUM_BATCH) {
+#pragma unroll
+        for (int j = 0; j < DSV41_SUM_BATCH; ++j) {
+            const int m = b0 + j;
+            red[j][tid] = m < DSV41_NMIX ? acc[m < DSV41_NMIX ? m : 0] : ss;
+        }
+        __syncthreads();
+        for (unsigned s = DSV41_BLOCK / 2; s >= 32; s >>= 1) {
+            if (tid < s) {
+#pragma unroll
+                for (int j = 0; j < DSV41_SUM_BATCH; ++j) red[j][tid] += red[j][tid + s];
+            }
+            __syncthreads();
+        }
+        if (warp < DSV41_SUM_BATCH) {
+            float v = red[warp][lane];
+#pragma unroll
+            for (unsigned s = 16; s > 0; s >>= 1) v += __shfl_down_sync(0xffffffffu, v, s);
+            if (lane == 0) sums[b0 + warp] = v;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const float rs = rsqrtf(sums[DSV41_NMIX] / (float)R + eps);
+        for (int m = 0; m < DSV41_NMIX; ++m) mix[m] = sums[m] * rs;
+    }
+    __syncthreads();
+    if (tid < 32) hc_mix_epilogue_warp(mix, t, scale, base, pre_o, post_o, comb_o, iters, hc_eps);
+    __syncthreads();
+    // pre (side_pre, may alias pre_o: read after the epilogue, as unfused) + rmsnorm
+    const float* p = side_pre + t * DSV41_HC;
+    float ssq = 0.f;
+    for (unsigned d = tid; d < D; d += DSV41_BLOCK) {
+        float a2 = 0.f;
+#pragma unroll
+        for (unsigned i = 0; i < DSV41_HC; ++i) a2 += p[i] * bf(hs[i * D + d]);
+        const __nv_bfloat16 xv = __float2bfloat16(a2);
+        x[(size_t)t * D + d] = xv;
+        const float v = bf(xv);
+        ssq += v * v;
+    }
+    const float rs2 = rsqrtf(block_sum(ssq, red[0]) / (float)D + eps);
+    for (unsigned d = tid; d < D; d += DSV41_BLOCK)
+        x[(size_t)t * D + d] = __float2bfloat16(bf(norm_w[d]) * (bf(x[(size_t)t * D + d]) * rs2));
+}
+
 // ── add + hc_post: dsv41_add_bf16 then dsv41_hc_post, one pass (the FFN end of a block) ──
 // Grid: (T)  Block: 256.
 extern "C" __global__ void dsv41_hc_add_post(const __nv_bfloat16* __restrict__ ya,

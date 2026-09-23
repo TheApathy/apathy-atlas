@@ -39,10 +39,11 @@ pub mod profile {
         let mut t = table().lock().expect("prof poisoned");
         let mut rows: Vec<(String, (f64, u64))> = std::mem::take(&mut *t).into_iter().collect();
         rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
-        let total: f64 = rows.iter().filter(|r| !r.0.contains('/')).map(|r| r.1.0).sum();
+        let top = |k: &str| !k.trim_start_matches("replay:").contains('/');
+        let total: f64 = rows.iter().filter(|r| top(&r.0)).map(|r| r.1.0).sum();
         let mut out = format!("{:<34} {:>9} {:>7} {:>6}\n", "scope (a/b = nested in a)", "ms", "calls", "%top");
         for (k, (sec, n)) in rows {
-            let pct = if k.contains('/') { String::new() } else { format!("{:.1}", 100.0 * sec / total.max(1e-12)) };
+            let pct = if !top(&k) { String::new() } else { format!("{:.1}", 100.0 * sec / total.max(1e-12)) };
             out += &format!("{k:<34} {:>9.1} {n:>7} {pct:>6}\n", sec * 1e3);
         }
         out += &format!("{:<34} {:>9.1}\n", "TOTAL (top-level scopes)", total * 1e3);
@@ -69,6 +70,33 @@ pub fn set_decode_pass(on: bool) {
 
 pub fn decode_pass() -> bool {
     DECODE_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set for the SWA replay pass (layers 21-39 over the last <= 128 prompt rows). Replay rows are
+/// only ever computed by replay passes, so a replay-only kernel choice keeps chunk invariance by
+/// construction (like decode_pass).
+static REPLAY_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_replay_pass(on: bool) {
+    REPLAY_PASS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn replay_pass() -> bool {
+    REPLAY_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `ATLAS_DSV41_REPLAY_FUSED=1`: replay passes run their FP8 linears through the fused FP8 GEMM
+/// (no bf16 dequant copy): at <= 128 rows the per-pass dequant of every dense weight dominates.
+pub const REPLAY_FUSED_ENV: &str = "ATLAS_DSV41_REPLAY_FUSED";
+
+fn replay_fused_enabled() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var(REPLAY_FUSED_ENV).as_deref() == Ok("1"))
+}
+
+fn fp8_fused_all() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var(FP8_FUSED_ENV).as_deref() == Ok("1"))
 }
 
 /// CUDA-graph decode: the device i32 holding the current pass's start (the position of its row
@@ -151,7 +179,10 @@ pub fn prof<R>(ops: &Ops, name: &str, f: impl FnOnce() -> Result<R>) -> Result<R
     ops.gpu.synchronize(ops.stream)?;
     let dt = t0.elapsed().as_secs_f64();
     let mut t = profile::table().lock().expect("prof poisoned");
-    let e = t.entry(name.to_string()).or_insert((0.0, 0));
+    // Replay-pass scopes are recorded separately ("replay:<scope>"), so the table shows the
+    // 128-row SWA replay's share next to the encoder chunks'.
+    let key = if replay_pass() { format!("replay:{name}") } else { name.to_string() };
+    let e = t.entry(key).or_insert((0.0, 0));
     e.0 += dt;
     e.1 += 1;
     Ok(r)
@@ -279,7 +310,9 @@ impl Dsv41Kernels {
             mul_bf16_to_f32: k("dsv41_mul_bf16_to_f32")?,
             hc_mean_bf16: k("dsv41_hc_mean_bf16")?,
             hc_fused: if std::env::var(HC_FUSED_ENV).as_deref() != Ok("0") {
-                Some((k("dsv41_hc_fused_v2")?, k("dsv41_hc_add_post")?))
+                // ATLAS_DSV41_HC_FUSED_V3=1: the h row held in shared memory (D <= 5120).
+                let v3 = std::env::var("ATLAS_DSV41_HC_FUSED_V3").as_deref() == Ok("1");
+                Some((k(if v3 { "dsv41_hc_fused_v3" } else { "dsv41_hc_fused_v2" })?, k("dsv41_hc_add_post")?))
             } else {
                 None
             },
@@ -307,7 +340,7 @@ impl Dsv41Kernels {
             } else {
                 None
             },
-            fp8_fused: if std::env::var(FP8_FUSED_ENV).as_deref() == Ok("1") { Some(Fp8Gemm::load(gpu)?) } else { None },
+            fp8_fused: if fp8_fused_all() || replay_fused_enabled() { Some(Fp8Gemm::load(gpu)?) } else { None },
         })
     }
 }
@@ -406,7 +439,8 @@ impl Ops<'_> {
         pre: DevicePtr, post: DevicePtr, comb: DevicePtr, side_pre: DevicePtr, norm_w: DevicePtr, x: DevicePtr,
         t: usize, d: usize, iters: u32, eps: f32, hc_eps: f32,
     ) -> Result<()> {
-        let (fused, _) = self.k.hc_fused.context("hc_fused: kernels not loaded (ATLAS_DSV41_HC_FUSED=1)")?;
+        let (fused, _) = self.k.hc_fused.context("hc_fused: kernels not loaded (ATLAS_DSV41_HC_FUSED=0)")?;
+        ensure!(d <= 5120, "hc_fused: hidden {d} > the v3 kernel's shared-memory row (5120)");
         self.l(fused)
             .grid([t as u32, 1, 1])
             .arg_ptr(ya).arg_ptr(yb).arg_ptr(post_in).arg_ptr(comb_in).arg_ptr(h)
@@ -527,10 +561,17 @@ impl Ops<'_> {
         // The kernel choice depends on the WEIGHT (N, K) only, never on M: every row of a given
         // weight takes the same kernel whatever the chunking, so chunk invariance holds by
         // construction rather than by fused == cuBLAS bytewise. Decode passes returned above.
+        // Replay passes (REPLAY_FUSED): every aligned shape, since at <= 128 rows the dequant copy of
+        // the weight costs more than the GEMM; the choice keys on the pass kind, never on M.
+        let fused_here = if fp8_fused_all() {
+            fused_wins(w.n, w.k)
+        } else {
+            replay_fused_enabled() && replay_pass() && w.n % 128 == 0 && w.k % 32 == 0
+        };
         if let Some(f) = self.k.fp8_fused
             && !fp8_force_rowtile()
             && fp8_policy() == Fp8Policy::Pinned
-            && fused_wins(w.n, w.k)
+            && fused_here
         {
             return prof(self, "dense/fused", || f.linear(self.gpu, x, w.k, w, out, w.n, m, self.stream));
         }

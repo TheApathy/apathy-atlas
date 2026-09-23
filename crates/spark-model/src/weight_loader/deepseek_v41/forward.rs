@@ -515,6 +515,7 @@ impl V41Forward {
         ops.hc_expand(self.scratch.x, self.scratch.h, self.scratch.pre_mix, t, self.dims.hidden)?;
         // Decode-size kernels key on the PASS KIND (never on t): see ops::set_decode_pass.
         super::ops::set_decode_pass(matches!(kind, PassKind::Decode | PassKind::Verify));
+        super::ops::set_replay_pass(matches!(kind, PassKind::Replay));
         hook.begin_pass(kind, start, t)?;
         moe.begin_pass(ids)?;
         self.run_layers(ops, seq, layers, t, start, 0, Some(&hashes), core, moe, tap)?;
@@ -615,10 +616,13 @@ impl V41Forward {
             ops.gpu.copy_d2d_async(seq.tail_h, self.scratch.h, t * hrow, ops.stream)?;
             ops.gpu.copy_d2d_async(seq.tail_pre, self.scratch.pre_mix, t * prow, ops.stream)?;
             super::ops::set_decode_pass(false);
+            super::ops::set_replay_pass(true);
             hook.begin_pass(PassKind::Replay, start, t)?;
             ensure!(seq.tail_ids.len() == t, "replay tail holds {} ids for {t} rows", seq.tail_ids.len());
             moe.begin_pass(&seq.tail_ids)?;
-            self.run_layers(ops, seq, (ENCODER_LAST + 1)..n, t, start, start, None, core, moe, tap)?;
+            let r = self.run_layers(ops, seq, (ENCODER_LAST + 1)..n, t, start, start, None, core, moe, tap);
+            super::ops::set_replay_pass(false);
+            r?;
         }
         prof(ops, "head", || super::fwd::final_logits_last_row(ops, &self.dims, &self.scratch, t, self.norm, self.head, self.vocab, logits))
     }
