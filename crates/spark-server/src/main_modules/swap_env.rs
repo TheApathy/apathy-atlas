@@ -253,8 +253,10 @@ pub(crate) fn exec(recipe_argv: &[String], wanted: &BTreeMap<String, String>) ->
         exe.display(),
         argv.get(1..).unwrap_or_default()
     );
-    // The new process takes the terminal over from scratch.
+    // The new process takes the terminal over from scratch, and the log tee is buffered: an
+    // exec discards whatever it still holds, including the line above.
     crate::tui::terminal_guard::restore();
+    crate::tui::init::flush_tee();
     let err = std::process::Command::new(&exe)
         .args(argv.get(1..).unwrap_or_default())
         .env_clear()
