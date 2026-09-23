@@ -360,6 +360,7 @@ impl Model for Dsv41Model {
 
     fn spec_verify(&self, token: u32, seq: &mut SequenceState, sampling: Option<&crate::traits::SpecSampling>, verify_drafts: Option<usize>, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
         let k = verify_drafts.unwrap_or(crate::weight_loader::deepseek_v41::dspark::B);
+        ensure!((1..=crate::weight_loader::deepseek_v41::dspark::B).contains(&k), "dsv41 spec_verify: verify_drafts {k}");
         let ds = self.dspark.as_ref().context("dsv41 spec_verify: DSpark is not loaded")?;
         let ops = self.ops();
         let l = &self.lanes;
@@ -373,9 +374,12 @@ impl Model for Dsv41Model {
             // Sampled drafts (T > 0): q_i = softmax(markov_logits_i / T) at the caller's uniforms.
             let draft_sampling = match sampling {
                 Some(sp) => {
-                    ensure!(sp.draft_uniforms.len() == crate::weight_loader::deepseek_v41::dspark::B, "dsv41 spec_verify: {} draft uniforms for {} drafts", sp.draft_uniforms.len(), crate::weight_loader::deepseek_v41::dspark::B);
-                    let mut u = [0f32; crate::weight_loader::deepseek_v41::dspark::B];
-                    u.copy_from_slice(&sp.draft_uniforms);
+                    // k uniforms (one per verified draft) or all B; drafts past k are drawn but
+                    // never verified, so their uniform is irrelevant.
+                    let n = sp.draft_uniforms.len();
+                    ensure!(n >= k && n <= crate::weight_loader::deepseek_v41::dspark::B, "dsv41 spec_verify: {n} draft uniforms for {k} verified drafts");
+                    let mut u = [0.5f32; crate::weight_loader::deepseek_v41::dspark::B];
+                    u[..n].copy_from_slice(&sp.draft_uniforms);
                     Some((sp.temperature, u))
                 }
                 None => None,

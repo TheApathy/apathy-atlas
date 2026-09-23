@@ -189,6 +189,12 @@ mod tests {
     }
 
     #[test]
+    fn policy_is_send_and_sync() {
+        fn check<T: Send + Sync + 'static>() {}
+        check::<AdaptiveK>();
+    }
+
+    #[test]
     fn costs_parse() {
         assert_eq!(Costs::parse("1,2,3,4,5,6").unwrap(), Costs { draft: 1.0, verify: [2.0, 3.0, 4.0, 5.0, 6.0] });
         assert!(Costs::parse("1,2,3").is_err());
