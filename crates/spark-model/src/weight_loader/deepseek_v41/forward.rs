@@ -111,20 +111,24 @@ const SHARED_RESIDENT_MIN_FREE: u64 = 16_000_000_000;
 /// low-water), so 20 GB here keeps the real low-water >= 16 GB (lead, 2026-09-23).
 const ATTN_RESIDENT_MIN_FREE: u64 = 20_000_000_000;
 
-/// `ATLAS_DSV41_ATTN_RESIDENT=1`: OPT-IN ("prefill-max") resident bf16 copies of the attention's
+/// `ATLAS_DSV41_ATTN_RESIDENT` (default ON; `0` = off): resident bf16 copies of the attention's
 /// biggest FP8 weights, wq_b (84 MB), wo_b (84 MB) and wo_a (67 MB) per layer, encoder layers
-/// first, as far as free memory allows above a 20 GB floor (the shared expert keeps 16 GB).
-/// Default OFF: 5-10 GB would eat into DSpark's low-water and the long-context KV.
+/// first, as far as free memory allows above a 20 GB floor (the shared expert keeps 16 GB). The
+/// per-layer fallback makes it ELASTIC: 40/40 layers (9.40 GB) plain, 11-21 with DSpark; the
+/// measured low-water stayed >= 16 GB with DSpark and at 32K.
 /// `=swap_control` makes them resident with each even/odd layer pair's wq_b SWAPPED (real
 /// matrices, the wrong layer's) - a byte gate must FAIL under it.
 pub const ATTN_RESIDENT_ENV: &str = "ATLAS_DSV41_ATTN_RESIDENT";
 
 /// See [`ATTN_RESIDENT_ENV`]. Returns the allocations to own.
 fn make_attn_resident(ops: &Ops, attn: &mut [V41AttnWeights]) -> Result<Vec<DevicePtr>> {
-    let mode = std::env::var(ATTN_RESIDENT_ENV).unwrap_or_default();
-    if mode != "1" && mode != "swap_control" {
+    // Default ON (lead, 2026-09-23: the 20 GB floor held under DSpark and at 32K); "0" = off.
+    let mode = std::env::var(ATTN_RESIDENT_ENV).unwrap_or_else(|_| "1".into());
+    if mode == "0" {
+        tracing::info!("DeepSeek-V4.1: resident attention weights OFF ({ATTN_RESIDENT_ENV}=0)");
         return Ok(Vec::new());
     }
+    ensure!(mode == "1" || mode == "swap_control", "{ATTN_RESIDENT_ENV}={mode}: use 1 (default), 0 or swap_control");
     let per_layer = |a: &V41AttnWeights| (a.wq_b.bf16_bytes() + a.wo_b.bf16_bytes() + a.wo_a.bf16_bytes()) as u64;
     let mut owned = Vec::new();
     let mut resident = 0usize;
