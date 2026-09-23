@@ -26,7 +26,9 @@ end() { echo "$(date -u +%FT%TZ) dsv41-integrate KEEP124 $LABEL window END rc=$1
 # Model-holding things only: a buildkit builder container or a cargo build is not resident on
 # the GPU (a build is reported as a warning: it slows GPU work but cannot OOM the device).
 others=$(docker ps --format '{{.Names}}' | grep -Ei 'dsv41|atlas|spark|vllm' | grep -v buildkit || true)
-procs=$(pgrep -af 'spark serve|bin/spark |v41_engine|capture_ref|examples/dsv41_forward' | grep -v "$$" | grep -v keep124_window | grep -v cargo | grep -v 'flock -w' || true)
+# GPU-resident candidates by EXECUTABLE name (argv[0]), not by any command line that merely
+# mentions one: a queued job's wrapper shell contains "examples/dsv41_forward" in its script text.
+procs=$(ps -eo pid=,args= | awk '{split($2,a,"/"); e=a[length(a)]} e=="spark" || e=="dsv41_forward" || e=="dsv41_drop_gate" || (e ~ /^python/ && ($0 ~ /v41_engine|capture_ref/))' | grep -v "^ *$$ " || true)
 builds=$(pgrep -af 'cargo build|rustc|nvcc' | head -3 || true)
 [ -n "$builds" ] && echo "WARNING: builds running (slow GPU work, not memory-resident): [${builds}]"
 avail=$(memavail)
@@ -55,9 +57,11 @@ run_one() {
   echo "=== run: $*"
   "$BIN" "$@" &
   child=$!
+  local runlow; runlow=$(memavail)
   while kill -0 "$child" 2>/dev/null; do
     m=$(memavail)
     [ "$m" -lt "$low" ] && low=$m
+    [ "$m" -lt "$runlow" ] && runlow=$m
     if [ "$m" -lt "$ABORT_KB" ]; then
       echo "WATCHDOG: MemAvailable $((m/1024)) MB < 6 GB -> SIGKILL pid $child"
       kill -9 "$child"
@@ -65,7 +69,7 @@ run_one() {
     sleep 0.1
   done
   wait "$child"; local r=$?
-  echo "=== run rc=$r, low-water so far $((low/1024/1024)) GB"
+  echo "=== run rc=$r, this run's low-water $((runlow/1024)) MB, low-water so far $((low/1024/1024)) GB"
   [ "$r" -ne 0 ] && rc=$r
   return 0
 }

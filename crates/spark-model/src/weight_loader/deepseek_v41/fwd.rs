@@ -28,7 +28,7 @@ use std::sync::Mutex;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::WeightStore;
 
-use super::ops::{Fp8Linear, HcParams, Ops, bf16_tensor, prof};
+use super::ops::{Fp8Linear, HcParams, Ops, bf16_tensor, decode_pass, prof, profile};
 
 /// Model constants the block needs. Read from `ModelConfig` by the caller; kept as a plain
 /// struct so the forward cannot silently read a field that means something else for V4.
@@ -82,11 +82,17 @@ impl SharedExpert {
 
     /// `v41_ref.expert_ffn(y, w1, w2, w3, limit)`: out = w2(bf16(silu(clamp(w1 y)) * clamp(w3 y))).
     pub fn forward(&self, ops: &Ops, y: DevicePtr, out: DevicePtr, t: usize, s: &PassScratch, dims: &V41Dims) -> Result<()> {
+        self.forward_with(ops, y, out, t, s, dims, s.wscratch)
+    }
+
+    /// [`SharedExpert::forward`] with an explicit dequant scratch (the side stream's).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with(&self, ops: &Ops, y: DevicePtr, out: DevicePtr, t: usize, s: &PassScratch, dims: &V41Dims, wscratch: DevicePtr) -> Result<()> {
         let n = t * dims.moe_inter;
-        ops.linear_fp8_tiled(y, &self.w1, s.wscratch, s.gate, t)?;
-        ops.linear_fp8_tiled(y, &self.w3, s.wscratch, s.up, t)?;
+        ops.linear_fp8_tiled(y, &self.w1, wscratch, s.gate, t)?;
+        ops.linear_fp8_tiled(y, &self.w3, wscratch, s.up, t)?;
         ops.swiglu(s.gate, s.up, s.act, n, dims.swiglu_limit)?;
-        ops.linear_fp8_tiled(s.act, &self.w2, s.wscratch, out, t)
+        ops.linear_fp8_tiled(s.act, &self.w2, wscratch, out, t)
     }
 }
 
@@ -190,7 +196,25 @@ pub struct PassScratch {
     /// The split hc_mixes' per-token partials (`ops::HC_RAW_BYTES`). Owned HERE, not by the
     /// Copy kernel table, so it is freed with the rest of the scratch.
     pub hc_raw: DevicePtr,
+    /// [`SHARED_OVERLAP_ENV`]: the shared expert runs on this side stream, concurrently with
+    /// the routed MoE on the main stream.
+    pub side: Option<SideStream>,
     allocations: Vec<DevicePtr>,
+}
+
+/// `ATLAS_DSV41_SHARED_OVERLAP=1`: prefill passes run the shared expert on a side stream,
+/// overlapped with the routed MoE (same kernels, same inputs: bit-identical).
+pub const SHARED_OVERLAP_ENV: &str = "ATLAS_DSV41_SHARED_OVERLAP";
+
+/// A second stream with its own dequant scratch and cuBLASLt workspace, plus the fork/join
+/// events. The stream and events live for the process (the backend has no destroy_stream).
+#[derive(Clone, Copy, Debug)]
+pub struct SideStream {
+    pub stream: u64,
+    pub fork: u64,
+    pub join: u64,
+    /// bf16 dequant scratch for the shared expert's weights.
+    pub wscratch: DevicePtr,
 }
 
 impl PassScratch {
@@ -233,6 +257,18 @@ impl PassScratch {
             wscratch: a(largest_fp8_weight * 2)?,
             hc_raw: a(super::ops::HC_RAW_BYTES)?,
             wscratch_bytes: largest_fp8_weight * 2,
+            side: if std::env::var(SHARED_OVERLAP_ENV).as_deref() == Ok("1") {
+                let stream = gpu.create_stream()?;
+                spark_runtime::cublaslt::register_stream_workspace(stream)?;
+                Some(SideStream {
+                    stream,
+                    fork: gpu.create_event()?,
+                    join: gpu.create_event()?,
+                    wscratch: a(dims.moe_inter * d * 2)?,
+                })
+            } else {
+                None
+            },
             allocations: Vec::new(),
         };
         Ok(Self { allocations, ..s })
@@ -298,7 +334,15 @@ pub fn block(
         BlockControl::None => s.pre_mix,
         BlockControl::OwnPre => s.attn_pre,
     };
+    let fused = ops.hc_fused_on();
+    let null = DevicePtr::NULL;
     prof(ops, "mhc+norm", || {
+        if fused {
+            return ops.hc_fused(
+                null, null, null, null, s.h, &w.hc_attn, s.attn_pre, s.attn_post, s.attn_comb, attn_side_pre,
+                w.attn_norm, s.x, t, d, it, eps, hce,
+            );
+        }
         ops.hc_mixes(s.h, &w.hc_attn, s.attn_pre, s.attn_post, s.attn_comb, t, d, it, eps, hce, s.hc_raw)?;
         ops.hc_pre(s.h, attn_side_pre, s.x, t, d)?;
         ops.rmsnorm(s.x, w.attn_norm, s.x, t, d, eps)
@@ -313,19 +357,43 @@ pub fn block(
         BlockControl::OwnPre => s.ffn_pre,
     };
     prof(ops, "mhc+norm", || {
+        if fused {
+            return ops.hc_fused(
+                s.y, null, s.attn_post, s.attn_comb, s.h, &w.hc_ffn, s.ffn_pre, s.ffn_post, s.ffn_comb, ffn_side_pre,
+                w.ffn_norm, s.x, t, d, it, eps, hce,
+            );
+        }
         ops.hc_post(s.y, s.h, s.attn_post, s.attn_comb, s.h, t, d)?;
         ops.hc_mixes(s.h, &w.hc_ffn, s.ffn_pre, s.ffn_post, s.ffn_comb, t, d, it, eps, hce, s.hc_raw)?;
         ops.hc_pre(s.h, ffn_side_pre, s.x, t, d)?;
         ops.rmsnorm(s.x, w.ffn_norm, s.x, t, d, eps)
     })?;
     tap.bf16(ops, "moe_in", l, s.x, &[t, d])?;
-    prof(ops, "moe.routed", || moe.forward(ops, l, s.x, s.routed, t))?;
-    prof(ops, "moe.shared", || w.shared.forward(ops, s.x, s.shared, t, s, dims))?;
+    match s.side.filter(|_| !decode_pass() && !profile::enabled()) {
+        Some(side) => {
+            // Fork: the shared expert on the side stream once x is ready; join before the add.
+            ops.gpu.record_event(side.fork, ops.stream)?;
+            ops.gpu.stream_wait_event(side.stream, side.fork)?;
+            let side_ops = Ops { gpu: ops.gpu, k: ops.k, stream: side.stream };
+            w.shared.forward_with(&side_ops, s.x, s.shared, t, s, dims, side.wscratch)?;
+            ops.gpu.record_event(side.join, side.stream)?;
+            moe.forward(ops, l, s.x, s.routed, t)?;
+            ops.gpu.stream_wait_event(ops.stream, side.join)?;
+        }
+        None => {
+            prof(ops, "moe.routed", || moe.forward(ops, l, s.x, s.routed, t))?;
+            prof(ops, "moe.shared", || w.shared.forward(ops, s.x, s.shared, t, s, dims))?;
+        }
+    }
     tap.bf16(ops, "moe_routed", l, s.routed, &[t, d])?;
     tap.bf16(ops, "moe_shared", l, s.shared, &[t, d])?;
     prof(ops, "mhc+norm", || {
-        ops.add_bf16(s.routed, s.shared, s.y, t * d)?;
-        ops.hc_post(s.y, s.h, s.ffn_post, s.ffn_comb, s.h, t, d)?;
+        if fused {
+            ops.hc_add_post(s.routed, s.shared, s.h, s.ffn_post, s.ffn_comb, t, d)?;
+        } else {
+            ops.add_bf16(s.routed, s.shared, s.y, t * d)?;
+            ops.hc_post(s.y, s.h, s.ffn_post, s.ffn_comb, s.h, t, d)?;
+        }
         ops.gpu.copy_d2d_async(s.ffn_pre, s.pre_mix, t * hc * 4, ops.stream)
     })?;
 

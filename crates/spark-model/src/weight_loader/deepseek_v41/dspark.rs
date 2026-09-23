@@ -259,6 +259,41 @@ impl Dspark {
         Ok((v[0] as usize, v[1..=T_VERIFY].to_vec()))
     }
 
+    /// The first half of a step: draft B tokens after `tok` and run the verify pass over
+    /// [tok, d1..dB] at position `seq.len` (T_VERIFY rows of logits in `logits`). Returns the
+    /// drafts, the greedy accept count and the argmax of every verify row. `seq` holds the
+    /// T_VERIFY verify positions until [`Dspark::commit`] rolls it back to the accepted prefix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_verify(
+        &self,
+        ops: &Ops,
+        fwd: &V41Forward,
+        seq: &mut V41Seq,
+        tok: u32,
+        hook: &dyn PassHook,
+        core: &dyn AttnCore,
+        main_moe: &dyn V41RoutedMoe,
+        tap: &Tap,
+        logits: DevicePtr,
+    ) -> Result<(Vec<u32>, usize, Vec<u32>)> {
+        let pos = seq.len;
+        let drafts = self.draft(ops, fwd, tok, pos, tap)?;
+        let mut block_ids = Vec::with_capacity(T_VERIFY);
+        block_ids.push(tok);
+        block_ids.extend_from_slice(&drafts);
+        fwd.verify(ops, seq, &block_ids, hook, core, main_moe, tap, logits)?;
+        let (a, am) = self.accept(ops, logits)?;
+        Ok((drafts, a, am))
+    }
+
+    /// The second half: keep `tok` and the first `accepted` drafts of the verify pass that
+    /// started at `pos` (roll the rest back) and seed the drafter ring from their rows.
+    pub fn commit(&self, ops: &Ops, fwd: &V41Forward, seq: &mut V41Seq, pos: usize, accepted: usize, hook: &dyn PassHook) -> Result<()> {
+        ensure!(accepted <= B, "DSpark commit: {accepted} > {B} drafts");
+        fwd.rollback(ops, seq, pos + accepted + 1, hook)?;
+        self.seed(ops, fwd, accepted + 1, pos)
+    }
+
     /// One greedy spec step for input token `tok` at position `seq.len`. `logits` must hold
     /// `tiled_rows(T_VERIFY)` rows. `force_accept_all` is a NEGATIVE CONTROL ONLY (accepts every
     /// draft without verifying): its output must diverge from non-spec greedy.
@@ -277,17 +312,11 @@ impl Dspark {
         force_accept_all: bool,
     ) -> Result<StepOut> {
         let pos = seq.len;
-        let drafts = self.draft(ops, fwd, tok, pos, tap)?;
-        let mut block_ids = Vec::with_capacity(T_VERIFY);
-        block_ids.push(tok);
-        block_ids.extend_from_slice(&drafts);
-        fwd.verify(ops, seq, &block_ids, hook, core, main_moe, tap, logits)?;
-        let (mut a, am) = self.accept(ops, logits)?;
+        let (drafts, mut a, am) = self.propose_verify(ops, fwd, seq, tok, hook, core, main_moe, tap, logits)?;
         if force_accept_all {
             a = B;
         }
-        fwd.rollback(ops, seq, pos + a + 1, hook)?;
-        self.seed(ops, fwd, a + 1, pos)?;
+        self.commit(ops, fwd, seq, pos, a, hook)?;
         let mut emitted: Vec<u32> = drafts[..a].to_vec();
         emitted.push(if force_accept_all { am[B] } else { am[a] });
         Ok(StepOut { accepted: a, emitted })

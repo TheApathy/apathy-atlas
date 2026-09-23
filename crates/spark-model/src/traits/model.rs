@@ -439,6 +439,28 @@ pub trait Model: Send + Sync {
     /// Check if self-speculative decoding is enabled.
     fn has_self_speculative(&self) -> bool;
 
+    /// The model speculates with its own drafter: the scheduler drives
+    /// [`Model::spec_verify`] then [`Model::spec_commit`] for eligible steps. Default: no.
+    fn has_internal_spec(&self) -> bool {
+        false
+    }
+
+    /// Feed `token` at `seq.seq_len`, draft with the model's own drafter and run ONE verify
+    /// pass over [token, drafts..]. Returns (drafts, argmax of every verify row); the verify
+    /// logits `[drafts.len() + 1, vocab]` (bf16) are at `logits_buffer_ptr()`, row i being the
+    /// distribution after [token, d1..di]. The model holds the verify positions until
+    /// [`Model::spec_commit`]; `seq` itself is not advanced here. `None`: the model cannot
+    /// speculate at this position (e.g. too close to max_seq); decode plainly instead.
+    fn spec_verify(&self, _token: u32, _seq: &mut SequenceState, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
+        anyhow::bail!("spec_verify: this model has no internal speculation")
+    }
+
+    /// Keep `token` and the first `accepted` drafts of the last [`Model::spec_verify`] (the
+    /// rest is rolled back) and advance `seq` by `accepted + 1`.
+    fn spec_commit(&self, _seq: &mut SequenceState, _accepted: usize, _stream: u64) -> Result<()> {
+        anyhow::bail!("spec_commit: this model has no internal speculation")
+    }
+
     /// Eager decode skipping SSM layers. Used by self-speculative drafting.
     /// Returns logits pointer for argmax. Advances seq_len by 1.
     fn decode_draft(&self, token: u32, seq: &mut SequenceState, stream: u64) -> Result<DevicePtr>;

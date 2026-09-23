@@ -234,6 +234,10 @@ pub fn run(
         .bind_gpu_to_thread()
         .expect("Failed to bind CUDA context to scheduler thread");
     let use_mtp = use_speculative && model.has_proposer();
+    let use_internal_spec = model.has_internal_spec();
+    if use_internal_spec {
+        tracing::info!("model speculates internally: eligible greedy steps run Model::spec_verify/spec_commit");
+    }
     let num_drafts = if use_mtp || use_self_speculative || use_ngram_speculative {
         num_drafts.max(1)
     } else {
@@ -561,7 +565,20 @@ pub fn run(
             let dflash_spec_think = *DFLASH_SPEC_THINK.get_or_init(|| {
                 std::env::var("ATLAS_DFLASH_SPEC_THINK").ok().as_deref() == Some("1")
             });
-            if use_ngram_speculative && active.len() == 1 && active[0].grammar_state.is_none() {
+            if use_internal_spec && active.len() == 1 && internal_spec_eligible(&active[0], &*model) {
+                // The model drafts, verifies and rolls back internally (DeepSeek-V4.1 DSpark).
+                step_internal_spec(
+                    &*model,
+                    &mut active,
+                    &verify_ctx,
+                    think_end_token,
+                    think_start_token,
+                    code_fence_token,
+                    tool_call_start_token,
+                    tool_call_end_token,
+                    adaptive_sampling,
+                );
+            } else if use_ngram_speculative && active.len() == 1 && active[0].grammar_state.is_none() {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
                     step_ngram(&*model, &mut active, proposer, &verify_ctx);
