@@ -41,6 +41,8 @@ pub(super) struct TestModel {
     tree: Mutex<Option<DDTreePayload>>,
     pub(super) proposals: AtomicUsize,
     pub(super) takes: AtomicUsize,
+    /// Tokens `argmax_batch` returns; empty = the call is unexpected.
+    pub(super) argmax: Mutex<Vec<u32>>,
 }
 
 impl TestModel {
@@ -50,6 +52,7 @@ impl TestModel {
             tree: Mutex::new(tree),
             proposals: AtomicUsize::new(0),
             takes: AtomicUsize::new(0),
+            argmax: Mutex::new(Vec::new()),
         }
     }
 }
@@ -125,7 +128,9 @@ impl Model for TestModel {
         unreachable!()
     }
     fn argmax_batch(&self, _: DevicePtr, _: usize, _: u64) -> Result<Vec<u32>> {
-        unreachable!()
+        let tokens = self.argmax.lock().unwrap().clone();
+        assert!(!tokens.is_empty(), "unexpected argmax_batch");
+        Ok(tokens)
     }
     fn hidden_after_norm(&self) -> DevicePtr {
         DevicePtr::NULL

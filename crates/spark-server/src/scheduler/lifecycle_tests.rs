@@ -18,6 +18,13 @@ mod model_support {
     pub(super) fn seq_state() -> spark_model::traits::SequenceState {
         implementation::seq_state()
     }
+
+    /// A model whose greedy decode step returns `tokens`.
+    pub(super) fn greedy_model(tokens: Vec<u32>) -> impl spark_model::traits::Model {
+        let m = implementation::TestModel::new(Ok(Vec::new()), None);
+        *m.argmax.lock().unwrap() = tokens;
+        m
+    }
 }
 
 const EOS: u32 = 17;
@@ -201,4 +208,44 @@ fn shared_sink_finish_reason_obeys_protocol_stop_boundaries() {
         "stop",
         "the registered ChatML stop must take precedence over tool close"
     );
+}
+
+/// A stream-side stop string sets the request's cancel flag. The serial decode
+/// path must end the sequence there (dropping the sample), as speculative
+/// `emit_token` already did; before the fix it committed the token and ran on.
+#[test]
+fn a_cancelled_sequence_stops_on_the_serial_decode_path() {
+    let _guard = HARD_STOP_TEST_LOCK.lock().expect("hard-stop test lock");
+    let _reset = HardStopReset;
+    set_im_start_hard_stop(0);
+    let run = |cancelled: bool| {
+        let model = model_support::greedy_model(vec![CONTENT]);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut a = active_seq(ResponseSink::Blocking(Some(tx)), CONTENT);
+        a.finished = false;
+        a.max_output_tokens = 100;
+        a.remaining = 100;
+        a.think_ended = false;
+        a.cancel_flag = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cancelled)));
+        let mut active = vec![a];
+        process_decode_logits(
+            &model,
+            &mut active,
+            spark_runtime::gpu::DevicePtr::NULL,
+            std::time::Instant::now(),
+            None,
+            None,
+            None,
+            None,
+            Some(TOOL_CLOSE),
+            &[],
+            false,
+        );
+        let a = active.pop().expect("sequence");
+        (a.finished, a.output_tokens.len())
+    };
+    // cancelled: finished, the sampled token is not committed
+    assert_eq!(run(true), (true, 1));
+    // CONTROL: without the flag the same step commits the token and continues
+    assert_eq!(run(false), (false, 2));
 }

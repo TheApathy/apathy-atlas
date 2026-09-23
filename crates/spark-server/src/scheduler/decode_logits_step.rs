@@ -164,6 +164,17 @@ pub fn process_decode_logits(
     let now = Instant::now();
     for (i, (tok, mut logprobs)) in new_tokens.into_iter().enumerate() {
         let a = &mut active[i];
+        // Cooperative cancellation (a stream-side stop string or loop guard):
+        // end here, like speculative `emit_token` does, and drop the sample.
+        // The serial path never read the flag, so a matched stop string only
+        // hid the text while generation ran on to max_tokens.
+        if a.cancel_flag
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
+        {
+            a.finished = true;
+            continue;
+        }
         let was_inside_thinking = a.inside_thinking;
         let previous_last_token = a.last_token;
         let previous_last_token_time = a.last_token_time;
