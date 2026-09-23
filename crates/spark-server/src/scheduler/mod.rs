@@ -22,6 +22,17 @@ mod decode_step;
 mod emit_step;
 mod fast_greedy;
 mod glm53_dflash2_admission;
+#[cfg(test)]
+mod glm53_ordinary_greedy_tests;
+#[cfg(test)]
+mod glm53_policy_adapter_tests;
+mod glm53_policy_driver;
+#[cfg(test)]
+mod glm53_policy_driver_tests;
+#[cfg(test)]
+mod glm53_policy_ordinary_slice_tests;
+#[cfg(test)]
+mod grammar_admission_tests;
 mod helpers;
 mod lifecycle;
 mod logit_dump;
@@ -32,6 +43,8 @@ pub use mod_helpers::capture_runtime_handle;
 mod mtp_gate;
 mod mtp_step;
 pub(crate) mod mtp_timing;
+mod ordinary_greedy;
+mod ordinary_transition;
 mod phase_continue_prefills;
 mod phase_promote_prefills;
 mod phase_start_prefills;
@@ -41,6 +54,10 @@ mod prefill_b_step;
 mod repetition;
 mod rollback;
 mod sample_step;
+mod sequence_error;
+use sequence_error::mark_sequence_error;
+#[cfg(test)]
+mod dflash_failure_source_tests;
 pub mod snapshot;
 mod spec_step;
 mod ssm_decode_ring;
@@ -78,7 +95,7 @@ use phase_start_prefills::start_new_requests;
 use prefill_a_step::*;
 use prefill_b_step::*;
 use repetition::*;
-use rollback::{RollbackOutcome, rollback_to_boundary};
+use rollback::RollbackOutcome;
 use sample_step::*;
 use spec_step::*;
 use ssm_decode_ring::SsmDecodeRing;
@@ -631,6 +648,8 @@ pub fn run(
                                 num_drafts,
                                 &verify_ctx,
                                 dflash_verify_raw_argmax,
+                                adaptive_sampling,
+                                code_fence_token,
                             );
                             let emitted = active[0].seq.seq_len.saturating_sub(seq_len_before);
                             gate.record_verify_step(t0.elapsed(), emitted);
@@ -657,6 +676,8 @@ pub fn run(
                         num_drafts,
                         &verify_ctx,
                         dflash_verify_raw_argmax,
+                        adaptive_sampling,
+                        code_fence_token,
                     );
                 }
             } else {

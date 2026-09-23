@@ -121,18 +121,8 @@ pub(crate) fn load_dflash_drafter(
     if !args.dflash {
         return Ok(None);
     }
-    let drafter_id = args
-        .draft_model
-        .clone()
-        .or_else(|| ptx_set.dflash.as_ref().map(|d| d.draft_model.to_string()))
-        .context(
-            "--dflash set but no drafter HF id provided: pass --draft-model <ID> \
-             or use a target whose MODEL.toml has a [dflash] section",
-        )?;
-    tracing::info!("DFlash: resolving drafter '{drafter_id}'");
-    let drafter_dir =
-        crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
-            .context("Failed to resolve DFlash drafter checkpoint")?;
+    let drafter_dir = resolve_dflash_drafter_dir(args, ptx_set)?;
+    tracing::info!("DFlash: resolved drafter at {}", drafter_dir.display());
     let drafter_config_json = std::fs::read_to_string(drafter_dir.join("config.json"))
         .with_context(|| {
             format!(
@@ -158,6 +148,23 @@ pub(crate) fn load_dflash_drafter(
     drafter_config.validate_store(&drafter_store)?;
     let drafter_config = drafter_config.into_legacy_runtime()?;
     Ok(Some((drafter_store, drafter_config)))
+}
+
+pub(crate) fn resolve_dflash_drafter_dir(
+    args: &cli::ServeArgs,
+    ptx_set: &atlas_kernels::TargetPtxSet,
+) -> Result<std::path::PathBuf> {
+    let drafter_id = args
+        .draft_model
+        .clone()
+        .or_else(|| ptx_set.dflash.as_ref().map(|d| d.draft_model.to_string()))
+        .context(
+            "--dflash set but no drafter HF id provided: pass --draft-model <ID> \
+             or use a target whose MODEL.toml has a [dflash] section",
+        )?;
+    tracing::info!("DFlash: resolving drafter '{drafter_id}'");
+    crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
+        .context("Failed to resolve DFlash drafter checkpoint")
 }
 
 /// Startup-loaded LoRA adapter: its own WeightStore + parsed PEFT config.

@@ -37,6 +37,7 @@ fn main() {
             // -lcuda for the raw cu* driver FFI in cuda_backend/gpu_impl.rs
             // (cudarc is dlopen-mode here, so it doesn't emit it for us).
             println!("cargo:rustc-link-lib=dylib=cuda");
+            println!("cargo:rustc-link-lib=dylib=cublas");
             println!("cargo:rustc-link-lib=dylib=cublasLt");
             // cudart: copy_d2d_2d_async uses cudaMemcpy2DAsync (a runtime, not
             // driver, symbol — CI's libcuda stub only has cu* driver symbols).
@@ -63,6 +64,7 @@ fn main() {
     // cuBLASLt for the high-efficiency GEMM path (ATLAS_CUBLAS_GEMM=1). The
     // hand-written mma.sync projection/MoE GEMMs hit only ~30% of the cuBLAS
     // ceiling on GB10; cuBLASLt is a measured 2.7-4.8x lever on those shapes.
+    println!("cargo:rustc-link-lib=dylib=cublas");
     println!("cargo:rustc-link-lib=dylib=cublasLt");
     // cudart: copy_d2d_2d_async uses cudaMemcpy2DAsync (a runtime, not driver,
     // symbol). Previously only emitted in the ATLAS_SKIP_BUILD stub path and

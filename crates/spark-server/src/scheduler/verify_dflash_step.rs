@@ -4,6 +4,17 @@
 
 use super::*;
 
+#[path = "dflash_verify_receipt.rs"]
+mod dflash_verify_receipt;
+use dflash_verify_receipt::{DflashVerifyReceipt, ReceiptExit};
+
+#[cfg(test)]
+#[path = "dflash_verify_receipt_source_tests.rs"]
+mod receipt_source_tests;
+#[cfg(test)]
+#[path = "dflash_verify_receipt_tests.rs"]
+mod receipt_tests;
+
 /// DFlash γ-token verify with accept-prefix.
 ///
 /// Phase 3 minimal-viable implementation: routes `[last_token, drafts...]`
@@ -35,8 +46,7 @@ pub fn step_verify_dflash(
     dflash_verify_raw_argmax: bool,
 ) {
     if let Err(e) = model.sync_secondary() {
-        tracing::error!("sync_secondary: {e:#}");
-        a.finished = true;
+        mark_sequence_error(a, "sync_secondary", &e);
         return;
     }
 
@@ -54,11 +64,22 @@ pub fn step_verify_dflash(
     let verified_argmax = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("decode_verify_dflash: {e:#}");
-            a.finished = true;
+            mark_sequence_error(a, "decode_verify_dflash", &e);
             return;
         }
     };
+    if verified_argmax.len() != tokens.len() {
+        mark_sequence_error(
+            a,
+            "decode_verify_dflash shape",
+            &anyhow::anyhow!(
+                "target returned {} oracle rows for {} input tokens",
+                verified_argmax.len(),
+                tokens.len()
+            ),
+        );
+        return;
+    }
     let verify_ms = if step_timing {
         t_verify.elapsed().as_secs_f64() * 1000.0
     } else {
@@ -105,6 +126,7 @@ pub fn step_verify_dflash(
             break;
         }
     }
+    let mut receipt = DflashVerifyReceipt::new(drafts.len(), num_accepted, a.output_tokens.len());
 
     // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling
     // accept window; may suspend this seq's speculation (see adaptive_spec).
@@ -139,7 +161,8 @@ pub fn step_verify_dflash(
     // pre_verify_len. Structural replacement for dflash_eagle_kgamma_append.
     if crate::scheduler::adaptive_spec::unified_ctx_enabled() {
         if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len) {
-            tracing::error!("commit_ctx (kgamma): {e:#}");
+            mark_sequence_error(a, "commit_ctx (kgamma)", &e);
+            return;
         }
     } else {
         let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
@@ -147,14 +170,18 @@ pub fn step_verify_dflash(
             && let Err(e) =
                 model.dflash_eagle_kgamma_append(&mut a.seq, num_accepted, pre_verify_len)
         {
-            tracing::error!("dflash_eagle_kgamma_append: {e:#}");
+            mark_sequence_error(a, "dflash_eagle_kgamma_append", &e);
+            return;
         }
     }
 
     // Emit accepted drafts.
     for i in 0..num_accepted {
+        let before_emit = a.output_tokens.len();
         emit_token(a, drafts[i], None);
+        receipt.observe_draft(drafts[i], before_emit, &a.output_tokens);
         if a.finished {
+            log_dflash_receipt(a, &receipt, ReceiptExit::TerminalDraft, pre_verify_len);
             return;
         }
     }
@@ -164,32 +191,17 @@ pub fn step_verify_dflash(
     let bonus_idx = num_accepted;
     if bonus_idx < verified.len() {
         let bonus = verified[bonus_idx];
+        let before_emit = a.output_tokens.len();
         emit_token(a, bonus, None);
+        receipt.observe_bonus(bonus, before_emit, &a.output_tokens);
         if a.finished {
+            log_dflash_receipt(a, &receipt, ReceiptExit::TerminalBonus, pre_verify_len);
             return;
         }
         a.last_token = bonus;
     }
 
-    crate::metrics::SPEC_DECODE_VERIFY
-        .with_label_values(&[
-            "dflash",
-            if num_accepted == drafts.len() {
-                "accept_all"
-            } else {
-                "accept_partial"
-            },
-        ])
-        .inc();
-
-    tracing::info!(
-        "DFLASH K=γ verify: γ={} accepted={}/{} ({:.0}%) seq_len={}",
-        drafts.len(),
-        num_accepted,
-        drafts.len(),
-        100.0 * (num_accepted as f64) / (drafts.len() as f64),
-        a.seq.seq_len,
-    );
+    log_dflash_receipt(a, &receipt, ReceiptExit::Continue, pre_verify_len);
 
     // Item #2 (STree-style in-place verify commit). h_state is canonical:
     //  - num_accepted == k_verify (full accept): no-op (h_state already correct)
@@ -200,8 +212,7 @@ pub fn step_verify_dflash(
     let k_verify = drafts.len() + 1;
     let total_accepted = num_accepted + 1; // bonus is always "accepted"
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
-        tracing::error!("commit_accepted_prefix (dflash): {e:#}");
-        a.finished = true;
+        mark_sequence_error(a, "commit_accepted_prefix (dflash)", &e);
         return;
     }
 
@@ -212,11 +223,13 @@ pub fn step_verify_dflash(
     // final-layer hidden, collapsing all 5 slots to the same value.
     let bonus_token_idx = total_accepted.saturating_sub(1);
     if let Err(e) = model.save_hidden_for_mtp(bonus_token_idx, 0) {
-        tracing::error!("save_hidden_for_mtp (dflash): {e:#}");
+        mark_sequence_error(a, "save_hidden_for_mtp (dflash)", &e);
+        return;
     }
 
     if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
-        tracing::error!("trim_proposer_state: {e:#}");
+        mark_sequence_error(a, "trim_proposer_state", &e);
+        return;
     }
 
     // Re-propose for next step — unless adaptive speculation just suspended
@@ -234,7 +247,7 @@ pub fn step_verify_dflash(
         ) {
             Ok(d) if !d.is_empty() => a.pending_drafts = d,
             Ok(_) => {}
-            Err(e) => tracing::error!("run_mtp_propose_multi (dflash): {e:#}"),
+            Err(e) => mark_sequence_error(a, "run_mtp_propose_multi (dflash)", &e),
         }
     }
     if step_timing {
@@ -245,6 +258,62 @@ pub fn step_verify_dflash(
             propose_ms,
             tokens.len(),
             num_accepted,
+        );
+    }
+}
+
+/// Exactly one receipt after the emission phase, including terminal branches.
+/// This reports verification/emission, not success of later state commits or
+/// re-proposal. Failures before an oracle exists retain their existing errors.
+fn log_dflash_receipt(
+    a: &ActiveSeq,
+    receipt: &DflashVerifyReceipt,
+    exit: ReceiptExit,
+    pre_verify_len: usize,
+) {
+    let summary = receipt.finish(exit, a.output_tokens.len());
+    crate::metrics::SPEC_DECODE_VERIFY
+        .with_label_values(&[
+            "dflash",
+            if summary.accepted == summary.proposed {
+                "accept_all"
+            } else {
+                "accept_partial"
+            },
+        ])
+        .inc();
+    tracing::info!(
+        "DFLASH K=γ verify: γ={} accepted={}/{} ({:.0}%) seq_len={}",
+        summary.proposed,
+        summary.accepted,
+        summary.proposed,
+        100.0 * (summary.accepted as f64) / (summary.proposed as f64),
+        a.seq.seq_len,
+    );
+    tracing::info!(
+        schema = "atlas.dflash.verify.v1",
+        request_start = ?a.request_start,
+        session_hash = a.session_hash,
+        slot = a.seq.slot_idx,
+        pre_verify_len,
+        proposed = summary.proposed,
+        accepted = summary.accepted,
+        rejected = summary.rejected,
+        attempted_drafts = summary.attempted_drafts,
+        emitted_drafts = summary.emitted_drafts,
+        emitted_bonus = summary.emitted_bonus,
+        output_tokens_added = summary.output_tokens_added,
+        injected_output_tokens = summary.injected_output_tokens,
+        terminal = a.finished,
+        exit = exit.label(),
+        receipt_valid = summary.error.is_none(),
+        receipt_error = summary.error.unwrap_or(""),
+        "DFLASH VERIFY_RECEIPT"
+    );
+    if let Some(error) = summary.error {
+        tracing::error!(
+            error,
+            "DFLASH receipt accounting invalid; no valid emission receipt"
         );
     }
 }

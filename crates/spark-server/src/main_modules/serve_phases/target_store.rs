@@ -241,7 +241,7 @@ mod tests {
 
     const SOURCE: &str = include_str!("target_store.rs");
     const PRODUCTION_SHA256: &str =
-        "c766f492a999fa917aebabfe89fa8faf85f1030787497f26cd4c447b2ffaf82c";
+        "1dd0c178406bf69f8e13e1b13932e3bf7fac91281f3cbc7cb01caf5dd62a0d1f";
     const LOAD_METHOD_SHA256: &str =
         "ba1571ba4a9f3d79f99305e99ec03f46d7c5f3ae069fb7976545f3b28b687e2e";
     const LOAD_METHOD_START: &str = "    pub(in crate::main_modules) fn load_glm53_gguf(";

@@ -14,6 +14,10 @@ use crate::ir::ChatRequest;
 
 use super::compact::{openai_error_response, openai_error_response_with_param};
 
+#[cfg(test)]
+#[path = "chat_phases_tool_tests.rs"]
+mod tool_admission_tests;
+
 /// Validate the input contract on the IR envelope: messages length,
 /// max_tokens > 0, temperature/top_p ranges, tool_choice mode/required
 /// compatibility. Returns `Err(Response)` for fail-fast 400 paths so
@@ -76,21 +80,7 @@ pub(super) fn validate_input(req: &ChatRequest) -> Result<(), Response> {
             None,
         ));
     }
-    if let Some(crate::tool_parser::ToolChoice::Mode(ref s)) = req.tool_choice {
-        if !["auto", "none", "required"].contains(&s.as_str()) {
-            return Err(openai_error_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "Invalid tool_choice value: '{s}'. Must be 'auto', 'none', 'required', or a function object."
-                ),
-            ));
-        }
-        if s == "required" && req.tools.is_empty() {
-            return Err(openai_error_response(
-                StatusCode::BAD_REQUEST,
-                "tool_choice is 'required' but no tools were provided".into(),
-            ));
-        }
-    }
+    crate::tool_parser::request_admission::validate(&req.tools, req.tool_choice.as_ref())
+        .map_err(|message| openai_error_response(StatusCode::BAD_REQUEST, message))?;
     Ok(())
 }

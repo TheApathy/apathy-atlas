@@ -494,22 +494,54 @@ pub(crate) fn emit_grammar_close(a: &mut ActiveSeq) {
 
 /// Compile a grammar state from a grammar specification + engine.
 ///
-/// Returns `Some(GrammarState)` if compilation succeeds, `None` otherwise
-/// (logging a warning on failure so the request falls back to legacy tool_call
-/// suppression). Called once per request during prefill.
+/// An absent specification is unconstrained by choice. A requested constraint
+/// that cannot be installed is an error, never an unconstrained success.
+/// Callers report the error to the response sink before allocating a sequence.
 pub fn compile_grammar_state(
     engine: &mut Option<GrammarEngine>,
     grammar_spec: &Option<GrammarSpec>,
     eos_tokens: &[u32],
-) -> Option<GrammarState> {
-    let spec = grammar_spec.as_ref()?;
-    let engine = engine.as_mut()?;
+    require_tool_call: bool,
+) -> Result<Option<GrammarState>> {
+    let Some(spec) = grammar_spec.as_ref() else {
+        anyhow::ensure!(
+            !require_tool_call,
+            "required tool grammar specification is missing"
+        );
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !require_tool_call
+            || matches!(
+                spec,
+                GrammarSpec::ToolCall {
+                    use_triggers: false,
+                    ..
+                }
+            ),
+        "required tool grammar specification does not enforce a tool call"
+    );
+    if let GrammarSpec::ToolCall {
+        parser,
+        use_triggers: true,
+        ..
+    } = spec
+        && !require_tool_call
+        && !parser.has_tool_grammar()
+    {
+        // Optional tools from an explicitly unconstrained parser remain usable
+        // even when startup intentionally did not create a grammar engine.
+        return Ok(None);
+    }
+    let engine = engine
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("requested grammar engine is unavailable"))?;
 
     // F69 (2026-04-29): symmetric dispatch via the trait. The parser
     // is the single source of truth for both runtime parsing and
     // grammar compilation; no string match keyed on `parser_name`.
-    // Mistral's default trait impl returns `None`, which we treat as
-    // "no constraint, fall through to unconstrained decoding."
+    // A parser may deliberately opt out for optional/auto tools, but not for
+    // a required call. Failed compilation is different from such an opt-out.
     let compiled = match spec {
         GrammarSpec::ToolCall {
             tools,
@@ -518,11 +550,16 @@ pub fn compile_grammar_state(
         } => match parser.compile_tool_grammar(engine, tools, *use_triggers) {
             Some(result) => result,
             None => {
+                anyhow::ensure!(
+                    *use_triggers && !require_tool_call,
+                    "required tool grammar is unsupported by parser '{}'",
+                    parser.name()
+                );
                 tracing::debug!(
                     "Grammar: parser '{}' opted out of constrained decoding for this request",
                     parser.name(),
                 );
-                return None;
+                return Ok(None);
             }
         },
         GrammarSpec::JsonObject => engine.compile_json_grammar(),
@@ -537,28 +574,12 @@ pub fn compile_grammar_state(
         GrammarSpec::JsonSchema { .. } => "response_format=json_schema".to_string(),
     };
 
-    match compiled {
-        Ok(grammar) => {
-            let vocab_size = engine.vocab_size();
-            match GrammarState::new(&grammar, vocab_size) {
-                Ok(state) => {
-                    tracing::info!("Grammar constrained decoding active: {label}");
-                    // Exempt the model's stop/EOS tokens from grammar refusal
-                    // so a legitimate end-of-turn token cannot desync the NPDA
-                    // and truncate the response (see GrammarState::accept_token).
-                    Some(state.with_stop_tokens(eos_tokens))
-                }
-                Err(e) => {
-                    tracing::warn!("Grammar state creation failed: {e}");
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Grammar compilation failed: {e}");
-            None
-        }
-    }
+    let grammar =
+        compiled.map_err(|e| anyhow::anyhow!("requested grammar compilation failed: {e}"))?;
+    let state = GrammarState::new(&grammar, engine.vocab_size())
+        .map_err(|e| anyhow::anyhow!("requested grammar state creation failed: {e}"))?;
+    tracing::info!("Grammar constrained decoding active: {label}");
+    Ok(Some(state.with_stop_tokens(eos_tokens)))
 }
 
 /// Result of starting a chunked prefill.

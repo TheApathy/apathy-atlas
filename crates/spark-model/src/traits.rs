@@ -268,5 +268,6 @@ impl SequenceState {
 /// single-thread invariant — do NOT share `&dyn Model` across threads.
 mod logprobs;
 mod model;
+mod sequence_state_init;
 pub use logprobs::*;
 pub use model::{BeamReq, Model, padded_batch_n};

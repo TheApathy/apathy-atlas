@@ -82,13 +82,32 @@ pub struct Glm53RouterBuffers {
 
 pub struct Glm53RouterKernels {
     logits: KernelHandle,
+    logits_t4: KernelHandle,
+    logits_t32: KernelHandle,
+    logits_mode: Glm53RouterLogitsMode,
     topk: KernelHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Glm53RouterLogitsMode {
+    Auto,
+    Baseline,
+    T4,
+    T32,
 }
 
 impl Glm53RouterKernels {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
+        let logits_mode = parse_logits_mode(
+            std::env::var("ATLAS_GLM53_ROUTER_LOGITS_TOKENS")
+                .ok()
+                .as_deref(),
+        )?;
         Ok(Self {
             logits: gpu.kernel("glm53_router", "atlas_glm53_router_logits")?,
+            logits_t4: gpu.kernel("glm53_router_batched", "atlas_glm53_router_logits_t4")?,
+            logits_t32: gpu.kernel("glm53_router_batched", "atlas_glm53_router_logits_t32")?,
+            logits_mode,
             topk: gpu.kernel("glm53_router", "atlas_glm53_topk_sigmoid_f32")?,
         })
     }
@@ -101,8 +120,25 @@ impl Glm53RouterKernels {
         stream: u64,
     ) -> Result<()> {
         validate_buffers(plan, buffers)?;
-        KernelLaunch::new(gpu, self.logits)
-            .grid([plan.logits_blocks, 1, 1])
+        let tokens_per_block = select_logits_tokens_per_block(self.logits_mode, plan.tokens);
+        let (logits, logits_blocks) = match tokens_per_block {
+            1 => (self.logits, plan.logits_blocks),
+            tokens_per_block @ (4 | 32) => {
+                let handle = match tokens_per_block {
+                    4 => self.logits_t4,
+                    32 => self.logits_t32,
+                    _ => unreachable!("matched GLM router token tile"),
+                };
+                let tiles = plan.tokens.div_ceil(tokens_per_block);
+                let blocks = tiles
+                    .checked_mul(plan.experts)
+                    .context("GLM router batched CUDA grid overflow")?;
+                (handle, blocks)
+            }
+            _ => unreachable!("validated GLM router token tile"),
+        };
+        KernelLaunch::new(gpu, logits)
+            .grid([logits_blocks, 1, 1])
             .block([THREADS, 1, 1])
             .arg_ptr(buffers.input_bf16.ptr)
             .arg_ptr(buffers.router_f32.ptr)
@@ -125,6 +161,28 @@ impl Glm53RouterKernels {
             .arg_u32(plan.top_k)
             .arg_f32(2.5)
             .launch(stream)
+    }
+}
+
+fn parse_logits_mode(value: Option<&str>) -> Result<Glm53RouterLogitsMode> {
+    match value {
+        None => Ok(Glm53RouterLogitsMode::Auto),
+        Some("0") => Ok(Glm53RouterLogitsMode::Baseline),
+        Some("4") => Ok(Glm53RouterLogitsMode::T4),
+        Some("32") => Ok(Glm53RouterLogitsMode::T32),
+        Some(value) => bail!(
+            "ATLAS_GLM53_ROUTER_LOGITS_TOKENS must be absent or exactly 0, 4, or 32; got {value:?}"
+        ),
+    }
+}
+
+fn select_logits_tokens_per_block(mode: Glm53RouterLogitsMode, tokens: u32) -> u32 {
+    match mode {
+        Glm53RouterLogitsMode::Auto if tokens <= 1_024 => 4,
+        Glm53RouterLogitsMode::Auto => 32,
+        Glm53RouterLogitsMode::Baseline => 1,
+        Glm53RouterLogitsMode::T4 => 4,
+        Glm53RouterLogitsMode::T32 => 32,
     }
 }
 
@@ -172,6 +230,11 @@ mod tests {
     use super::*;
     use spark_runtime::gpu::mock::MockGpuBackend;
 
+    const BATCHED_CUDA_SOURCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../kernels/gb10/glm5.3-flash/iq3/glm53_router_batched.cu"
+    ));
+
     fn reference_route(logits: &[f32], bias: &[f32]) -> (Vec<usize>, Vec<f32>) {
         let sigmoid = logits
             .iter()
@@ -212,6 +275,44 @@ mod tests {
         assert!(Glm53RouterPlan::new(1, 4095, 288, 8).is_err());
         assert!(Glm53RouterPlan::new(1, 4096, 289, 8).is_err());
         assert!(Glm53RouterPlan::new(1, 4096, 288, 7).is_err());
+    }
+
+    #[test]
+    fn token_reuse_variants_are_exact_row_aware_and_have_rollback() {
+        let auto = parse_logits_mode(None).unwrap();
+        assert_eq!(select_logits_tokens_per_block(auto, 1), 4);
+        assert_eq!(select_logits_tokens_per_block(auto, 1_024), 4);
+        assert_eq!(select_logits_tokens_per_block(auto, 1_025), 32);
+        assert_eq!(select_logits_tokens_per_block(auto, 1_875), 32);
+        assert_eq!(
+            select_logits_tokens_per_block(parse_logits_mode(Some("0")).unwrap(), 1_875),
+            1
+        );
+        assert_eq!(
+            select_logits_tokens_per_block(parse_logits_mode(Some("4")).unwrap(), 1_875),
+            4
+        );
+        assert_eq!(
+            select_logits_tokens_per_block(parse_logits_mode(Some("32")).unwrap(), 128),
+            32
+        );
+        assert_eq!(1_875u32.div_ceil(4) * GLM53_EXPERTS, 135_072);
+        assert_eq!(1_875u32.div_ceil(32) * GLM53_EXPERTS, 16_992);
+        for invalid in ["", "1", "2", "3", "04", "8", "16", "64", " 4", "4 "] {
+            assert!(parse_logits_mode(Some(invalid)).is_err());
+        }
+        assert!(BATCHED_CUDA_SOURCE.contains("k = threadIdx.x"));
+        assert!(BATCHED_CUDA_SOURCE.contains("k += GLM53_THREADS"));
+        assert!(BATCHED_CUDA_SOURCE.contains("sums[row] = fmaf"));
+        assert!(BATCHED_CUDA_SOURCE.contains("stride = GLM53_THREADS / 2U"));
+        for symbol in [
+            "atlas_glm53_router_logits_t4",
+            "atlas_glm53_router_logits_t32",
+        ] {
+            assert!(BATCHED_CUDA_SOURCE.contains(symbol));
+        }
+        assert!(!BATCHED_CUDA_SOURCE.contains("atlas_glm53_router_logits_t8"));
+        assert!(!BATCHED_CUDA_SOURCE.contains("atlas_glm53_router_logits_t16"));
     }
 
     #[test]

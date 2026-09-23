@@ -37,6 +37,13 @@ pub async fn messages(State(state): State<Arc<AppState>>, body: axum::body::Byte
         }
     };
 
+    if let Err(error) = req.validate_images() {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            error.into(),
+        );
+    }
     tracing::info!(
         "Anthropic request: max_tokens={}, thinking={:?}, tools={}, model={}, stream={}",
         req.max_tokens,
@@ -100,30 +107,9 @@ pub async fn messages(State(state): State<Arc<AppState>>, body: axum::body::Byte
     };
 
     if !chat_resp.status().is_success() {
-        // Forward the error envelope. Translate the JSON body into
-        // Anthropic's error shape if it's an OpenAI-style envelope; else
-        // pass bytes through.
-        let (parts, body) = chat_resp.into_parts();
-        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(b) => b,
-            Err(e) => {
-                return anthropic_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    format!("Error body collect: {e}"),
-                );
-            }
-        };
-        let err_msg = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-            .ok()
-            .and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| String::from_utf8_lossy(&body_bytes).into_owned());
-        return anthropic_error(parts.status, "api_error", err_msg);
+        // Use the same status-preserving adapter as count_tokens: rejected
+        // client input is invalid_request_error, not an internal api_error.
+        return openai_error_to_anthropic(chat_resp).await;
     }
 
     // Unreachable in practice: Http outcomes are error envelopes (both
@@ -153,6 +139,18 @@ pub async fn count_tokens(
         }
     };
 
+    if let Err(error) = req.validate_images() {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            error.into(),
+        );
+    }
+    if req.contains_image() {
+        return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error",
+            "This endpoint does not yet count expanded image tokens (unsupported_multimodal_token_count)".into());
+    }
+
     // Count against the EXACT prompt the serving path renders: same
     // adapter (the IR `From` impl), same tool-prompt injection / hint /
     // cwd / thinking resolution / Jinja variant (prepare_chat_prompt). The
@@ -161,13 +159,7 @@ pub async fn count_tokens(
     // rendered through the non-openai Jinja variant, so counts drifted
     // from real usage.
     let mut ir_req = crate::ir::ChatRequest::from(req);
-    // Counting must not require the vision encoder: strip image parts
-    // (they contributed 0 tokens in the old count too — pad expansion
-    // needs real pixel grids, which a count endpoint can't produce).
-    for m in &mut ir_req.messages {
-        m.content
-            .retain(|p| !matches!(p, crate::ir::ContentPart::Image(_)));
-    }
+
     // Same treatment as the chat handler: the Jinja render + tokenize inside
     // `prepare_chat_prompt` is CPU-bound (measured 13 ms at 12931 prompt tokens)
     // and must not hold an async worker. `ir_req` is not read after this point,

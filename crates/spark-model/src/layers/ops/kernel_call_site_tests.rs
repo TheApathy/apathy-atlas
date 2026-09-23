@@ -30,19 +30,7 @@ const DORMANT: &[(&str, &str)] = &[
          receipts -- which is effect-equivalent only because that path never \
          rejects. Wired when speculation makes rejection possible.",
     ),
-    (
-        "Glm53Dflash2AttentionKernels",
-        "DFlash2 drafter is not wired; the proposer and head have no call sites either",
-    ),
     ("Glm53Dflash2CaptureKernel", "DFlash2 drafter is not wired"),
-    ("Glm53Dflash2ConvKernel", "DFlash2 drafter is not wired"),
-    ("Glm53Dflash2SelectorKernel", "DFlash2 drafter is not wired"),
-    ("Glm53Dflash2TopkKernel", "DFlash2 drafter is not wired"),
-    (
-        "Glm53KdaPrefillKernel",
-        "takes (batch, tokens) and is the batched-prefill primitive the rows>1 \
-         work will use; wired when prefill stops looping walk()",
-    ),
 ];
 
 fn sources() -> Vec<(String, String)> {
@@ -50,6 +38,7 @@ fn sources() -> Vec<(String, String)> {
     for directory in [
         concat!(env!("CARGO_MANIFEST_DIR"), "/src/layers"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/src/model/glm53"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/weight_loader"),
     ] {
         let entries = std::fs::read_dir(directory).expect("readable source directory");
         for entry in entries.flatten() {
@@ -58,17 +47,26 @@ fn sources() -> Vec<(String, String)> {
                 continue;
             }
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            out.push((name, std::fs::read_to_string(&path).expect("readable source")));
+            out.push((
+                name,
+                std::fs::read_to_string(&path).expect("readable source"),
+            ));
         }
     }
     let ops = concat!(env!("CARGO_MANIFEST_DIR"), "/src/layers/ops");
-    for entry in std::fs::read_dir(ops).expect("readable ops directory").flatten() {
+    for entry in std::fs::read_dir(ops)
+        .expect("readable ops directory")
+        .flatten()
+    {
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        out.push((name, std::fs::read_to_string(&path).expect("readable source")));
+        out.push((
+            name,
+            std::fs::read_to_string(&path).expect("readable source"),
+        ));
     }
     out
 }
@@ -145,7 +143,9 @@ fn every_kernel_has_a_non_test_call_site_or_a_declared_reason() {
     // list stops meaning anything.
     let stale: Vec<&str> = dormant
         .iter()
-        .filter(|name| kernels.iter().any(|k| k == *name) && !unwired.contains(&(*name).to_string()))
+        .filter(|name| {
+            kernels.iter().any(|k| k == *name) && !unwired.contains(&(*name).to_string())
+        })
         .copied()
         .collect();
     assert!(

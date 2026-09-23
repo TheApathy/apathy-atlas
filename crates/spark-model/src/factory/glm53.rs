@@ -5,7 +5,9 @@
 #![allow(dead_code)] // Runtime construction is staged behind the typed server store seam.
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use atlas_core::config::{Glm5NextIndexerType, Glm5NextMlpType, LayerType, ModelConfig};
+use atlas_core::config::{
+    Glm5NextIndexerType, Glm5NextMlpType, LayerType, ModelConfig, VisionConfig,
+};
 use spark_runtime::weights::gguf::GgufDeviceStore;
 
 use super::{Glm53QuantProfile, ModelSourceKind};
@@ -268,7 +270,7 @@ fn validate_official_config(config: &ModelConfig) -> Result<()> {
         && config.nested_config
         && config.weight_prefix == "model.language_model"
         && !config.attn_gated
-        && config.vision.is_none()
+        && config.vision.as_ref().is_none_or(is_exact_glm53_vision)
         && config.tp_world_size == 1
         && config.ep_world_size == 1;
     let schedules = config.layer_types.len() == TARGET_LAYERS
@@ -472,8 +474,12 @@ fn validate_official_config(config: &ModelConfig) -> Result<()> {
             if config.ep_world_size != 1 {
                 why.push(format!("ep_world_size={}", config.ep_world_size));
             }
-            if config.vision.is_some() {
-                why.push("vision=Some".into());
+            if config
+                .vision
+                .as_ref()
+                .is_some_and(|vision| !is_exact_glm53_vision(vision))
+            {
+                why.push("vision=unsupported".into());
             }
         }
         if !schedules {
@@ -501,6 +507,26 @@ fn validate_official_config(config: &ModelConfig) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn is_exact_glm53_vision(vision: &VisionConfig) -> bool {
+    vision.model_type == "glm5_next_vision"
+        && vision.depth == 24
+        && vision.hidden_size == 1024
+        && vision.num_heads == 16
+        && vision.patch_size == 14
+        && vision.temporal_patch_size == 2
+        && vision.spatial_merge_size == 2
+        && vision.intermediate_size == 4096
+        && vision.out_hidden_size == 4096
+        && vision.in_channels == 3
+        && vision.image_size == 448
+        && vision.projection_intermediate_size == 10240
+        && (vision.rms_norm_eps - 1e-5).abs() < f64::EPSILON
+        && vision.swiglu_limit == Some(10.0)
+        && vision.deepstack_visual_indexes.is_empty()
+        && vision.image_pad_token_id == 154854
+        && vision.video_pad_token_id == 154855
 }
 
 #[cfg(test)]
@@ -608,10 +634,37 @@ mod tests {
         }
     }
 
+    fn official_vision() -> VisionConfig {
+        VisionConfig {
+            model_type: "glm5_next_vision".into(),
+            depth: 24,
+            hidden_size: 1024,
+            num_heads: 16,
+            patch_size: 14,
+            temporal_patch_size: 2,
+            spatial_merge_size: 2,
+            intermediate_size: 4096,
+            out_hidden_size: 4096,
+            in_channels: 3,
+            image_size: 448,
+            projection_intermediate_size: 10240,
+            rms_norm_eps: 1e-5,
+            swiglu_limit: Some(10.0),
+            deepstack_visual_indexes: Vec::new(),
+            image_pad_token_id: 154854,
+            video_pad_token_id: 154855,
+        }
+    }
+
     #[test]
     fn official_geometry_is_exact_and_drift_fails() {
         let mut config = official_config();
         validate_official_config(&config).unwrap();
+        config.vision = Some(official_vision());
+        validate_official_config(&config).unwrap();
+        config.vision.as_mut().unwrap().depth = 23;
+        assert!(validate_official_config(&config).is_err());
+        config.vision = None;
         config.glm5_next.as_mut().unwrap().index_topk = 2047;
         assert!(validate_official_config(&config).is_err());
     }

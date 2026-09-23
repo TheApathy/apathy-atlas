@@ -10,11 +10,12 @@
 
 __device__ __forceinline__ bool glm53_dflash2_capture_pair(
         unsigned int post_layer, unsigned int slot) {
-    return (post_layer == 5U && slot == 0U) ||
-        (post_layer == 14U && slot == 1U) ||
-        (post_layer == 24U && slot == 2U) ||
-        (post_layer == 33U && slot == 3U) ||
-        (post_layer == 42U && slot == 4U);
+    // Config IDs are one-based; the Atlas walk passes zero-based layer indices.
+    return (post_layer == 4U && slot == 0U) ||
+        (post_layer == 13U && slot == 1U) ||
+        (post_layer == 23U && slot == 2U) ||
+        (post_layer == 32U && slot == 3U) ||
+        (post_layer == 41U && slot == 4U);
 }
 
 extern "C" __global__ void __launch_bounds__(GLM53_DFLASH2_THREADS, 1)

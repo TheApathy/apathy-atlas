@@ -10,8 +10,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::*;
 
-const TAIL_CAP: usize =
-    spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY as usize;
+const TAIL_CAP: usize = spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY as usize;
 use crate::layers::{Glm53TargetFfnKind, Glm53TargetGeometry, Glm53TargetSchedule};
 use crate::model::glm53::arena::Glm53ArenaPlan;
 use crate::model::glm53::t1_state_transaction::Glm53T1StateLayout;
@@ -21,6 +20,36 @@ use crate::weight_loader::{
     Glm53KdaWeights, Glm53MoeWeights,
 };
 use spark_runtime::weights::gguf::{GgmlType, GgufDeviceTensor};
+
+#[test]
+fn exl3_last_row_head_selector_is_fail_closed_and_scope_bound() {
+    let last = glm53_exl3_lm_head_slice(1_875, true, None).unwrap();
+    assert_eq!(last.rows, 1);
+    assert_eq!(last.input_row, 1_874);
+    assert_eq!(last.output_row, 1_874);
+
+    let full = glm53_exl3_lm_head_slice(1_875, true, Some("0")).unwrap();
+    assert_eq!(full.rows, 1_875);
+    assert_eq!(full.input_row, 0);
+    assert_eq!(full.output_row, 0);
+
+    assert_eq!(
+        glm53_exl3_lm_head_slice(1_875, false, Some("1")).unwrap(),
+        full
+    );
+    assert_eq!(
+        glm53_exl3_lm_head_slice(1_875, true, Some("1")).unwrap(),
+        last
+    );
+
+    let singleton = glm53_exl3_lm_head_slice(1, true, Some("1")).unwrap();
+    assert_eq!(singleton.rows, 1);
+    assert_eq!(singleton.input_row, 0);
+    assert_eq!(singleton.output_row, 0);
+
+    assert!(glm53_exl3_lm_head_slice(1_875, true, Some("yes")).is_err());
+    assert!(glm53_exl3_lm_head_slice(0, true, Some("1")).is_err());
+}
 
 /// Records which kernel *symbol* ran, in order, so a test can assert the
 /// composed sequence rather than a launch count. Distinct handles per symbol
@@ -201,8 +230,12 @@ fn f32_tensor_at(c: &mut u64, dims: &[u64]) -> GgufDeviceTensor {
         dimensions: dims.to_vec(),
         ggml_type: GgmlType::F32,
         byte_len: (elements * 4) as usize,
-        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(GgmlType::F32, dims, (elements * 4) as usize)
-            .expect("test tensor slack"),
+        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(
+            GgmlType::F32,
+            dims,
+            (elements * 4) as usize,
+        )
+        .expect("test tensor slack"),
     }
 }
 
@@ -733,7 +766,7 @@ fn the_whole_schedule_walks_without_a_single_refusal() {
         "atlas_glm53_rms_norm",
         "atlas_glm53_kda_decode",
         "atlas_glm53_dsa_selected_attention_bf16",
-        "atlas_glm53_router_logits",
+        "atlas_glm53_router_logits_t4",
         "atlas_glm53_ordered_expert_reduce",
     ] {
         assert!(

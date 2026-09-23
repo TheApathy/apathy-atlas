@@ -142,7 +142,7 @@ impl ImageSourceBlock {
         match self.source_type.as_str() {
             "base64" => {
                 let data = self.data.as_ref()?;
-                let mt = self.media_type.as_deref().unwrap_or("image/png");
+                let mt = self.media_type.as_deref()?;
                 Some(format!("data:{mt};base64,{data}"))
             }
             "url" => self.url.clone(),
@@ -184,6 +184,7 @@ pub struct AnthropicTool {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(try_from = "super::tool_choice::WireChoice")]
 pub struct AnthropicToolChoice {
     #[serde(rename = "type")]
     pub choice_type: String,

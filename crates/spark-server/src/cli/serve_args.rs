@@ -164,6 +164,12 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 16)]
     pub dflash_gamma: usize,
 
+    /// GLM-5.3 EXL3 only: verify the first N drafts from the trained block (1..7).
+    /// Requires --dflash --dflash-gamma 8. The drafter still executes all eight
+    /// rows; only target verification is shortened. Omit to keep seven drafts.
+    #[arg(long, requires = "dflash", conflicts_with_all = ["speculative", "self_speculative", "ngram_speculative"], value_parser = clap::value_parser!(u8).range(1..=7))]
+    pub glm_dflash_max_drafts: Option<u8>,
+
     /// DFlash drafter sliding-window size for long context. The drafter
     /// runs full-prefix attention by default; at Atlas's typical 16K
     /// `--max-seq-len`, drafter attention dominates per-step cost. The

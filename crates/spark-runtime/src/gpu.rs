@@ -131,6 +131,26 @@ pub trait GpuBackend: Send + Sync {
         params: &mut [*mut std::ffi::c_void],
     ) -> Result<()>;
 
+    /// Launch a kernel whose implementation performs a grid-wide cooperative sync.
+    /// Backends without CUDA cooperative-grid support reject before enqueue.
+    fn launch_cooperative(
+        &self,
+        _func: KernelHandle,
+        _grid: [u32; 3],
+        _block: [u32; 3],
+        _shared_mem: u32,
+        _stream: u64,
+        _params: &mut [*mut std::ffi::c_void],
+    ) -> Result<()> {
+        anyhow::bail!("cooperative-grid kernel launch is unsupported by this backend")
+    }
+
+    /// Opt a kernel into a dynamic shared-memory allocation above the default limit.
+    /// Unsupported backends reject before mutating function state.
+    fn set_kernel_max_dynamic_shared_memory(&self, _func: KernelHandle, _bytes: u32) -> Result<()> {
+        anyhow::bail!("kernel dynamic shared-memory attributes are unsupported by this backend")
+    }
+
     /// Typed-args kernel launch.
     ///
     /// CUDA's default impl packs args into u64 slots and forwards to
@@ -384,5 +404,26 @@ mod tests {
     fn test_device_ptr_offset() {
         let ptr = DevicePtr(0x1000);
         assert_eq!(ptr.offset(256).0, 0x1100);
+    }
+
+    #[test]
+    fn mock_cooperative_launch_fails_closed() {
+        let gpu = MockGpuBackend::new();
+        let mut params = [];
+        let error = gpu
+            .launch_cooperative(KernelHandle(1), [1, 1, 1], [32, 1, 1], 0, 0, &mut params)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported"));
+        assert_eq!(gpu.launch_count(), 0);
+    }
+
+    #[test]
+    fn mock_kernel_shared_memory_attribute_fails_closed() {
+        let gpu = MockGpuBackend::new();
+        let error = gpu
+            .set_kernel_max_dynamic_shared_memory(KernelHandle(1), 90 * 1024)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported"));
+        assert_eq!(gpu.launch_count(), 0);
     }
 }

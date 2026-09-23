@@ -13,10 +13,17 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::gguf::GgmlType;
 
 use crate::layers::ops::{
-    GgmlIqBuffer, GgmlIqMmqKernels, GgmlIqMmqPlan, Glm53ActivationKernels,
-    Glm53ExpertReduceBuffers, Glm53ExpertReducePlan, Glm53SwigluBuffers, Glm53SwigluPlan,
+    GLM53_EXL3_MAX_WIDE_ROWS, GgmlIqBuffer, GgmlIqMmqKernels, GgmlIqMmqPlan,
+    Glm53ActivationKernels, Glm53Exl3Buffer, Glm53Exl3CastKernels, Glm53Exl3CastPlan,
+    Glm53Exl3MoeBuffers, Glm53Exl3MoeKernels, Glm53Exl3MoePointerTables, Glm53Exl3MoeScratch,
+    Glm53Exl3Projection, Glm53Exl3ProjectionBuffers, Glm53Exl3ProjectionScratch,
+    Glm53Exl3RoutePolicy, Glm53ExpertReduceBuffers, Glm53ExpertReducePlan, Glm53SwigluBuffers,
+    Glm53SwigluPlan,
 };
-use crate::weight_loader::{Glm53GgufMatrix, Glm53GgufMatrixBank, Glm53MoeWeights};
+use crate::weight_loader::{
+    Glm53Exl3ExpertWeights, Glm53Exl3MoeWeights, Glm53GgufMatrix, Glm53GgufMatrixBank,
+    Glm53MoeWeights,
+};
 
 const HIDDEN: u32 = 4096;
 const EXPERTS: u32 = 288;
@@ -34,6 +41,7 @@ const MAX_Q8_ACTIVATION_BYTES: usize = 4_608;
 pub const GLM53_SERIAL_MOE_D2H_COPIES: u32 = 1;
 pub const GLM53_SERIAL_MOE_MANDATORY_STREAM_SYNCS: u32 = 1;
 pub const GLM53_SERIAL_MOE_KERNEL_LAUNCHES: u32 = 64;
+pub const GLM53_EXL3_SERIAL_MOE_KERNEL_LAUNCHES: u32 = 91;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Glm53SerialMoeBuffers {
@@ -95,6 +103,8 @@ pub struct Glm53SerialMoeKernels {
     iq3_s: GgmlIqMmqKernels,
     iq4_xs: GgmlIqMmqKernels,
     activations: Glm53ActivationKernels,
+    exl3_moe: Option<Glm53Exl3MoeKernels>,
+    exl3_cast: Option<Glm53Exl3CastKernels>,
     /// The grouped kernels, loaded ALONGSIDE the serial ones rather than
     /// instead of them. One struct, two methods, so the A/B is on one binary
     /// and a regression localises in a single run.
@@ -118,6 +128,8 @@ impl Glm53SerialMoeKernels {
             iq3_s: GgmlIqMmqKernels::load(gpu, GgmlType::IQ3_S)?,
             iq4_xs: GgmlIqMmqKernels::load(gpu, GgmlType::IQ4_XS)?,
             activations: Glm53ActivationKernels::load(gpu)?,
+            exl3_moe: None,
+            exl3_cast: None,
             // Only the eleven types the grouped kernel is DEFINED for. Q3_K has
             // no grouped definition, so a Q3_K bank falls to the serial path by
             // failing to resolve here rather than by resolving a symbol that was
@@ -142,6 +154,31 @@ impl Glm53SerialMoeKernels {
             })
             .collect::<Result<Vec<_>>>()?,
         })
+    }
+
+    pub fn load_exl3(gpu: &dyn GpuBackend) -> Result<Self> {
+        let policy = Glm53Exl3RoutePolicy::parse_with_verify_group(
+            std::env::var_os("ATLAS_GLM53_EXL3_ROUTE_PRIVATE").as_deref(),
+            std::env::var_os("ATLAS_GLM53_EXL3_ROUTE_PRIVATE_PREFILL").as_deref(),
+            std::env::var_os("ATLAS_GLM53_EXL3_MOE_VERIFY_GROUP_WIDTH").as_deref(),
+            std::env::var_os("ATLAS_GLM53_EXACT_VERIFY").as_deref(),
+        )?
+        .with_verify_staged_k32(
+            std::env::var_os("ATLAS_GLM53_EXL3_MOE_VERIFY_STAGED_K32").as_deref(),
+            std::env::var_os("ATLAS_GLM53_EXACT_VERIFY").as_deref(),
+        )?;
+        policy.validate_moe_mode(std::env::var_os("ATLAS_GLM53_EXL3_MOE").as_deref())?;
+        Self::load_exl3_with_route_policy(gpu, policy)
+    }
+
+    pub fn load_exl3_with_route_policy(
+        gpu: &dyn GpuBackend,
+        policy: Glm53Exl3RoutePolicy,
+    ) -> Result<Self> {
+        let mut kernels = Self::load(gpu)?;
+        kernels.exl3_moe = Some(Glm53Exl3MoeKernels::load_with_route_policy(gpu, policy)?);
+        kernels.exl3_cast = Some(Glm53Exl3CastKernels::load(gpu)?);
+        Ok(kernels)
     }
 
     /// Execute exactly one token on exactly one stream, without device allocation.
@@ -217,6 +254,274 @@ impl Glm53SerialMoeKernels {
             mandatory_stream_syncs: GLM53_SERIAL_MOE_MANDATORY_STREAM_SYNCS,
             kernel_launches: GLM53_SERIAL_MOE_KERNEL_LAUNCHES,
         })
+    }
+
+    /// Correctness-first EXL3 MoE path. Route ids are still read once to the
+    /// host per layer; the later grouped EXL3 lane removes that decode drain.
+    pub fn execute_exl3(
+        &self,
+        gpu: &dyn GpuBackend,
+        weights: &Glm53Exl3MoeWeights,
+        buffers: Glm53SerialMoeBuffers,
+        scratch: Glm53Exl3ProjectionScratch,
+        stream: u64,
+    ) -> Result<Glm53SerialMoeReceipt> {
+        if gpu.stream_is_capturing(stream) {
+            bail!("serial GLM EXL3 MoE cannot synchronize inside graph capture");
+        }
+        self.preflight_exl3(weights, buffers)?;
+        let mut raw_ids = [0u8; ROUTE_BYTES];
+        crate::model::glm53::walk_timing::blocked_moe(|| {
+            gpu.copy_d2h_on_stream(buffers.route_ids_u32.ptr, &mut raw_ids, stream)
+        })?;
+        let route_ids = decode_route_ids(raw_ids)?;
+
+        for (slot, expert_id) in route_ids.into_iter().enumerate() {
+            let expert = weights
+                .experts
+                .get(expert_id as usize)
+                .context("GLM EXL3 routed expert missing")?;
+            self.exl3_expert(
+                gpu,
+                expert,
+                buffers.input_bf16,
+                buffers.expert_gate_bf16,
+                buffers.expert_up_bf16,
+                buffers.expert_swiglu_bf16,
+                slot_buffer(buffers.routed_bf16, slot)?,
+                scratch,
+                stream,
+            )?;
+        }
+        self.exl3_expert(
+            gpu,
+            &weights.shared,
+            buffers.input_bf16,
+            buffers.shared_gate_bf16,
+            buffers.shared_up_bf16,
+            buffers.shared_swiglu_bf16,
+            buffers.shared_bf16,
+            scratch,
+            stream,
+        )?;
+        self.activations.reduce(
+            gpu,
+            Glm53ExpertReducePlan::new(1, HIDDEN, EXPERTS, TOP_K)?,
+            Glm53ExpertReduceBuffers {
+                routed_bf16: buffers.routed_bf16,
+                indices_u32: buffers.route_ids_u32,
+                weights_f32: buffers.route_weights_f32,
+                shared_bf16: buffers.shared_bf16,
+                output_bf16: buffers.output_bf16,
+            },
+            stream,
+        )?;
+        Ok(Glm53SerialMoeReceipt {
+            route_ids,
+            d2h_copies: GLM53_SERIAL_MOE_D2H_COPIES,
+            mandatory_stream_syncs: GLM53_SERIAL_MOE_MANDATORY_STREAM_SYNCS,
+            kernel_launches: GLM53_EXL3_SERIAL_MOE_KERNEL_LAUNCHES,
+        })
+    }
+
+    /// Device-routed EXL3 path used by the target and the K8 verifier. No route
+    /// bytes cross to the host and no stream synchronization occurs here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_exl3_fused(
+        &self,
+        gpu: &dyn GpuBackend,
+        weights: &Glm53Exl3MoeWeights,
+        buffers: Glm53SerialMoeBuffers,
+        projection_scratch: Glm53Exl3ProjectionScratch,
+        moe_scratch: Glm53Exl3MoeScratch,
+        pointers: Glm53Exl3MoePointerTables,
+        stream: u64,
+    ) -> Result<Glm53GroupedMoeReceipt> {
+        self.execute_exl3_fused_rows(
+            gpu,
+            1,
+            weights,
+            buffers,
+            projection_scratch,
+            moe_scratch,
+            pointers,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_exl3_fused_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: u32,
+        weights: &Glm53Exl3MoeWeights,
+        buffers: Glm53SerialMoeBuffers,
+        projection_scratch: Glm53Exl3ProjectionScratch,
+        moe_scratch: Glm53Exl3MoeScratch,
+        pointers: Glm53Exl3MoePointerTables,
+        stream: u64,
+    ) -> Result<Glm53GroupedMoeReceipt> {
+        self.preflight_exl3_rows(weights, buffers, rows)?;
+        let fused = self
+            .exl3_moe
+            .as_ref()
+            .context("GLM EXL3 fused MoE kernels were not loaded")?;
+        let plan = fused.plan(rows)?;
+        let casts = self
+            .exl3_cast
+            .as_ref()
+            .context("GLM EXL3 cast kernels were not loaded")?;
+        let input_f16 = prefix(projection_scratch.input_f16, plan.input_f16_bytes)?;
+        let exact = Glm53Exl3MoeBuffers {
+            input_f16,
+            output_f32: prefix(moe_scratch.output_f32, plan.output_f32_bytes)?,
+            route_private_f32: prefix(moe_scratch.route_private_f32, plan.route_private_f32_bytes)?,
+            route_ids_u32: exl3_buffer(buffers.route_ids_u32),
+            route_weights_f32: exl3_buffer(buffers.route_weights_f32),
+            expert_count_i64: prefix(moe_scratch.expert_count_i64, plan.expert_count_i64_bytes)?,
+            token_sorted_i64: prefix(moe_scratch.token_sorted_i64, plan.token_sorted_i64_bytes)?,
+            weight_sorted_f16: prefix(moe_scratch.weight_sorted_f16, plan.weight_sorted_f16_bytes)?,
+            temp_state_g_f16: prefix(moe_scratch.temp_state_g_f16, plan.temp_state_f16_bytes)?,
+            temp_state_u_f16: prefix(moe_scratch.temp_state_u_f16, plan.temp_state_f16_bytes)?,
+            temp_intermediate_g_f16: prefix(
+                moe_scratch.temp_intermediate_g_f16,
+                plan.temp_intermediate_f16_bytes,
+            )?,
+            temp_intermediate_u_f16: prefix(
+                moe_scratch.temp_intermediate_u_f16,
+                plan.temp_intermediate_f16_bytes,
+            )?,
+            route_status_u32: moe_scratch.route_status_u32,
+            locks_i32: moe_scratch.locks_i32,
+            pair_expert_u32: prefix(moe_scratch.pair_expert_u32, plan.pair_expert_u32_bytes)?,
+            chunk_expert_u32: prefix(
+                moe_scratch.chunk_expert_u32,
+                plan.chunk_descriptor_u32_bytes,
+            )?,
+            chunk_start_u32: prefix(moe_scratch.chunk_start_u32, plan.chunk_descriptor_u32_bytes)?,
+            chunk_rows_u32: prefix(moe_scratch.chunk_rows_u32, plan.chunk_descriptor_u32_bytes)?,
+            chunk_count_u32: prefix(moe_scratch.chunk_count_u32, plan.chunk_count_u32_bytes)?,
+            pointers,
+        };
+        // All selected extents and pointer tables must be admitted before
+        // even the first input cast submits work to the caller's stream.
+        fused.validate(plan, exact)?;
+        casts.bf16_to_f16(
+            gpu,
+            Glm53Exl3CastPlan::new(rows, HIDDEN)?,
+            exl3_buffer(buffers.input_bf16),
+            input_f16,
+            stream,
+        )?;
+        let fused_kernel_launches = fused.kernel_launches(rows);
+        fused.launch(gpu, plan, exact, stream)?;
+        self.exl3_expert_rows(
+            gpu,
+            rows,
+            &weights.shared,
+            buffers.input_bf16,
+            buffers.shared_gate_bf16,
+            buffers.shared_up_bf16,
+            buffers.shared_swiglu_bf16,
+            buffers.shared_bf16,
+            projection_scratch,
+            stream,
+        )?;
+        fused.combine_shared(
+            gpu,
+            plan,
+            exact.output_f32,
+            exact.route_private_f32,
+            exl3_buffer(buffers.shared_bf16),
+            exl3_buffer(buffers.output_bf16),
+            exact.route_status_u32,
+            stream,
+        )?;
+        Ok(Glm53GroupedMoeReceipt {
+            d2h_copies: 0,
+            mandatory_stream_syncs: 0,
+            // Twelve launches surround the fused routed MoE: one input cast,
+            // three shared projections times three launches, SwiGLU, combine.
+            kernel_launches: 12 + fused_kernel_launches,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exl3_expert(
+        &self,
+        gpu: &dyn GpuBackend,
+        weights: &Glm53Exl3ExpertWeights,
+        input: GgmlIqBuffer,
+        gate: GgmlIqBuffer,
+        up: GgmlIqBuffer,
+        swiglu: GgmlIqBuffer,
+        output: GgmlIqBuffer,
+        scratch: Glm53Exl3ProjectionScratch,
+        stream: u64,
+    ) -> Result<()> {
+        self.exl3_expert_rows(
+            gpu, 1, weights, input, gate, up, swiglu, output, scratch, stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exl3_expert_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: u32,
+        weights: &Glm53Exl3ExpertWeights,
+        input: GgmlIqBuffer,
+        gate: GgmlIqBuffer,
+        up: GgmlIqBuffer,
+        swiglu: GgmlIqBuffer,
+        output: GgmlIqBuffer,
+        scratch: Glm53Exl3ProjectionScratch,
+        stream: u64,
+    ) -> Result<()> {
+        self.exl3_linear_rows(gpu, rows, &weights.gate, input, gate, scratch, stream)?;
+        self.exl3_linear_rows(gpu, rows, &weights.up, input, up, scratch, stream)?;
+        self.activations.swiglu(
+            gpu,
+            Glm53SwigluPlan::new(rows, EXPERT_INTERMEDIATE)?,
+            Glm53SwigluBuffers {
+                gate_bf16: gate,
+                up_bf16: up,
+                output_bf16: swiglu,
+            },
+            stream,
+        )?;
+        self.exl3_linear_rows(gpu, rows, &weights.down, swiglu, output, scratch, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exl3_linear_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: u32,
+        linear: &crate::weight_loader::Glm53Exl3Linear,
+        input: GgmlIqBuffer,
+        output: GgmlIqBuffer,
+        scratch: Glm53Exl3ProjectionScratch,
+        stream: u64,
+    ) -> Result<()> {
+        let projection = Glm53Exl3Projection::Compressed(linear);
+        let plan = projection.plan(rows)?;
+        projection.launch(
+            gpu,
+            plan,
+            Glm53Exl3ProjectionBuffers {
+                input_bf16: Glm53Exl3Buffer {
+                    ptr: input.ptr,
+                    bytes: input.bytes,
+                },
+                output_bf16: Glm53Exl3Buffer {
+                    ptr: output.ptr,
+                    bytes: output.bytes,
+                },
+                scratch,
+            },
+            stream,
+        )
     }
 
     /// The shared expert and the weighted reduce.
@@ -323,10 +628,7 @@ impl Glm53SerialMoeKernels {
 
         let mut launches = 0u32;
         // Gate and up: one activation per row, shared by all top_k experts.
-        for (bank, output) in [
-            (gate_bank, grouped.gate_bf16),
-            (up_bank, grouped.up_bf16),
-        ] {
+        for (bank, output) in [(gate_bank, grouped.gate_bf16), (up_bank, grouped.up_bf16)] {
             let plan = Glm53GroupedMoePlan::new(bank, 1, TOP_K)?;
             self.grouped_kernels(bank.kind)?.launch(
                 gpu,
@@ -369,16 +671,41 @@ impl Glm53SerialMoeKernels {
             Glm53GroupedActivations::PerPair,
         )?;
         let down_kernels = self.grouped_kernels(down_bank.kind)?;
-        down_kernels.quantize(
-            gpu,
-            down.quantize_plan()?,
-            grouped.swiglu_bf16.ptr,
-            GgmlIqBuffer {
-                ptr: grouped.down_q8.ptr,
-                bytes: down.activation_bytes,
-            },
-            stream,
-        )?;
+        // ONE rows=1 QUANTIZE PER PAIR, not one multi-row quantize sliced up.
+        // The MMQ q8_1 layout for rows > 1 is tiled, so row p does not live at
+        // p * per_row_bytes; slicing it reads scrambled data, which is what made
+        // `routed` differ in 99.92% of its elements from index 0. Each block is
+        // quantized independently into its own region, which is byte-for-byte
+        // what the serial path produces.
+        let quantize_plan = down.quantize_plan()?;
+        let row_bytes = u64::from(EXPERT_INTERMEDIATE) * 2;
+        for block in 0..down.activation_blocks {
+            down_kernels.quantize(
+                gpu,
+                quantize_plan,
+                DevicePtr(
+                    grouped
+                        .swiglu_bf16
+                        .ptr
+                        .0
+                        .checked_add(u64::from(block) * row_bytes)
+                        .context("GLM grouped MoE swiglu row overflow")?,
+                ),
+                GgmlIqBuffer {
+                    ptr: DevicePtr(
+                        grouped
+                            .down_q8
+                            .ptr
+                            .0
+                            .checked_add(down.activation_block_offset(block)?)
+                            .context("GLM grouped MoE activation block overflow")?,
+                    ),
+                    bytes: quantize_plan.activation_bytes,
+                },
+                stream,
+            )?;
+        }
+        launches += down.activation_blocks;
         down_kernels.launch_tiles(
             gpu,
             down,
@@ -493,6 +820,48 @@ impl Glm53SerialMoeKernels {
         })
     }
 
+    fn preflight_exl3(
+        &self,
+        weights: &Glm53Exl3MoeWeights,
+        buffers: Glm53SerialMoeBuffers,
+    ) -> Result<()> {
+        self.preflight_exl3_rows(weights, buffers, 1)
+    }
+
+    fn preflight_exl3_rows(
+        &self,
+        weights: &Glm53Exl3MoeWeights,
+        buffers: Glm53SerialMoeBuffers,
+        rows: u32,
+    ) -> Result<()> {
+        if weights.experts.len() != EXPERTS as usize
+            || weights.router.bytes() != HIDDEN as usize * EXPERTS as usize * 4
+            || weights.expert_bias.bytes() != EXPERTS as usize * 4
+        {
+            bail!("GLM EXL3 MoE router, bias, or expert census mismatch");
+        }
+        for expert in weights
+            .experts
+            .iter()
+            .chain(std::iter::once(&weights.shared))
+        {
+            for (linear, inner, columns) in [
+                (&expert.gate, HIDDEN, EXPERT_INTERMEDIATE),
+                (&expert.up, HIDDEN, EXPERT_INTERMEDIATE),
+                (&expert.down, EXPERT_INTERMEDIATE, HIDDEN),
+            ] {
+                if linear.size_k() != inner || linear.size_n() != columns {
+                    bail!("GLM EXL3 MoE expert projection geometry mismatch");
+                }
+            }
+        }
+        if rows == 1 {
+            validate_work_ranges(buffers)
+        } else {
+            validate_exl3_fused_work_ranges(buffers, rows)
+        }
+    }
+
     fn bank_plan(
         &self,
         bank: &Glm53GgufMatrixBank,
@@ -551,6 +920,23 @@ fn decode_route_ids(raw: [u8; ROUTE_BYTES]) -> Result<[u32; TOP_K as usize]> {
     Ok(ids)
 }
 
+fn exl3_buffer(buffer: GgmlIqBuffer) -> Glm53Exl3Buffer {
+    Glm53Exl3Buffer {
+        ptr: buffer.ptr,
+        bytes: buffer.bytes,
+    }
+}
+
+fn prefix(buffer: Glm53Exl3Buffer, bytes: usize) -> Result<Glm53Exl3Buffer> {
+    if buffer.ptr == DevicePtr::NULL || buffer.bytes < bytes {
+        bail!("GLM EXL3 fused MoE scratch is null or too small");
+    }
+    Ok(Glm53Exl3Buffer {
+        ptr: buffer.ptr,
+        bytes,
+    })
+}
+
 fn slot_buffer(routed: GgmlIqBuffer, slot: usize) -> Result<GgmlIqBuffer> {
     let offset = slot
         .checked_mul(HIDDEN_BYTES)
@@ -567,7 +953,42 @@ fn slot_buffer(routed: GgmlIqBuffer, slot: usize) -> Result<GgmlIqBuffer> {
 }
 
 fn validate_ranges(weights: &Glm53MoeWeights, b: Glm53SerialMoeBuffers) -> Result<()> {
-    let work = [
+    let work = work_ranges(b);
+    validate_work_ranges(b)?;
+    let weight_ranges = [
+        GgmlIqBuffer {
+            ptr: weights.router.ptr(),
+            bytes: weights.router.bytes(),
+        },
+        GgmlIqBuffer {
+            ptr: weights.expert_bias.ptr(),
+            bytes: weights.expert_bias.bytes(),
+        },
+        bank_buffer(&weights.gate_experts)?,
+        bank_buffer(&weights.up_experts)?,
+        bank_buffer(&weights.down_experts)?,
+        weights.shared_gate.buffer(),
+        weights.shared_up.buffer(),
+        weights.shared_down.buffer(),
+    ];
+    for &buffer in &weight_ranges {
+        checked_end(buffer)?;
+    }
+    for left in 0..work.len() {
+        for &weight in &weight_ranges {
+            reject_overlap(work[left].1, weight)?;
+        }
+    }
+    for left in 0..weight_ranges.len() {
+        for right in left + 1..weight_ranges.len() {
+            reject_overlap(weight_ranges[left], weight_ranges[right])?;
+        }
+    }
+    Ok(())
+}
+
+fn work_ranges(b: Glm53SerialMoeBuffers) -> [(&'static str, GgmlIqBuffer, usize); 13] {
+    [
         ("input", b.input_bf16, HIDDEN_BYTES),
         ("route IDs", b.route_ids_u32, ROUTE_BYTES),
         ("route weights", b.route_weights_f32, ROUTE_BYTES),
@@ -589,43 +1010,61 @@ fn validate_ranges(weights: &Glm53MoeWeights, b: Glm53SerialMoeBuffers) -> Resul
         ),
         ("shared output", b.shared_bf16, HIDDEN_BYTES),
         ("output", b.output_bf16, HIDDEN_BYTES),
-    ];
+    ]
+}
+
+fn validate_work_ranges(b: Glm53SerialMoeBuffers) -> Result<()> {
+    let work = work_ranges(b);
     for &(name, buffer, bytes) in &work {
         if buffer.bytes != bytes || buffer.ptr == DevicePtr::NULL {
             bail!("GLM serial MoE {name} buffer extent or pointer mismatch");
         }
         checked_end(buffer)?;
     }
-    let weight_ranges = [
-        GgmlIqBuffer {
-            ptr: weights.router.ptr(),
-            bytes: weights.router.bytes(),
-        },
-        GgmlIqBuffer {
-            ptr: weights.expert_bias.ptr(),
-            bytes: weights.expert_bias.bytes(),
-        },
-        bank_buffer(&weights.gate_experts)?,
-        bank_buffer(&weights.up_experts)?,
-        bank_buffer(&weights.down_experts)?,
-        weights.shared_gate.buffer(),
-        weights.shared_up.buffer(),
-        weights.shared_down.buffer(),
+    for left in 0..work.len() {
+        for right in left + 1..work.len() {
+            reject_overlap(work[left].1, work[right].1)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_exl3_fused_work_ranges(b: Glm53SerialMoeBuffers, rows: u32) -> Result<()> {
+    if !(2..=GLM53_EXL3_MAX_WIDE_ROWS as u32).contains(&rows) {
+        bail!("GLM fused wide MoE rows must be 2..={GLM53_EXL3_MAX_WIDE_ROWS}");
+    }
+    let rows = usize::try_from(rows)?;
+    let work = [
+        ("input", b.input_bf16, rows * HIDDEN_BYTES),
+        ("route IDs", b.route_ids_u32, rows * ROUTE_BYTES),
+        ("route weights", b.route_weights_f32, rows * ROUTE_BYTES),
+        (
+            "shared gate",
+            b.shared_gate_bf16,
+            rows * SHARED_INTERMEDIATE_BYTES,
+        ),
+        (
+            "shared up",
+            b.shared_up_bf16,
+            rows * SHARED_INTERMEDIATE_BYTES,
+        ),
+        (
+            "shared SwiGLU",
+            b.shared_swiglu_bf16,
+            rows * SHARED_INTERMEDIATE_BYTES,
+        ),
+        ("shared output", b.shared_bf16, rows * HIDDEN_BYTES),
+        ("output", b.output_bf16, rows * HIDDEN_BYTES),
     ];
-    for &buffer in &weight_ranges {
+    for &(name, buffer, bytes) in &work {
+        if buffer.bytes != bytes || buffer.ptr == DevicePtr::NULL {
+            bail!("GLM fused wide MoE {name} buffer extent or pointer mismatch");
+        }
         checked_end(buffer)?;
     }
     for left in 0..work.len() {
         for right in left + 1..work.len() {
             reject_overlap(work[left].1, work[right].1)?;
-        }
-        for &weight in &weight_ranges {
-            reject_overlap(work[left].1, weight)?;
-        }
-    }
-    for left in 0..weight_ranges.len() {
-        for right in left + 1..weight_ranges.len() {
-            reject_overlap(weight_ranges[left], weight_ranges[right])?;
         }
     }
     Ok(())

@@ -9,13 +9,35 @@
 #define GLM53_DSA_KPOOL 4U
 #define GLM53_DSA_SELECTED_POOLS 512U
 #define GLM53_DSA_OUTPUT_WIDTH 2051U
-#define GLM53_DSA_MAX_QUERIES 8U
+#define GLM53_DSA_MAX_QUERIES 2048U
 #define GLM53_DSA_MAX_POOLS 262144U
 #define GLM53_DSA_MAX_POSITIONS 1048576U
 #define GLM53_DSA_THREADS 256U
 #define GLM53_DSA_NETWORK 1024U
 #define GLM53_DSA_MAX_GRID_YZ 65535ULL
 #define GLM53_DSA_INVALID_POOL 0xffffffffU
+
+// Stream-ordered replacement for four tiny synchronous H2D metadata copies.
+// One launch prepares the fixed K<=2048 query geometry consumed by top-k and
+// selected attention. Keeping this on device also makes the path capturable.
+extern "C" __global__ void atlas_glm53_dsa_prepare_metadata(
+        unsigned int * __restrict__ sequence_length,
+        unsigned int * __restrict__ query_positions,
+        unsigned char * __restrict__ query_validity,
+        unsigned char * __restrict__ tail_validity,
+        unsigned int position, unsigned int rows) {
+    const unsigned int lane = threadIdx.x;
+    if (blockIdx.x != 0U || rows == 0U || rows > GLM53_DSA_MAX_QUERIES)
+        return;
+    if (lane == 0U)
+        sequence_length[0] = position + rows;
+    for (unsigned int row = lane; row < rows; row += blockDim.x) {
+        query_positions[row] = position + row;
+        query_validity[row] = 1U;
+    }
+    if (rows > 1U && lane < GLM53_DSA_KPOOL - 1U)
+        tail_validity[lane] = 1U;
+}
 
 __device__ __forceinline__ bool glm53_dsa_better(
         float left_score, unsigned int left_pool,

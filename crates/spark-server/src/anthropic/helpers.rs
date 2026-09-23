@@ -47,10 +47,15 @@ impl From<&AnthropicToolChoice> for tool_parser::ToolChoice {
                         function: tool_parser::ToolChoiceFunction { name: name.clone() },
                     }
                 } else {
-                    tool_parser::ToolChoice::Mode("auto".to_string())
+                    // Deserialization rejects this; preserve a programmatic
+                    // invalid choice for shared admission instead of weakening it.
+                    tool_parser::ToolChoice::Mode("invalid_tool_without_name".to_string())
                 }
             }
-            _ => tool_parser::ToolChoice::Mode("auto".to_string()),
+            _ => tool_parser::ToolChoice::Mode(format!(
+                "invalid_anthropic_choice:{}",
+                tc.choice_type
+            )),
         }
     }
 }

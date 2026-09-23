@@ -125,7 +125,7 @@ fn reference(
 fn plan_pins_1m_extents_and_rejects_fp8_or_wrong_geometry() {
     let plan = Glm53DsaSelectedAttentionPlan::new(
         1,
-        8,
+        MAX_QUERIES,
         1_048_576,
         64,
         512,
@@ -133,11 +133,11 @@ fn plan_pins_1m_extents_and_rejects_fp8_or_wrong_geometry() {
         Glm53DsaSelectedStorage::Bf16,
     )
     .unwrap();
-    assert_eq!((plan.grid_y, plan.grid_z), (8, 1));
-    assert_eq!(plan.query_bytes, 524_288);
+    assert_eq!((plan.grid_y, plan.grid_z), (2_048, 1));
+    assert_eq!(plan.query_bytes, 134_217_728);
     assert_eq!(plan.latent_cache_bytes, 1_073_741_824);
-    assert_eq!(plan.selected_index_bytes, 65_632);
-    assert_eq!(plan.output_bytes, 524_288);
+    assert_eq!(plan.selected_index_bytes, 16_801_792);
+    assert_eq!(plan.output_bytes, 134_217_728);
     let split = Glm53DsaSelectedAttentionPlan::new(
         70_000,
         1,
@@ -160,7 +160,15 @@ fn plan_pins_1m_extents_and_rejects_fp8_or_wrong_geometry() {
             Glm53DsaSelectedStorage::Fp8E4M3,
         ),
         Glm53DsaSelectedAttentionPlan::new(0, 1, 1, 64, 512, 2_051, Glm53DsaSelectedStorage::Bf16),
-        Glm53DsaSelectedAttentionPlan::new(1, 9, 1, 64, 512, 2_051, Glm53DsaSelectedStorage::Bf16),
+        Glm53DsaSelectedAttentionPlan::new(
+            1,
+            MAX_QUERIES + 1,
+            1,
+            64,
+            512,
+            2_051,
+            Glm53DsaSelectedStorage::Bf16,
+        ),
         Glm53DsaSelectedAttentionPlan::new(
             1,
             1,
@@ -174,6 +182,37 @@ fn plan_pins_1m_extents_and_rejects_fp8_or_wrong_geometry() {
     ] {
         assert!(hostile.is_err());
     }
+}
+
+#[test]
+fn head_transpose_admits_m2048_and_rejects_m2049_before_enqueue() {
+    assert!(CUDA_SOURCE.contains("#define GLM53_DSA_MAX_QUERIES 2048U"));
+    assert!(CUDA_SOURCE.contains("rows > GLM53_DSA_MAX_QUERIES"));
+    assert!(!CUDA_SOURCE.contains("rows > 8U"));
+    let gpu = MockGpuBackend::new();
+    let kernel = Glm53DsaSelectedAttentionKernel::load(&gpu).unwrap();
+    let rows = GLM53_EXL3_MAX_WIDE_ROWS as u32;
+    let bytes = rows as usize * 64 * 512 * 2;
+    let buffers = Glm53DsaHeadTransposeBuffers {
+        input_bf16: GgmlIqBuffer {
+            ptr: DevicePtr(0x2000_0000),
+            bytes,
+        },
+        output_bf16: GgmlIqBuffer {
+            ptr: DevicePtr(0x2100_0000),
+            bytes,
+        },
+    };
+    kernel
+        .transpose_heads(&gpu, rows, 512, true, buffers, 0)
+        .unwrap();
+    assert_eq!(gpu.launch_count(), 1);
+    assert!(
+        kernel
+            .transpose_heads(&gpu, rows + 1, 512, true, buffers, 0)
+            .is_err()
+    );
+    assert_eq!(gpu.launch_count(), 1);
 }
 
 #[test]
@@ -329,6 +368,59 @@ fn forged_extent_alignment_alias_or_overflow_has_zero_launches() {
     assert_eq!(gpu.launch_count(), 1);
 }
 
+#[test]
+fn dense_causal_launch_is_exactly_b1_full_prefix_and_m2051_bounded() {
+    assert!(CUDA_SOURCE.contains("#define KERNEL_NAME atlas_glm53_dsa_dense_causal_bf16"));
+    assert!(CUDA_SOURCE.contains("#include \"../../common/prefill_paged_compute_512.cuh\""));
+    assert!(CUDA_SOURCE.contains("(unsigned long long)_pos * HDIM_512 + _col"));
+    let gpu = MockGpuBackend::new();
+    let kernel = Glm53DsaSelectedAttentionKernel::load(&gpu).unwrap();
+    let plan = Glm53DsaSelectedAttentionPlan::new(
+        1,
+        32,
+        64,
+        64,
+        512,
+        2_051,
+        Glm53DsaSelectedStorage::Bf16,
+    )
+    .unwrap();
+    let mut address = 0x20_0000u64;
+    let mut next = |bytes: usize| {
+        address = address.checked_add(3).unwrap() & !3;
+        let buffer = GgmlIqBuffer {
+            ptr: DevicePtr(address),
+            bytes,
+        };
+        address += u64::try_from(bytes).unwrap() + 0x1000;
+        buffer
+    };
+    let buffers = Glm53DsaSelectedAttentionBuffers {
+        absorbed_query_bf16: next(plan.query_bytes),
+        latent_cache_bf16: next(plan.latent_cache_bytes),
+        selected_indices_i32: next(plan.selected_index_bytes),
+        sequence_lengths_u32: next(plan.sequence_length_bytes),
+        query_positions_u32: next(plan.query_position_bytes),
+        query_validity_u8: next(plan.query_validity_bytes),
+        output_weighted_latent_bf16: next(plan.output_bytes),
+    };
+    kernel
+        .launch_dense_causal(&gpu, plan, buffers, 16, 48, 0)
+        .unwrap();
+    assert_eq!(gpu.launch_count(), 1);
+    assert!(
+        kernel
+            .launch_dense_causal(&gpu, plan, buffers, 16, 49, 0)
+            .is_err()
+    );
+    assert!(
+        kernel
+            .launch_dense_causal(&gpu, plan, buffers, 2_020, 2_052, 0)
+            .is_err()
+    );
+    assert_eq!(gpu.launch_count(), 1);
+}
+
 fn swap_unique(source: &str, left: &str, right: &str) -> String {
     assert_eq!(source.matches(left).count(), 1);
     assert_eq!(source.matches(right).count(), 1);
@@ -362,7 +454,13 @@ fn launch_argument_chain_matches_cuda_signature_and_rejects_swaps() {
     fn abi_contract(host: &str, cuda: &str) -> bool {
         host.contains(HOST_ARG_CHAIN) && cuda.contains(CUDA_SIGNATURE)
     }
-    assert!(abi_contract(HOST_SOURCE, CUDA_SOURCE));
+    let sparse_start = HOST_SOURCE.find("pub fn launch(").unwrap();
+    let sparse_end = HOST_SOURCE[sparse_start..]
+        .find("pub fn transpose_heads(")
+        .map(|offset| sparse_start + offset)
+        .unwrap();
+    let sparse_host = &HOST_SOURCE[sparse_start..sparse_end];
+    assert!(abi_contract(sparse_host, CUDA_SOURCE));
 
     let host_pointer_swaps = [
         (
@@ -376,7 +474,7 @@ fn launch_argument_chain_matches_cuda_signature_and_rejects_swaps() {
     ];
     for (left, right) in host_pointer_swaps {
         assert!(!abi_contract(
-            &swap_unique(HOST_SOURCE, left, right),
+            &swap_unique(sparse_host, left, right),
             CUDA_SOURCE,
         ));
     }
@@ -385,7 +483,7 @@ fn launch_argument_chain_matches_cuda_signature_and_rejects_swaps() {
         (".arg_u32(plan.batch)", ".arg_u32(plan.kv_capacity)"),
     ] {
         assert!(!abi_contract(
-            &swap_unique(HOST_SOURCE, left, right),
+            &swap_unique(sparse_host, left, right),
             CUDA_SOURCE,
         ));
     }
@@ -402,7 +500,7 @@ fn launch_argument_chain_matches_cuda_signature_and_rejects_swaps() {
     ];
     for (left, right) in cuda_pointer_swaps {
         assert!(!abi_contract(
-            HOST_SOURCE,
+            sparse_host,
             &swap_unique(CUDA_SOURCE, left, right),
         ));
     }
@@ -418,7 +516,7 @@ fn launch_argument_chain_matches_cuda_signature_and_rejects_swaps() {
             1,
         ),
     ] {
-        assert!(!abi_contract(HOST_SOURCE, &cuda_scalar_swap));
+        assert!(!abi_contract(sparse_host, &cuda_scalar_swap));
     }
 }
 

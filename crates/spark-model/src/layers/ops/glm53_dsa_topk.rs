@@ -11,14 +11,14 @@ use anyhow::{Context, Result, bail};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use super::GgmlIqBuffer;
+use super::{GLM53_EXL3_MAX_WIDE_ROWS, GgmlIqBuffer};
 
 const INDEX_TOPK: u32 = 2_048;
 const KPOOL: u32 = 4;
 #[cfg(test)]
 const SELECTED_POOLS: u32 = INDEX_TOPK / KPOOL;
 const OUTPUT_WIDTH: u32 = INDEX_TOPK + KPOOL - 1;
-const MAX_QUERIES: u32 = 8;
+const MAX_QUERIES: u32 = GLM53_EXL3_MAX_WIDE_ROWS as u32;
 const MAX_POOLS: u32 = 262_144;
 const MAX_POSITIONS: u32 = 1_048_576;
 const THREADS: u32 = 256;
@@ -53,7 +53,7 @@ impl Glm53DsaTopkPlan {
         always_select_tail: bool,
     ) -> Result<Self> {
         if batch == 0 || !(1..=MAX_QUERIES).contains(&queries) {
-            bail!("GLM DSA top-k requires batch>0 and Q in 1..=8");
+            bail!("GLM DSA top-k requires batch>0 and Q in 1..={MAX_QUERIES}");
         }
         if !(1..=MAX_POOLS).contains(&pools) || !(1..=MAX_POSITIONS).contains(&kv_capacity) {
             bail!("GLM DSA top-k has invalid pool or sequence geometry");

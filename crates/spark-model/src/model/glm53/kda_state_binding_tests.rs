@@ -121,7 +121,9 @@ fn binds_kda_state_unsafely(name: &str, source: &str) -> bool {
     }
     let touches_state = source.contains("Glm53KdaDecodeBuffers")
         || source.contains("Glm53KdaPrefillBuffers")
-        || source.contains("state_f32");
+        || source
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|identifier| identifier == "state_f32");
     touches_state && !source.contains("Glm53KdaScratchState")
 }
 
@@ -152,6 +154,24 @@ fn the_bypass_guard_actually_fires_on_a_violation() {
 
     // A module that never touches recurrent state is irrelevant to the guard.
     assert!(!binds_kda_state_unsafely("dispatch.rs", "let x = 1;"));
+}
+
+#[test]
+fn bypass_guard_distinguishes_the_writable_identifier_from_convolution_readback() {
+    for source in [
+        "let span = conv.persistent_state_f32;",
+        "let span = conv.staged_state_f32;",
+    ] {
+        assert!(!binds_kda_state_unsafely("readback.rs", source));
+    }
+    for source in [
+        "let span = buffers.state_f32;",
+        "state_f32 : raw,",
+        "Glm53KdaDecodeBuffers { .. }",
+        "Glm53KdaPrefillBuffers { .. }",
+    ] {
+        assert!(binds_kda_state_unsafely("readback.rs", source));
+    }
 }
 
 #[test]

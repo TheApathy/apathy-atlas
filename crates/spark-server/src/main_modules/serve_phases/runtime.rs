@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-
 //! Runtime helpers run after model build: EOS / sampling defaults from
 //! generation_config.json, dump-writer open, response-store / behavior
 //! audit logging, model-name resolution, tool-call parser dispatch.
+
+#[cfg(test)]
+#[path = "glm_tool_contract_registry.rs"]
+mod glm_tool_contract_registry;
 
 use std::path::Path;
 

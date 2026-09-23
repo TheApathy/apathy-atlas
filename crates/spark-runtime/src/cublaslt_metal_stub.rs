@@ -11,6 +11,18 @@
 
 use anyhow::Result;
 
+#[path = "cublaslt/serial_rows_request.rs"]
+mod serial_rows_request;
+pub use serial_rows_request::{ByteSpan, Orientation, SerialRowsRequest};
+
+pub fn bf16_gemm_serial_rows(_request: SerialRowsRequest) -> Result<()> {
+    unreachable!("cublaslt::bf16_gemm_serial_rows is cuda-only (not built for metal)")
+}
+
+pub fn bf16_gemm_batched_rows(_request: SerialRowsRequest) -> Result<()> {
+    unreachable!("cublaslt::bf16_gemm_batched_rows is cuda-only (not built for metal)")
+}
+
 pub fn bf16_gemm_act_weight_t(
     _act: u64,
     _weight: u64,
@@ -21,6 +33,18 @@ pub fn bf16_gemm_act_weight_t(
     _stream: u64,
 ) -> Result<()> {
     unreachable!("cublaslt::bf16_gemm_act_weight_t is cuda-only (not built for metal)")
+}
+
+pub fn bf16_gemm_act_weight(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::bf16_gemm_act_weight is cuda-only (not built for metal)")
 }
 
 pub fn fp8_gemm_act_weight_t_rowwise(

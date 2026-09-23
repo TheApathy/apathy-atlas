@@ -13,7 +13,8 @@ const HC_STREAMS: u32 = 4;
 const CAPTURE_SLOTS: u32 = 5;
 const THREADS: u32 = 256;
 const MAX_GRID_X: u64 = 2_147_483_647;
-const TARGET_LAYERS: [u32; 5] = [5, 14, 24, 33, 42];
+// Zero-based walk indices for checkpoint IDs [5,14,24,33,42].
+const TARGET_LAYERS: [u32; 5] = [4, 13, 23, 32, 41];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Glm53Dflash2CapturePlan {
@@ -174,7 +175,7 @@ mod tests {
                 u32::try_from(slot).unwrap()
             );
         }
-        for layer in [0, 4, 6, 13, 15, 23, 25, 32, 34, 41, 43] {
+        for layer in [0, 3, 5, 12, 14, 22, 24, 31, 33, 40, 42] {
             assert!(plan.slot_for_post_layer(layer).is_err());
         }
         assert!(Glm53Dflash2CapturePlan::new(0, 1, 4096, 4).is_err());
@@ -217,7 +218,7 @@ mod tests {
                 .capture_post_layer(
                     &gpu,
                     Glm53Dflash2CapturePlan { rows: 1, ..plan },
-                    5,
+                    4,
                     buffers,
                     0,
                 )
@@ -225,7 +226,7 @@ mod tests {
         );
         assert!(
             kernel
-                .capture_post_layer(&gpu, plan, 13, buffers, 0)
+                .capture_post_layer(&gpu, plan, 14, buffers, 0)
                 .is_err()
         );
         assert!(
@@ -233,7 +234,7 @@ mod tests {
                 .capture_post_layer(
                     &gpu,
                     plan,
-                    5,
+                    4,
                     Glm53Dflash2CaptureBuffers {
                         captures_bf16: GgmlIqBuffer {
                             ptr: streams.ptr,

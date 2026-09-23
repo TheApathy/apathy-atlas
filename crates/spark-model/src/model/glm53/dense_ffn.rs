@@ -21,10 +21,13 @@ use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::gguf::GgmlType;
 
 use crate::layers::ops::{
-    GgmlIqBuffer, GgmlIqMmqKernels, GgmlIqMmqPlan, Glm53ActivationKernels, Glm53SwigluBuffers,
-    Glm53SwigluPlan,
+    GLM53_EXL3_MAX_WIDE_ROWS, GgmlIqBuffer, GgmlIqMmqKernels, GgmlIqMmqPlan,
+    Glm53ActivationKernels, Glm53Exl3Buffer, Glm53Exl3Projection, Glm53Exl3ProjectionBuffers,
+    Glm53Exl3ProjectionScratch, Glm53SwigluBuffers, Glm53SwigluPlan,
 };
-use crate::weight_loader::{Glm53DenseFfnWeights, Glm53GgufMatrix};
+use crate::weight_loader::{
+    Glm53DenseFfnWeights, Glm53Exl3DenseFfnWeights, Glm53Exl3Linear, Glm53GgufMatrix,
+};
 
 use super::walk_scratch::Glm53DenseFfnBuffers;
 
@@ -39,6 +42,9 @@ pub const GLM53_DENSE_FFN_MATMULS: u32 = 3;
 /// way: 8 experts x (3 matmuls + 1 SwiGLU) = 56, the shared branch's 7, and one
 /// ordered reduce.
 pub const GLM53_DENSE_FFN_KERNEL_LAUNCHES: u32 = 7;
+
+/// Three EXL3 projections (BF16->F16, GEMM, F16->BF16) plus SwiGLU.
+pub const GLM53_EXL3_DENSE_FFN_KERNEL_LAUNCHES: u32 = 10;
 
 /// Typed MMQ handles for every quant a dense GLM layer can carry.
 pub struct Glm53DenseFfnKernels {
@@ -146,6 +152,43 @@ impl Glm53DenseFfnKernels {
         Ok(())
     }
 
+    pub fn project_exl3(
+        &self,
+        gpu: &dyn GpuBackend,
+        matrix: &Glm53Exl3Linear,
+        input: GgmlIqBuffer,
+        scratch: Glm53Exl3ProjectionScratch,
+        output: GgmlIqBuffer,
+        stream: u64,
+    ) -> Result<()> {
+        self.project_exl3_rows(gpu, 1, matrix, input, scratch, output, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_exl3_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: u32,
+        matrix: &Glm53Exl3Linear,
+        input: GgmlIqBuffer,
+        scratch: Glm53Exl3ProjectionScratch,
+        output: GgmlIqBuffer,
+        stream: u64,
+    ) -> Result<()> {
+        let projection = Glm53Exl3Projection::Compressed(matrix);
+        let plan = projection.plan(rows)?;
+        projection.launch(
+            gpu,
+            plan,
+            Glm53Exl3ProjectionBuffers {
+                input_bf16: exl3_buffer(input),
+                output_bf16: exl3_buffer(output),
+                scratch,
+            },
+            stream,
+        )
+    }
+
     /// Run one dense FFN layer: `down(swiglu(gate(x), up(x)))`.
     ///
     /// `input` is the normalized block input and `output` the block output.
@@ -211,6 +254,92 @@ impl Glm53DenseFfnKernels {
             stream,
         )?;
         Ok(GLM53_DENSE_FFN_KERNEL_LAUNCHES)
+    }
+
+    /// Run the exact EXL3 dense stack through the unified projection seam.
+    ///
+    /// The supplied scratch is shared by the ordered target walk. Upstream's
+    /// completing K-slice resets every EXL3 column lock before the projection
+    /// returns on this stream, so the next projection may reuse it directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_exl3(
+        &self,
+        gpu: &dyn GpuBackend,
+        weights: &Glm53Exl3DenseFfnWeights,
+        input: GgmlIqBuffer,
+        buffers: Glm53DenseFfnBuffers,
+        scratch: Glm53Exl3ProjectionScratch,
+        output: GgmlIqBuffer,
+        stream: u64,
+    ) -> Result<u32> {
+        self.execute_exl3_rows(gpu, 1, weights, input, buffers, scratch, output, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_exl3_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: u32,
+        weights: &Glm53Exl3DenseFfnWeights,
+        input: GgmlIqBuffer,
+        buffers: Glm53DenseFfnBuffers,
+        scratch: Glm53Exl3ProjectionScratch,
+        output: GgmlIqBuffer,
+        stream: u64,
+    ) -> Result<u32> {
+        ensure!(
+            (1..=u32::try_from(GLM53_EXL3_MAX_WIDE_ROWS)?).contains(&rows),
+            "GLM EXL3 dense rows exceed the prompt maximum"
+        );
+        let project = |linear, input: GgmlIqBuffer, output: GgmlIqBuffer| -> Result<()> {
+            let projection = Glm53Exl3Projection::Compressed(linear);
+            let plan = projection.plan(rows)?;
+            projection.launch(
+                gpu,
+                plan,
+                Glm53Exl3ProjectionBuffers {
+                    input_bf16: exl3_buffer(input),
+                    output_bf16: exl3_buffer(output),
+                    scratch,
+                },
+                stream,
+            )
+        };
+
+        for (name, linear, inner, columns) in [
+            ("gate", &weights.gate, HIDDEN, DENSE_INTERMEDIATE),
+            ("up", &weights.up, HIDDEN, DENSE_INTERMEDIATE),
+            ("down", &weights.down, DENSE_INTERMEDIATE, HIDDEN),
+        ] {
+            ensure!(
+                linear.size_k() == inner && linear.size_n() == columns,
+                "GLM EXL3 dense FFN {name} is [{}, {}], expected [{inner}, {columns}]",
+                linear.size_k(),
+                linear.size_n()
+            );
+        }
+
+        project(&weights.gate, input, buffers.gate_bf16)?;
+        project(&weights.up, input, buffers.up_bf16)?;
+        self.activations.swiglu(
+            gpu,
+            Glm53SwigluPlan::new(rows, DENSE_INTERMEDIATE)?,
+            Glm53SwigluBuffers {
+                gate_bf16: buffers.gate_bf16,
+                up_bf16: buffers.up_bf16,
+                output_bf16: buffers.swiglu_bf16,
+            },
+            stream,
+        )?;
+        project(&weights.down, buffers.swiglu_bf16, output)?;
+        Ok(GLM53_EXL3_DENSE_FFN_KERNEL_LAUNCHES)
+    }
+}
+
+fn exl3_buffer(buffer: GgmlIqBuffer) -> Glm53Exl3Buffer {
+    Glm53Exl3Buffer {
+        ptr: buffer.ptr,
+        bytes: buffer.bytes,
     }
 }
 

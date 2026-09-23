@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-
 //! Extracted piecewise from `tokenizer.rs` (500-LoC cap).
+
+pub(crate) mod glm_tool_contract_template;
 
 use super::*;
 use serde_json::json;

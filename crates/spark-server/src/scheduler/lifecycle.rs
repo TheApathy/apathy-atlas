@@ -6,6 +6,10 @@ use super::*;
 
 /// Send final response and free GPU resources for a completed sequence.
 pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
+    if let Some(error) = a.terminal_error.take() {
+        send_error(model, a, &error);
+        return;
+    }
     let last_tok = a.output_tokens.last().copied();
     let is_eos = last_tok.is_some_and(|t| a.eos_tokens.contains(&t));
     let is_tool_call_end = last_tok == a.tool_call_end_token;
@@ -282,6 +286,7 @@ pub fn resume_swapped_seq(
         min_tokens: s.min_tokens,
         eos_tokens: s.eos_tokens,
         finished: false,
+        terminal_error: None,
         guard_stop: None,
         param_close_pending: 0,
         sink: s.sink,

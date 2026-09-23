@@ -160,6 +160,14 @@ pub async fn tokenize(
         }
     };
 
+    if req.messages.as_ref().is_some_and(|messages| {
+        messages
+            .iter()
+            .any(|message| !message.content.images.is_empty())
+    }) {
+        return openai_error_response(StatusCode::BAD_REQUEST,
+            "This endpoint does not yet count expanded image tokens (unsupported_multimodal_token_count)".into());
+    }
     let tokens = if let Some(ref prompt) = req.prompt {
         match state.tokenizer.encode(prompt) {
             Ok(t) => t,

@@ -77,12 +77,22 @@ pub struct Glm53KdaPrefillBuffers {
 
 pub struct Glm53KdaPrefillKernel {
     prefill: KernelHandle,
+    register_resident: KernelHandle,
+    register_resident_c8: KernelHandle,
+    register_resident_c8_enabled: bool,
 }
 
 impl Glm53KdaPrefillKernel {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
+        let register_resident_c8_enabled =
+            parse_rr_c8_enabled(std::env::var("ATLAS_GLM53_KDA_RR_COLUMNS").ok().as_deref())?;
         Ok(Self {
             prefill: gpu.kernel("glm53_kda", "atlas_glm53_kda_prefill")?,
+            register_resident: gpu
+                .kernel("glm53_kda", "atlas_glm53_kda_prefill_register_resident")?,
+            register_resident_c8: gpu
+                .kernel("glm53_kda_rr_columns", "atlas_glm53_kda_prefill_rr_c8")?,
+            register_resident_c8_enabled,
         })
     }
 
@@ -111,6 +121,51 @@ impl Glm53KdaPrefillKernel {
             .arg_u32(HEAD_DIM)
             .arg_f32(L2_EPS)
             .launch(stream)
+    }
+
+    pub fn launch_register_resident(
+        &self,
+        gpu: &dyn GpuBackend,
+        plan: Glm53KdaPrefillPlan,
+        buffers: Glm53KdaPrefillBuffers,
+        stream: u64,
+    ) -> Result<()> {
+        if plan.tokens <= 8 {
+            bail!("GLM KDA register-resident prefill requires more than 8 tokens");
+        }
+        validate_buffers(plan, buffers)?;
+        let (kernel, columns) = if self.register_resident_c8_enabled {
+            (self.register_resident_c8, 8)
+        } else {
+            (self.register_resident, 1)
+        };
+        KernelLaunch::new(gpu, kernel)
+            .grid([plan.groups, HEAD_DIM / (4 * columns), 1])
+            .block([THREADS, 1, 1])
+            .arg_ptr(buffers.state_f32.ptr)
+            .arg_ptr(buffers.query_bf16.ptr)
+            .arg_ptr(buffers.key_bf16.ptr)
+            .arg_ptr(buffers.value_bf16.ptr)
+            .arg_ptr(buffers.log_decay_f32.ptr)
+            .arg_ptr(buffers.beta_bf16.ptr)
+            .arg_ptr(buffers.output_bf16.ptr)
+            .arg_u32(plan.batch)
+            .arg_u32(plan.tokens)
+            .arg_u32(HEADS)
+            .arg_u32(HEAD_DIM)
+            .arg_u32(HEAD_DIM)
+            .arg_f32(L2_EPS)
+            .launch(stream)
+    }
+}
+
+fn parse_rr_c8_enabled(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(value) => {
+            bail!("ATLAS_GLM53_KDA_RR_COLUMNS must be absent or exactly 0 or 1; got {value:?}")
+        }
     }
 }
 
@@ -153,6 +208,42 @@ mod tests {
     use spark_runtime::gpu::mock::MockGpuBackend;
 
     use super::*;
+
+    const CUDA_SOURCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../kernels/gb10/glm5.3-flash/iq3/glm53_kda.cu"
+    ));
+    const RR_COLUMNS_CUDA_SOURCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../kernels/gb10/glm5.3-flash/iq3/glm53_kda_rr_columns.cu"
+    ));
+
+    fn original_tree(mut values: [f32; 128]) -> f32 {
+        let mut stride = 64;
+        while stride > 0 {
+            for index in 0..stride {
+                values[index] += values[index + stride];
+            }
+            stride >>= 1;
+        }
+        values[0]
+    }
+
+    fn register_tree(values: [f32; 128]) -> f32 {
+        let mut lanes = [0.0f32; 32];
+        for lane in 0..32 {
+            lanes[lane] =
+                (values[lane] + values[lane + 64]) + (values[lane + 32] + values[lane + 96]);
+        }
+        let mut offset = 16;
+        while offset > 0 {
+            for lane in 0..offset {
+                lanes[lane] += lanes[lane + offset];
+            }
+            offset >>= 1;
+        }
+        lanes[0]
+    }
 
     fn step(mut state: [f32; 4], query: [f32; 2]) -> ([f32; 2], [f32; 4]) {
         let key = [1.5f32, 0.25];
@@ -202,10 +293,46 @@ mod tests {
     }
 
     #[test]
+    fn register_resident_norm_tree_and_scope_are_pinned() {
+        let squares = std::array::from_fn(|index| {
+            let value = (index as f32 - 47.0) * 0.03125;
+            value * value
+        });
+        assert_eq!(
+            original_tree(squares).to_bits(),
+            register_tree(squares).to_bits()
+        );
+        assert!(CUDA_SOURCE.contains("atlas_glm53_kda_prefill_register_resident"));
+        assert!(CUDA_SOURCE.contains("tokens <= 8U"));
+        assert!(CUDA_SOURCE.contains("blockIdx.y * GLM53_KDA_RR_WARPS + warp"));
+        assert!(CUDA_SOURCE.contains("lane + 96U"));
+        assert!(CUDA_SOURCE.contains("__shfl_down_sync"));
+    }
+
+    #[test]
+    fn register_resident_c8_is_default_on_with_exact_rollback() {
+        assert!(parse_rr_c8_enabled(None).unwrap());
+        assert!(parse_rr_c8_enabled(Some("1")).unwrap());
+        assert!(!parse_rr_c8_enabled(Some("0")).unwrap());
+        for invalid in ["", "2", "4", "8", "01", " 1", "1 "] {
+            assert!(
+                parse_rr_c8_enabled(Some(invalid)).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        assert!(RR_COLUMNS_CUDA_SOURCE.contains("atlas_glm53_kda_prefill_rr_c8"));
+        assert!(!RR_COLUMNS_CUDA_SOURCE.contains("prefill_rr_c2"));
+        assert!(!RR_COLUMNS_CUDA_SOURCE.contains("prefill_rr_c4"));
+        assert_eq!(HEAD_DIM % (4 * 8), 0);
+        assert!(RR_COLUMNS_CUDA_SOURCE.contains("first_column"));
+        assert!(RR_COLUMNS_CUDA_SOURCE.contains("__shfl_down_sync"));
+    }
+
+    #[test]
     fn launch_rejects_alias_before_effect() {
         let gpu = MockGpuBackend::new();
         let kernel = Glm53KdaPrefillKernel::load(&gpu).unwrap();
-        let plan = Glm53KdaPrefillPlan::new(1, 2, 64, 128, 128).unwrap();
+        let plan = Glm53KdaPrefillPlan::new(1, 9, 64, 128, 128).unwrap();
         let at = |ptr, bytes| GgmlIqBuffer {
             ptr: DevicePtr(ptr),
             bytes,
@@ -235,5 +362,20 @@ mod tests {
         assert_eq!(gpu.launch_count(), 0);
         kernel.launch(&gpu, plan, valid, 0).unwrap();
         assert_eq!(gpu.launch_count(), 1);
+        kernel
+            .launch_register_resident(&gpu, plan, valid, 0)
+            .unwrap();
+        assert_eq!(gpu.launch_count(), 2);
+        assert!(
+            kernel
+                .launch_register_resident(
+                    &gpu,
+                    Glm53KdaPrefillPlan::new(1, 8, 64, 128, 128).unwrap(),
+                    valid,
+                    0,
+                )
+                .is_err()
+        );
+        assert_eq!(gpu.launch_count(), 2);
     }
 }

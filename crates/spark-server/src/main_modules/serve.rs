@@ -126,6 +126,37 @@ fn startup(
     // whose TOP LEVEL is already the quantization block.
     serve_phases::merge_sidecar_quant_config(&model_dir, &mut config);
 
+    // GLM-5.3 has two deliberately disjoint physical sources. An explicit
+    // GGUF directory always wins; otherwise the presence of both EXL3 marker
+    // files selects the strict 2.05-bpw admission. A partial marker set is a
+    // broken EXL3 checkpoint, not permission to fall through to GGUF.
+    let glm53_exl3_files =
+        if config.model_type == "glm5_next" && std::env::var_os("ATLAS_GLM53_GGUF_DIR").is_none() {
+            let index = model_dir.join("model.safetensors.index.json");
+            let quant = model_dir.join("quantization_config.json");
+            match (index.is_file(), quant.is_file()) {
+                (true, true) => Some(
+                    spark_model::weight_loader::admit_glm53_exl3_files(&model_dir)
+                        .context("admitting the exact GLM-5.3 EXL3 checkpoint")?,
+                ),
+                (false, false) => None,
+                _ => anyhow::bail!(
+                    "GLM-5.3 EXL3 checkpoint is incomplete: both {} and {} are required",
+                    index.display(),
+                    quant.display(),
+                ),
+            }
+        } else {
+            None
+        };
+    let is_glm53_exl3 = glm53_exl3_files.is_some();
+    let glm_dflash_max_drafts = serve_phases::resolve_glm_dflash_max_drafts(
+        args.glm_dflash_max_drafts,
+        is_glm53_exl3,
+        args.dflash,
+        args.dflash_gamma,
+    )?;
+
     if let Some(ref qc) = config.quantization_config {
         tracing::info!(
             "Quantization config: method={:?}, algo={:?}, format={:?}, {} module(s) in ignore list",
@@ -186,40 +217,39 @@ fn startup(
     // Comparing against the config would reject a correct pairing, so validate
     // against the kernel bundle that actually provides the ggml IQ MMQ dispatch.
     if config.model_type == "glm5_next" {
-        if kernel_quant != "iq3" {
+        let required_quant = if is_glm53_exl3 { "exl3" } else { "iq3" };
+        if kernel_quant != required_quant {
             anyhow::bail!(
-                "GLM-5.3 GGUF serving needs the iq3 kernel bundle (it carries the \
-                 ggml IQ MMQ dispatch used by the UD-IQ2_XXS and UD-IQ3_XXS \
-                 profiles); this binary was built for quant={kernel_quant}. \
-                 Rebuild with ATLAS_TARGET_QUANT=iq3 and restart."
+                "GLM-5.3 serving selected the {required_quant} physical source, but this \
+                 binary was built for quant={kernel_quant}. Rebuild with \
+                 ATLAS_TARGET_QUANT={required_quant} and restart."
             );
         }
         tracing::info!(
-            "Selected kernel target: {} ({} modules) — GLM-5.3 GGUF, quant from \
-             shard profile rather than config.json",
+            "Selected kernel target: {} ({} modules) — GLM-5.3 physical source={required_quant}",
             ptx_set.target,
             ptx_set.modules.len(),
         );
     } else {
-    let model_quant = canonicalize_model_quant(&config);
-    if !quant_pair_compatible(kernel_quant, &model_quant) {
-        anyhow::bail!(
-            "Kernel/model QUANT MISMATCH. Kernel target: {} (quant={kernel_quant}). \
+        let model_quant = canonicalize_model_quant(&config);
+        if !quant_pair_compatible(kernel_quant, &model_quant) {
+            anyhow::bail!(
+                "Kernel/model QUANT MISMATCH. Kernel target: {} (quant={kernel_quant}). \
              Model declares quant={model_quant} ({}). \
              The compiled kernel set has no known dispatch path for \
              quant '{model_quant}' — loading would produce silent garbage. \
              Rebuild with ATLAS_TARGET_QUANT={model_quant} (or =* to bundle multiple \
              variants) and restart.",
-            ptx_set.target,
-            describe_quant_source(&config),
-        );
-    }
-    tracing::info!(
-        "Selected kernel target: {} ({} modules) — quant compat: kernel={kernel_quant} \
+                ptx_set.target,
+                describe_quant_source(&config),
+            );
+        }
+        tracing::info!(
+            "Selected kernel target: {} ({} modules) — quant compat: kernel={kernel_quant} \
          model={model_quant} OK",
-        ptx_set.target,
-        ptx_set.modules.len(),
-    );
+            ptx_set.target,
+            ptx_set.modules.len(),
+        );
     }
 
     // Text-only kernel target + a checkpoint that ships a vision tower: honor the
@@ -229,11 +259,16 @@ fn startup(
     // kernel target (qwen3.5-27b) ships no `vision_encoder` PTX module. Drop the
     // vision tower to text-only; image inputs are unsupported until the target
     // is rebuilt with vision.
+    let required_vision_module = if is_glm53_exl3 {
+        "glm53_vision"
+    } else {
+        "vision_encoder"
+    };
     if config.vision.is_some()
         && !ptx_set
             .modules
             .iter()
-            .any(|(name, _)| *name == "vision_encoder")
+            .any(|(name, _)| *name == required_vision_module)
     {
         tracing::warn!(
             "Checkpoint declares a vision tower but kernel target {} ships no \
@@ -299,10 +334,40 @@ fn startup(
     // transformer path. Load it through the GGUF target-store plan and keep the
     // owned device store for `build_glm53_model` below. Every other model takes
     // the unchanged safetensors path.
+    let glm53_exl3 = if let Some(files) = glm53_exl3_files {
+        let physical_vocab = spark_runtime::weights::gguf::GLM53_GGUF_VOCAB_SIZE;
+        if config.vocab_size != physical_vocab {
+            tracing::info!(
+                "GLM-5.3 EXL3: config.json declares vocab_size={}, physical embedding holds {} — using the payload",
+                config.vocab_size,
+                physical_vocab,
+            );
+            config.vocab_size = physical_vocab;
+        }
+        let loaded = match spark_model::weight_loader::load_glm53_exl3_store(
+            &files,
+            gpu.as_ref(),
+            oom_reserve_bytes,
+        ) {
+            Ok(store) => store,
+            Err(error) => match error.retry_cleanup(gpu.as_ref()) {
+                Ok(primary) => return Err(primary.context("loading GLM-5.3 EXL3 checkpoint")),
+                Err(retained) => anyhow::bail!("GLM-5.3 EXL3 load cleanup failed: {retained}"),
+            },
+        };
+        tracing::info!(
+            "GLM-5.3 EXL3 store: {} tensors, {} bytes resident",
+            loaded.len(),
+            loaded.allocated_bytes(),
+        );
+        Some((files, loaded))
+    } else {
+        None
+    };
     let glm53_gguf: Option<(
         spark_runtime::weights::gguf::Glm53QuantProfile,
         spark_runtime::weights::gguf::GgufDeviceStore,
-    )> = if config.model_type == "glm5_next" {
+    )> = if config.model_type == "glm5_next" && glm53_exl3.is_none() {
         let profile = spark_runtime::weights::gguf::Glm53QuantProfile::UdIq2Xxs;
         // The GGUF payload does not have to sit beside config.json: an Unsloth
         // download keeps the shards in `<root>/UD-IQ2_XXS/` while the config
@@ -347,7 +412,8 @@ fn startup(
         None
     };
 
-    let store = if glm53_gguf.is_some() {
+    let has_glm53_target_store = glm53_exl3.is_some() || glm53_gguf.is_some();
+    let store = if has_glm53_target_store {
         // The safetensors-shaped checks below are skipped for GLM; this empty
         // store keeps their types satisfied without pretending to hold weights.
         spark_runtime::weights::WeightStore::empty()
@@ -366,7 +432,7 @@ fn startup(
     // 3b. Auto-detect weight key prefix for nested models. Safetensors only:
     // the GLM GGUF store has its own pinned tensor names and is validated by
     // `PreparedGlm53Target` instead.
-    if glm53_gguf.is_none() {
+    if !has_glm53_target_store {
         serve_phases::auto_detect_weight_prefix(&store, &mut config);
     }
 
@@ -378,7 +444,7 @@ fn startup(
     // MiniMax M2.7 hang on NCCL init today because the actual mismatch
     // only surfaces later inside `build_model`; this check surfaces it
     // up-front.
-    if glm53_gguf.is_none() {
+    if !has_glm53_target_store {
         spark_model::preflight::preflight(&store, &config, args.speculative)
             .context("Checkpoint pre-flight check failed")?;
     }
@@ -414,7 +480,9 @@ fn startup(
         &args,
         &config,
         gpu.as_ref(),
-        store.total_bytes(),
+        glm53_exl3
+            .as_ref()
+            .map_or_else(|| store.total_bytes(), |(_, store)| store.allocated_bytes()),
         free_mem,
         inference_reserve,
         total_reserve,
@@ -466,7 +534,7 @@ fn startup(
     // target geometry check validates the PHYSICAL matrix (schema-pinned and
     // SHA-verified), so capping to the tokenizer here would undo the override
     // above and refuse a correct checkpoint.
-    if glm53_gguf.is_none() {
+    if !has_glm53_target_store {
         serve_phases::cap_vocab_size_to_tokenizer(&model_dir, &mut config);
     }
     let serve_phases::KvCacheConfig {
@@ -497,7 +565,21 @@ fn startup(
             .context("kv-cache kernel preflight failed")?;
         }
     }
-    let dflash_drafter_state = serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref())?;
+    let glm53_dflash2_dir = if glm53_exl3.is_some() && args.dflash {
+        if args.dflash_gamma != 8 {
+            anyhow::bail!(
+                "GLM-5.3 DFlash2 has a checkpoint-pinned block size of 8; pass --dflash-gamma 8"
+            );
+        }
+        Some(serve_phases::resolve_dflash_drafter_dir(&args, &ptx_set)?)
+    } else {
+        None
+    };
+    let dflash_drafter_state = if glm53_dflash2_dir.is_some() {
+        None
+    } else {
+        serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref())?
+    };
     // LoRA adapters: resolve + load BEFORE `gpu` is moved into build_model.
     // `lora_states` must outlive build_model (lora_args borrows &l.store) and
     // stays alive until after AppState construction (adapter name clones).
@@ -592,32 +674,35 @@ fn startup(
     // GLM-5.3 bypasses the generic transformer builder: its weights are the
     // owned GGUF device store loaded above and `Glm53Model` implements `Model`
     // directly. Every other model takes the unchanged path below.
-    let model = if let Some((profile, gguf_store)) = glm53_gguf {
-        spark_model::factory::build_glm53_model(
-            profile,
-            &config,
-            gguf_store,
+    let model = if let Some((files, exl3_store)) = glm53_exl3 {
+        spark_model::factory::build_glm53_exl3_model(
+            files,
+            exl3_store,
             gpu,
             args.max_seq_len,
+            glm53_dflash2_dir.as_deref(),
         )
-        .context("building the GLM-5.3 model")?
+        .context("building the GLM-5.3 EXL3 model")?
+    } else if let Some((profile, gguf_store)) = glm53_gguf {
+        spark_model::factory::build_glm53_model(profile, &config, gguf_store, gpu, args.max_seq_len)
+            .context("building the GLM-5.3 model")?
     } else {
         serve_phases::build_model(
-        &args,
-        &config,
-        &store,
-        gpu,
-        max_batch_tokens,
-        kv_dtype,
-        inference_reserve,
-        layer_dtypes,
-        hss_cache_blocks_per_seq,
-        prefix_cache,
-        comm,
-        dflash_args,
-        lora_args,
-        nllb_lang,
-        nllb_lora_dir,
+            &args,
+            &config,
+            &store,
+            gpu,
+            max_batch_tokens,
+            kv_dtype,
+            inference_reserve,
+            layer_dtypes,
+            hss_cache_blocks_per_seq,
+            prefix_cache,
+            comm,
+            dflash_args,
+            lora_args,
+            nllb_lang,
+            nllb_lora_dir,
         )?
     };
 
@@ -758,7 +843,13 @@ fn startup(
     // For DFlash, force `num_drafts = γ - 1` so the scheduler asks the
     // proposer for γ tokens (DraftProposer::propose semantics: "up to
     // num_drafts" → drafts.len() = γ → routes to step_verify_dflash).
-    let num_drafts = if args.dflash {
+    // GLM may verify a bounded prefix while its drafter and arenas retain gamma8.
+    let num_drafts = if let Some(limit) = glm_dflash_max_drafts {
+        tracing::info!(
+            "GLM DFlash2 verify prefix: {limit} drafts; checkpoint proposal block remains 8"
+        );
+        limit
+    } else if args.dflash {
         args.dflash_gamma.saturating_sub(1).max(1)
     } else {
         args.num_drafts
@@ -1025,6 +1116,8 @@ fn startup(
             lora_states.first().map(|l| l.name.clone()),
         )),
         max_seq_len: args.max_seq_len,
+        max_batch_size,
+        yarn_context: config.yarn_factor > 0.0,
         request_tx,
         rotation_tx: if lora_states.is_empty() {
             None

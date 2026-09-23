@@ -10,11 +10,11 @@ use anyhow::{Context, Result, bail};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use super::GgmlIqBuffer;
+use super::{GLM53_EXL3_MAX_WIDE_ROWS, GgmlIqBuffer};
 
 const HEADS: u32 = 32;
 const INDEX_DIM: u32 = 128;
-const MAX_QUERIES: u32 = 8;
+const MAX_QUERIES: u32 = GLM53_EXL3_MAX_WIDE_ROWS as u32;
 const MAX_POOLS: u32 = 262_144;
 const THREADS: u32 = INDEX_DIM;
 const MAX_GRID_YZ: u64 = 65_535;
@@ -39,7 +39,7 @@ pub struct Glm53DsaScorePlan {
 impl Glm53DsaScorePlan {
     pub fn new(batch: u32, queries: u32, pools: u32, heads: u32, index_dim: u32) -> Result<Self> {
         if batch == 0 || !(1..=MAX_QUERIES).contains(&queries) {
-            bail!("GLM DSA scoring requires batch>0 and Q in 1..=8");
+            bail!("GLM DSA scoring requires batch>0 and Q in 1..={MAX_QUERIES}");
         }
         if !(1..=MAX_POOLS).contains(&pools) || heads != HEADS || index_dim != INDEX_DIM {
             bail!("GLM DSA scoring requires P in 1..=262,144, heads32 and dim128");
@@ -234,23 +234,26 @@ mod tests {
 
     #[test]
     fn plan_pins_bootstrap_geometry_extents_and_grid_split() {
-        let plan = Glm53DsaScorePlan::new(1, 8, 262_144, 32, 128).unwrap();
-        assert_eq!((plan.grid_x, plan.grid_y, plan.grid_z), (262_144, 8, 1));
-        assert_eq!(plan.query_bytes, 65_536);
-        assert_eq!(plan.head_weight_bytes, 512);
+        const CUDA: &str =
+            include_str!("../../../../../kernels/gb10/glm5.3-flash/iq3/glm53_dsa_score.cu");
+        assert!(CUDA.contains("#define GLM53_DSA_MAX_QUERIES 2048U"));
+        let plan = Glm53DsaScorePlan::new(1, MAX_QUERIES, 262_144, 32, 128).unwrap();
+        assert_eq!((plan.grid_x, plan.grid_y, plan.grid_z), (262_144, 2_048, 1));
+        assert_eq!(plan.query_bytes, 16_777_216);
+        assert_eq!(plan.head_weight_bytes, 131_072);
         assert_eq!(plan.pool_key_bytes, 67_108_864);
         assert_eq!(plan.pool_validity_bytes, 262_144);
-        assert_eq!(plan.output_bytes, 8_388_608);
+        assert_eq!(plan.output_bytes, 2_147_483_648);
         let split = Glm53DsaScorePlan::new(70_000, 1, 1, 32, 128).unwrap();
         assert_eq!((split.grid_y, split.grid_z), (65_535, 2));
         assert!(Glm53DsaScorePlan::new(0, 1, 1, 32, 128).is_err());
         assert!(Glm53DsaScorePlan::new(1, 0, 1, 32, 128).is_err());
-        assert!(Glm53DsaScorePlan::new(1, 9, 1, 32, 128).is_err());
+        assert!(Glm53DsaScorePlan::new(1, MAX_QUERIES + 1, 1, 32, 128).is_err());
         assert!(Glm53DsaScorePlan::new(1, 1, 0, 32, 128).is_err());
         assert!(Glm53DsaScorePlan::new(1, 1, 262_145, 32, 128).is_err());
         assert!(Glm53DsaScorePlan::new(1, 1, 1, 31, 128).is_err());
         assert!(Glm53DsaScorePlan::new(1, 1, 1, 32, 127).is_err());
-        assert!(Glm53DsaScorePlan::new(u32::MAX, 8, 1, 32, 128).is_err());
+        assert!(Glm53DsaScorePlan::new(u32::MAX, MAX_QUERIES, 1, 32, 128).is_err());
     }
 
     #[test]

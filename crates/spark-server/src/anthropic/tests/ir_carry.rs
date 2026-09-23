@@ -55,8 +55,9 @@ fn user_image_block_is_carried() {
         vec![&ImageData::Base64("data:image/png;base64,AAA".into())]
     );
     assert_eq!(text_of(&user.content), "what is this?");
-    // Canonical part order: images first, then the joined text.
-    assert!(matches!(user.content[0], ContentPart::Image(_)));
+    // Original wire order is retained: text before its image.
+    assert!(matches!(user.content[0], ContentPart::Text(_)));
+    assert!(matches!(user.content[1], ContentPart::Image(_)));
 }
 
 #[test]
@@ -212,13 +213,13 @@ fn thinking_disabled_and_unspecified_directives() {
 }
 
 #[test]
-fn rendered_prompt_json_matches_retired_json_hop_output() {
+fn rendered_prompt_json_preserves_retired_fields_and_tool_result_association() {
     // GOLDEN captured from the retired anthropic_to_chat_request_json
     // path (pre-deletion): the same fixture, run through the old
     // wire→OpenAI-JSON→IncomingMessage→IR lowering, produced exactly
     // this build_json_messages output. The direct adapter must render
-    // identical prompt bytes (kv-cache prefix stability across the
-    // migration).
+    // identical fields, with the intentional correction that a tool result's
+    // original tool_use_id is retained as tool_call_id for template association.
     let ir = lower(serde_json::json!({
         "model": "m", "max_tokens": 32,
         "system": "Be helpful.",
@@ -248,7 +249,7 @@ fn rendered_prompt_json_matches_retired_json_hop_output() {
             ],
             "reasoning_content": "need the tool"
         },
-        {"role": "tool", "content": "[tool error]\nnetwork down"},
+        {"role": "tool", "content": "[tool error]\nnetwork down", "tool_call_id": "c1"},
         {"role": "user", "content": "try again"}
     ]);
     assert_eq!(serde_json::Value::Array(json), expected);

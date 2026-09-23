@@ -118,6 +118,8 @@ pub(super) struct ActiveSeq {
     pub min_tokens: usize,
     pub eos_tokens: Vec<u32>,
     pub finished: bool,
+    /// Fatal inference error; retirement must not emit Done or cache this state.
+    pub terminal_error: Option<String>,
     /// Which server-side guard force-finished this sequence (e.g.
     /// "fuzzy_repetition"), if any. Surfaced in the synthesized --dump body
     /// so a guard-cut turn is attributable without log archaeology (the

@@ -9,6 +9,13 @@ mod chat_response;
 mod completions;
 mod encode;
 mod encode_stream;
+#[cfg(test)]
+mod ordered_content_tests;
+#[cfg(test)]
+mod ordered_content_wiring_tests;
+mod ordered_ir;
+#[cfg(test)]
+mod parsed_content_tests;
 mod responses;
 mod responses_lowering;
 mod stream_chunk;

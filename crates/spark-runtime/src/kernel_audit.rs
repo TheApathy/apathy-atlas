@@ -15,17 +15,75 @@
 //!     `w8a16_gemm_pipelined` resolved to 0 and QKVZ fell back to the ~4.6×
 //!     slower `w8a16_gemm`).
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{LazyLock, Mutex};
 
-/// (module, func, loaded). Appended on every `kernel()` lookup.
-static AUDIT: Mutex<Vec<(String, String, bool)>> = Mutex::new(Vec::new());
+const MAX_AUDIT_ROWS: usize = 4096;
+
+#[derive(Default)]
+struct AuditState {
+    modules: HashMap<String, HashMap<String, bool>>,
+    rows: usize,
+    truncated: bool,
+}
+
+impl AuditState {
+    fn record(&mut self, module: &str, func: &str, loaded: bool, limit: usize) {
+        if let Some(functions) = self.modules.get_mut(module) {
+            if let Some(previous) = functions.get_mut(func) {
+                *previous |= loaded;
+                return;
+            }
+            if self.rows >= limit {
+                self.truncated = true;
+                return;
+            }
+            functions.insert(func.to_owned(), loaded);
+            self.rows += 1;
+            return;
+        }
+        if self.rows >= limit {
+            self.truncated = true;
+            return;
+        }
+        self.modules.insert(
+            module.to_owned(),
+            HashMap::from([(func.to_owned(), loaded)]),
+        );
+        self.rows += 1;
+    }
+
+    fn snapshot(&self) -> (Vec<(String, String, bool)>, bool) {
+        let mut rows: Vec<_> = self
+            .modules
+            .iter()
+            .flat_map(|(module, functions)| {
+                functions
+                    .iter()
+                    .map(move |(func, loaded)| (module.clone(), func.clone(), *loaded))
+            })
+            .collect();
+        rows.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        (rows, self.truncated)
+    }
+}
+
+/// Deduplicated `(module, func, loaded)` resolution state. Runtime lookup may
+/// call `record` on every launch, so retaining lookup history is unbounded.
+static AUDIT: LazyLock<Mutex<AuditState>> = LazyLock::new(|| Mutex::new(AuditState::default()));
 
 /// Record one kernel lookup. Cheap; called from `GpuBackend::kernel`.
 pub fn record(module: &str, func: &str, loaded: bool) {
-    if let Ok(mut v) = AUDIT.lock() {
-        v.push((module.to_string(), func.to_string(), loaded));
+    if let Ok(mut audit) = AUDIT.lock() {
+        audit.record(module, func, loaded, MAX_AUDIT_ROWS);
     }
+}
+
+fn audit_snapshot() -> (Vec<(String, String, bool)>, bool) {
+    AUDIT
+        .lock()
+        .map(|audit| audit.snapshot())
+        .unwrap_or_default()
 }
 
 /// FNV-1a 64-bit content fingerprint → 12 hex chars (matches build.rs).
@@ -42,17 +100,12 @@ fn ptx_hash(bytes: &[u8]) -> String {
 /// deduped `(module, func, loaded)`, sorted. `loaded` is true if ANY lookup
 /// of that (module, func) resolved.
 pub fn audit_rows() -> Vec<(String, String, bool)> {
-    let mut resolved: BTreeMap<(String, String), bool> = BTreeMap::new();
-    if let Ok(v) = AUDIT.lock() {
-        for (m, f, ok) in v.iter() {
-            let e = resolved.entry((m.clone(), f.clone())).or_insert(false);
-            *e = *e || *ok;
-        }
-    }
-    resolved
-        .into_iter()
-        .map(|((m, f), ok)| (m, f, ok))
-        .collect()
+    audit_snapshot().0
+}
+
+/// True when distinct lookup names exceeded the defensive audit bound.
+pub fn audit_truncated() -> bool {
+    AUDIT.lock().map(|audit| audit.truncated).unwrap_or(false)
 }
 
 /// Render the embedded kernel set (`embedded` = the binary's `ptx_modules()`,
@@ -60,13 +113,11 @@ pub fn audit_rows() -> Vec<(String, String, bool)> {
 /// runtime resolution overlay. `set_hash` is `atlas_kernels::KERNEL_SET_HASH`.
 pub fn render_kernel_table(embedded: &[(&str, &[u8])], set_hash: &str) -> String {
     // Dedup resolution audit: (module, func) → loaded (true if ever true).
-    let mut resolved: BTreeMap<(String, String), bool> = BTreeMap::new();
-    if let Ok(v) = AUDIT.lock() {
-        for (m, f, ok) in v.iter() {
-            let e = resolved.entry((m.clone(), f.clone())).or_insert(false);
-            *e = *e || *ok;
-        }
-    }
+    let (rows, truncated) = audit_snapshot();
+    let resolved: BTreeMap<(String, String), bool> = rows
+        .into_iter()
+        .map(|(module, func, loaded)| ((module, func), loaded))
+        .collect();
     // Per-module resolution rollup: any-loaded / any-requested.
     let mut mod_resolved: BTreeMap<&str, (bool, bool)> = BTreeMap::new(); // (requested, loaded)
     for ((m, _f), ok) in &resolved {
@@ -117,5 +168,51 @@ pub fn render_kernel_table(embedded: &[(&str, &[u8])], set_hash: &str) -> String
             out.push_str(&format!("    - {m}::{f}\n"));
         }
     }
+    if truncated {
+        out.push_str(&format!(
+            "\n⚠ Kernel resolution audit truncated at {MAX_AUDIT_ROWS} distinct lookups.\n"
+        ));
+    }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuditState;
+
+    #[test]
+    fn repeated_lookup_keeps_one_row_and_ors_loaded_status() {
+        let mut audit = AuditState::default();
+        for _ in 0..10_000 {
+            audit.record("module", "function", false, 4);
+        }
+        audit.record("module", "function", true, 4);
+
+        assert_eq!(
+            audit.snapshot(),
+            (vec![("module".into(), "function".into(), true)], false)
+        );
+        assert_eq!(audit.rows, 1);
+    }
+
+    #[test]
+    fn distinct_lookup_bound_is_sticky_and_existing_rows_still_update() {
+        let mut audit = AuditState::default();
+        audit.record("a", "one", false, 2);
+        audit.record("a", "two", true, 2);
+        audit.record("b", "three", true, 2);
+        audit.record("a", "one", true, 2);
+
+        assert_eq!(
+            audit.snapshot(),
+            (
+                vec![
+                    ("a".into(), "one".into(), true),
+                    ("a".into(), "two".into(), true),
+                ],
+                true,
+            )
+        );
+        assert_eq!(audit.rows, 2);
+    }
 }

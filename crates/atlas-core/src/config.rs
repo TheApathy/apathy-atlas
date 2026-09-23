@@ -444,9 +444,11 @@ pub struct QuantizationConfig {
     pub ignore_modules: Vec<String>,
 }
 
-/// Vision encoder configuration for Qwen3-VL models.
+/// Vision encoder configuration parsed from a conditional-generation model.
 #[derive(Debug, Clone)]
 pub struct VisionConfig {
+    /// Architecture tag from `vision_config.model_type`.
+    pub model_type: String,
     /// Number of ViT transformer blocks (depth=27).
     pub depth: usize,
     /// ViT hidden dimension (1152).
@@ -463,12 +465,24 @@ pub struct VisionConfig {
     pub intermediate_size: usize,
     /// Projection output dimension = LLM hidden_size (2048).
     pub out_hidden_size: usize,
+    /// Input channel count (normally RGB = 3).
+    pub in_channels: usize,
+    /// Native image size from the checkpoint contract, when declared.
+    pub image_size: usize,
+    /// GLM vision merger bottleneck width. Zero for Qwen-family towers.
+    pub projection_intermediate_size: usize,
+    /// Vision RMSNorm epsilon. Zero when the tower uses LayerNorm/defaults.
+    pub rms_norm_eps: f64,
+    /// Optional model-defined clamp for vision SwiGLU.
+    pub swiglu_limit: Option<f32>,
     /// Layer indices after which deepstack mergers are applied ([8, 16, 24]).
     pub deepstack_visual_indexes: Vec<usize>,
     /// Placeholder token ID that marks where vision embeddings get spliced
     /// into the text embedding stream. Qwen3-VL uses 151655; Qwen3.6 uses
     /// 248056. When 0 the runtime falls back to the legacy Qwen3-VL value.
     pub image_pad_token_id: u32,
+    /// Video placeholder token ID. Zero when video is unsupported/not declared.
+    pub video_pad_token_id: u32,
 }
 
 impl VisionConfig {

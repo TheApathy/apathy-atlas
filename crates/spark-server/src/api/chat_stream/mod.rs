@@ -28,6 +28,9 @@ mod strip;
 mod token_ids;
 mod tool_handlers;
 
+#[cfg(test)]
+mod glm_tool_publication_stream_tests;
+
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};

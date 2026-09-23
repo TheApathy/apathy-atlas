@@ -49,6 +49,9 @@ pub struct AppState {
     /// authoritative active slot.
     pub active_adapter: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pub max_seq_len: usize,
+    /// Effective scheduler concurrency, used for image ownership admission.
+    pub max_batch_size: usize,
+    pub yarn_context: bool,
     pub request_tx: mpsc::Sender<InferenceRequest>,
     /// LoRA adapter-rotation control channel (`POST /v1/lora/active`). `None`
     /// when no adapter is loaded. Carries `(adapter_name, ack)` to the

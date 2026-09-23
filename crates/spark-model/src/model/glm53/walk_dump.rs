@@ -55,7 +55,8 @@ impl Glm53WalkDump {
         let Some(raw) = std::env::var_os(Self::ENV) else {
             return Self { dir: None };
         };
-        let (dir, note) = Self::resolve(std::path::PathBuf::from(raw), std::env::current_dir().ok());
+        let (dir, note) =
+            Self::resolve(std::path::PathBuf::from(raw), std::env::current_dir().ok());
         eprintln!("GLM dump: {}", note);
         Self { dir: Some(dir) }
     }
@@ -196,16 +197,26 @@ mod tests {
         let cwd = Some(PathBuf::from("/var/tmp/atlas-bringup-logs"));
 
         let (dir, note) = Glm53WalkDump::resolve(PathBuf::from("dump_dsafix"), cwd.clone());
-        assert_eq!(dir, PathBuf::from("/var/tmp/atlas-bringup-logs/dump_dsafix"));
+        assert_eq!(
+            dir,
+            PathBuf::from("/var/tmp/atlas-bringup-logs/dump_dsafix")
+        );
         assert!(dir.is_absolute());
         assert!(note.contains("is RELATIVE"), "{note}");
-        assert!(note.contains("/var/tmp/atlas-bringup-logs/dump_dsafix"), "{note}");
+        assert!(
+            note.contains("/var/tmp/atlas-bringup-logs/dump_dsafix"),
+            "{note}"
+        );
 
         // `./x` and `../x` are relative too -- the check is is_absolute, not a
         // leading-slash or leading-dot test.
         for sneaky in ["./dump", "../dump", "a/b/c"] {
             let (dir, note) = Glm53WalkDump::resolve(PathBuf::from(sneaky), cwd.clone());
-            assert!(dir.is_absolute(), "{sneaky} stayed relative as {}", dir.display());
+            assert!(
+                dir.is_absolute(),
+                "{sneaky} stayed relative as {}",
+                dir.display()
+            );
             assert!(note.contains("is RELATIVE"), "{sneaky}: {note}");
         }
 
@@ -216,7 +227,10 @@ mod tests {
         let (dir, note) = Glm53WalkDump::resolve(absolute.clone(), cwd);
         assert_eq!(dir, absolute);
         assert!(!note.contains("is RELATIVE"), "{note}");
-        assert!(note.contains("/var/tmp/atlas-bringup-logs/dump_poolfix"), "{note}");
+        assert!(
+            note.contains("/var/tmp/atlas-bringup-logs/dump_poolfix"),
+            "{note}"
+        );
 
         // No working directory: unresolved, but LOUD rather than silently
         // relative. Dumps landing somewhere unknown is the failure being cured.
