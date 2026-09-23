@@ -289,7 +289,9 @@ impl TransformerModel {
                 (1..=32).contains(&num_tokens),
                 "NVFP4 speculative LM-head rows must be in 1..=32, got {num_tokens}"
             );
-            if num_tokens == 1 {
+            if num_tokens == 1 && self.decode_tc_parity_lm_head() {
+                self.lm_head_tc_rows(hidden, logits, 1, v, stream)?;
+            } else if num_tokens == 1 {
                 // A one-row tail (for example, a chunked diagnostic verify)
                 // stays on the ordinary qualified K1 LM-head path.
                 ops::w4a16_gemv(
@@ -312,20 +314,8 @@ impl TransformerModel {
                 // rounding and packing are proven coherent. ldb is the
                 // 64-padded vocab stride (== vocab for 248320). Output stays
                 // row-major [M, v]. Re-reference class: ATLAS_FFN_TC=1.
-                let ldb = (self.config.vocab_size.div_ceil(64) * 64) as u32;
                 log_lm_head_tc_engagement(num_tokens, v, h);
-                ops::w4a16_gemm_n64_m32_ldb(
-                    self.gpu.as_ref(),
-                    self.w4a16_gemm_t_m32_n64_kernel,
-                    hidden,
-                    self.lm_head_nvfp4_t.as_ref().expect("checked above"),
-                    logits,
-                    num_tokens,
-                    v,
-                    h,
-                    ldb,
-                    stream,
-                )?;
+                self.lm_head_tc_rows(hidden, logits, num_tokens, v, stream)?;
             } else {
                 let route = self
                     .w4a16_exact_lm_head_kernels
@@ -410,6 +400,44 @@ impl TransformerModel {
         Ok(logits)
     }
 
+    /// `ATLAS_DECODE_TC_PARITY=1` with `ATLAS_LM_HEAD_TC=1`: single-token
+    /// decode shares the verify's tensor-core LM head.
+    fn decode_tc_parity_lm_head(&self) -> bool {
+        crate::layers::decode_tc_parity_enabled()
+            && lm_head_tc_enabled()
+            && self.lm_head_nvfp4.is_some()
+            && self.lm_head_nvfp4_t.is_some()
+            && self.w4a16_gemm_t_m32_n64_kernel.0 != 0
+    }
+
+    /// `rows` hidden rows through the transposed-NVFP4 m32_n64 tensor-core
+    /// LM head. ldb is the 64-padded vocab stride (== vocab for 248320);
+    /// output stays row-major `[rows, v]`.
+    fn lm_head_tc_rows(
+        &self,
+        hidden: DevicePtr,
+        logits: DevicePtr,
+        rows: u32,
+        v: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let ldb = (self.config.vocab_size.div_ceil(64) * 64) as u32;
+        ops::w4a16_gemm_n64_m32_ldb(
+            self.gpu.as_ref(),
+            self.w4a16_gemm_t_m32_n64_kernel,
+            hidden,
+            self.lm_head_nvfp4_t
+                .as_ref()
+                .expect("caller checked the transposed LM head"),
+            logits,
+            rows,
+            v,
+            self.config.hidden_size as u32,
+            ldb,
+            stream,
+        )
+    }
+
     pub(super) fn lm_head(&self, hidden: DevicePtr, stream: u64) -> Result<DevicePtr> {
         let h = self.config.hidden_size as u32;
         let v = self.config.vocab_size as u32;
@@ -421,7 +449,12 @@ impl TransformerModel {
         } else {
             (self.buffers.logits(), false)
         };
-        if let Some(ref nvfp4) = self.lm_head_nvfp4 {
+        if !fp32 && self.decode_tc_parity_lm_head() {
+            // ATLAS_DECODE_TC_PARITY=1: one row through the verify's
+            // ATLAS_LM_HEAD_TC=1 kernel so plain decode and speculative
+            // verify produce bit-identical logits.
+            self.lm_head_tc_rows(hidden, logits, 1, v, stream)?;
+        } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
             // Pick FP32-output variant when the FP32 logits buffer is the
             // destination. Same packed-NVFP4 weights, same activation, but the
             // accumulator is NOT downcast to BF16 — closes the 0.125-logit
