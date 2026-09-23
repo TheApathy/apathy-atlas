@@ -50,6 +50,7 @@ mod citation;
 mod cli;
 mod conversation_store;
 pub mod dsv41;
+pub(crate) mod pyjson;
 mod error_hints;
 pub mod grammar;
 mod halluc_probe;
