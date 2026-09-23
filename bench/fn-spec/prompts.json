@@ -1,0 +1,10 @@
+[
+  {"id": "code_py", "think": false, "max_tokens": 320,
+   "content": "Write a Python class LRUCache with get and put methods in O(1) time using a dict and a doubly linked list. Include type hints and a short docstring, then show a usage example."},
+  {"id": "code_rs", "think": false, "max_tokens": 320,
+   "content": "In Rust, implement a function `fn merge_intervals(mut v: Vec<(i64, i64)>) -> Vec<(i64, i64)>` that merges overlapping closed intervals. Explain the algorithm briefly and add unit tests."},
+  {"id": "chat", "think": false, "max_tokens": 256,
+   "content": "I am planning a three-day trip to Lisbon in late autumn. Suggest an itinerary with neighbourhoods to walk, food to try, and one day trip, and keep it practical."},
+  {"id": "think_code", "think": true, "max_tokens": 384,
+   "content": "What is the time complexity of building a binary heap from an unsorted array of n elements, and why is it not O(n log n)? Answer concisely."}
+]
