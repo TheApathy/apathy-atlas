@@ -188,28 +188,9 @@ pub struct TransformerModel {
     pub(super) gpu: std::sync::Arc<dyn GpuBackend>,
     pub(super) rms_norm_kernel: KernelHandle,
     /// Byte-exact strided row copy (`strided_copy_rows_16`); 0 when absent.
-    ///
-    /// UNREACHABLE since the phaseA-a1 merge: the DFlash prefill capture in
-    /// `impl_b3.rs` was rewritten around `DflashCaptureMode` + the bounded ring
-    /// (`plan_append_at`), which replaced the strided fast path that was this
-    /// field's only reader. It is still initialised in `impl_a1.rs`, so the
-    /// `allow` below is what keeps `deny(warnings)` from failing the build.
-    ///
-    /// This is a KNOWN REGRESSION, not dead weight. The dropped path was worth
-    /// a measured, BIT-IDENTICAL +3.8% in the `SSM_RESET_ASYNC +
-    /// DFLASH_CAPTURE_STRIDED` glue arm (1563.5 -> 1506.9 ms, 1309.9 -> 1359.1
-    /// tok/s; RUST_PREFILL_REPORTS/qwen27b.md:207) and is part of the chain
-    /// reaching the banked 1773.0 — the two flags were measured together, so
-    /// the strided path alone is not separately attributed.
-    ///
-    /// Restoring it is NOT a revert. It needs a per-span strided copy keyed off
-    /// `append.write.spans()` with `src_stride = source_stride * bf16` (the
-    /// source stride now varies by capture mode), and it must still satisfy the
-    /// per-row `dst_offset / ctx_slot_bytes == physical_slot` assert that the
-    /// rewrite added and a bulk copy cannot express. The two sides also diverge
-    /// past `max_ctx`: the old path `break`s, the new one errors via
-    /// `plan_append_at`. Needs a GPU A/B before it goes back.
-    #[allow(dead_code)]
+    /// Read by the DFlash prefill capture in `impl_b3.rs` under
+    /// `ATLAS_DFLASH_CAPTURE_STRIDED=1`: one copy per ring span instead of one
+    /// D2D copy per row.
     pub(super) strided_copy_rows_kernel: KernelHandle,
     pub(super) bf16_to_f32_kernel: KernelHandle,
     pub(super) dense_gemv_kernel: KernelHandle,
