@@ -291,6 +291,11 @@ pub(crate) fn load_model(
         ptx_set.target,
         ptx_set.modules.len(),
     );
+    // Record the (model, quant) this serve path actually resolved, so the
+    // TUI Kernels tab can look up its exact module set instead of falling
+    // back to whichever target sorts first in a multi-target build. Nothing
+    // called this before, so the tab was always empty (dsv41-engine2).
+    crate::tui::data::kernels::publish_loaded_target(ptx_set.target.model, ptx_set.target.quant);
 
     // Apply MODEL.toml [behavior].default_num_drafts unless user passed --num-drafts.
     serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);

@@ -77,10 +77,37 @@ const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b3657
 // No admission rule and no phase ordering moved. This hash exists so somebody
 // LOOKS when it breaks; updating it without the diff is how it becomes a
 // rubber stamp.
-const SERVE_LOAD_SHA256: &str = "f88c17367f80ef17f4ea4536f285bf560220fd8a5ee57564f561f76f80877255";
+//
+// Re-pinned 2026-09-22 (FIFTH time) for fix/swap-reclaim. `git diff -U0
+// 6dfbc0c77 -- serve_load.rs` matches ZERO lines against
+// admission|max_seq_len|context_extension|ensure!. The guard block
+// (`let context_extension =` .. its `if let Some(extension) =`) still
+// appears exactly once and still precedes both `phase(3, "gpu init")` and
+// `init_gpu_backend` (grep -c on each, all still 1). The deltas, all past
+// the guard and unrelated to admission: (1) a `gpu: Arc<dyn GpuBackend>`
+// field added to `Prepared`, cloned from `gpu` right after
+// `init_gpu_backend` returns and threaded into the struct literal at the
+// end, so a swap can free every allocation that specific backend instance
+// made once it is provably quiescent; (2) `resolve_tool_call_parser(..)?`
+// moved from just after the scheduler `std::thread::spawn` to just before
+// it, so a failure there can no longer return `Err` with the scheduler
+// thread already detached and owning the model; (3) one new line right
+// after the "Selected kernel target" log, calling
+// `tui::data::kernels::publish_loaded_target(ptx_set.target.model,
+// ptx_set.target.quant)` so the TUI Kernels tab has a target to look up —
+// nothing called it before, so the tab was always empty (dsv41-engine2).
+// This hash exists so somebody LOOKS when it breaks; updating it without the
+// diff is how it becomes a rubber stamp.
+const SERVE_LOAD_SHA256: &str = "a10074644db1e2215bf6bba06dab1c4eaf790dfa9047946c3b7e785290188eb1";
 const SERVE_PHASES_SHA256: &str =
     "e3e84d068c761ff43ad49a04c67d3cd37a8107f99110c919bd016832219c9f1e";
-const BUILD_SHA256: &str = "63b5663ef0880e17d3725ec8833b6d82c20ef45567bc6cfbd41a8136c2005f3e";
+// Re-pinned 2026-09-22 for fix/swap-reclaim: `git diff -U2 6dfbc0c77 --
+// serve_phases/build.rs` is exactly one line, the `gpu` parameter's type
+// changing from `Box<dyn GpuBackend>` to `Arc<dyn GpuBackend>` (a swap needs
+// a second handle to the same backend instance to free its allocations once
+// quiescent — see `GpuBackend::free_all_allocations`). No admission rule,
+// no context-extension path, no phase ordering touched.
+const BUILD_SHA256: &str = "be417e9d112349c46a9456815df3020ad8004a43456cdc1ce280dcb955ccb953";
 
 const INITIAL: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
