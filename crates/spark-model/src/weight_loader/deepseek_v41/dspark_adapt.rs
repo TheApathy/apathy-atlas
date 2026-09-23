@@ -2,8 +2,9 @@
 //!
 //! Output is greedy-exact for every k (the verify pass decides every emitted token), so this is a
 //! pure speed policy. It keeps a per-position conditional acceptance estimate
-//! c_i = P(a >= i | a >= i-1), updated only where the last step observed it (k >= i and a >= i-1),
-//! and picks the k that maximises expected tokens per ms:
+//! c_i = P(a >= i | a >= i-1): decayed hit/trial counts (a step observes position i only when
+//! k >= i and a >= i-1) shrunk toward a prior, so a position left unobserved drifts back to the
+//! prior instead of keeping a stale value. It picks the k that maximises expected tokens per ms:
 //! (1 + sum_{i<=k} prod_{j<=i} c_j) / (draft_ms + verify_ms[k]).
 //! Every `PROBE` steps it verifies all B drafts so a position it stopped verifying is re-measured.
 //! Deterministic given the acceptance history.
@@ -12,10 +13,16 @@ use anyhow::{ensure, Result};
 
 use super::dspark::B;
 
-/// Verify all B drafts at least once every PROBE steps.
-const PROBE: usize = 16;
-/// EMA weight of the newest observation.
-const ALPHA: f64 = 0.125;
+/// Verify all B drafts at least once every PROBE steps (16 cost ~1% on chat in k124v: each probe
+/// is a ~40 ms longer step).
+const PROBE: usize = 32;
+/// Per-step decay of the hit/trial counts (an effective window of ~20 steps).
+const DECAY: f64 = 0.95;
+/// Prior mean of each c_i and its weight in pseudo-trials. Chosen by replaying the measured
+/// k124k/k124c k=5 acceptance sequences through the policy: within 0.3% of the best fixed k on
+/// both chat (best k=2..3) and code (best k=5); an optimistic 1.0 start lost 3% on chat.
+const PRIOR: f64 = 0.7;
+const PRIOR_WEIGHT: f64 = 2.0;
 /// `DSV41_DSPARK_K=k` pins the verify length (1..=B); unset = adaptive.
 pub const FIXED_K_ENV: &str = "DSV41_DSPARK_K";
 /// `DSV41_DSPARK_COSTS=draft,v1,..,vB` overrides the cost table (ms).
@@ -47,8 +54,9 @@ impl Costs {
 pub struct AdaptiveK {
     costs: Costs,
     fixed: Option<usize>,
-    /// c[i-1] = P(a >= i | a >= i-1).
-    cond: [f64; B],
+    /// Decayed hits and trials of position i at [i-1].
+    hits: [f64; B],
+    trials: [f64; B],
     step: usize,
 }
 
@@ -57,8 +65,7 @@ impl AdaptiveK {
         if let Some(k) = fixed {
             ensure!((1..=B).contains(&k), "{FIXED_K_ENV}={k}: must be 1..={B}");
         }
-        // Optimistic start: verify everything until acceptance says otherwise.
-        Ok(Self { costs, fixed, cond: [1.0; B], step: 0 })
+        Ok(Self { costs, fixed, hits: [0.0; B], trials: [0.0; B], step: 0 })
     }
 
     /// From `DSV41_DSPARK_K` / `DSV41_DSPARK_COSTS`.
@@ -83,9 +90,10 @@ impl AdaptiveK {
             return B;
         }
         let (mut best_k, mut best_rate) = (B, f64::MIN);
+        let cond = self.cond();
         let (mut reach, mut expected) = (1.0, 1.0);
         for k in 1..=B {
-            reach *= self.cond[k - 1];
+            reach *= cond[k - 1];
             expected += reach;
             let rate = expected / (self.costs.draft + self.costs.verify[k - 1]);
             // Strict >: on a tie keep the shorter verify.
@@ -100,16 +108,23 @@ impl AdaptiveK {
     /// Record a step that verified `k` drafts and accepted `a` of them.
     pub fn observe(&mut self, k: usize, a: usize) {
         debug_assert!(a <= k && k <= B);
+        for i in 0..B {
+            self.hits[i] *= DECAY;
+            self.trials[i] *= DECAY;
+        }
         // Position i was tested iff i <= k and every earlier draft was accepted (a >= i-1).
         for i in 1..=k.min(a + 1) {
-            let hit = if a >= i { 1.0 } else { 0.0 };
-            self.cond[i - 1] += ALPHA * (hit - self.cond[i - 1]);
+            self.trials[i - 1] += 1.0;
+            if a >= i {
+                self.hits[i - 1] += 1.0;
+            }
         }
         self.step += 1;
     }
 
+    /// The current estimate of c_i at [i-1].
     pub fn cond(&self) -> [f64; B] {
-        self.cond
+        std::array::from_fn(|i| (self.hits[i] + PRIOR * PRIOR_WEIGHT) / (self.trials[i] + PRIOR_WEIGHT))
     }
 }
 
@@ -130,16 +145,16 @@ mod tests {
     #[test]
     fn always_accepting_keeps_the_full_block() {
         let (_, ks) = run(AdaptiveK::new(Costs::DEFAULT, None).unwrap(), |k| k, 64);
-        assert!(ks.iter().all(|&k| k == B), "{ks:?}");
+        assert!(ks[8..].iter().all(|&k| k == B), "{ks:?}");
     }
 
     #[test]
     fn never_accepting_shrinks_to_one_and_still_probes() {
         let (p, ks) = run(AdaptiveK::new(Costs::DEFAULT, None).unwrap(), |_| 0, 64);
-        assert!(p.cond()[0] < 0.01);
+        assert!(p.cond()[0] < 0.1, "{:?}", p.cond());
         // After the estimate decays, only the probe steps verify the full block.
-        let tail: Vec<usize> = ks[32..].to_vec();
-        assert!(tail.iter().enumerate().all(|(i, &k)| if (32 + i) % PROBE == 0 { k == B } else { k == 1 }), "{tail:?}");
+        let tail: Vec<usize> = ks[4..].to_vec();
+        assert!(tail.iter().enumerate().all(|(i, &k)| if (4 + i) % PROBE == 0 { k == B } else { k == 1 }), "{tail:?}");
     }
 
     #[test]
@@ -161,8 +176,8 @@ mod tests {
         let mut p = AdaptiveK::new(Costs::DEFAULT, None).unwrap();
         p.observe(2, 0);
         let c = p.cond();
-        assert!(c[0] < 1.0);
-        assert_eq!(c[1..], [1.0; B - 1][..], "position 2 was never tested (draft 1 rejected)");
+        assert!(c[0] < PRIOR);
+        assert!(c[1..].iter().all(|&x| (x - PRIOR).abs() < 1e-12), "position 2 was never tested (draft 1 rejected): {c:?}");
     }
 
     #[test]

@@ -49,10 +49,11 @@ struct Kernels {
     router: KernelHandle,
     router_bf16w: KernelHandle,
     route: KernelHandle,
-    gateup_r1: KernelHandle,
-    gateup_r8: KernelHandle,
-    down_r1: KernelHandle,
-    down_r8: KernelHandle,
+    /// Row-count variants R = 1, 2, 4, 6, 8 (a group holds at most `t` rows, since a token's
+    /// top-6 experts are distinct): the smallest R >= t runs. Same per-row arithmetic for every R,
+    /// fewer registers for small R (down: 73 regs at R=8 vs 64 at R=6 -> 24 vs 32 warps/SM).
+    gateup: [KernelHandle; 5],
+    down: [KernelHandle; 5],
     sum: KernelHandle,
 }
 
@@ -101,10 +102,20 @@ impl MoeDecode {
             router: k("dsv41_router_logits_decode")?,
             router_bf16w: k("dsv41_router_logits_decode_bf16w")?,
             route: k("dsv41_route_decode")?,
-            gateup_r1: k("dsv41_cb3_gateup_decode_r1")?,
-            gateup_r8: k("dsv41_cb3_gateup_decode_r8")?,
-            down_r1: k("dsv41_cb3_down_decode_r1")?,
-            down_r8: k("dsv41_cb3_down_decode_r8")?,
+            gateup: [
+                k("dsv41_cb3_gateup_decode_r1")?,
+                k("dsv41_cb3_gateup_decode_r2")?,
+                k("dsv41_cb3_gateup_decode_r4")?,
+                k("dsv41_cb3_gateup_decode_r6")?,
+                k("dsv41_cb3_gateup_decode_r8")?,
+            ],
+            down: [
+                k("dsv41_cb3_down_decode_r1")?,
+                k("dsv41_cb3_down_decode_r2")?,
+                k("dsv41_cb3_down_decode_r4")?,
+                k("dsv41_cb3_down_decode_r6")?,
+                k("dsv41_cb3_down_decode_r8")?,
+            ],
             sum: k("dsv41_moe_sum_decode")?,
         };
         let upload = |bytes: &[u8]| -> Result<DevicePtr> {
@@ -276,7 +287,16 @@ impl MoeDecode {
         let (s2, sc2_s) = plane(w2.scale, w2.rows, w2.cols / 32)?;
 
         let max_groups = (t * TOP_K) as u32;
-        let (gateup, down) = if t == 1 { (self.k.gateup_r1, self.k.down_r1) } else { (self.k.gateup_r8, self.k.down_r8) };
+        // `ATLAS_DSV41_MOE_R8=1`: every t > 1 on the R=8 kernels (the pre-variant path, A/B only).
+        let v = match t {
+            1 => 0,
+            _ if r8_only() => 4,
+            2 => 1,
+            3 | 4 => 2,
+            5 | 6 => 3,
+            _ => 4,
+        };
+        let (gateup, down) = (self.k.gateup[v], self.k.down[v]);
         KernelLaunch::new(gpu, gateup)
             .grid([(INTER as u32).div_ceil(WARPS), max_groups, 1])
             .block([32 * WARPS, 1, 1])
@@ -308,6 +328,11 @@ impl MoeDecode {
         }
         Ok(())
     }
+}
+
+fn r8_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_DSV41_MOE_R8").as_deref() == Ok("1"))
 }
 
 /// `ATLAS_DSV41_MOE_GROUPS_LOG=1`: print the distinct-expert count of every multi-row MoE pass.

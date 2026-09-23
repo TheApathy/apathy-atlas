@@ -64,7 +64,7 @@ pub fn step_internal_spec(
             adaptive_sampling,
         );
     }
-    let (drafts, argmax) = match model.spec_verify(a.last_token, &mut a.seq, None, 0) {
+    let (drafts, argmax) = match model.spec_verify(a.last_token, &mut a.seq, None, None, 0) {
         Ok(Some(r)) => r,
         Ok(None) => {
             step_decode_only(
@@ -188,7 +188,7 @@ fn step_internal_spec_sampled(
         temperature: a.temperature,
         draft_uniforms: (0..B).map(|i| spec_uniform(a.seed, base * 8 + i, SALT_DRAFT) as f32).collect(),
     };
-    let drafts = match model.spec_verify(a.last_token, &mut a.seq, Some(&sampling), 0) {
+    let drafts = match model.spec_verify(a.last_token, &mut a.seq, Some(&sampling), None, 0) {
         Ok(Some((d, _))) => d,
         Ok(None) => {
             // Too close to max_seq: one plain sampled step.

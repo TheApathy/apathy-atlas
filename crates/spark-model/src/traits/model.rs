@@ -464,7 +464,11 @@ pub trait Model: Send + Sync {
     /// `sampling`: None = greedy drafts (the argmax chain). Some = SAMPLED drafts for T > 0: draft
     /// i is drawn from the model's draft distribution q_i at `draft_uniforms[i]` (one uniform in
     /// [0,1) per draft, from the request RNG), and q_i is kept for [`Model::spec_draft_probs`].
-    fn spec_verify(&self, _token: u32, _seq: &mut SequenceState, _sampling: Option<&SpecSampling>, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
+    ///
+    /// `verify_drafts`: verify only the first k drafts (k + 1 rows; the returned drafts are those
+    /// k). None = all of them. Output is exact for every k; it is a speed choice (DSV4.1:
+    /// `dspark_adapt::AdaptiveK`).
+    fn spec_verify(&self, _token: u32, _seq: &mut SequenceState, _sampling: Option<&SpecSampling>, _verify_drafts: Option<usize>, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
         anyhow::bail!("spec_verify: this model has no internal speculation")
     }
 

@@ -116,6 +116,18 @@ pub struct Dsv41Model {
     spec_pending: Mutex<Option<(u32, Vec<u32>)>>,
     /// Whether the last spec_verify drew SAMPLED drafts (its q rows are valid).
     spec_sampled: Mutex<bool>,
+    /// [`DSPARK_ADAPTIVE_ENV`]: the live sequence's adaptive verify length (dsv41-decode's
+    /// AdaptiveK v2) and the k of the uncommitted spec_verify. Reset per sequence.
+    spec_adapt: Mutex<Option<(crate::weight_loader::deepseek_v41::dspark_adapt::AdaptiveK, usize)>>,
+}
+
+/// `ATLAS_DSV41_DSPARK_ADAPTIVE=1`: serve chooses each step's draft count adaptively per sequence
+/// (spec_verify with `verify_drafts: None`); off = always all 5.
+pub const DSPARK_ADAPTIVE_ENV: &str = "ATLAS_DSV41_DSPARK_ADAPTIVE";
+
+fn dspark_adaptive() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var(DSPARK_ADAPTIVE_ENV).as_deref() == Ok("1"))
 }
 
 // SAFETY-adjacent: every field is either immutable after construction, behind a Mutex, or a
@@ -206,6 +218,7 @@ impl Dsv41Model {
             spec_stats: Mutex::new((0, 0)),
             spec_pending: Mutex::new(None),
             spec_sampled: Mutex::new(false),
+            spec_adapt: Mutex::new(None),
         })
     }
 
@@ -366,7 +379,20 @@ impl Model for Dsv41Model {
         self.dspark.is_some()
     }
 
-    fn spec_verify(&self, token: u32, seq: &mut SequenceState, sampling: Option<&crate::traits::SpecSampling>, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
+    fn spec_verify(&self, token: u32, seq: &mut SequenceState, sampling: Option<&crate::traits::SpecSampling>, verify_drafts: Option<usize>, _stream: u64) -> Result<Option<(Vec<u32>, Vec<u32>)>> {
+        let k = match verify_drafts {
+            Some(k) => k,
+            None if dspark_adaptive() => {
+                let mut ad = self.spec_adapt.lock().expect("dsv41 spec adapt poisoned");
+                if ad.is_none() {
+                    *ad = Some((crate::weight_loader::deepseek_v41::dspark_adapt::AdaptiveK::from_env()?, 0));
+                }
+                let (policy, last) = ad.as_mut().expect("just set");
+                *last = policy.choose();
+                *last
+            }
+            None => crate::weight_loader::deepseek_v41::dspark::B,
+        };
         let ds = self.dspark.as_ref().context("dsv41 spec_verify: DSpark is not loaded")?;
         let ops = self.ops();
         let l = &self.lanes;
@@ -389,7 +415,7 @@ impl Model for Dsv41Model {
             };
             *self.spec_sampled.lock().expect("dsv41 spec sampled poisoned") = draft_sampling.as_ref().is_some_and(|(t, _)| *t > 0.0);
             ds.set_draft_sampling(draft_sampling);
-            let (drafts, _a, am) = ds.propose_verify(&ops, &self.fwd, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits)?;
+            let (drafts, _a, am) = ds.propose_verify(&ops, &self.fwd, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits, k)?;
             Ok(Some((drafts, am)))
         })?;
         if let Some((drafts, _)) = &r {
@@ -415,6 +441,10 @@ impl Model for Dsv41Model {
         self.with_seq(seq.slot_idx, |s| {
             ds.lock().expect("dspark poisoned").commit(&ops, &self.fwd, s, pos, accepted, self.lanes.hook.as_ref())
         })?;
+        if let Some((policy, k)) = self.spec_adapt.lock().expect("dsv41 spec adapt poisoned").as_mut() {
+            // Leading drafts kept (greedy match, or the sampled rejection rule's accept count).
+            policy.observe(*k, accepted);
+        }
         {
             let mut st = self.spec_stats.lock().expect("dsv41 spec stats poisoned");
             st.0 += 1;
@@ -440,6 +470,8 @@ impl Model for Dsv41Model {
     }
 
     fn alloc_sequence(&self) -> Result<SequenceState> {
+        // A new sequence starts a fresh adaptive-k policy (acceptance differs by request).
+        *self.spec_adapt.lock().expect("dsv41 spec adapt poisoned") = None;
         let mut map = self.seqs.lock().expect("dsv41 seqs poisoned");
         ensure!(
             map.is_empty(),
