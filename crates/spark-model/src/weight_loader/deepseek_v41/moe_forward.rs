@@ -246,8 +246,8 @@ impl Cb3RoutedMoe {
             arena.layer(*layer).with_context(|| format!("router for layer {layer} has no resident experts"))?;
         }
         ensure!(
-            inter % FUSED_TILE_N == 0 && hidden % FUSED_TILE_N == 0 && inter % 64 == 0 && hidden % 64 == 0,
-            "fused CB3 GEMM needs N % {FUSED_TILE_N} == 0 and K % 64 == 0 (one BK step) (hidden {hidden}, inter {inter})"
+            inter % FUSED_TILE_N == 0 && hidden % FUSED_TILE_N == 0 && inter % 128 == 0 && hidden % 128 == 0,
+            "fused CB3 GEMM needs N % {FUSED_TILE_N} == 0 and K % 128 == 0 (a pair of BK steps) (hidden {hidden}, inter {inter})"
         );
         let e = max_t * TOP_K;
         // Every group contributes ceil(rows / BM) tiles: at most e / BM + one partial per expert.
