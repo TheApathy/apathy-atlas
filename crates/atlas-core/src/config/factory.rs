@@ -122,6 +122,27 @@ impl ModelConfig {
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 1e-6,
+            // DeepSeek-V4.1 fields — all default to "unused" (empty/0/None) so the base
+            // Qwen3-Next-80B template behaves identically to before. This is a build-unblocking
+            // fixture fix, not a DSV4.1 port step: it just gives this ONE hardcoded ModelConfig
+            // literal the same treatment every prior model-specific field addition got here.
+            num_attention_heads_per_layer: Vec::new(),
+            deepseek_main_rope_theta: None,
+            lm_head_bf16_override: None,
+            lm_head_fp8: false,
+            mlp_only_layers: Vec::new(),
+            moe_intermediate_sizes: Vec::new(),
+            num_experts_per_toks: Vec::new(),
+            o_lora_rank: 0,
+            o_groups: 0,
+            yarn_mscale: 0.0,
+            yarn_mscale_all_dim: 0.0,
+            compress_ratios: Vec::new(),
+            deepseek_v4_indexer: None,
+            num_hash_layers: 0,
+            yarn_attention_factor: 0.0,
+            deepseek_vision: None,
+            adapter_max_rank: 0,
         }
     }
 }
