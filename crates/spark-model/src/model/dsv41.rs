@@ -166,6 +166,8 @@ impl Dsv41Model {
         fwd.own_allocations(shared.clone());
         fwd.vision = load_vision(store, model_dir, dims.hidden, &shared)?;
         let lanes = build_lanes(store, config, gpu, kernels, &shared, &fwd, model_dir, max_seq, max_chunk)?;
+        // Resident bf16 weight copies, now that the arena, core and drafter hold their memory.
+        fwd.make_resident(&ops)?;
         // Whole-step CUDA graphs for Decode/Verify passes, segmented around the engram gathers
         // (measured full model: -3.21 ms/step, bit-identical to eager over 63 steps; see
         // V41Forward::step_graphed).

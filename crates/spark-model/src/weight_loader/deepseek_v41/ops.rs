@@ -587,6 +587,20 @@ impl Ops<'_> {
     }
 
     pub fn linear_fp8_tiled(&self, x: DevicePtr, w: &Fp8Linear, scratch: DevicePtr, out: DevicePtr, m: usize) -> Result<()> {
+        self.linear_fp8_tiled_as(x, w, scratch, out, m, "dense/dequant")
+    }
+
+    /// [`Ops::linear_fp8_tiled`] with its dequant PROF scope named `dequant_scope` (per-weight
+    /// attribution, e.g. "dense/dequant/wq_b").
+    pub fn linear_fp8_tiled_as(
+        &self,
+        x: DevicePtr,
+        w: &Fp8Linear,
+        scratch: DevicePtr,
+        out: DevicePtr,
+        m: usize,
+        dequant_scope: &str,
+    ) -> Result<()> {
         if m == 1 && decode_pass() && self.k.fp8_gemv_m1.is_some() {
             return self.fp8_gemv_m1(x, w, out, w.n, 0);
         }
@@ -615,7 +629,7 @@ impl Ops<'_> {
         let scratch = match w.bf16 {
             Some(resident) => resident,
             None => {
-                prof(self, "dense/dequant", || self.dequant(w, scratch))?;
+                prof(self, dequant_scope, || self.dequant(w, scratch))?;
                 scratch
             }
         };

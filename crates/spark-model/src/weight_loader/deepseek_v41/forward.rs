@@ -97,61 +97,96 @@ pub const ENCODER_LAST: usize = 20;
 
 /// `ATLAS_DSV41_SHARED_RESIDENT=0` turns OFF the resident bf16 shared-expert weights (default
 /// ON: +[`super::fwd::shared_resident_bytes`] = 70.8 MB per layer, 2.83 GB for all 40, as far
-/// as free memory allows after the planned arena; the arena's own check then sees them).
+/// as free memory allows above a 16 GB floor, made after the arena; see [`V41Forward::make_resident`]).
 pub const SHARED_RESIDENT_ENV: &str = "ATLAS_DSV41_SHARED_RESIDENT";
 
-/// Free device memory that must remain after the resident copies AND the CB3 arena that is
-/// loaded after them (the arena applies its own 16 GB floor then; this keeps residency from
-/// eating into it).
+/// Free device memory that must remain after the resident copies. They are made AFTER the CB3
+/// arena, the attention core and (with DSpark) the drafter are resident
+/// ([`V41Forward::make_resident`]), so this is the same 16 GB floor the arena keeps for KV,
+/// activations and page cache — nothing loaded later is budgeted against a guess.
 const SHARED_RESIDENT_MIN_FREE: u64 = 16_000_000_000;
 
-/// Bytes the CB3 expert arena will take (the pack manifest at the served keep), so residency
-/// can leave room for it. None if the pack cannot be read here (then nothing is made resident).
-fn planned_arena_bytes(model_dir: &std::path::Path) -> Option<u64> {
-    use super::cb3_arena::resolve_packed_keep;
-    let manifest = std::fs::read_to_string(model_dir.join("k154-cb3").join("manifest.json")).ok()?;
-    let pack = atlas_core::config::ExpertPack::parse(&manifest, resolve_packed_keep().ok()?).ok()?;
-    Some(pack.resident_bytes() as u64)
+/// `ATLAS_DSV41_ATTN_RESIDENT=1`: OPT-IN ("prefill-max") resident bf16 copies of the attention's
+/// biggest FP8 weights, wq_b (84 MB), wo_b (84 MB) and wo_a (67 MB) per layer, encoder layers
+/// first, as far as free memory allows above the 16 GB floor (same rule as the shared expert).
+/// Default OFF: 5-10 GB would eat into DSpark's low-water and the long-context KV.
+/// `=swap_control` makes them resident with each even/odd layer pair's wq_b SWAPPED (real
+/// matrices, the wrong layer's) - a byte gate must FAIL under it.
+pub const ATTN_RESIDENT_ENV: &str = "ATLAS_DSV41_ATTN_RESIDENT";
+
+/// See [`ATTN_RESIDENT_ENV`]. Returns the allocations to own.
+fn make_attn_resident(ops: &Ops, attn: &mut [V41AttnWeights]) -> Result<Vec<DevicePtr>> {
+    let mode = std::env::var(ATTN_RESIDENT_ENV).unwrap_or_default();
+    if mode != "1" && mode != "swap_control" {
+        return Ok(Vec::new());
+    }
+    let per_layer = |a: &V41AttnWeights| (a.wq_b.bf16_bytes() + a.wo_b.bf16_bytes() + a.wo_a.bf16_bytes()) as u64;
+    let mut owned = Vec::new();
+    let mut resident = 0usize;
+    for a in attn.iter_mut() {
+        let free = ops.gpu.free_memory().context("attention residency: querying free memory")? as u64;
+        if free < per_layer(a) + SHARED_RESIDENT_MIN_FREE {
+            break;
+        }
+        for w in [&mut a.wq_b, &mut a.wo_b, &mut a.wo_a] {
+            let p = ops.gpu.alloc(w.bf16_bytes())?;
+            ops.dequant(w, p)?;
+            w.bf16 = Some(p);
+            owned.push(p);
+        }
+        resident += 1;
+    }
+    if mode == "swap_control" {
+        for pair in attn[..resident].chunks_exact_mut(2) {
+            let (a, b) = pair.split_at_mut(1);
+            std::mem::swap(&mut a[0].wq_b.bf16, &mut b[0].wq_b.bf16);
+        }
+    }
+    ops.gpu.synchronize(ops.stream)?;
+    let bytes: u64 = attn[..resident].iter().map(per_layer).sum();
+    eprintln!("DeepSeek-V4.1: resident attention on {resident} of {} layers ({:.2} GB)", attn.len(), bytes as f64 / 1e9);
+    tracing::info!(
+        "DeepSeek-V4.1: resident bf16 attention wq_b/wo_b/wo_a on {resident} of {} layers ({:.2} GB{})",
+        attn.len(),
+        bytes as f64 / 1e9,
+        if mode == "swap_control" { ", SWAP CONTROL" } else { "" },
+    );
+    Ok(owned)
 }
 
 /// Resident bf16 shared-expert weights, layer by layer: the encoder layers `0..=ENCODER_LAST`
 /// first (every prefill chunk), then the replay layers (once per prompt, T <= 128). Each takes
 /// the dequant path otherwise. Byte-identical to the per-pass dequant; see
-/// `SharedExpert::make_resident`. A layer is made resident only while free memory stays at
-/// least the planned arena plus [`SHARED_RESIDENT_MIN_FREE`]; past that, the remaining layers
-/// FALL BACK to the dequant path (logged), never a refusal. Returns the allocations to own.
+/// `SharedExpert::make_resident`. A layer is made resident only while free memory stays above
+/// [`SHARED_RESIDENT_MIN_FREE`]; past that, the remaining layers FALL BACK to the dequant path
+/// (logged), never a refusal. Returns the allocations to own.
 fn make_shared_resident(
     ops: &Ops,
     dims: &V41Dims,
     blocks: &mut [V41BlockWeights],
-    model_dir: &std::path::Path,
 ) -> Result<Vec<DevicePtr>> {
     if std::env::var(SHARED_RESIDENT_ENV).as_deref() == Ok("0") {
         tracing::info!("DeepSeek-V4.1: resident shared-expert weights OFF ({SHARED_RESIDENT_ENV}=0)");
         return Ok(Vec::new());
     }
-    let Some(arena) = planned_arena_bytes(model_dir) else {
-        tracing::warn!("DeepSeek-V4.1: expert pack manifest unreadable here; shared expert stays on the dequant path");
-        return Ok(Vec::new());
-    };
     let per_layer = super::fwd::shared_resident_bytes(dims) as u64;
     let mut owned = Vec::with_capacity(2 * blocks.len());
     let mut resident = 0usize;
     for b in blocks.iter_mut() {
         let free = ops.gpu.free_memory().context("shared-expert residency: querying free memory")? as u64;
-        if free < per_layer + arena + SHARED_RESIDENT_MIN_FREE {
+        if free < per_layer + SHARED_RESIDENT_MIN_FREE {
             break;
         }
         owned.extend(b.shared.make_resident(ops)?);
         resident += 1;
     }
     ops.gpu.synchronize(ops.stream)?;
+    eprintln!("DeepSeek-V4.1: resident shared expert on {resident} of {} layers", blocks.len());
     tracing::info!(
         "DeepSeek-V4.1: resident bf16 shared-expert weights on {resident} of {} layers ({:.2} GB; the rest use the \
-         dequant path; room kept for the {:.1} GB arena + {:.0} GB floor)",
+         dequant path; {:.0} GB floor kept)",
         blocks.len(),
         (resident as u64 * per_layer) as f64 / 1e9,
-        arena as f64 / 1e9,
         SHARED_RESIDENT_MIN_FREE as f64 / 1e9,
     );
     Ok(owned)
@@ -374,9 +409,10 @@ impl V41Forward {
         model_dir: &std::path::Path,
         engram_threads: usize,
     ) -> Result<Self> {
-        let mut blocks = (0..n_layers).map(|l| V41BlockWeights::load(store, l, &dims, ops)).collect::<Result<Vec<_>>>()?;
-        let shared_resident = make_shared_resident(ops, &dims, &mut blocks, model_dir)?;
+        let blocks = (0..n_layers).map(|l| V41BlockWeights::load(store, l, &dims, ops)).collect::<Result<Vec<_>>>()?;
+
         let attn = (0..n_layers).map(|l| V41AttnWeights::load(store, l, dims.hidden)).collect::<Result<Vec<_>>>()?;
+
         let largest = blocks
             .iter()
             .flat_map(|b| [b.shared.w1, b.shared.w2, b.shared.w3].into_iter().chain(b.engram.as_ref().map(|e| e.wkv)))
@@ -414,7 +450,7 @@ impl V41Forward {
             dspark_seed: None,
             dspark: None,
             graph: None,
-            shared_resident,
+            shared_resident: Vec::new(),
         })
     }
 
@@ -451,6 +487,20 @@ impl V41Forward {
         Ok(())
     }
 
+    /// Make the resident bf16 weight copies ([`SHARED_RESIDENT_ENV`], default on; and the opt-in
+    /// [`ATTN_RESIDENT_ENV`]) — call once, AFTER the CB3 arena, the attention core and any
+    /// drafter are loaded, so each layer's copy is checked against the real remaining memory.
+    /// Byte-identical to the per-pass dequant; the allocations join [`Self::allocs`].
+    pub fn make_resident(&mut self, ops: &Ops) -> Result<()> {
+        let mut new = make_shared_resident(ops, &self.dims, &mut self.blocks)?;
+        new.extend(make_attn_resident(ops, &mut self.attn)?);
+        for p in &new {
+            self.allocs.adopt(*p);
+        }
+        self.shared_resident.extend(new);
+        Ok(())
+    }
+
     /// Take ownership of every allocation made in [`Self::load`] so dropping the forward frees
     /// it (serving). The driver skips this and lets process exit clean up.
     pub fn own_allocations(&mut self, gpu: super::device_allocs::SharedGpu) {
@@ -471,6 +521,8 @@ impl V41Forward {
                 a.adopt(e.weight);
             }
         }
+        // Resident copies made before this point move to the new owner; later ones are adopted
+        // by make_resident itself.
         for p in &self.shared_resident {
             a.adopt(*p);
         }

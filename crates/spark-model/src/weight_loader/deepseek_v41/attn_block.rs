@@ -217,14 +217,14 @@ pub fn attention(
         gpu.copy_h2d_async(bytemuck_i32(&wpos), s.wpos, ops.stream)?;
     }
 
-    ops.linear_fp8_tiled(x, &w.wq_a, wscratch, s.qr, t)?;
+    ops.linear_fp8_tiled_as(x, &w.wq_a, wscratch, s.qr, t, "dense/dequant/wq_a")?;
     ops.rmsnorm(s.qr, w.q_norm, s.qr, t, Q_LORA, norm_eps)?;
     tap.bf16(ops, "qr", l, s.qr, &[t, Q_LORA])?;
-    ops.linear_fp8_tiled(s.qr, &w.wq_b, wscratch, s.q, t)?;
+    ops.linear_fp8_tiled_as(s.qr, &w.wq_b, wscratch, s.q, t, "dense/dequant/wq_b")?;
     ops.rope_tail(s.q, s.pos, rope, t, N_HEADS, HEAD_DIM, false)?;
     tap.bf16(ops, "q", l, s.q, &[t, N_HEADS, HEAD_DIM])?;
 
-    ops.linear_fp8_tiled(x, &w.wkv, wscratch, s.kv, t)?;
+    ops.linear_fp8_tiled_as(x, &w.wkv, wscratch, s.kv, t, "dense/dequant/wkv")?;
     ops.rmsnorm(s.kv, w.kv_norm, s.kv, t, HEAD_DIM, norm_eps)?;
     ops.rope_tail(s.kv, s.pos, rope, t, 1, HEAD_DIM, false)?;
     tap.bf16(ops, "kv_new", l, s.kv, &[t, HEAD_DIM])?;
@@ -277,15 +277,22 @@ pub fn attn_output(
     if t == 1 && decode && ops.k.fp8_gemv_m1.is_some() {
         // One grouped fp8 GEMV: output row n reads activation group n / 1024.
         ops.fp8_gemv_m1(s.o, &w.wo_a, s.o2, O_LORA, grp_k)?;
-        return ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t);
+        return ops.linear_fp8_tiled_as(s.o2, &w.wo_b, wscratch, out, t, "dense/dequant/wo_b");
     }
     if t <= super::ops::GEMV_MAX_M && decode && ops.k.fp8_gemv_m8.is_some() {
         ops.fp8_gemv_rows(s.o, N_HEADS * HEAD_DIM, &w.wo_a, s.o2, O_GROUPS * O_LORA, t, O_LORA, grp_k)?;
-        return ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t);
+        return ops.linear_fp8_tiled_as(s.o2, &w.wo_b, wscratch, out, t, "dense/dequant/wo_b");
     }
     // `v41_ref.wo_a_proj` runs the grouped fp8 kernel (row-invariant, not row-tiled), so the
     // same row policy as `linear_fp8_tiled`: one GEMM per group at M > 16, one tile at M <= 16.
-    prof(ops, "dense/dequant", || ops.dequant(&w.wo_a, wscratch))?;
+    // A resident bf16 wo_a (ATLAS_DSV41_ATTN_RESIDENT) holds exactly what this dequant writes.
+    let wo_a = match w.wo_a.bf16 {
+        Some(resident) => resident,
+        None => {
+            prof(ops, "dense/dequant/wo_a", || ops.dequant(&w.wo_a, wscratch))?;
+            wscratch
+        }
+    };
     let grouped = |x: DevicePtr, lda: usize, wt: DevicePtr, o: DevicePtr, ldc: usize, m: usize, n: usize, k: usize| {
         if m > MM_TILE && !super::ops::fp8_force_rowtile() {
             ops.linear_bf16_policy(x, lda, wt, o, ldc, m, n, k)
@@ -295,7 +302,7 @@ pub fn attn_output(
         grouped(
             s.o.offset(g * grp_k * 2),
             N_HEADS * HEAD_DIM,
-            wscratch.offset(g * O_LORA * grp_k * 2),
+            wo_a.offset(g * O_LORA * grp_k * 2),
             s.o2.offset(g * O_LORA * 2),
             O_GROUPS * O_LORA,
             t,
@@ -303,7 +310,7 @@ pub fn attn_output(
             grp_k,
         )?;
     }
-    ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t)
+    ops.linear_fp8_tiled_as(s.o2, &w.wo_b, wscratch, out, t, "dense/dequant/wo_b")
 }
 
 #[cfg(test)]

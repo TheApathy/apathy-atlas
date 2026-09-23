@@ -294,7 +294,7 @@ fn run_model_path(
         fwd.enable_graphs(ops.gpu, hook)?;
         println!("decode: CUDA graphs ON (Decode/Verify passes captured once, replayed)");
     }
-    let fwd = fwd;
+    let mut fwd = fwd;
     let fed_moe = FedMoe(&feeder, dims.hidden);
     let real;
     let moe: &dyn V41RoutedMoe = if moe_real {
@@ -303,6 +303,9 @@ fn run_model_path(
     } else {
         &fed_moe
     };
+    // As serve: resident weight copies after the arena, core and drafter are loaded.
+    fwd.make_resident(ops)?;
+    let fwd = fwd;
     let tap_base = tap_dir.clone();
     let tap = match tap_dir {
         Some(d) => Tap::to_dir(d, Vec::new())?,
