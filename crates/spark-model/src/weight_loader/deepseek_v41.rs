@@ -3,12 +3,16 @@
 //! Weight loader for **DeepSeek-V4.1-Flash-Next**.
 //!
 //! This loader deliberately **fails loudly for everything it has not implemented** rather
-//! than borrowing [`super::deepseek_v4::DeepSeekV4WeightLoader`]. That loader targets
-//! DeepSeek-V4-Flash-0731 and its experts are **EXL3 2-bit**; V4.1's are **CB3 3-bit**.
-//! Reusing it would not fail at the dispatch — it would fail somewhere far downstream in a
-//! tensor reader, or worse, decode EXL3 over CB3 bytes and produce plausible garbage.
-//! An honest "not implemented" at the seam is worth more than a confusing crash three
-//! layers down.
+//! than depending on `deepseek_v4::DeepSeekV4WeightLoader` (DeepSeek-V4-Flash-0731's own
+//! loader). That loader's experts are **EXL3 2-bit**; V4.1's are **CB3 3-bit**. Reusing it
+//! would not fail at the dispatch — it would fail somewhere far downstream in a tensor
+//! reader, or worse, decode EXL3 over CB3 bytes and produce plausible garbage. An honest
+//! "not implemented" at the seam is worth more than a confusing crash three layers down.
+//!
+//! [`v4_dense_compat`] carries the ONE exception: `load_embedding`/`load_final_norm`/
+//! `load_lm_head`, copied verbatim as plain functions (not the V4 loader's trait impl —
+//! DeepSeek-V4-Flash-0731 and its DSpark/MTP/indexer/vision_moe internals are out of scope
+//! for this port; see that module's doc comment).
 //!
 //! ## What IS implemented and tested
 //! - Embedding, final norm and lm_head, which load TODAY. V4.1's bare key names are the
@@ -43,12 +47,12 @@ pub mod moe_decode;
 pub mod moe_forward;
 pub mod routing;
 pub mod seams;
+mod v4_dense_compat;
 
 use anyhow::{Result, bail};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 
-use super::deepseek_v4::DeepSeekV4WeightLoader;
 use super::{DenseWeight, ModelWeightLoader, MtpWeights, WeightStore};
 use crate::layer::TransformerLayer;
 use spark_runtime::kv_cache::KvCacheDtype;
@@ -156,7 +160,7 @@ impl ModelWeightLoader for DeepSeekV41WeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        DeepSeekV4WeightLoader.load_embedding(store, config, gpu)
+        v4_dense_compat::load_embedding(store, config, gpu)
     }
 
     fn load_final_norm(
@@ -168,7 +172,7 @@ impl ModelWeightLoader for DeepSeekV41WeightLoader {
         // V4.1 ships VANILLA norm weights (scale = weight), established by reading the
         // tensors -- see `crate::model_type_ships_vanilla_norm_weights`, which now lists
         // deepseek_v41. So the V4 path, which loads them exactly, is correct here.
-        DeepSeekV4WeightLoader.load_final_norm(store, config, gpu)
+        v4_dense_compat::load_final_norm(store, config, gpu)
     }
 
     fn load_lm_head(
@@ -177,7 +181,7 @@ impl ModelWeightLoader for DeepSeekV41WeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        DeepSeekV4WeightLoader.load_lm_head(store, config, gpu)
+        v4_dense_compat::load_lm_head(store, config, gpu)
     }
 
     fn load_mtp_weights(
@@ -277,12 +281,12 @@ mod tests {
         }
     }
 
-    /// The dispatch must hand V4.1 its OWN loader, not the 0731 one.
+    /// The dispatch must hand V4.1 its OWN loader, not a 0731-style EXL3 one.
     ///
     /// Asserted behaviourally rather than by reading the match arm: build a real V4.1
-    /// config, run the factory, and check the loader REFUSES. `DeepSeekV4WeightLoader`
-    /// would not refuse here -- it would go on to look for EXL3 tensors -- so a refusal
-    /// naming CB3 is positive evidence that the v41 arm was taken.
+    /// config, run the factory, and check the loader REFUSES. A 0731 loader would not
+    /// refuse here -- it would go on to look for EXL3 tensors -- so a refusal naming CB3
+    /// is positive evidence that the v41 arm was taken.
     #[test]
     fn the_factory_gives_v41_its_own_loader() {
         const CONFIG: &str =
