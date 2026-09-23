@@ -709,6 +709,17 @@ impl TransformerModel {
             None => return Ok(()),
         };
 
+        // The replay runs the MTP layer over the shared activation buffers
+        // (its MoE and head use `buffers.logits()` as scratch), and the
+        // scheduler samples the first output token from the target's logits
+        // after this returns. Park them in the capture buffer's tail and
+        // restore them after the replay.
+        let logits = self.decode_logits_ptr();
+        let logits_bytes = self.config.vocab_size * if self.use_fp32_logits { 4 } else { 2 };
+        let saved_logits = lastk_buf.offset(capacity * row_bytes);
+        self.gpu
+            .copy_d2d_async(logits, saved_logits, logits_bytes, stream)?;
+
         let t0 = std::time::Instant::now();
         proposer.prefill_last_k(
             &captured_tokens,
@@ -718,6 +729,8 @@ impl TransformerModel {
             &ctx,
             stream,
         )?;
+        self.gpu
+            .copy_d2d_async(saved_logits, logits, logits_bytes, stream)?;
         let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(
             "MTP last-K prefill: filled={filled}/{capacity} rows from cross-chunk ring, \

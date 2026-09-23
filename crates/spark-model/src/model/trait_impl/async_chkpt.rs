@@ -511,11 +511,14 @@ impl TransformerModel {
                         let h_inter =
                             self.ssm_pool
                                 .h_intermediate(ssm_layer_idx, slot, last_inter_slot);
-                        // canonical → live (h_state read by next forward).
-                        // The skip-restore control deliberately leaves the
-                        // live state describing the rejected drafts; the
-                        // exact spec==plain gate must FAIL with it set.
+                        // The skip-restore control deliberately leaves both
+                        // the live state and the checkpoint (the next verify
+                        // re-seeds live from it) at their post-verify values,
+                        // so decoding continues from a state that is wrong
+                        // for the accepted prefix. The exact spec==plain gate
+                        // must FAIL with it set.
                         if !skip_restore_control() {
+                            // canonical → live (h_state read by next forward)
                             self.gpu
                                 .copy_d2d_async(h_inter, ssm.h_state, h_bytes, stream)?;
                             self.gpu.copy_d2d_async(
@@ -524,11 +527,11 @@ impl TransformerModel {
                                 conv_bytes,
                                 stream,
                             )?;
+                            // canonical → checkpoint (for any future rollback)
+                            self.gpu.copy_d2d_async(h_inter, h_ckpt, h_bytes, stream)?;
+                            self.gpu
+                                .copy_d2d_async(conv_inter, conv_ckpt, conv_bytes, stream)?;
                         }
-                        // canonical → checkpoint (for any future rollback)
-                        self.gpu.copy_d2d_async(h_inter, h_ckpt, h_bytes, stream)?;
-                        self.gpu
-                            .copy_d2d_async(conv_inter, conv_ckpt, conv_bytes, stream)?;
                     }
                 }
 

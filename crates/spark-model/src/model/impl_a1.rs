@@ -656,7 +656,10 @@ impl TransformerModel {
                  {} KiB hidden capture buffer)",
                 mtp_lastk_capacity * row_bytes / 1024,
             );
-            Some(gpu.alloc(mtp_lastk_capacity * row_bytes)?)
+            // Tail: one FP32-wide logits row. The prompt replay runs the MTP
+            // layer over the shared activation buffers, so the target's
+            // first-token logits are parked here across the replay.
+            Some(gpu.alloc(mtp_lastk_capacity * row_bytes + config.vocab_size * 4)?)
         } else {
             None
         };
