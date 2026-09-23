@@ -146,6 +146,13 @@ struct Qwen4VerifyRouteIdentity {
 }
 
 const QWEN4_K16_BATCHED_VERIFY_ENV: &str = "ATLAS_QWEN4_K16_BATCHED_VERIFY";
+
+/// `ATLAS_QWEN4_VERIFY_GRAPH=1`: capture the Qwen4 verify (layers 1.. and the
+/// head) in a CUDA graph behind an eager layer-0 + PLE prefix.
+fn qwen4_verify_graph_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_QWEN4_VERIFY_GRAPH").ok().as_deref() == Some("1"))
+}
 const QWEN4_K16_BATCHED_VERIFY_GRAPH_BIT: u32 = 1 << 3;
 
 fn parse_exact_bool_env_value(name: &str, value: Option<&str>) -> Result<bool> {
@@ -978,11 +985,12 @@ impl TransformerModel {
             && serial_family.is_none()
             && !crate::model::k1_stage_diag::enabled()
             && !controlled_verify
-            // Qwen4 PLE performs host-backed sparse row fetches and the
-            // four-stream layer traversal carries row-specific inject
-            // scratch. Keep this path eager until a graph-safe batched PLE
-            // fetch exists.
-            && !self.config.is_qwen4_exp();
+            // Qwen4 PLE performs host-backed sparse row fetches, so a Qwen4
+            // verify graph is segmented: layer 0 and the PLE rows run eagerly
+            // before the graph, which covers layers 1.. and the head (the same
+            // split as the plain-decode suffix graph). Opt-in until gated.
+            && (!self.config.is_qwen4_exp() || qwen4_verify_graph_enabled());
+        let qwen4_graph_prefix = use_graphs && self.config.is_qwen4_exp();
 
         // M8A: upload DDTree parent_ids (when stashed) so the GDN dispatch
         // can fire the tree-aware kernel. Stash lives on the model so we
@@ -1234,6 +1242,28 @@ impl TransformerModel {
                 0
             };
         let cache_key = (seq.slot_idx, k, pack_key);
+        if qwen4_graph_prefix {
+            self.qwen4_verify_layer(
+                0,
+                self.layers[0].as_ref(),
+                0,
+                qwen4_layer_route,
+                k,
+                seq,
+                &mut kv_cache,
+                &ctx,
+                mb,
+                hidden,
+                residual,
+                persistent_width * fp32,
+                stream,
+            )?;
+            self.capture_k1_stage("layer_00", hidden, k, persistent_width * fp32, stream)?;
+            for t in 0..k {
+                self.try_dflash_capture(0, t, stream)?;
+            }
+            self.qwen4_verify_ple(tokens, seq, hidden, persistent_width * fp32, stream)?;
+        }
         let cached_for_slot = graph_cache
             .as_ref()
             .and_then(|c| c.get(&cache_key).copied());
@@ -1293,121 +1323,38 @@ impl TransformerModel {
                 }
 
                 if self.config.is_qwen4_exp() {
-                    if layer_idx == 1
-                        && let Some(ple) = &self.qwen4_ple
-                    {
-                        for (row, &token) in tokens.iter().enumerate() {
-                            let mut prior = seq.tokens.clone();
-                            prior.extend_from_slice(&tokens[..row]);
-                            ple.forward_token(
-                                token,
-                                &prior,
-                                hidden.offset(row * persistent_width * fp32),
-                                seq.slot_idx,
-                                false,
-                                self.gpu.as_ref(),
-                                stream,
-                            )?;
-                            ple.save_intermediate(seq.slot_idx, row, self.gpu.as_ref(), stream)?;
+                    if qwen4_graph_prefix && layer_idx == 0 {
+                        // Ran eagerly before the graph (see below).
+                        if layer_type == LayerType::LinearAttention {
+                            qwen4_ssm_layer_idx += 1;
                         }
+                        continue;
                     }
-
-                    let (h_inter, conv_inter) = if layer_type == LayerType::LinearAttention {
-                        (
-                            self.ssm_pool
-                                .h_intermediate(qwen4_ssm_layer_idx, seq.slot_idx, 0),
-                            self.ssm_pool
-                                .conv_intermediate(qwen4_ssm_layer_idx, seq.slot_idx, 0),
-                        )
-                    } else {
-                        (DevicePtr::NULL, DevicePtr::NULL)
-                    };
-                    // A batched route with no proof for this exact physical K
-                    // can corrupt recurrent state even when its logits happen
-                    // to agree. Keep gamma15/K16 and shortened, unqualified
-                    // widths on ordinary row-serial decode. K=2/K=3, the
-                    // separately qualified K=5 hybrid, and the explicit
-                    // research-only K16 selector may enter
-                    // `decode_qwen4_batched`.
-                    let verify_route = qwen4_layer_route.ok_or_else(|| {
-                        anyhow::anyhow!("Qwen4 verify layer route was not resolved (K={k})")
-                    })?;
-                    if verify_route == Qwen4VerifyLayerRoute::RowSerialOracle {
-                        let metadata = ctx.attn_metadata.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Qwen4 row-serial verify requires attention metadata (K={k})"
-                            )
-                        })?;
-                        for row in 0..k {
-                            let token_metadata = AttnMetadataDev {
-                                positions: metadata.positions.offset(row * 4),
-                                positions_h: metadata.positions_h.offset(row * 4),
-                                positions_w: metadata.positions_w.offset(row * 4),
-                                slot: metadata.slot.offset(row * 8),
-                                seq_len: metadata.seq_len.offset(row * 4),
-                                block_table: metadata.block_table.offset(row * mb * 4),
-                                num_seqs: 1,
-                                ..metadata
-                            };
-                            let token_ctx = ForwardContext {
-                                attn_metadata: Some(token_metadata),
-                                ..ctx
-                            };
-                            layer.decode(
-                                hidden.offset(row * persistent_width * fp32),
-                                residual.offset(row * persistent_width * fp32),
-                                seq.layer_states[layer_idx].as_mut(),
-                                &mut kv_cache,
-                                seq.seq_len + row,
-                                &mut seq.block_table,
-                                &mut seq.disk_block_ids,
-                                &mut seq.disk_last_offloaded_per_layer,
-                                &token_ctx,
-                                stream,
-                            )?;
-                            if layer_type == LayerType::LinearAttention {
-                                let ssm = seq.layer_states[layer_idx]
-                                    .as_any_mut()
-                                    .downcast_mut::<SsmLayerState>()
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "Qwen4 row-serial verify expected SSM state at layer \
-                                             {layer_idx} (K={k})"
-                                        )
-                                    })?;
-                                self.gpu.copy_d2d_async(
-                                    ssm.h_state,
-                                    h_inter.offset(row * self.ssm_pool.h_bytes),
-                                    self.ssm_pool.h_bytes,
-                                    stream,
-                                )?;
-                                self.gpu.copy_d2d_async(
-                                    ssm.conv_state,
-                                    conv_inter.offset(row * self.ssm_pool.conv_bytes),
-                                    self.ssm_pool.conv_bytes,
-                                    stream,
-                                )?;
-                            }
-                        }
-                    } else {
-                        layer.decode_qwen4_batched(
+                    if layer_idx == 1 && !qwen4_graph_prefix {
+                        self.qwen4_verify_ple(
+                            tokens,
+                            seq,
                             hidden,
-                            residual,
-                            k,
-                            seq.layer_states[layer_idx].as_mut(),
-                            &mut kv_cache,
-                            seq.seq_len,
-                            &mut seq.block_table,
-                            &mut seq.disk_block_ids,
-                            &mut seq.disk_last_offloaded_per_layer,
-                            h_inter,
-                            conv_inter,
-                            self.ssm_pool.h_bytes,
-                            self.ssm_pool.conv_bytes,
-                            &ctx,
+                            persistent_width * fp32,
                             stream,
                         )?;
                     }
+
+                    self.qwen4_verify_layer(
+                        layer_idx,
+                        layer.as_ref(),
+                        qwen4_ssm_layer_idx,
+                        qwen4_layer_route,
+                        k,
+                        seq,
+                        &mut kv_cache,
+                        &ctx,
+                        mb,
+                        hidden,
+                        residual,
+                        persistent_width * fp32,
+                        stream,
+                    )?;
                     if layer_type == LayerType::LinearAttention {
                         qwen4_ssm_layer_idx += 1;
                     }
@@ -1916,6 +1863,154 @@ impl TransformerModel {
                 accepted_compact,
                 moves,
             );
+        }
+        Ok(())
+    }
+}
+
+impl TransformerModel {
+    /// One Qwen4 target layer of the K-row verify: row-serial oracle or the
+    /// qualified batched route, with per-row recurrent intermediates.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen4_verify_layer(
+        &self,
+        layer_idx: usize,
+        layer: &dyn TransformerLayer,
+        qwen4_ssm_layer_idx: usize,
+        qwen4_layer_route: Option<Qwen4VerifyLayerRoute>,
+        k: usize,
+        seq: &mut SequenceState,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        mb: usize,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        row_stride: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let layer_type = self.config.layer_type(layer_idx);
+        let (h_inter, conv_inter) = if layer_type == LayerType::LinearAttention {
+            (
+                self.ssm_pool
+                    .h_intermediate(qwen4_ssm_layer_idx, seq.slot_idx, 0),
+                self.ssm_pool
+                    .conv_intermediate(qwen4_ssm_layer_idx, seq.slot_idx, 0),
+            )
+        } else {
+            (DevicePtr::NULL, DevicePtr::NULL)
+        };
+        // A batched route with no proof for this exact physical K
+        // can corrupt recurrent state even when its logits happen
+        // to agree. Keep gamma15/K16 and shortened, unqualified
+        // widths on ordinary row-serial decode. K=2/K=3, the
+        // separately qualified K=5 hybrid, and the explicit
+        // research-only K16 selector may enter
+        // `decode_qwen4_batched`.
+        let verify_route = qwen4_layer_route
+            .ok_or_else(|| anyhow::anyhow!("Qwen4 verify layer route was not resolved (K={k})"))?;
+        if verify_route == Qwen4VerifyLayerRoute::RowSerialOracle {
+            let metadata = ctx.attn_metadata.ok_or_else(|| {
+                anyhow::anyhow!("Qwen4 row-serial verify requires attention metadata (K={k})")
+            })?;
+            for row in 0..k {
+                let token_metadata = AttnMetadataDev {
+                    positions: metadata.positions.offset(row * 4),
+                    positions_h: metadata.positions_h.offset(row * 4),
+                    positions_w: metadata.positions_w.offset(row * 4),
+                    slot: metadata.slot.offset(row * 8),
+                    seq_len: metadata.seq_len.offset(row * 4),
+                    block_table: metadata.block_table.offset(row * mb * 4),
+                    num_seqs: 1,
+                    ..metadata
+                };
+                let token_ctx = ForwardContext {
+                    attn_metadata: Some(token_metadata),
+                    ..*ctx
+                };
+                layer.decode(
+                    hidden.offset(row * row_stride),
+                    residual.offset(row * row_stride),
+                    seq.layer_states[layer_idx].as_mut(),
+                    kv_cache,
+                    seq.seq_len + row,
+                    &mut seq.block_table,
+                    &mut seq.disk_block_ids,
+                    &mut seq.disk_last_offloaded_per_layer,
+                    &token_ctx,
+                    stream,
+                )?;
+                if layer_type == LayerType::LinearAttention {
+                    let ssm = seq.layer_states[layer_idx]
+                        .as_any_mut()
+                        .downcast_mut::<SsmLayerState>()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Qwen4 row-serial verify expected SSM state at layer \
+                                 {layer_idx} (K={k})"
+                            )
+                        })?;
+                    self.gpu.copy_d2d_async(
+                        ssm.h_state,
+                        h_inter.offset(row * self.ssm_pool.h_bytes),
+                        self.ssm_pool.h_bytes,
+                        stream,
+                    )?;
+                    self.gpu.copy_d2d_async(
+                        ssm.conv_state,
+                        conv_inter.offset(row * self.ssm_pool.conv_bytes),
+                        self.ssm_pool.conv_bytes,
+                        stream,
+                    )?;
+                }
+            }
+        } else {
+            layer.decode_qwen4_batched(
+                hidden,
+                residual,
+                k,
+                seq.layer_states[layer_idx].as_mut(),
+                kv_cache,
+                seq.seq_len,
+                &mut seq.block_table,
+                &mut seq.disk_block_ids,
+                &mut seq.disk_last_offloaded_per_layer,
+                h_inter,
+                conv_inter,
+                self.ssm_pool.h_bytes,
+                self.ssm_pool.conv_bytes,
+                ctx,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Qwen4 sparse PLE rows for every verify row. Host/NVMe row I/O, so it
+    /// runs eagerly and never inside a captured graph.
+    fn qwen4_verify_ple(
+        &self,
+        tokens: &[u32],
+        seq: &SequenceState,
+        hidden: DevicePtr,
+        row_stride: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(ple) = &self.qwen4_ple else {
+            return Ok(());
+        };
+        for (row, &token) in tokens.iter().enumerate() {
+            let mut prior = seq.tokens.clone();
+            prior.extend_from_slice(&tokens[..row]);
+            ple.forward_token(
+                token,
+                &prior,
+                hidden.offset(row * row_stride),
+                seq.slot_idx,
+                false,
+                self.gpu.as_ref(),
+                stream,
+            )?;
+            ple.save_intermediate(seq.slot_idx, row, self.gpu.as_ref(), stream)?;
         }
         Ok(())
     }
