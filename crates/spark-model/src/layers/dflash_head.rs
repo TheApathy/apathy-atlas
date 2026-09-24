@@ -98,6 +98,11 @@ pub(crate) fn effective_draft_width(trained_drafts: usize) -> usize {
     )
 }
 
+/// DFlash verify width (drafts + 1 rows) at the current launch/runtime cap.
+pub fn effective_verify_rows(trained_drafts: usize) -> usize {
+    effective_draft_width(trained_drafts) + 1
+}
+
 #[cfg(test)]
 mod effective_draft_width_tests {
     use super::resolve_effective_draft_width;
@@ -1527,8 +1532,12 @@ mod draft_kv_storage_contract_tests {
         ] {
             assert!(head.contains(required), "head is missing `{required}`");
         }
+        // The per-chunk advance moved into RingState::advanced_after_chunk (f018dce11), which
+        // calls plan_append_at itself; the prefill keeps its two direct capture sites.
+        let ring_state = include_str!("dflash_head/ring_window_state.rs");
         assert!(prefill.matches(".plan_append_at(").count() >= 2);
         assert!(prefill.contains(".advanced_after_chunk("));
+        assert!(ring_state.contains("Ok(Some(self.plan_append_at(absolute_start, rows)?.next))"));
         assert!(prefill.contains(".plan_gather("));
         assert!(propose.contains(".plan_append_at("));
         assert!(propose.contains(".physical_slot_for("));

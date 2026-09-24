@@ -286,6 +286,7 @@ pub enum ToolCallFormat {
     Mistral,
     MinimaxXml,
     BareJson,
+    DsmlV41,
 }
 
 impl std::str::FromStr for ToolCallFormat {
@@ -299,8 +300,9 @@ impl std::str::FromStr for ToolCallFormat {
             "mistral" => Ok(Self::Mistral),
             "minimax_xml" => Ok(Self::MinimaxXml),
             "bare_json" => Ok(Self::BareJson),
+            "dsml_v41" => Ok(Self::DsmlV41),
             other => Err(format!(
-                "Unknown tool call parser '{other}'. Supported: glm_xml, hermes, qwen3_coder, gemma4, mistral, minimax_xml, bare_json",
+                "Unknown tool call parser '{other}'. Supported: glm_xml, hermes, qwen3_coder, gemma4, mistral, minimax_xml, bare_json, dsml_v41",
             )),
         }
     }
@@ -317,6 +319,7 @@ impl ToolCallFormat {
             Self::Mistral => Box::new(MistralNativeParser),
             Self::MinimaxXml => Box::new(MinimaxXmlParser),
             Self::BareJson => Box::new(BareJsonParser),
+            Self::DsmlV41 => Box::new(DsmlV41Parser),
         }
     }
 
@@ -343,6 +346,7 @@ impl ToolCallFormat {
             Self::Mistral => "mistral",
             Self::MinimaxXml => "minimax_xml",
             Self::BareJson => "bare_json",
+            Self::DsmlV41 => "dsml_v41",
         }
     }
 }
@@ -351,6 +355,7 @@ impl ToolCallFormat {
 
 // ── Sub-modules (split from monolithic file) ──
 mod bare_json;
+mod dsml_v41;
 mod fuzzy_match;
 mod gemma4;
 mod glm_xml;
@@ -375,6 +380,7 @@ mod streaming_impl;
 mod validation;
 
 pub use bare_json::*;
+pub use dsml_v41::*;
 pub use gemma4::*;
 pub use glm_xml::GlmXmlParser;
 use helpers_a::*;

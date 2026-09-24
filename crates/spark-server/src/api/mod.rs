@@ -38,6 +38,7 @@ pub mod compact;
 pub mod completions;
 mod context_budget;
 pub mod conversations;
+pub mod dsv41;
 pub mod failures;
 pub mod inference_impl;
 pub mod inference_types;

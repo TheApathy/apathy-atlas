@@ -1538,6 +1538,7 @@ version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb3d648e68cea56d9858d535ee28f9538404e2dd8cb08ed0bd05dca379477f39"
 dependencies = [
+ "indexmap",
  "memo-map",
  "serde",
  "serde_json",
@@ -2229,6 +2230,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -2412,8 +2414,10 @@ dependencies = [
  "crossterm",
  "futures",
  "http-body",
+ "image",
  "lazy_static",
  "libc",
+ "libloading 0.8.9",
  "mimalloc",
  "minijinja",
  "parking_lot",

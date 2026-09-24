@@ -118,8 +118,31 @@ pub fn sample_token(
     suppress_ids: &[u32],
     history: &[u32],
 ) -> Result<u32> {
-    if !needs_sampler(params, history) && suppress_ids.is_empty() {
-        return model.argmax_on_device(logits, 0);
+    sample_token_with_logprobs(model, logits, params, suppress_ids, history, None)
+        .map(|(tok, _)| tok)
+}
+
+/// [`sample_token`] that also returns the token's logprobs when the request
+/// asked for them (`top_logprobs`). The first generated token is sampled here,
+/// from the prefill logits, so this is where its logprobs entry comes from;
+/// they are taken over the same (suppressed) distribution the token was drawn
+/// from, as the decode path does.
+pub fn sample_token_with_logprobs(
+    model: &dyn Model,
+    logits: DevicePtr,
+    params: &SamplingParams,
+    suppress_ids: &[u32],
+    history: &[u32],
+    top_logprobs: Option<u8>,
+) -> Result<(u32, Option<crate::api::TokenLogprobs>)> {
+    // deepseek_v41: the Python engine may end on its very first token.
+    let suppress_ids = if crate::dsv41::serving() {
+        &[][..]
+    } else {
+        suppress_ids
+    };
+    if !needs_sampler(params, history) && suppress_ids.is_empty() && top_logprobs.is_none() {
+        return Ok((model.argmax_on_device(logits, 0)?, None));
     }
     let vocab_size = model.vocab_size();
     // Read logits from device. Gemma-4 dense single-token decode produces FP32
@@ -146,7 +169,10 @@ pub fn sample_token(
             })
             .collect()
     };
-    Ok(sample_host_logits(&mut f32_logits, params, suppress_ids, history))
+    let tok = sample_host_logits(&mut f32_logits, params, suppress_ids, history);
+    let logprobs = top_logprobs
+        .map(|k| super::logprobs::extract_logprobs_from_f32(&f32_logits, tok, k as usize));
+    Ok((tok, logprobs))
 }
 
 /// The host half of [`sample_token`]: mask `suppress_ids`, then sample with the full
@@ -164,13 +190,8 @@ fn sample_host_logits(
         }
     }
     if !needs_sampler(params, history) {
-        // Greedy argmax over FP32
-        return f32_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+        // Greedy argmax over FP32, first id of a tie (the device rule).
+        return spark_runtime::sampler::first_max_index(f32_logits);
     }
     // SAFETY: an f32 slice viewed as its bytes; same length in bytes, no alignment demand.
     let f32_bytes: &[u8] = unsafe {
@@ -216,56 +237,17 @@ pub fn sample_token_with_grammar(
 
     // ── Greedy fused fast path (temperature == 0) ──
     //
-    // Earlier implementation made THREE sequential passes over `vocab_size`:
-    // (1) BF16→f32 conversion, (2) apply_bitmask_to_logits, (3) max_by scan
-    // with f32 partial_cmp — about 5 ms wall on the 248k-vocab aeon-ultimate
-    // model. We fuse them into ONE pass, comparing BF16 values directly as
-    // signed i16 (which preserves the natural ordering of finite BF16
-    // values) so no f32 scratch buffer is needed. Plus we apply suppress_ids
-    // post-hoc since they're typically a handful of token IDs.
+    // One pass over the BF16 row: the grammar bitmask and suppress_ids are
+    // folded into the admit filter of the shared greedy pick, so no f32
+    // scratch buffer is needed. A fully-masked row falls back to token 0.
     if !needs_sampler(params, history) {
-        let bytes: &[u8] = &bf16_buf;
-        let mut best_tok: u32 = 0;
-        let mut best_val: i16 = i16::MIN;
-        for tok in 0..vocab_size {
-            let word = tok / 32;
-            let bit = tok % 32;
-            if word >= bitmask.len() || (bitmask[word] & (1i32 << bit)) == 0 {
-                continue;
-            }
-            // Reinterpret BF16 bit pattern as signed i16 for total ordering
-            // over finite values. Suppress-ids are filtered post-loop.
-            let hi = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]);
-            let signed = hi as i16;
-            if signed > best_val {
-                best_val = signed;
-                best_tok = tok as u32;
-            }
-        }
-        // Suppress-id post-filter: rare hit path, recompute argmax only when
-        // a suppressed token was chosen. Cheaper than per-token suppress
-        // check inside the hot loop above.
-        if suppress_ids.contains(&best_tok) {
-            best_val = i16::MIN;
-            best_tok = 0;
-            for tok in 0..vocab_size {
-                if suppress_ids.contains(&(tok as u32)) {
-                    continue;
-                }
-                let word = tok / 32;
-                let bit = tok % 32;
-                if word >= bitmask.len() || (bitmask[word] & (1i32 << bit)) == 0 {
-                    continue;
-                }
-                let hi = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]);
-                let signed = hi as i16;
-                if signed > best_val {
-                    best_val = signed;
-                    best_tok = tok as u32;
-                }
-            }
-        }
-        return Ok(best_tok);
+        let allowed = |tok: u32| {
+            let (word, bit) = ((tok / 32) as usize, tok % 32);
+            word < bitmask.len()
+                && (bitmask[word] & (1i32 << bit)) != 0
+                && !suppress_ids.contains(&tok)
+        };
+        return Ok(spark_runtime::sampler::argmax_bf16_first_wins(&bf16_buf, allowed).unwrap_or(0));
     }
 
     // Stochastic sampling path: needs f32 logits for the sampler. Keep the
@@ -284,10 +266,29 @@ pub fn sample_token_with_grammar(
             f32_logits[id as usize] = f32::NEG_INFINITY;
         }
     }
+    // Kept as A's own structure (grammar_state is already unwrapped into `gs` above, at the
+    // `let Some(gs) = grammar_state else { .. }` earlier in this function -- D's conflicting
+    // side re-wrapped it in an `if let Some` that doesn't match, and also threaded penalties/
+    // history through a stage A doesn't apply them at, which is a separate, pre-existing gap
+    // out of scope for this cherry-pick). The argmax fix itself needs no change HERE: this
+    // path falls through to `sample_with_params` below, which now calls the fixed
+    // `first_max_index` internally via `sample_with_params_seeded` whenever temperature <= 0.
     gs.apply_bitmask_to_logits(&mut f32_logits);
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
     Ok(sample_with_params_history(f32_bytes, params, history))
+}
+
+/// The stream event for a first generated token (with its logprobs when the
+/// request asked for them).
+pub(super) fn first_token_event(
+    tok: u32,
+    logprobs: &Option<crate::api::TokenLogprobs>,
+) -> crate::api::StreamEvent {
+    match logprobs {
+        Some(lp) => crate::api::StreamEvent::TokenWithLogprobs(tok, lp.clone()),
+        None => crate::api::StreamEvent::Token(tok),
+    }
 }
 
 #[cfg(test)]

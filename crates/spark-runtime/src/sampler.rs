@@ -496,8 +496,34 @@ pub fn argmax_first_wins_f32(v: &[f32]) -> u32 {
         .unwrap_or(0)
 }
 
+/// Greedy pick over a little-endian BF16 logits row, restricted to the ids
+/// `admit` accepts. SSOT for every host-side BF16 greedy pick.
+///
+/// Tie rule: the FIRST maximal id wins — the same rule as the device
+/// reduction (`kernels/gb10/common/argmax_bf16.cu`), [`argmax_first_wins_f32`]
+/// and torch.argmax. Plain decode and speculative verify must agree on it, or
+/// they fork on exact BF16 ties. Values compare as f32 (BF16 is the high half
+/// of an f32), so negative logits order numerically — comparing the raw bit
+/// patterns as i16 does not: sign-magnitude makes -2.0 look larger than -1.0 —
+/// and -0.0 == +0.0. NaN never wins, matching the kernel's `>` scan. `None`
+/// when no admitted id carries a non-NaN value.
+pub fn argmax_bf16_first_wins(row: &[u8], mut admit: impl FnMut(u32) -> bool) -> Option<u32> {
+    let mut best: Option<(u32, f32)> = None;
+    for (id, bytes) in row.chunks_exact(2).enumerate() {
+        let id = id as u32;
+        if !admit(id) {
+            continue;
+        }
+        let v = bf16_to_f32(bytes[0], bytes[1]);
+        if !v.is_nan() && best.is_none_or(|(_, best_v)| v > best_v) {
+            best = Some((id, v));
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
 mod sample_impl;
-pub use sample_impl::{sample_with_params_history, sample_with_params_seeded};
+pub use sample_impl::{first_max_index, sample_with_params_history, sample_with_params_seeded};
 
 /// Convenience wrapper: sample without token history (no repetition penalty).
 pub fn sample_with_params(data: &[u8], params: &SamplingParams) -> u32 {

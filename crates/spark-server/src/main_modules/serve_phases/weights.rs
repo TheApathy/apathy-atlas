@@ -34,6 +34,19 @@ pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
     None
 }
 
+/// Per-model "never upload" filter for the serving store. DeepSeek-V4.1's engram tables
+/// (~190 GB) are gathered from NVMe and must not be loaded — see
+/// `spark_model::weight_loader::deepseek_v41::skip_tensor_for_serving`.
+fn serving_skip(config: &ModelConfig) -> Option<spark_runtime::weights::TensorSkipFn> {
+    if config.model_type == "deepseek_v41" {
+        Some(std::sync::Arc::new(
+            spark_model::weight_loader::deepseek_v41::skip_tensor_for_serving,
+        ))
+    } else {
+        None
+    }
+}
+
 /// NVFP4 scale group size used by `QuantizedWeight`
 /// (`spark-model/src/weight_map/quantized.rs`).
 const NVFP4_GROUP: usize = 16;
@@ -292,6 +305,7 @@ pub(crate) fn load_weight_store(
             };
             loader.peak_memory_multiplier = mult;
             loader.construction_overhead_bytes = overhead.total();
+            loader.extra_skip = serving_skip(config);
             loader
                 .load(model_dir, gpu, oom_reserve_bytes)
                 .context("Failed to load model weights (fast loader)")?
@@ -308,6 +322,7 @@ pub(crate) fn load_weight_store(
         };
         loader.peak_memory_multiplier = mult;
         loader.construction_overhead_bytes = overhead.total();
+        loader.extra_skip = serving_skip(config);
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?
@@ -355,6 +370,8 @@ pub(crate) fn load_dflash_drafter(
 > {
     use spark_runtime::weights::WeightLoader;
     if !args.dflash {
+        // No drafter, no verify to mirror: decode TC parity stays off.
+        spark_model::layers::configure_decode_tc_parity(None);
         return Ok(None);
     }
     let drafter_id = args
@@ -408,6 +425,14 @@ pub(crate) fn load_dflash_drafter(
         drafter_store.len(),
         drafter_store.total_bytes()
     );
+    // Decode TC parity may only mirror a verify that runs the tensor-core
+    // routes: record the configured verify width (γ + 1) at every model load,
+    // before the first decode, so the gate fails closed when it cannot hold.
+    spark_model::layers::configure_decode_tc_parity(Some(
+        spark_model::layers::dflash_head::effective_verify_rows(
+            drafter_config.resolve_draft_count(args.dflash_gamma)?,
+        ),
+    ));
     Ok(Some((drafter_store, drafter_config)))
 }
 

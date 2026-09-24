@@ -27,6 +27,13 @@ pub struct AppState {
     pub request_tx: mpsc::Sender<InferenceRequest>,
     /// Vision config for VL models — None for text-only models.
     pub vision_config: Option<atlas_core::config::VisionConfig>,
+    /// The served model is DeepSeek-V4.1 (`model_type = "deepseek_v41"`):
+    /// chat prompts are rendered and outputs parsed by `crate::dsv41` (the
+    /// production Python server's semantics), see `api/dsv41.rs`.
+    pub dsv41: bool,
+    /// deepseek_v41 image input: config.json's `vision_config` preprocessing
+    /// parameters for `crate::dsv41::vision`. None = text-only.
+    pub dsv41_vision: Option<crate::dsv41::vision::VisionConfig>,
     /// Default sampling temperature from generation_config.json.
     pub default_temperature: f32,
     /// Default top-k from generation_config.json.

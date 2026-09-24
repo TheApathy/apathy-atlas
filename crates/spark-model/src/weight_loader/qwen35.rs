@@ -64,7 +64,7 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         load_layers::load_layers(self, store, config, gpu, layer_kv_dtypes)
     }
 
-    fn load_embedding(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight> {
+    fn load_embedding(&self, store: &WeightStore, config: &ModelConfig, _gpu: &dyn GpuBackend) -> Result<DenseWeight> {
         let prefix = &config.weight_prefix;
         dense(store, &format!("{prefix}.embed_tokens.weight"))
     }

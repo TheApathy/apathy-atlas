@@ -181,7 +181,8 @@ pub fn set_enable_thinking_loop_watchdog(enabled: bool) {
 }
 
 pub fn enable_thinking_loop_watchdog() -> bool {
-    *ENABLE_THINKING_LOOP_WATCHDOG.get().unwrap_or(&true)
+    // deepseek_v41: the Python engine has no thinking-loop watchdog.
+    *ENABLE_THINKING_LOOP_WATCHDOG.get().unwrap_or(&true) && !crate::dsv41::serving()
 }
 
 // ── Grammar forced-token fast-path (xgrammar Tier 3b) ───────────────────────

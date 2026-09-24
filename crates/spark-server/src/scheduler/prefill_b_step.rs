@@ -112,7 +112,7 @@ pub fn prefill_request(
     seq.session_hash = req_session_hash;
 
     // Guard: free SSM slot on any error after allocation (Bug #16).
-    let prefill_result = (|| -> Result<u32> {
+    let prefill_result = (|| -> Result<(u32, Option<crate::api::TokenLogprobs>)> {
         // Vision: encode images and store embeddings for prefill token overwrite.
         // Empty input invalidates the prior request's published images.
         model.prepare_vision_embed(&image_pixels)?;
@@ -125,10 +125,17 @@ pub fn prefill_request(
         model.ep_broadcast_tokens(&prompt_tokens)?;
 
         let logits = model.prefill(&prompt_tokens, &mut seq, 0)?;
-        sample_token(model, logits, &first_params, eos_tokens, &[])
+        sample_token_with_logprobs(
+            model,
+            logits,
+            &first_params,
+            eos_tokens,
+            &[],
+            req_top_logprobs,
+        )
     })();
 
-    let first = match prefill_result {
+    let (first, first_lp) = match prefill_result {
         Ok(token) => token,
         Err(e) => {
             let msg = format!("prefill failed: {e:#}");
@@ -149,10 +156,12 @@ pub fn prefill_request(
 
     // Spontaneous <think>: if the first token is <think> and thinking was not
     // requested, suppress it and enter thinking mode on the ActiveSeq.
-    let spontaneous_think = !req_enable_thinking && think_start_token == Some(first);
+    // deepseek_v41: a first <think> is an ordinary token for the Python engine.
+    let spontaneous_think =
+        !req_enable_thinking && think_start_token == Some(first) && !crate::dsv41::serving();
     if !spontaneous_think
         && let ResponseSink::Streaming(ref tx) = sink
-        && let Err(e) = tx.blocking_send(StreamEvent::Token(first))
+        && let Err(e) = tx.blocking_send(first_token_event(first, &first_lp))
     {
         tracing::warn!("prefill_b_step: first-token send failed (receiver dropped): {e}");
     }
@@ -238,7 +247,7 @@ pub fn prefill_request(
             decode_start: now,
             seed: req_seed,
             top_logprobs: req_top_logprobs,
-            logprobs_data: Vec::new(),
+            logprobs_data: first_lp.clone().filter(|_| !spontaneous_think).into_iter().collect(),
             timeout_at: req_timeout_at,
             adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
         };
@@ -321,7 +330,7 @@ pub fn prefill_request(
         decode_start: now,
         seed: req_seed,
         top_logprobs: req_top_logprobs,
-        logprobs_data: Vec::new(),
+        logprobs_data: first_lp.clone().filter(|_| !spontaneous_think).into_iter().collect(),
         timeout_at: req_timeout_at,
         adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
     }))

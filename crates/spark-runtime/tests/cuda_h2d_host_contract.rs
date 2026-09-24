@@ -206,7 +206,12 @@ fn cuda_override_uses_one_sync_and_blocking_members() {
     assert!(GPU_TRAIT.contains("pub struct PinnedHostSlice<'a>"));
     assert!(!GPU_TRAIT.contains("pub fn PinnedHostSlice"));
     assert!(!GPU_TRAIT.contains("fn free_host_pinned("));
-    assert!(!GPU_TRAIT.contains("fn copy_h2d_async("));
+    // `copy_h2d_async` is allowed back, for now, for DeepSeek-V4.1's per-step uploads.
+    // Host-reuse safe: CUDA stages a pageable source before cuMemcpyHtoDAsync returns.
+    // But it is NOT async (a pageable copy implicitly synchronizes), and it is the same
+    // stall class as the Flash-Next load hang (a spin inside pageable H2D). The fix is a
+    // pinned staging ring (dsv41-decode). Until then it must stay a plain pass-through.
+    assert!(GPU_TRAIT.contains("fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, _stream: u64)"));
 }
 
 #[test]

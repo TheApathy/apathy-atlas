@@ -386,7 +386,13 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
 
         // Expand quant wildcard
         let quants: Vec<String> = if quant_spec == "*" {
+            // A quant target has a KERNEL.toml of its own or a common quant dir. DeepSeek-V4.1
+            // keeps gate/tooling dirs (attn/, fp8gemm/) beside its one target (cb3/); those
+            // are not targets.
             list_subdirs(&model_dir)
+                .into_iter()
+                .filter(|q| model_dir.join(q).join("KERNEL.toml").exists() || hw_dir.join(q).is_dir())
+                .collect()
         } else {
             vec![quant_spec.clone()]
         };

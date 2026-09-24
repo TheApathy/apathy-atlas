@@ -1800,8 +1800,8 @@ fn cfg_jf_splice_drafts(a: &ActiveSeq, drafts: &mut [u32]) {
 ///
 /// Mask-application convention mirrors the MTP masked-draft path in
 /// `spark-model/src/layers/mtp_head/forward.rs`: bit `tok` set in the i32
-/// bitmask ⇒ token allowed; BF16 logits are ordered by their raw bit
-/// pattern reinterpreted as i16 (a total order over finite values).
+/// bitmask ⇒ token allowed; the pick is the shared first-wins greedy rule
+/// (`spark_runtime::sampler::argmax_bf16_first_wins`).
 ///
 /// Returns `(num_accepted, bonus_token)`, or `None` when masking does not
 /// apply (thinking span, no/terminated grammar, fp32 logits) or the
@@ -2180,9 +2180,7 @@ fn dflash_relax_accept(
 /// Relaxed-accept test for one host-copied BF16 logits row. Accepts `tok`
 /// when it is within the top-`topk` logits OR its logit gap to the argmax
 /// satisfies `l_tok - l_max >= ln_ratio` (== `p(tok)/p(max) >= ratio`,
-/// temperature-free). BF16 values compare correctly as i16 for finite
-/// magnitudes (same ordering trick as `masked_argmax_bf16`); the exact
-/// logit gap is computed in f32 for the ratio test.
+/// temperature-free). Logits are compared in f32.
 fn relax_row_accepts(bytes: &[u8], vocab: usize, tok: u32, topk: usize, ln_ratio: f32) -> bool {
     let ti = tok as usize;
     if ti >= vocab {
@@ -2384,40 +2382,20 @@ fn reargmax_bonus_skip_think(
 /// EOS tokens when think_ended=true so the re-derived bonus is always a valid
 /// content token.
 fn argmax_bf16_skip_tokens(bytes: &[u8], skip_toks: &[u32], vocab: usize) -> Option<u32> {
-    let mut best_tok: Option<u32> = None;
-    let mut best_val = i16::MIN;
-    for tok in 0..vocab {
-        if skip_toks.contains(&(tok as u32)) {
-            continue;
-        }
-        let signed = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]) as i16;
-        if best_tok.is_none() || signed > best_val {
-            best_val = signed;
-            best_tok = Some(tok as u32);
-        }
-    }
-    best_tok
+    spark_runtime::sampler::argmax_bf16_first_wins(&bytes[..2 * vocab], |tok| {
+        !skip_toks.contains(&tok)
+    })
 }
 
 /// Masked argmax over one host-copied BF16 logits row. `None` when the
-/// bitmask allows zero tokens. Same BF16-as-i16 ordering trick as the MTP
-/// masked path (`mtp_head/forward.rs`) — valid for all finite values.
+/// bitmask allows zero tokens. Bit `tok` set in the i32 bitmask ⇒ allowed;
+/// the pick is the shared first-wins rule
+/// ([`spark_runtime::sampler::argmax_bf16_first_wins`]).
 fn masked_argmax_bf16(bytes: &[u8], bitmask: &[i32], vocab: usize) -> Option<u32> {
-    let mut best_tok: Option<u32> = None;
-    let mut best_val = i16::MIN;
-    for tok in 0..vocab {
-        let word = tok / 32;
-        let bit = tok % 32;
-        if word >= bitmask.len() || (bitmask[word] & (1i32 << bit)) == 0 {
-            continue;
-        }
-        let signed = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]) as i16;
-        if best_tok.is_none() || signed > best_val {
-            best_val = signed;
-            best_tok = Some(tok as u32);
-        }
-    }
-    best_tok
+    spark_runtime::sampler::argmax_bf16_first_wins(&bytes[..2 * vocab], |tok| {
+        let (word, bit) = ((tok / 32) as usize, tok % 32);
+        word < bitmask.len() && (bitmask[word] & (1i32 << bit)) != 0
+    })
 }
 
 #[cfg(test)]
@@ -2698,5 +2676,38 @@ mod wide_verify_hidden_save_tests {
             .is_err()
         );
         assert!(trajectory_selector_values_match(Some("yes"), None, None, 31, &tokens).is_err());
+    }
+}
+
+#[cfg(test)]
+mod host_argmax_tests {
+    use super::{argmax_bf16_skip_tokens, masked_argmax_bf16};
+
+    fn row(vals: &[f32]) -> Vec<u8> {
+        vals.iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn skip_argmax_orders_an_all_negative_row_numerically() {
+        let r = row(&[-8.0, -1.0, -2.0, -8.0]);
+        assert_eq!(argmax_bf16_skip_tokens(&r, &[], 4), Some(1));
+        assert_eq!(argmax_bf16_skip_tokens(&r, &[1], 4), Some(2));
+    }
+
+    #[test]
+    fn masked_argmax_orders_an_all_negative_row_numerically() {
+        let r = row(&[-8.0, -1.0, -2.0, -8.0]);
+        assert_eq!(masked_argmax_bf16(&r, &[0b1111], 4), Some(1));
+        assert_eq!(masked_argmax_bf16(&r, &[0b1101], 4), Some(2));
+        assert_eq!(masked_argmax_bf16(&r, &[0], 4), None);
+    }
+
+    #[test]
+    fn host_argmaxes_keep_the_first_of_a_signed_zero_tie() {
+        let r = row(&[-8.0, -0.0, 0.0, -8.0]);
+        assert_eq!(argmax_bf16_skip_tokens(&r, &[], 4), Some(1));
+        assert_eq!(masked_argmax_bf16(&r, &[0b1111], 4), Some(1));
     }
 }

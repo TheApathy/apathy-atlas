@@ -231,6 +231,7 @@ pub fn lower_responses_to_chat(
         prediction: None,
         web_search_options: None,
         reasoning_effort: None,
+        raw_body: None,
     })
 }
 

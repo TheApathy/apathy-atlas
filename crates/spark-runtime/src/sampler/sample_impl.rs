@@ -122,13 +122,13 @@ pub fn sample_with_params_seeded(
     // monotonic transforms, neither of which can re-order the maximum. Only
     // penalties + logit_bias actually re-order logits, so as long as those
     // ran first, this argmax is correct AND respects caller config.
+    //
+    // Ties keep the FIRST maximal id, like the device argmax and the verify
+    // path (`argmax_first_wins_f32` is the SSOT); `Iterator::max_by` would
+    // keep the LAST and fork plain decode from speculative verify on exact
+    // BF16 ties.
     if params.temperature <= 0.0 {
-        return raw_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+        return first_max_index(&raw_logits);
     }
     let temperature = params.temperature;
 
@@ -154,12 +154,7 @@ pub fn sample_with_params_seeded(
 
     if logits.is_empty() {
         // Fallback: if top-n-sigma filtered everything, use argmax of original
-        return raw_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+        return first_max_index(&raw_logits);
     }
 
     // ── 3. Sort descending + top-k ──
@@ -250,4 +245,20 @@ pub(super) fn top_n_sigma_threshold(logits: &[f32], n: f32) -> Option<f32> {
     let mean = finite().sum::<f32>() / count as f32;
     let sigma = (finite().map(|x| (x - mean).powi(2)).sum::<f32>() / count as f32).sqrt();
     (sigma > 0.0).then(|| max - n * sigma)
+}
+
+/// Greedy argmax with torch/vLLM tie-breaking: the LOWEST index among equal maxima.
+/// (`Iterator::max_by` returns the LAST of equal elements, which flipped exact bf16 ties.)
+/// NaN is never selected and never blocks a later value; all-NaN or empty returns 0.
+pub fn first_max_index(logits: &[f32]) -> u32 {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &v) in logits.iter().enumerate() {
+        if v.is_nan() {
+            continue;
+        }
+        if best.is_none_or(|(_, b)| v > b) {
+            best = Some((i, v));
+        }
+    }
+    best.map_or(0, |(i, _)| i as u32)
 }

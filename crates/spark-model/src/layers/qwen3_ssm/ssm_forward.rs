@@ -123,6 +123,18 @@ impl Qwen3SsmLayer {
                         ctx.config.rms_norm_eps as f32,
                         stream,
                     )
+                } else if let Some((proj_t, ws)) = self.decode_tc_parity_qkvz() {
+                    self.decode_tc_parity_splitk(
+                        ctx,
+                        normed,
+                        proj_t,
+                        deinterleaved,
+                        ws,
+                        qkvz_size,
+                        h,
+                        super::super::ssm_qkvz_splitk(),
+                        stream,
+                    )
                 } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
                     ops::w4a16_decode_gemv(
                         ctx.gpu,
@@ -407,6 +419,18 @@ impl Qwen3SsmLayer {
                 value_dim as u32,
                 stream,
             )?;
+        } else if let Some((proj_t, ws)) = self.decode_tc_parity_out() {
+            self.decode_tc_parity_splitk(
+                ctx,
+                normed_out,
+                proj_t,
+                out,
+                ws,
+                h,
+                value_dim as u32,
+                super::super::ssm_out_splitk(),
+                stream,
+            )?;
         } else {
             ops::w4a16_decode_gemv(
                 ctx.gpu,
@@ -432,5 +456,71 @@ impl Qwen3SsmLayer {
         }
 
         Ok(out)
+    }
+
+    /// `ATLAS_DECODE_TC_PARITY=1`: the transposed QKVZ weight + split-K
+    /// workspace when single-token decode must mirror the K=γ verify's
+    /// `ATLAS_SSM_PROJ_TC=1` split-K route (see `trait_decode_batched.rs`).
+    /// `None` keeps the ordinary K1 GEMV.
+    fn decode_tc_parity_qkvz(&self) -> Option<(&QuantizedWeight, DevicePtr)> {
+        if !self.decode_tc_parity_splitk_ready(super::super::ssm_qkvz_splitk())
+            || self.qkvz_fp8.is_some()
+            || super::super::tc_nvfp4_m16_enabled()
+        {
+            return None;
+        }
+        let ws = (*self.ssm_splitk_workspace.lock().unwrap())?;
+        Some((self.qkvz_nvfp4_t.as_ref()?, ws))
+    }
+
+    /// Output-projection counterpart of [`Self::decode_tc_parity_qkvz`].
+    fn decode_tc_parity_out(&self) -> Option<(&QuantizedWeight, DevicePtr)> {
+        if !self.decode_tc_parity_splitk_ready(super::super::ssm_out_splitk())
+            || self.out_proj_dense.is_some()
+        {
+            return None;
+        }
+        let ws = (*self.ssm_splitk_workspace.lock().unwrap())?;
+        Some((self.out_proj_nvfp4_t.as_ref()?, ws))
+    }
+
+    fn decode_tc_parity_splitk_ready(&self, splits: u32) -> bool {
+        super::super::decode_tc_parity_enabled()
+            && super::super::ssm_proj_tc_enabled()
+            && splits > 0
+            && self.w4a16_gemm_t_m32_n64_splitk_k.0 != 0
+            && self.reduce_splitk_k.0 != 0
+    }
+
+    /// One row through the verify's split-K tensor-core GEMM. The kernel is
+    /// row-independent, so this equals row r of an M=k verify bit-for-bit.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_tc_parity_splitk(
+        &self,
+        ctx: &ForwardContext,
+        input: DevicePtr,
+        weight_t: &QuantizedWeight,
+        output: DevicePtr,
+        workspace: DevicePtr,
+        n: u32,
+        k: u32,
+        splits: u32,
+        stream: u64,
+    ) -> Result<()> {
+        ops::w4a16_gemm_n64_m32_splitk(
+            ctx.gpu,
+            self.w4a16_gemm_t_m32_n64_splitk_k,
+            self.reduce_splitk_k,
+            input,
+            weight_t,
+            output,
+            workspace,
+            1,
+            n,
+            k,
+            n, // ldb == N for tightly-packed T-weight
+            splits,
+            stream,
+        )
     }
 }

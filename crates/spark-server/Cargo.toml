@@ -62,6 +62,10 @@ tui-textarea = "0.7"
 unicode-width = "0.2"
 # stderr redirection while the TUI owns the screen (terminal_guard).
 libc = "0.2"
+# DeepSeek-V4.1 image input (crate::dsv41::vision) and the runtime dlopen of
+# libturbojpeg for JPEG parity with Pillow (optional at runtime).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libloading = "0.8"
 tokio-stream = "0.1"
 futures = "0.3"
 rayon = "1.12"
@@ -70,7 +74,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 toml = "0.8"
-minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "loop_controls"] }
+# `preserve_order`: minijinja stores `Value` maps as IndexMap (insertion
+# order) instead of BTreeMap, so `tojson` in chat templates keeps the tool
+# schema's key order like HF transformers.
+minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "loop_controls", "preserve_order"] }
 # Pure-Rust grammar-constrained decoding (W7: was the C++-backed
 # `xgrammar-rs = "0.1"` patched to `vendor/xgrammar-rs`; now the
 # from-scratch Rust port at `crates/xgrammar`). The crate's lib is

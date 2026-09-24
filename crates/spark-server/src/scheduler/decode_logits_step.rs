@@ -36,7 +36,9 @@ pub fn process_decode_logits(
         .iter()
         .any(|a| a.inside_thinking || a.think_ended || a.grammar_state.is_some())
         || any_logprobs
-        || model_logits_fp32;
+        || model_logits_fp32
+        // deepseek_v41's cycle breaker bans tokens on host logits, greedy included.
+        || crate::dsv41::repetition::active();
 
     let new_tokens: Vec<(u32, Option<crate::api::TokenLogprobs>)> = if active
         .iter()
@@ -162,6 +164,17 @@ pub fn process_decode_logits(
     let now = Instant::now();
     for (i, (tok, mut logprobs)) in new_tokens.into_iter().enumerate() {
         let a = &mut active[i];
+        // Cooperative cancellation (a stream-side stop string or loop guard):
+        // end here, like speculative `emit_token` does, and drop the sample.
+        // The serial path never read the flag, so a matched stop string only
+        // hid the text while generation ran on to max_tokens.
+        if a.cancel_flag
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
+        {
+            a.finished = true;
+            continue;
+        }
         let was_inside_thinking = a.inside_thinking;
         let previous_last_token = a.last_token;
         let previous_last_token_time = a.last_token_time;
@@ -195,7 +208,10 @@ pub fn process_decode_logits(
         // arrives, the token is already in the KV cache (committed by verify),
         // so we must enter thinking mode but force an immediate exit: next token
         // is forced to </think> (0 thinking content tokens, 1 </think> overhead).
-        if !a.inside_thinking && think_start_token == Some(tok) {
+        // deepseek_v41: `<think>` and a stray `</think>` are ordinary output
+        // tokens for the Python engine (its router splits on the text).
+        let dsv41 = crate::dsv41::serving();
+        if !dsv41 && !a.inside_thinking && think_start_token == Some(tok) {
             // Re-entering thinking re-arms the response-entry counter for the
             // next `</think>` boundary.
             a.post_think_gate_steps = 0;
@@ -232,7 +248,7 @@ pub fn process_decode_logits(
         // At long context (37k+), models degenerate into repeating </think>.
         // Skip up to 50 occurrences, then force-stop. This gives cached
         // prompts a chance to produce content while limiting degenerate loops.
-        if !a.inside_thinking && think_end_token == Some(tok) {
+        if !dsv41 && !a.inside_thinking && think_end_token == Some(tok) {
             a.think_skip_count += 1;
             if a.think_skip_count >= 50 {
                 a.finished = true;

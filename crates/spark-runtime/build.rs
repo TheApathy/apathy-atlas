@@ -24,6 +24,11 @@ fn main() {
     // time. -lcuda is emitted above; -lcublasLt is our own (the search paths
     // below already cover libcublasLt.so, same treatment as libcuda).
     println!("cargo:rustc-link-lib=dylib=cublasLt");
+    // cudart: cuda_backend/gpu_impl.rs's copy_d2d_2d_async uses cudaMemcpy2DAsync,
+    // a CUDA RUNTIME (not driver) symbol -- -lcuda above only covers cu* driver
+    // symbols, so without this a real build fails to link with "undefined
+    // reference to cudaMemcpy2DAsync".
+    println!("cargo:rustc-link-lib=dylib=cudart");
 
     if let Ok(cuda_path) = std::env::var("CUDA_HOME") {
         println!("cargo:rustc-link-search=native={cuda_path}/lib64");

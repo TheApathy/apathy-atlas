@@ -37,12 +37,14 @@ pub(super) fn promote_completed_prefills(
             }
             continue;
         };
-        let spontaneous_think = !p.enable_thinking && think_start_token == Some(first);
+        // deepseek_v41: a first <think> is an ordinary token for the Python engine.
+        let spontaneous_think =
+            !p.enable_thinking && think_start_token == Some(first) && !crate::dsv41::serving();
         // Only stream non-EOS tokens (OpenAI: stop seq not in output).
         if !spontaneous_think
             && !p.eos_tokens.contains(&first)
             && let ResponseSink::Streaming(ref tx) = p.sink
-            && let Err(e) = tx.blocking_send(StreamEvent::Token(first))
+            && let Err(e) = tx.blocking_send(first_token_event(first, &p.first_logprobs))
         {
             tracing::warn!(
                 "phase_promote_prefills: first-token send failed (receiver dropped): {e}"
@@ -194,7 +196,11 @@ fn build_active_seq_from_prefill(
         decode_start: now,
         seed: p.seed,
         top_logprobs: p.top_logprobs,
-        logprobs_data: Vec::new(),
+        logprobs_data: if spontaneous_think {
+            Vec::new()
+        } else {
+            p.first_logprobs.into_iter().collect()
+        },
         timeout_at: p.timeout_at,
         adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
     }

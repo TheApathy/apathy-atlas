@@ -14,6 +14,7 @@ mod target_store;
 mod sampling_audit;
 mod tokenizer_runtime;
 mod topology;
+mod vision_context;
 mod weights;
 
 /// Resolve the construction-time speculative draft width in one unit.
@@ -67,6 +68,7 @@ pub(super) use sampling_audit::log_sampling_presets;
 pub(super) use target_store::TargetStoreLoadPlan;
 pub(super) use tokenizer_runtime::{TokenizerRuntime, resolve_tokenizer_runtime};
 pub(super) use topology::{Topology, init_nccl_comm, resolve_topology};
+pub(super) use vision_context::text_only_yarn_context;
 pub(super) use weights::{
     auto_detect_weight_prefix, load_dflash_donor, load_dflash_drafter, load_weight_store,
 };

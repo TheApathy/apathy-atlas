@@ -1,0 +1,47 @@
+T=148 NH=64 D=512 NW=128 NC=512 RING=4096 n_c=1024
+kernel vs fp32-P reference  : rel_l2=3.473e-07 worst_abs=2.623e-06
+kernel vs bf16-P reference  : rel_l2=1.039e-03 worst_abs=4.774e-03
+all-masked row              : NOT PRESENT in this fixture -- NaN-avoidance
+                              control NOT EXERCISED here (token 0 is a real token)
+CONTROL order  (compressed-first): rel_l2=3.317e-07 vs ref, 3.851e-07 vs correct order
+CONTROL gather (sequential rows) : rel_l2=7.765e-01  -> separation 2235979x
+
+BLOCK ORDER IS NOT COVERED BY THIS GATE. Reordering moves the result
+      3.851e-07 (vs the kernel's own 3.473e-07 from the fp32 reference, and the
+      1.039e-03 that prefill_attn's bf16-P rounding already costs). Order is a
+      bit-exactness question here, not a correctness one.
+
+NOTE: the gap against the bf16-P reference is this kernel being MORE
+      accurate, not less. tools/prefill_attn.py rounds P to bf16 because
+      tl.dot needs a tensor-core dtype; this kernel's hand-rolled FMA dot
+      has no reason to pay that. DO NOT 'fix' the kernel toward the bf16-P
+      number -- that makes the port worse to make a number prettier.
+      Consequence to expect: being more accurate means DIVERGING from the
+      Python engine, and ulp differences flip MoE router decisions. So
+      end-to-end validation is on OUTPUT QUALITY, not bit-identity, and a
+      per-layer bisect is only valid up to the FIRST routing flip.
+PRODUCTION entry (i64 idx, bf16 out)            : 0/4849664 differ from bf16(fp32 kernel) | CTRL other mode: 4562738 differ
+PRODUCTION entry (i64 idx, bf16 out) window-only: 0/4849664 differ from bf16(fp32 kernel) | CTRL other mode: 4809958 differ
+PRODUCTION entry w32 (i32 wpos, i64 idx, bf16) : 0/4849664 differ from bf16(fp32 kernel)
+SPLIT-KV decode entry (S=20 x 32 keys + combine): 733/4849664 bf16 differ from bf16(one-pass) (99.9849% identical), vs fp32 ref rel_l2=1.663e-03 | CTRL last split dropped: 2667024 differ
+T=1 latency (GPU-lock held, nothing else running): one-pass 528.2 us
+    split SLICE=64 (S=10,  80 CTAs) + combine 86.1 us (6.1x)  [split alone 82.8, combine alone 4.1]
+    split SLICE=32 (S=20, 160 CTAs) + combine 88.2 us (6.0x)  [split alone 82.4, combine alone 5.0]
+    split SLICE=16 (S=40, 320 CTAs) + combine 83.4 us (6.3x)  [split alone 73.7, combine alone 6.1]
+    split SLICE= 8 (S=80, 640 CTAs) + combine 88.6 us (6.0x)  [split alone 77.0, combine alone 10.2]
+    T=1 SLICE= 16 (S=40): split+combine 82.3 us | split_lb 99.8 us (0.82x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9817% identical
+    T=1 SLICE= 32 (S=20): split+combine 86.8 us | split_lb 96.9 us (0.90x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9756% identical
+    T=1 SLICE= 64 (S=10): split+combine 86.1 us | split_lb 96.3 us (0.89x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9756% identical
+    T=1 SLICE=128 (S= 5): split+combine 112.5 us | split_lb 118.9 us (0.95x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9847% identical
+    T=6 SLICE= 16 (S=40): split+combine 560.1 us | split_lb 555.5 us (1.01x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9827% identical
+    T=6 SLICE= 32 (S=20): split+combine 397.9 us | split_lb 408.7 us (0.97x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9822% identical
+    T=6 SLICE= 64 (S=10): split+combine 395.2 us | split_lb 404.4 us (0.98x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9827% identical
+    T=6 SLICE=128 (S= 5): split+combine 399.5 us | split_lb 407.3 us (0.98x) | split_lb vs split+combine: 0 differ (must be 0) | vs one-pass 99.9812% identical
+MMA prefill entry: 4819/4849664 bf16 differ from bf16(one-pass) (99.9006% identical); vs fp32 ref: mma 1.663e-03 (bf16-rounded one-pass 1.663e-03) | CTRL compressed rows dropped: 4809961 differ | T=148: one-pass 8.222 ms, mma 0.494 ms (16.7x)
+MMA64 prefill entry (64 heads/CTA): 0/4849664 differ from mma16 (must be 0) | T=148: 0.482 ms (1.03x mma16)
+MMA32H prefill entry (32 heads/CTA): 0/4849664 differ from mma16 (must be 0) | T=148: 0.449 ms (1.10x mma16)
+FA16H prefill entry: 0/4849664 differ from mma16 (must be 0) | CTRL scale*(1+2^-10): 1662993 differ (must be > 0) | T=148: 0.610 ms (0.74x mma32h)
+FA32H prefill entry: 0/4849664 differ from mma16 (must be 0) | CTRL scale*(1+2^-10): 1662993 differ (must be > 0) | T=148: 0.454 ms (0.99x mma32h)
+PIPE mma16p (ldmatrix.trans PV, cp.async gather)PIPE mma32p (ldmatrix.trans PV, cp.async gather)PROBE T=2072 mma32h with every K gather on ONE hot row: 4.973 ms vs 5.460 ms real (1.10x) -- gather share of the time
+T=2072 (fixture x14): mma32h 5.460 ms (47.8 TF/s) | fa16h 10.490 ms (0.52x) | fa32h 6.531 ms (0.84x) | mma16p 10.239 ms (0.53x) | mma32p 5.967 ms (0.92x, 43.7 TF/s)
+PASS one-pass streaming gather (controls separate)

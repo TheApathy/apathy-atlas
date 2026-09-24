@@ -81,9 +81,13 @@ fn attests_exact_finite_bf16_and_binds_content() {
     assert_eq!(first.tensor_count, 2);
     assert_eq!(first.element_count, 3);
     assert_eq!(first.file_bytes, 126);
+    // Re-pinned 2026-09-23: serde_json `preserve_order` (workspace-wide since the DeepSeek
+    // port) serializes the fixture header's keys in insertion order (dtype, shape,
+    // data_offsets) instead of sorted. Both hashes were reproduced from the fixture bytes:
+    // sorted keys give the old 75a3591e..., insertion order gives this one; 126 bytes either way.
     assert_eq!(
         first.file_sha256,
-        "75a3591e6bce928e74b0e4dee033689251f28a8fc542a9bd8afa766c0d15f110"
+        "525a993cec4f6a8643743dff3c15be1c73d63b4453721a9813fb08aa7f383b50"
     );
 
     write_fixture(

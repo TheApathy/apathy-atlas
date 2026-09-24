@@ -23,6 +23,7 @@ impl Qwen3SsmLayer {
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
         let k = num_tokens as u32;
+        super::super::note_verify_rows_for_decode_tc_parity(num_tokens);
         let bf16 = 2usize; // bytes per BF16
         let fp32 = 4usize; // bytes per FP32
 
@@ -338,8 +339,7 @@ impl Qwen3SsmLayer {
                     h as u32,
                     stream,
                 )?;
-            } else if k > 3
-                && k <= 32
+            } else if super::super::rows_in_tc_verify_window(k as usize)
                 && super::super::ssm_qkvz_splitk() > 0
                 && self.w4a16_gemm_t_m32_n64_splitk_k.0 != 0
                 && self.reduce_splitk_k.0 != 0
@@ -1067,8 +1067,7 @@ impl Qwen3SsmLayer {
                     value_dim as u32,
                     stream,
                 )?;
-            } else if k > 3
-                && k <= 32
+            } else if super::super::rows_in_tc_verify_window(k as usize)
                 && super::super::ssm_out_splitk() > 0
                 && self.w4a16_gemm_t_m32_n64_splitk_k.0 != 0
                 && self.reduce_splitk_k.0 != 0
@@ -1143,8 +1142,7 @@ impl Qwen3SsmLayer {
                         value_dim as u32,
                         stream,
                     )?;
-                } else if k > 3
-                    && k <= 32
+                } else if super::super::rows_in_tc_verify_window(k as usize)
                     && self.w4a16_gemm_t_m32_n64_k.0 != 0
                     && super::super::ssm_out_proj_m32n64()
                 {
@@ -1366,7 +1364,7 @@ impl Qwen3SsmLayer {
             // interaction that has since been resolved upstream; keeping
             // it suppressed the fast kernel on truncated-γ verifies,
             // costing the prose path 15-20 tok/s.
-            let try_kgamma = (num_tokens as u32) > 3
+            let try_kgamma = num_tokens >= super::super::TC_VERIFY_MIN_ROWS
                 && (super::super::ffn_kgamma_m16_enabled()
                     || self.ffn.exact_kgamma_applicable(num_tokens as u32));
             let used_kgamma = if try_kgamma {

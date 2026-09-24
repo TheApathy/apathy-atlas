@@ -624,6 +624,43 @@ fn fast_path_truncates_at_divergence() {
     assert_eq!(a.last_token, 9);
 }
 
+/// The fast path commits the raw verify argmax (device reduction, FIRST id of
+/// an exact BF16 tie wins); the slow path re-derives the token through the
+/// host sampler. Both must commit the same token on an exact tie, or greedy
+/// thinking forks from plain decode (measured on Qwen3.8-27B: " to" and
+/// " answer" tied at -0.7212).
+#[test]
+fn fast_and_slow_paths_agree_on_an_exact_tie() {
+    let sup = [SUPPRESS];
+    let tie = [row_with(1, &[(9, 8.0)])]; // ids 1 and 9 tied at 8.0
+    let verified = [1, 0]; // device argmax: first id of the tie
+
+    let mut fast = think_seq();
+    let out_fast = dflash_thinking_accept(
+        &mut fast,
+        &[],
+        &verified[..1],
+        &ctx(&sup),
+        no_rows,
+        no_snapshot,
+    );
+
+    let mut slow = think_seq();
+    slow.top_logprobs = Some(1); // logprobs force the host-sampler walk
+    let out_slow = dflash_thinking_accept(
+        &mut slow,
+        &[],
+        &verified[..1],
+        &ctx(&sup),
+        serve_rows(&tie),
+        no_snapshot,
+    );
+
+    assert_eq!(out_fast.bonus, Some(1));
+    assert_eq!(out_slow.bonus, out_fast.bonus);
+    assert_eq!(slow.output_tokens, fast.output_tokens);
+}
+
 // ── F1 reflection suppression ───────────────────────────────────────────────
 
 #[test]
@@ -902,9 +939,11 @@ fn f2_run_resets_on_unconfident_position() {
     a.thinking_tokens = 400;
     a.consecutive_confident = 7;
     let sup = [SUPPRESS];
-    // Flat-ish row: two near-equal logits → top-1 prob ≈ 0.5 < 0.95.
-    // `verified` has a single row, so position 0 is the bonus row.
-    let rows = [row_with(1, &[(0, 8.0)])];
+    // Flat-ish row: two near-equal logits → top-1 prob ≈ 0.52 < 0.95.
+    // `verified` has a single row, so position 0 is the bonus row. Token 0 is
+    // a hair below token 1 (bf16 7.90625 vs 8.0) so the argmax is 1 without
+    // relying on tie-breaking (greedy now takes the FIRST of equal maxima).
+    let rows = [row_with(1, &[(0, 7.9)])];
     let out = dflash_thinking_accept(
         &mut a,
         &[1],
@@ -913,8 +952,7 @@ fn f2_run_resets_on_unconfident_position() {
         serve_rows(&rows),
         no_snapshot,
     );
-    // argmax ties resolve to the LAST max under the plain sampler
-    // (`max_by` keeps later elements) — target is 1, matching the draft.
+    // target is 1, matching the draft.
     assert_eq!(out.num_accepted, 0); // i+1 >= verified.len() → bonus row
     assert_eq!(out.bonus, Some(1));
     assert_eq!(

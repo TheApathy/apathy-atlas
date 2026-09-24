@@ -1,0 +1,386 @@
+{
+ "meta": {
+  "generator": "scripts/dsv41_parity/gen_fixtures.py",
+  "py_tree": "/home/flocka/atlas/dsv41-prefill-work",
+  "model_dir": "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K"
+ },
+ "cases": [
+  {
+   "name": "content_only",
+   "mode": "chat",
+   "text": "Hello there.",
+   "strict": {
+    "content": "Hello there.",
+    "reasoning_content": "",
+    "tool_calls": []
+   },
+   "tolerant": [],
+   "server": {
+    "reasoning": "",
+    "content": "Hello there.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "think_content",
+   "mode": "thinking",
+   "text": "I think.</think>Answer.",
+   "strict": {
+    "content": "Answer.",
+    "reasoning_content": "I think.",
+    "tool_calls": []
+   },
+   "tolerant": [],
+   "server": {
+    "reasoning": "I think.",
+    "content": "Answer.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "one_call",
+   "mode": "chat",
+   "text": "Sure.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "strict": {
+    "content": "Sure.",
+    "reasoning_content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\", \"days\": 2}"
+     }
+    ]
+   },
+   "tolerant": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Paris\", \"days\": 2}"
+    }
+   ],
+   "server": {
+    "reasoning": "",
+    "content": "Sure.",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\", \"days\": 2}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "two_calls_think",
+   "mode": "thinking",
+   "text": "plan</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">東京</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"web_search\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">a <b> & c\nline2</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"filters\" string=\"false\">{\"x\": [1, 2]}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"flag\" string=\"false\">true</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "strict": {
+    "content": "",
+    "reasoning_content": "plan",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"東京\"}"
+     },
+     {
+      "name": "web_search",
+      "arguments": "{\"query\": \"a <b> & c\\nline2\", \"filters\": {\"x\": [1, 2]}, \"flag\": true}"
+     }
+    ]
+   },
+   "tolerant": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"東京\"}"
+    },
+    {
+     "name": "web_search",
+     "arguments": "{\"query\": \"a \", \"filters\": {\"x\": [1, 2]}, \"flag\": true}"
+    }
+   ],
+   "server": {
+    "reasoning": "plan",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"東京\"}"
+     },
+     {
+      "name": "web_search",
+      "arguments": "{\"query\": \"a <b> & c\\nline2\", \"filters\": {\"x\": [1, 2]}, \"flag\": true}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "no_params",
+   "mode": "chat",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"now\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "strict": {
+    "content": "",
+    "reasoning_content": "",
+    "tool_calls": [
+     {
+      "name": "now",
+      "arguments": "{}"
+     }
+    ]
+   },
+   "tolerant": [
+    {
+     "name": "now",
+     "arguments": "{}"
+    }
+   ],
+   "server": {
+    "reasoning": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "now",
+      "arguments": "{}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "namespaced",
+   "mode": "chat",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"fs::read_file\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">/tmp/x</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "strict": {
+    "content": "",
+    "reasoning_content": "",
+    "tool_calls": [
+     {
+      "name": "read_file",
+      "arguments": "{\"path\": \"/tmp/x\"}",
+      "namespace": "fs"
+     }
+    ]
+   },
+   "tolerant": [
+    {
+     "name": "fs::read_file",
+     "arguments": "{\"path\": \"/tmp/x\"}"
+    }
+   ],
+   "server": {
+    "reasoning": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "fs::read_file",
+      "arguments": "{\"path\": \"/tmp/x\"}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "empty_content_call",
+   "mode": "chat",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ping\">\n<｜DSML｜ parameter name=\"a\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "strict": {
+    "content": "",
+    "reasoning_content": "",
+    "tool_calls": [
+     {
+      "name": "ping",
+      "arguments": "{\"a\": \"\"}"
+     }
+    ]
+   },
+   "tolerant": [
+    {
+     "name": "ping",
+     "arguments": "{\"a\": \"\"}"
+    }
+   ],
+   "server": {
+    "reasoning": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "ping",
+      "arguments": "{\"a\": \"\"}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "value_in_attr",
+   "mode": "chat",
+   "text": "Let me search.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"web_search\">\n<｜DSML｜ parameter name=\"query\" string=\"rust async book\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "strict_error": "ValueError: Parameter format error: ' name=\"query\" string=\"rust async book\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>'",
+   "tolerant": [
+    {
+     "name": "web_search",
+     "arguments": "{\"query\": \"rust async book\"}"
+    }
+   ],
+   "server": {
+    "reasoning": "",
+    "content": "Let me search.",
+    "tool_calls": [
+     {
+      "name": "web_search",
+      "arguments": "{\"query\": \"rust async book\"}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "prose_after_block",
+   "mode": "chat",
+   "text": "x\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ping\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">1</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\nDone, anything else?",
+   "strict_error": "AssertionError: Unexpected content after tool calls",
+   "tolerant": [
+    {
+     "name": "ping",
+     "arguments": "{\"a\": \"1\"}"
+    }
+   ],
+   "server": {
+    "reasoning": "",
+    "content": "x",
+    "tool_calls": [
+     {
+      "name": "ping",
+      "arguments": "{\"a\": \"1\"}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "dup_param",
+   "mode": "chat",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ping\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">1</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "strict_error": "ValueError: Duplicate parameter name: 'a'",
+   "tolerant": [
+    {
+     "name": "ping",
+     "arguments": "{\"a\": \"2\"}"
+    }
+   ],
+   "server": {
+    "reasoning": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "ping",
+      "arguments": "{\"a\": \"2\"}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "unterminated",
+   "mode": "chat",
+   "text": "x\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ping\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">1</｜DSML｜ parameter>",
+   "strict_error": "ValueError: Parameter format error: expected '>\\n' but got '><｜end▁of▁sentence｜>'",
+   "tolerant": [
+    {
+     "name": "ping",
+     "arguments": "{\"a\": \"1\"}"
+    }
+   ],
+   "server": {
+    "reasoning": "",
+    "content": "x",
+    "tool_calls": [
+     {
+      "name": "ping",
+      "arguments": "{\"a\": \"1\"}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "bad_json_false",
+   "mode": "chat",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ping\">\n<｜DSML｜ parameter name=\"n\" string=\"false\">{oops</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "strict": {
+    "content": "",
+    "reasoning_content": "",
+    "tool_calls": [
+     {
+      "name": "ping",
+      "arguments": "{\"n\": {oops}"
+     }
+    ]
+   },
+   "tolerant": [
+    {
+     "name": "ping",
+     "arguments": "{\"n\": \"{oops\"}"
+    }
+   ],
+   "server": {
+    "reasoning": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "ping",
+      "arguments": "{\"n\": {oops}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "missing_newline",
+   "mode": "chat",
+   "text": "\n\n<｜DSML｜ calls><｜DSML｜ invoke name=\"ping\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "strict_error": "ValueError: Tool call format error: expected '>\\n' but got '>'",
+   "tolerant": [
+    {
+     "name": "ping",
+     "arguments": "{}"
+    }
+   ],
+   "server": {
+    "reasoning": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "ping",
+      "arguments": "{}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "think_missing_end",
+   "mode": "thinking",
+   "text": "never closes",
+   "strict_error": "AssertionError: Invalid thinking format: missing </think>",
+   "tolerant": [],
+   "server": {
+    "reasoning": "never closes",
+    "content": "",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "special_in_content",
+   "mode": "chat",
+   "text": "a <think> b",
+   "strict_error": "AssertionError: Unexpected special token '<think>' in content",
+   "tolerant": [],
+   "server": {
+    "reasoning": "",
+    "content": "a <think> b",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "v4_spelling_is_not_v41",
+   "mode": "chat",
+   "text": "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"ping\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+   "strict_error": "AssertionError: Unexpected special token '｜DSML｜' in content",
+   "tolerant": [],
+   "server": {
+    "reasoning": "",
+    "content": "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"ping\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    "tool_calls": []
+   }
+  }
+ ]
+}
