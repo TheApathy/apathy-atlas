@@ -65,14 +65,28 @@ def atlas_chunks(d):
 
 
 def load_atlas(path, rows):
-    return bf16_to_f32(np.fromfile(path, dtype=np.uint16)).reshape(rows, V)
+    # Converted to f32 per ROW_CHUNK by per_row; memmap keeps 16K-row dumps off the heap.
+    return Bf16Rows(np.memmap(path, dtype=np.uint16, mode="r").reshape(rows, V))
+
+
+class Bf16Rows:
+    """Lazy bf16 -> f32 view: slicing returns float32 rows."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def __len__(self):
+        return len(self.raw)
+
+    def __getitem__(self, key):
+        return bf16_to_f32(np.asarray(self.raw[key]))
 
 
 def load_ref(d, i, rows):
     path = os.path.join(d, f"ref-{i}-r{rows}.f32")
     if not os.path.isfile(path) or os.path.getsize(path) != rows * V * 4:
         unavailable(f"reference {path} missing or wrong size")
-    return np.fromfile(path, dtype=np.float32).reshape(rows, V)
+    return np.memmap(path, dtype=np.float32, mode="r").reshape(rows, V)
 
 
 def log_softmax(x):
@@ -89,18 +103,39 @@ def tied(x):
 ROW_CHUNK = 256  # rows per log-softmax pass: keeps host memory flat at 8K rows
 
 
-def per_row(ref, atl, truth):
-    """Per-row scalars for one prompt, computed ROW_CHUNK rows at a time. On GB10
-    host RAM is GPU memory, so an 8K x 154,880 float64 pass must never be whole."""
+class Concat:
+    """Row-concatenation of chunk views without materialising them."""
+
+    def __init__(self, parts):
+        self.parts, self.starts = parts, np.cumsum([0] + [len(p) for p in parts])
+
+    def __len__(self):
+        return int(self.starts[-1])
+
+    def __getitem__(self, key):
+        lo, hi, _ = key.indices(len(self))
+        out = []
+        for part, start in zip(self.parts, self.starts):
+            a, b = max(lo, start), min(hi, start + len(part))
+            if a < b:
+                out.append(np.asarray(part[a - start:b - start]))
+        return np.concatenate(out)
+
+
+def per_row(ref, atl, truth, n=None):
+    """Per-row scalars for rows [0, n) of one prompt, ROW_CHUNK rows at a time. On
+    GB10 host RAM is GPU memory, so a 16K x 154,880 pass must never be whole."""
+    n = len(ref) if n is None else n
     out = {k: [] for k in ("kl", "tied", "agree", "top1_ref", "top1_atlas", "nll_ref", "nll_atlas")}
-    for lo in range(0, len(ref), ROW_CHUNK):
-        r, a = ref[lo:lo + ROW_CHUNK], atl[lo:lo + ROW_CHUNK]
+    for lo in range(0, n, ROW_CHUNK):
+        hi = min(lo + ROW_CHUNK, n)
+        r, a = np.asarray(ref[lo:hi]), np.asarray(atl[lo:hi])
         rlp, alp = log_softmax(r), log_softmax(a)
         out["kl"].append((np.exp(rlp) * (rlp - alp)).sum(1))
         out["tied"].append(tied(a) | tied(f32_to_bf16_rne(r)))
         out["agree"].append(r.argmax(1) == a.argmax(1))
         if truth is not None:
-            t = truth[lo:lo + ROW_CHUNK]
+            t = truth[lo:hi]
             idx = np.arange(len(t))
             out["top1_ref"].append(r.argmax(1) == t)
             out["top1_atlas"].append(a.argmax(1) == t)
@@ -178,10 +213,10 @@ def run_prefill(prompts_path, ref_dir, atlas_dir):
             parts.append(load_atlas(f, rows)); have += rows; c += 1
         if have != n:
             unavailable(f"prompt {i}: Atlas chunks cover {have} rows, prompt has {n}")
-        atl = np.concatenate(parts)
+        atl = Concat(parts)
         ref = load_ref(ref_dir, i, n)
         truth = np.array(p["ids"][1:])
-        rows = per_row(ref[:-1], atl[:-1], truth)
+        rows = per_row(ref, atl, truth, n - 1)
         del ref, atl, parts
         per.append((p["name"], rows))
     if c != len(chunks):

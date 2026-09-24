@@ -43,6 +43,17 @@ def mem_available_gb():
     raise RuntimeError("MemAvailable missing from /proc/meminfo")
 
 
+def write_logits(out_dir, i, prompt, logits):
+    logits = logits.reshape(-1, logits.shape[-1])[:, :VOCAB].float().cpu().contiguous()
+    if logits.shape != (len(prompt["ids"]), VOCAB):
+        sys.exit(f"refusing: prompt {i} logits shape {tuple(logits.shape)}")
+    if not torch.isfinite(logits).all():
+        sys.exit(f"refusing: prompt {i} logits are not finite")
+    path = os.path.join(out_dir, f"ref-{i}-r{len(prompt['ids'])}.f32")
+    logits.numpy().tofile(path)
+    return os.path.basename(path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("prompts")
@@ -66,6 +77,7 @@ def main():
     model = Model.from_config(config)
 
     states = [torch.tensor([p["ids"]], dtype=torch.long) for p in prompts]
+    files = []
     params = [{} for _ in prompts]
     shared = 0
     if args.causality_probe:
@@ -85,13 +97,18 @@ def main():
             params[b]["dev_cache"] = None
             x = module.prepare_for_device(states[b], params[b])
             states[b] = module.forward(x, params[b])
+            if idx == last:
+                # 16K rows of logits are 10 GB: write each prompt's out and free
+                # it before the next, so at most one is resident.
+                files.append(write_logits(args.out_dir, b, prompts[b], states[b]))
+                states[b] = None
         module.unload()
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
         now = mem_available_gb()
         low_water = min(low_water, now)
         probe = ""
-        if shared:
+        if shared and idx != last:
             # Rows before the first differing token must be identical in a causal model.
             sa, sb = states[0], states[1]
             seq = len(prompts[0]["ids"])
@@ -104,17 +121,6 @@ def main():
             f"mem_avail={now:.1f}GB mem_avail_low={low_water:.1f}GB{probe}",
             flush=True,
         )
-
-    files = []
-    for i, (p, logits) in enumerate(zip(prompts, states)):
-        logits = logits.reshape(-1, logits.shape[-1])[:, :VOCAB].float().cpu().contiguous()
-        if logits.shape != (len(p["ids"]), VOCAB):
-            sys.exit(f"refusing: prompt {i} logits shape {tuple(logits.shape)}")
-        if not torch.isfinite(logits).all():
-            sys.exit(f"refusing: prompt {i} logits are not finite")
-        path = os.path.join(args.out_dir, f"ref-{i}-r{len(p['ids'])}.f32")
-        logits.numpy().tofile(path)
-        files.append(os.path.basename(path))
 
     meta = {
         "reference": "exllamav3 streaming uncached forward (flash_attn_nc)",

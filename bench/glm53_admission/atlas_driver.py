@@ -35,8 +35,8 @@ V = 154_880
 ESCAPE = "ATLAS_GLM53_UNVALIDATED_BRINGUP"
 
 
-def generate(kind, *extra):
-    out = subprocess.run([sys.executable, GENERATE, RECIPE, MODEL_DIR, MODEL_NAME, kind, *extra],
+def generate(kind, *extra, recipe=RECIPE):
+    out = subprocess.run([sys.executable, GENERATE, recipe, MODEL_DIR, MODEL_NAME, kind, *extra],
                          check=True, capture_output=True, text=True).stdout
     return [line for line in out.splitlines() if line]
 
@@ -71,6 +71,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--port", type=int, default=8894)
     ap.add_argument("--env", action="append", default=[])
+    ap.add_argument("--recipe", default=RECIPE, help="recipe YAML (default: this worktree's built-in)")
     ap.add_argument("--argv-override", action="append", default=[],
                     help="recipe default override passed to generate.py, e.g. max_model_len=9216")
     ap.add_argument("--prefill")
@@ -83,8 +84,8 @@ def main():
 
     os.makedirs(args.out, exist_ok=False)
     logits_dir = os.path.join(args.out, "logits")
-    env_lines = generate("env")
-    argv = generate("argv", f"port={args.port}", *args.argv_override)
+    env_lines = generate("env", recipe=args.recipe)
+    argv = generate("argv", f"port={args.port}", *args.argv_override, recipe=args.recipe)
     extra = list(args.env) + [f"ATLAS_GLM53_LOGITS_DUMP={logits_dir}", "ATLAS_GLM53_LOGITS_DUMP_ALL=1",
                               "ATLAS_GLM53_EXL3_LAST_ROW_HEAD=0"]
     env = {"HOME": os.environ["HOME"], "LANG": "C.UTF-8",
@@ -100,7 +101,8 @@ def main():
                                                                 if k.startswith("ATLAS_"))}, f, indent=2)
     server = subprocess.Popen([args.bin, *argv], env=env, stdout=open(log_path, "w"),
                               stderr=subprocess.STDOUT)
-    run = {"escape_in_env": escape, "extra_env": list(args.env), "argv_override": list(args.argv_override)}
+    run = {"escape_in_env": escape, "extra_env": list(args.env), "argv_override": list(args.argv_override),
+           "recipe": os.path.abspath(args.recipe)}
     try:
         for _ in range(900):
             if server.poll() is not None:
