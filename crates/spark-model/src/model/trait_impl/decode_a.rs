@@ -475,7 +475,7 @@ impl TransformerModel {
             return Ok(());
         }
         self.gpu.synchronize(stream)?;
-        let mut fnv = |ptr: DevicePtr| -> Result<u64> {
+        let fnv = |ptr: DevicePtr| -> Result<u64> {
             let mut buf = vec![0u8; row_bytes];
             self.gpu.copy_d2h(ptr, &mut buf)?;
             let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
