@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Fail-closed capability census for the dedicated GLM-5.3 executor.
+//!
+//! These six seams belong to the receipt-verified speculative B1/T1 executor
+//! (stage, verify, accept 0/1, commit under device completion receipts). They
+//! gate speculative runtimes and the GGUF target. Non-speculative EXL3 serving
+//! is admitted separately, on reference evidence, by
+//! `target_only_admission::Glm53TargetOnlyAdmission`.
 
 use anyhow::{Result, bail};
 

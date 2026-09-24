@@ -1,0 +1,92 @@
+{
+  "status": "pass",
+  "build_commit": "fde50c600",
+  "binary_sha256": "866a99f1a7c60e202b4405ce11fceaff53fb2e12287e889101465763c4ec581c",
+  "reference": "exllamav3 e648f1a1 glm5_next, streaming uncached",
+  "prompts_sha256": "41ba4af22334504114bbda4493a5ffd7d8a3901f8877e89fbee4ce52ec5ccfa0",
+  "bounds": {
+    "min_argmax_agreement_excl_ties": 0.9,
+    "max_mean_kl": 0.05,
+    "max_top1_delta_abs": 0.01,
+    "max_nll_delta_rel": 0.02,
+    "min_prompts": 3
+  },
+  "prefill": {
+    "prompts": 4,
+    "positions": 4092,
+    "argmax_agreement_excl_ties": 0.9640306122448979,
+    "mean_kl": 0.023254699287861613,
+    "top1_delta_abs": 0.0009775171065493637,
+    "nll_delta_rel": 0.0004379956401634977
+  },
+  "decode": {
+    "prompts": 4,
+    "positions": 260,
+    "argmax_agreement_excl_ties": 0.9803149606299213,
+    "mean_kl": 0.00919001405966067,
+    "top1_delta_abs": null,
+    "nll_delta_rel": null
+  },
+  "control": {
+    "prompts": 4,
+    "positions": 4092,
+    "argmax_agreement_excl_ties": 0.8515784114052953,
+    "mean_kl": 0.3100568705031267,
+    "top1_delta_abs": 0.024682306940371435,
+    "nll_delta_rel": 0.10141025200264409
+  },
+  "control_arm": "ATLAS_GLM53_NEGATIVE_CONTROL=skip-kda-commit, 256-row prefill chunks",
+  "control_decode": {
+    "prompts": 4,
+    "positions": 260,
+    "argmax_agreement_excl_ties": 0.4049586776859504,
+    "mean_kl": 16.008109572904978,
+    "top1_delta_abs": null,
+    "nll_delta_rel": null
+  },
+  "control_fails": [
+    "agreement 0.8516 < 0.9",
+    "mean KL 0.31006 > 0.05",
+    "top-1 delta 0.0247 > 0.01",
+    "NLL delta 0.1014 > 0.02"
+  ],
+  "control_decode_fails": [
+    "agreement 0.4050 < 0.9",
+    "mean KL 16.00811 > 0.05"
+  ],
+  "secondary_views": {
+    "prefill": {
+      "rows_4_plus": {
+        "prompts": 4,
+        "positions": 4076,
+        "argmax_agreement_excl_ties": 0.9667093469910372,
+        "mean_kl": 0.017984271009023663,
+        "max_kl": 1.07129534848888,
+        "tied_rows": 171,
+        "top1_ref": 0.6604514229636899,
+        "top1_atlas": 0.6594700686947987,
+        "top1_delta_abs": 0.0009813542688911214,
+        "nll_ref": 1.6582244970426672,
+        "nll_atlas": 1.6578233384749625,
+        "nll_delta_rel": 0.00024192054116921904,
+        "fails": []
+      }
+    },
+    "decode": {
+      "rows_4_plus": {
+        "prompts": 4,
+        "positions": 244,
+        "argmax_agreement_excl_ties": 0.9789915966386554,
+        "mean_kl": 0.008790059825265208,
+        "max_kl": 0.09595537467133046,
+        "tied_rows": 6,
+        "fails": []
+      }
+    }
+  },
+  "reference_self_disagreement_1024": {
+    "note": "same inputs, two reference runs: the reference's own noise floor",
+    "argmax_agreement_excl_ties": 0.96977,
+    "mean_kl": 0.01068
+  }
+}
