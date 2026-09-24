@@ -97,6 +97,9 @@ impl Glm53KdaPrefillKernel {
                 match std::env::var("ATLAS_GLM53_KDA_RR_PREFETCH").as_deref() {
                     Ok("1") => "atlas_glm53_kda_prefill_rr_c8_pf",
                     Ok("2") => "atlas_glm53_kda_prefill_rr_c8_pf2",
+                    // q/k/decay/beta/value staged through shared memory one
+                    // six-token tile ahead; bit-identical to rr_c8.
+                    Ok("3") => "atlas_glm53_kda_prefill_rr_c8_st",
                     _ => columns_symbol,
                 },
             )?,
