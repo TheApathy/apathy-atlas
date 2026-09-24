@@ -96,10 +96,26 @@ atlas_glm53_dsa_score_bf16(
 // construction. One CTA owns one query row and stages its 32x128 queries once;
 // each warp scores whole pools. Per head the channel products are reduced by
 // the reference's halving tree (strides 64..1): lane j holds partial[j + 32r],
-// so strides 64/32 are in-register and 16..1 are operand-exact shuffles. The
-// head sum then accumulates serially in head order, exactly as lane 0 of the
+// so strides 64/32 are in-register. Strides 16..1 are an xor reduce-scatter
+// over the 32 heads: at each level the lower lane half keeps the lower half of
+// its heads and adds its partner's value (a + b == b + a exactly, and the lower
+// lane is always the reference's left operand index), so after five levels lane
+// h holds head h's complete sum with 31 shuffles instead of 160. The weighted
+// head terms then accumulate serially in head order, exactly as lane 0 of the
 // reference does.
 #define GLM53_DSA_SCORE_ROWS_THREADS 256U
+
+template <unsigned int N>
+__device__ __forceinline__ void glm53_dsa_score_scatter(float * values, unsigned int lane) {
+    // values[0..2N) -> values[0..N): keep the half this lane's bit selects.
+    const bool upper = (lane & N) != 0U;
+    #pragma unroll
+    for (unsigned int i = 0U; i < N; ++i) {
+        const float send = upper ? values[i] : values[N + i];
+        const float kept = upper ? values[N + i] : values[i];
+        values[i] = __fadd_rn(kept, __shfl_xor_sync(0xffffffffU, send, N));
+    }
+}
 
 extern "C" __global__ void __launch_bounds__(GLM53_DSA_SCORE_ROWS_THREADS)
 atlas_glm53_dsa_score_rows_bf16(
@@ -138,6 +154,7 @@ atlas_glm53_dsa_score_rows_bf16(
             GLM53_DSA_INV_SQRT_HEADS);
     }
     __syncthreads();
+    const float own_weight = weight[lane];
     const unsigned long long batch_index = row / query_count;
     for (unsigned int pool = warp; pool < pool_count; pool += warps) {
         const unsigned long long pool_row = batch_index * pool_count + pool;
@@ -152,8 +169,8 @@ atlas_glm53_dsa_score_rows_bf16(
         for (unsigned int r = 0U; r < 4U; ++r) {
             k[r] = __bfloat162float(key[lane + 32U * r]);
         }
-        float score = 0.0f;
-        #pragma unroll 4
+        float values[GLM53_DSA_HEADS];
+        #pragma unroll
         for (unsigned int head = 0U; head < GLM53_DSA_HEADS; ++head) {
             const float * q = query + head * GLM53_DSA_INDEX_DIM;
             float a[4];
@@ -163,14 +180,21 @@ atlas_glm53_dsa_score_rows_bf16(
             }
             a[0] = __fadd_rn(a[0], a[2]);
             a[1] = __fadd_rn(a[1], a[3]);
-            float sum = __fadd_rn(a[0], a[1]);
-            #pragma unroll
-            for (unsigned int offset = 16U; offset != 0U; offset >>= 1U) {
-                sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffU, sum, offset));
-            }
-            float head_score = __fmul_rn(sum, GLM53_DSA_INV_SQRT_DIM);
-            head_score = head_score < 0.0f ? 0.0f : head_score;
-            score = __fadd_rn(score, __fmul_rn(weight[head], head_score));
+            values[head] = __fadd_rn(a[0], a[1]);
+        }
+        glm53_dsa_score_scatter<16U>(values, lane);
+        glm53_dsa_score_scatter<8U>(values, lane);
+        glm53_dsa_score_scatter<4U>(values, lane);
+        glm53_dsa_score_scatter<2U>(values, lane);
+        glm53_dsa_score_scatter<1U>(values, lane);
+        // Lane h now holds head h's full channel sum.
+        float head_score = __fmul_rn(values[0], GLM53_DSA_INV_SQRT_DIM);
+        head_score = head_score < 0.0f ? 0.0f : head_score;
+        const float term = __fmul_rn(own_weight, head_score);
+        float score = 0.0f;
+        #pragma unroll
+        for (unsigned int head = 0U; head < GLM53_DSA_HEADS; ++head) {
+            score = __fadd_rn(score, __shfl_sync(0xffffffffU, term, head));
         }
         if (lane == 0U) output_scores[output] = score;
     }
