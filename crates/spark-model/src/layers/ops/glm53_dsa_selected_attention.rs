@@ -24,10 +24,11 @@ const THREADS: u32 = 256;
 const MAX_GRID_YZ: u64 = 65_535;
 const ROWS_THREADS: u32 = 512;
 const ROWS_GROUP: u32 = 8;
-const ROWS_TILE: u32 = 8;
+const ROWS_TILE: u32 = 16;
 const SORT_WIDTH: u32 = 4_096;
-// [item][group] f32 scores | canonical item list | sort network or two KV tiles.
-const ROWS_ORDER_BYTES: u32 = 8_224;
+// [item][group] f32 scores | sort network or two KV tiles; the canonical item
+// list is written back over the row's selected indices.
+const ROWS_ORDER_BYTES: u32 = 0;
 const ROWS_SCRATCH_BYTES: u32 = if 2 * ROWS_TILE * LATENT * 2 > SORT_WIDTH * 4 {
     2 * ROWS_TILE * LATENT * 2
 } else {
@@ -267,7 +268,9 @@ impl Glm53DsaSelectedAttentionKernel {
         validate_buffers(plan, buffers)?;
         if selected_rows()? {
             // One CTA per row serves all 64 heads; bit-identical to the
-            // per-(row, head) reference below (see the .cu header).
+            // per-(row, head) reference below (see the .cu header). It
+            // overwrites each row's selected indices with the canonical
+            // (sorted, unique) list, which nothing reads afterwards.
             let rows = plan
                 .batch
                 .checked_mul(plan.queries)
