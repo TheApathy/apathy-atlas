@@ -1665,7 +1665,14 @@ impl Glm53DsaAttentionKernels {
             );
             gpu.copy_h2d(&bytes, buffers.selected_indices_i32.ptr)?;
         } else {
-            let score_plan = Glm53DsaScorePlan::new(1, rows, pools, INDEX_HEADS, INDEX_DIM)?;
+            // Rows a wide opening chunk attends densely need no selection.
+            let skipped = dense_prefix_rows(rows, geometry.position)?.unwrap_or(0);
+            let scored = rows - skipped;
+            let rows_from = |b: GgmlIqBuffer, row_bytes: usize| GgmlIqBuffer {
+                ptr: b.ptr.offset(skipped as usize * row_bytes),
+                bytes: scored as usize * row_bytes,
+            };
+            let score_plan = Glm53DsaScorePlan::new(1, scored, pools, INDEX_HEADS, INDEX_DIM)?;
             ensure!(
                 buffers.scores_f32.bytes >= score_plan.output_bytes,
                 "GLM DSA score buffer holds {} bytes, {pools} pools need {}",
@@ -1689,8 +1696,14 @@ impl Glm53DsaAttentionKernels {
                 gpu,
                 score_plan,
                 Glm53DsaScoreBuffers {
-                    queries_bf16: buffers.index_q_bf16,
-                    head_weights_bf16: buffers.head_weights_bf16,
+                    queries_bf16: rows_from(
+                        buffers.index_q_bf16,
+                        INDEX_HEADS as usize * INDEX_DIM as usize * 2,
+                    ),
+                    head_weights_bf16: rows_from(
+                        buffers.head_weights_bf16,
+                        INDEX_HEADS as usize * 2,
+                    ),
                     // Same exact-extent rule as `scores` above: the cache
                     // buffers are sized for full context capacity, but the op
                     // validates against this step's pool count.
@@ -1709,8 +1722,15 @@ impl Glm53DsaAttentionKernels {
             // Every buffer below is extent-validated by the op against THIS
             // step's pool count, while the cache buffers are sized for full
             // context capacity. Slice each to exactly what the plan asks for.
-            let topk_plan =
-                Glm53DsaTopkPlan::new(1, rows, pools, geometry.capacity, INDEX_TOPK, KPOOL, true)?;
+            let topk_plan = Glm53DsaTopkPlan::new(
+                1,
+                scored,
+                pools,
+                geometry.capacity,
+                INDEX_TOPK,
+                KPOOL,
+                true,
+            )?;
             let slice = |b: GgmlIqBuffer, want: usize, name: &str| -> Result<GgmlIqBuffer> {
                 ensure!(
                     b.bytes >= want,
@@ -1738,12 +1758,12 @@ impl Glm53DsaAttentionKernels {
                         "sequence lengths",
                     )?,
                     query_positions_u32: slice(
-                        query_positions,
+                        rows_from(query_positions, 4),
                         topk_plan.query_position_bytes,
                         "query positions",
                     )?,
                     query_validity_u8: slice(
-                        query_validity,
+                        rows_from(query_validity, 1),
                         topk_plan.query_validity_bytes,
                         "query validity",
                     )?,
@@ -1752,7 +1772,11 @@ impl Glm53DsaAttentionKernels {
                         topk_plan.tail_validity_bytes,
                         "tail validity",
                     )?,
-                    output_indices_i32: buffers.selected_indices_i32,
+                    output_indices_i32: if skipped == 0 {
+                        buffers.selected_indices_i32
+                    } else {
+                        rows_from(buffers.selected_indices_i32, SELECTED as usize * 4)
+                    },
                 },
                 stream,
             )?;
