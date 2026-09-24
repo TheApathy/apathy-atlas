@@ -576,7 +576,11 @@ impl Ops<'_> {
         if m <= GEMV_MAX_M && decode_pass() && self.k.fp8_gemv_m8.is_some() {
             return None;
         }
-        let fused_here = if fp8_fused_all() {
+        // A RESIDENT bf16 copy already removed the dequant, and cuBLAS on it beats the fused kernel
+        // (k124m4: fused over resident weights cost 1.2% at 8K); fused is for non-resident weights.
+        let fused_here = if w.bf16.is_some() {
+            false
+        } else if fp8_fused_all() {
             fused_wins(w.n, w.k)
         } else {
             replay_fused_enabled() && replay_pass() && w.n % 128 == 0 && w.k % 32 == 0
@@ -613,7 +617,11 @@ impl Ops<'_> {
         // construction rather than by fused == cuBLAS bytewise. Decode passes returned above.
         // Replay passes (REPLAY_FUSED): every aligned shape, since at <= 128 rows the dequant copy of
         // the weight costs more than the GEMM; the choice keys on the pass kind, never on M.
-        let fused_here = if fp8_fused_all() {
+        // A RESIDENT bf16 copy already removed the dequant, and cuBLAS on it beats the fused kernel
+        // (k124m4: fused over resident weights cost 1.2% at 8K); fused is for non-resident weights.
+        let fused_here = if w.bf16.is_some() {
+            false
+        } else if fp8_fused_all() {
             fused_wins(w.n, w.k)
         } else {
             replay_fused_enabled() && replay_pass() && w.n % 128 == 0 && w.k % 32 == 0
