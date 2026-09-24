@@ -132,3 +132,20 @@ s7 timing C G C GV96 C GV32 C GD C GC C ALL C NT C, 5 reps:
 - ALL: code_py >= 60 tok/s (1.45x). 50%.
 - Outputs == plain census on code/chat for every arm. 90%.
 - NT think_code == plain 166af6bb. 50%.
+
+## Think divergence ROOT CAUSE (found by reading, 2026-09-23 ~14:30Z)
+Plain greedy = host `Iterator::max_by` over the row = ties go to the HIGHEST token id. The device
+`argmax_bf16` breaks ties to the LOWEST id. Every spec path that trusts the raw verify argmax
+(the think-spec walk's fast path) therefore disagrees with plain decode on an exact BF16 tie.
+" times" = 2942, " weighted" = 35604: device picks "times", plain picks "weighted" - the observed
+divergence. The content walk was already exact because its fast path re-derives the argmax on
+the host with last-wins. Fix (vg5+): `argmax_bf16_last_wins` for the Qwen4 verify rows;
+`ATLAS_QWEN4_VERIFY_ARGMAX_FIRST_WINS=1` restores the old kernel as the control.
+
+# s8 — pre-registered (vg6 = vg5 + ATLAS_LOGITS_FNV row hashing), C ALL C ALLF C, 5 reps
+ALL = K5 hybrid + graph + dedup + chain + mtp-vocab 96000.
+- ALL think_code == plain 166af6bb on all 5 reps. 85%.
+- ALLF (control) think_code != plain ("times" at char 239) on all reps. 90%.
+- FNV: plain-vs-plain rows identical up to the first flip index in any flipped trial; spec
+  content rows (fast-path hashes) bit-identical to plain rows at the same output index for most
+  indices — if NOT bit-identical, verify is argmax-exact but not logits-exact (the DSpark bar). 50%.

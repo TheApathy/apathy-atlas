@@ -29,6 +29,7 @@ pub fn process_seq_logits(
     adaptive_sampling: bool,
 ) -> (u32, Option<crate::api::TokenLogprobs>) {
     let slice = &buf[i * vocab_size * elem_bytes..(i + 1) * vocab_size * elem_bytes];
+    log_logits_fnv(a.output_tokens.len(), slice);
     let mut f32_logits: Vec<f32> = if logits_fp32 {
         // Direct FP32: 4 bytes/element little-endian.
         (0..vocab_size)
@@ -420,4 +421,22 @@ pub fn process_seq_logits(
         .top_logprobs
         .map(|k| extract_logprobs_from_f32(&f32_logits, sampled, k as usize));
     (sampled, logprobs)
+}
+
+/// `ATLAS_LOGITS_FNV=1`: log an FNV-1a hash of every logits row the sampler
+/// sees, keyed by the output index it produces. Two runs (or a plain and a
+/// speculative run) agree bit-for-bit up to the first index whose hashes
+/// differ, which localises nondeterminism and verify-vs-decode drift without
+/// dumping tensors.
+pub(super) fn log_logits_fnv(output_index: usize, row: &[u8]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("ATLAS_LOGITS_FNV").ok().as_deref() == Some("1")) {
+        return;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in row {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    tracing::info!("LOGITS_FNV idx={output_index} fnv={hash:016x}");
 }
