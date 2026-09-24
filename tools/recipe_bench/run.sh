@@ -42,16 +42,28 @@ exec 9>"$LOCK"
 flock -w 14400 9 || { echo "LOCK TIMEOUT"; exit 1; }
 echo "$(date -u +%FT%TZ) $LANE recipe_bench:$LABEL window START pid=$$" >> "$Q"
 
-# Guaranteed cleanup on every exit path (EXIT/INT/TERM/ERR): kill the whole
-# process group the server runs in — not a bare PID, which is what let an
-# earlier version of this harness orphan a NEVER-READY server (it was
-# actually alive on a different port than the health-check was polling; the
-# port mismatch is fixed below by generating --port explicitly, but the
-# process-group kill and this trap are the defense-in-depth that makes a
-# similar future bug fail safely instead of costing the shared queue 17
-# minutes) — and wait for it to actually be gone before logging END.
+# Guaranteed cleanup on every exit path: kill the whole process group the
+# server runs in — not a bare PID, which is what let an earlier version of
+# this harness orphan a NEVER-READY server (it was actually alive on a
+# different port than the health-check was polling; the port mismatch is
+# fixed below by generating --port explicitly, but the process-group kill
+# and this trap are the defense-in-depth that makes a similar future bug
+# fail safely instead of costing the shared queue 17 minutes) — and wait
+# for it to actually be gone before logging END.
+#
+# NOT trapping ERR: bash fires the ERR trap on ANY simple command that
+# returns nonzero, with or without `set -e` — a routine `grep` that finds
+# nothing, or any curl the server answers with a non-2xx, would trigger it.
+# An earlier version of this script trapped EXIT/INT/TERM/ERR together and
+# killed several HEALTHY servers about a second after they reported ready,
+# because something as mundane as a `grep -q` with no match ran cleanup.
+# EXIT already covers every real exit path (normal return, `exit N`, an
+# uncaught error under `set -e`) without that false-positive surface.
 CURRENT_PID=""
+CLEANED_UP=0
 cleanup() {
+  [ "$CLEANED_UP" = 1 ] && return 0
+  CLEANED_UP=1
   if [ -n "$CURRENT_PID" ] && kill -0 "$CURRENT_PID" 2>/dev/null; then
     kill -INT -- -"$CURRENT_PID" 2>/dev/null
     for w in $(seq 1 30); do kill -0 "$CURRENT_PID" 2>/dev/null || break; sleep 1; done
@@ -61,7 +73,7 @@ cleanup() {
   for w in $(seq 1 30); do nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q . || break; sleep 2; done
   echo "$(date -u +%FT%TZ) $LANE recipe_bench:$LABEL window END" >> "$Q"
 }
-trap cleanup EXIT INT TERM ERR
+trap cleanup EXIT INT TERM
 
 for i in $(seq 1 60); do
   APPS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -c .)
