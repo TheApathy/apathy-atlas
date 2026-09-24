@@ -14,6 +14,7 @@
 #[cfg(test)]
 mod attention_gate_fused_tests;
 mod cache_skip;
+mod core_dump;
 mod cache_skip_mla;
 mod cache_skip_qkv;
 #[cfg(all(feature = "cuda", target_os = "linux"))]

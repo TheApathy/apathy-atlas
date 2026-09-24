@@ -386,6 +386,7 @@ pub fn dense_gemv_ba_gates_batchn(
 pub fn dense_gemm_ba_gates_prefill(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
+    rows_kernel: KernelHandle,
     input: DevicePtr,        // [M, K_stride] activations (BF16)
     ba_weight: &DenseWeight, // [N, K] BA weight (BF16, row-major)
     a_log: DevicePtr,
@@ -400,6 +401,35 @@ pub fn dense_gemm_ba_gates_prefill(
     vheads_per_group: u32,
     stream: u64,
 ) -> Result<()> {
+    // Rows shadow: 8 tokens per block, K/8 <= 64 * 16 uint4 slots per lane.
+    // Below a few blocks' worth of tokens the parent's wider grid wins.
+    const ROWS_TOK: u32 = 8;
+    const ROWS_MIN_M: u32 = 256;
+    if crate::layers::ssm_ba_prefill_rows_enabled()
+        && rows_kernel.0 != 0
+        && m >= ROWS_MIN_M
+        && k.is_multiple_of(8)
+        && k_stride.is_multiple_of(8)
+        && k / 8 <= 64 * 16
+    {
+        return KernelLaunch::new(gpu, rows_kernel)
+            .grid([div_ceil(m, ROWS_TOK), 1, 1])
+            .block([256, 1, 1])
+            .shared_mem(ROWS_TOK * k * 2)
+            .arg_ptr(input)
+            .arg_ptr(ba_weight.weight)
+            .arg_ptr(a_log)
+            .arg_ptr(dt_bias)
+            .arg_ptr(gate_out)
+            .arg_u32(m)
+            .arg_u32(n)
+            .arg_u32(k)
+            .arg_u32(k_stride)
+            .arg_u32(gate_stride)
+            .arg_u32(nv)
+            .arg_u32(vheads_per_group)
+            .launch(stream);
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), m, 1])
         .block([256, 1, 1])

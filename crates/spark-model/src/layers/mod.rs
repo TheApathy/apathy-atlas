@@ -1365,6 +1365,15 @@ pub fn gdn_prefill_gatecache_v2_enabled() -> bool {
 }
 
 
+/// `ATLAS_SSM_BA_PREFILL_ROWS=1`: the SSM b/a gate projection in prefill runs
+/// `dense_gemm_ba_gates_prefill_rows8`, an exact multi-token shadow of the
+/// per-(token, 4 outputs) parent that stages activation rows once and keeps
+/// weight slices in registers across 8 tokens.
+pub fn ssm_ba_prefill_rows_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_BA_PREFILL_ROWS").ok().as_deref() == Some("1"))
+}
+
 /// `ATLAS_SSM_RESET_ASYNC=1`: per-request SSM slot reset uses stream-ordered,
 /// per-region memsets + one sync instead of ~2000 synchronous memsets.
 pub fn ssm_reset_async_enabled() -> bool {

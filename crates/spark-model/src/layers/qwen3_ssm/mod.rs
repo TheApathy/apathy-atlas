@@ -382,6 +382,8 @@ pub struct Qwen3SsmLayer {
     /// back to per-seq loop if `n > ssm_multi_seq_ptr_max`).
     ssm_multi_seq_ptr_max: usize,
     ba_gates_prefill_k: KernelHandle,
+    /// Exact multi-token shadow (`ATLAS_SSM_BA_PREFILL_ROWS=1`); 0 when absent.
+    ba_gates_prefill_rows_k: KernelHandle,
     // Kernels — prefill (multi-token sequential)
     conv1d_prefill_k: KernelHandle,
     /// Exact conv1d-prefill shadow that also copies the projected Z channel

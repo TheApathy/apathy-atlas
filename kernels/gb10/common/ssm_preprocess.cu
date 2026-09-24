@@ -534,6 +534,121 @@ extern "C" __global__ void dense_gemm_ba_gates_prefill(
     }
 }
 
+// Exact multi-token shadow of dense_gemm_ba_gates_prefill.
+//
+// The parent launches one 256-thread block per (token, 4 outputs), so every
+// token's activation row is fetched 24 times and every weight row once per
+// token, with a full-block barrier per output. Here a block owns BA_ROWS_TOK
+// consecutive tokens: their activation rows are staged in shared memory once,
+// each weight uint4 is loaded once for all of them, the tokens' reductions
+// run as independent chains, and each two-warp output slot syncs only itself. Per output the
+// arithmetic is statement-for-statement the parent's: the same lane owns the
+// same uint4 slots in the same ascending order, the same FMA sequence, the
+// same shuffle tree, the same warp0 + warp1 fold and the same epilogue.
+//
+// Grid: (ceil(M / BA_ROWS_TOK), 1, 1)  Block: (256, 1, 1)
+// Dynamic smem: BA_ROWS_TOK * K * 2 bytes (K % 8 == 0, K / 8 <= 64 * BA_ROWS_MAXI).
+#define BA_ROWS_TOK 8
+#define BA_ROWS_MAXI 16
+extern "C" __global__ void dense_gemm_ba_gates_prefill_rows8(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ gate_out,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int K_stride,
+    unsigned int gate_stride,
+    unsigned int nv,
+    unsigned int vheads_per_group
+) {
+    extern __shared__ uint4 ba_rows_smem[];
+    // Per output slot: the two warp partials of each of the block's tokens.
+    __shared__ float red[4][2][BA_ROWS_TOK];
+    const unsigned int threads_per_out = 256 / 4;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int warp_lane = threadIdx.x % 32;
+    const unsigned int K_VEC = K / 8;
+    const unsigned int tok0 = blockIdx.x * BA_ROWS_TOK;
+    const unsigned int ntok = min(BA_ROWS_TOK, M - tok0);
+
+    for (unsigned int t = 0; t < ntok; t++) {
+        const uint4* A_vec = (const uint4*)(A + (unsigned long long)(tok0 + t) * K_stride);
+        for (unsigned int kv = threadIdx.x; kv < K_VEC; kv += 256) {
+            ba_rows_smem[t * K_VEC + kv] = A_vec[kv];
+        }
+    }
+    __syncthreads();
+
+    // Each output slot (two warps) walks its outputs independently and syncs
+    // only its own 64 threads, on named barrier 1 + local_out.
+    for (unsigned int n = local_out; n < N; n += 4) {
+        const uint4* B_vec = (const uint4*)(B + (unsigned long long)n * K);
+        // One accumulator per token; each is the parent's exact FMA chain.
+        float acc[BA_ROWS_TOK];
+        #pragma unroll
+        for (unsigned int t = 0; t < BA_ROWS_TOK; t++) acc[t] = 0.0f;
+        #pragma unroll
+        for (unsigned int i = 0; i < BA_ROWS_MAXI; i++) {
+            const unsigned int kv = lane + i * threads_per_out;
+            if (kv >= K_VEC) break;
+            const uint4 b_data = B_vec[kv];
+            const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
+            #pragma unroll
+            for (unsigned int t = 0; t < BA_ROWS_TOK; t++) {
+                if (t >= ntok) break;
+                const uint4 a_data = ba_rows_smem[t * K_VEC + kv];
+                const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    __nv_bfloat16 a_lo, a_hi, b_lo, b_hi;
+                    *(unsigned short*)&a_lo = (unsigned short)(a_raw[j] & 0xFFFF);
+                    *(unsigned short*)&a_hi = (unsigned short)(a_raw[j] >> 16);
+                    *(unsigned short*)&b_lo = (unsigned short)(b_raw[j] & 0xFFFF);
+                    *(unsigned short*)&b_hi = (unsigned short)(b_raw[j] >> 16);
+                    acc[t] += __bfloat162float(a_lo) * __bfloat162float(b_lo);
+                    acc[t] += __bfloat162float(a_hi) * __bfloat162float(b_hi);
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int t = 0; t < BA_ROWS_TOK; t++) {
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                acc[t] += __shfl_down_sync(0xFFFFFFFF, acc[t], offset);
+            }
+        }
+        if (warp_lane == 0) {
+            #pragma unroll
+            for (unsigned int t = 0; t < BA_ROWS_TOK; t++) red[local_out][lane / 32][t] = acc[t];
+        }
+        asm volatile("bar.sync %0, 64;" :: "r"(1 + local_out));
+        if (lane < ntok) {
+            const unsigned int token = tok0 + lane;
+            float result = red[local_out][0][lane] + red[local_out][1][lane];
+            unsigned int group_dim_ba = 2 * vheads_per_group;
+            unsigned int within_group = n % group_dim_ba;
+            unsigned int group = n / group_dim_ba;
+            float* gate_tok = gate_out + (unsigned long long)token * gate_stride;
+            if (within_group < vheads_per_group) {
+                unsigned int vh = group * vheads_per_group + within_group;
+                gate_tok[nv + vh] = 1.0f / (1.0f + __expf(-result));
+            } else {
+                unsigned int vh = group * vheads_per_group + (within_group - vheads_per_group);
+                float a_log_val = A_log[vh];
+                float dt_b = dt_bias[vh];
+                float A_val = __expf(fminf(a_log_val, 20.0f));
+                float dt = __logf(1.0f + __expf(fminf(result + dt_b, 20.0f)));
+                gate_tok[vh] = __expf(-A_val * dt);
+            }
+        }
+        asm volatile("bar.sync %0, 64;" :: "r"(1 + local_out));
+    }
+}
+
 // ============================================================
 // Compute GDN gates from interleaved BA + learned parameters
 // ============================================================
