@@ -116,10 +116,20 @@ where
             None,
         ),
         RollbackOutcome::Fallback(reason) => {
-            tracing::debug!(
-                ?reason,
-                "Serial loop rollback declined; committing stop sample"
-            );
+            if reason == super::rollback::RollbackFallback::LayerStateNotRewindable {
+                // The response ends early here; make that explainable from the logs.
+                tracing::warn!(
+                    ?reason,
+                    output_tokens = a.output_tokens.len(),
+                    "Loop watchdog fired but this model's recurrent state cannot be \
+                     rolled back; ending the response early"
+                );
+            } else {
+                tracing::debug!(
+                    ?reason,
+                    "Serial loop rollback declined; committing stop sample"
+                );
+            }
             a.finished = true;
             ContentTokenDisposition::CommitSample
         }
