@@ -243,16 +243,19 @@ atlas_glm53_dsa_selected_attention_bf16(
 // staged through shared memory in double-buffered cp.async tiles. Every
 // rounding step of the reference is reproduced in the same order:
 //  * score: partial[l] = q[l]*k[l] + q[l+256]*k[l+256] (no FMA), reduced by the
-//    same halving tree (strides 128..1). A warp holds partial[j + 32r] in lane
-//    j, register r, so strides 128/64/32 are in-register and 16..1 are
-//    shuffles pairing exactly the reference's operands; then * 1/16.
+//    same halving tree (strides 128..1). A warp scores one item for four heads
+//    and holds partial[j + 32r] in lane j, register r, so strides 128/64/32 are
+//    in-register; strides 16..1 are an xor butterfly that also splits the four
+//    heads across lane halves, so every addition pairs the reference's
+//    operands (a + b == b + a exactly) with 6 shuffles per 4 dots, not 20.
+//    The score is then * 1/16.
 //  * softmax: max is order-free; exponentials use the same expf; the
 //    denominator is the reference's serial ascending-item sum.
 //  * probability = bf16(exp / denominator); each output column accumulates
 //    fadd(sum, p*v) serially in ascending item order, as the reference does.
 #define GLM53_DSA_ROWS_THREADS 512U
 #define GLM53_DSA_ROWS_GROUP 8U
-#define GLM53_DSA_ROWS_TILE 12U
+#define GLM53_DSA_ROWS_TILE 8U
 // [item][GROUP] f32 scores | canonical item list | sort network / 2 KV tiles
 #define GLM53_DSA_ROWS_SCORE_BYTES (GLM53_DSA_SELECTED * GLM53_DSA_ROWS_GROUP * 4U)
 #define GLM53_DSA_ROWS_ORDER_BYTES 8224U
@@ -421,19 +424,25 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
     const unsigned int tile_count = (count + GLM53_DSA_ROWS_TILE - 1U) / GLM53_DSA_ROWS_TILE;
 
     for (unsigned int group = 0U; group < GLM53_DSA_HEADS; group += GLM53_DSA_ROWS_GROUP) {
-        // Scores: two warps per head, alternating items within each tile.
+        // Scores: warp w scores heads 4*(w&1)..+3 of the group for tile item
+        // w>>1; one staged key row feeds four dots.
         {
-            const unsigned int local_head = warp % GLM53_DSA_ROWS_GROUP;
-            const unsigned int parity = warp / GLM53_DSA_ROWS_GROUP;
-            const __nv_bfloat16 * query = absorbed_query + row_base +
-                (unsigned long long)(group + local_head) * GLM53_DSA_LATENT;
-            float q_low[8];
-            float q_high[8];
+            const unsigned int quad = warp & 1U;
+            const unsigned int slot = warp >> 1U;
+            float q_low[4][8];
+            float q_high[4][8];
             #pragma unroll
-            for (unsigned int r = 0U; r < 8U; ++r) {
-                q_low[r] = __bfloat162float(query[lane + 32U * r]);
-                q_high[r] = __bfloat162float(query[lane + 32U * r + 256U]);
+            for (unsigned int h = 0U; h < 4U; ++h) {
+                const __nv_bfloat16 * query = absorbed_query + row_base +
+                    (unsigned long long)(group + quad * 4U + h) * GLM53_DSA_LATENT;
+                #pragma unroll
+                for (unsigned int r = 0U; r < 8U; ++r) {
+                    q_low[h][r] = __bfloat162float(query[lane + 32U * r]);
+                    q_high[h][r] = __bfloat162float(query[lane + 32U * r + 256U]);
+                }
             }
+            const bool upper16 = (lane & 16U) != 0U;
+            const bool upper8 = (lane & 8U) != 0U;
             glm53_dsa_rows_stage(tiles, cache, ordered, 0U,
                                  min(count, GLM53_DSA_ROWS_TILE), thread);
             for (unsigned int t = 0U; t < tile_count; ++t) {
@@ -450,30 +459,50 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
                     asm volatile("cp.async.wait_group 0;");
                 }
                 __syncthreads();
-                const __nv_bfloat16 * tile =
-                    tiles + (t & 1U) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT;
-                for (unsigned int local = parity; local < n; local += 2U) {
-                    const __nv_bfloat16 * key = tile + local * GLM53_DSA_LATENT;
-                    float a[8];
+                if (slot < n) {
+                    const __nv_bfloat16 * key = tiles +
+                        (t & 1U) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT +
+                        slot * GLM53_DSA_LATENT;
+                    float k_low[8];
+                    float k_high[8];
                     #pragma unroll
                     for (unsigned int r = 0U; r < 8U; ++r) {
-                        a[r] = __fadd_rn(
-                            __fmul_rn(q_low[r], __bfloat162float(key[lane + 32U * r])),
-                            __fmul_rn(q_high[r],
-                                      __bfloat162float(key[lane + 32U * r + 256U])));
+                        k_low[r] = __bfloat162float(key[lane + 32U * r]);
+                        k_high[r] = __bfloat162float(key[lane + 32U * r + 256U]);
                     }
+                    float v[4];
                     #pragma unroll
-                    for (unsigned int r = 0U; r < 4U; ++r) a[r] = __fadd_rn(a[r], a[r + 4U]);
-                    #pragma unroll
-                    for (unsigned int r = 0U; r < 2U; ++r) a[r] = __fadd_rn(a[r], a[r + 2U]);
-                    float sum = __fadd_rn(a[0], a[1]);
-                    #pragma unroll
-                    for (unsigned int offset = 16U; offset != 0U; offset >>= 1U) {
-                        sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffU, sum, offset));
+                    for (unsigned int h = 0U; h < 4U; ++h) {
+                        float a[8];
+                        #pragma unroll
+                        for (unsigned int r = 0U; r < 8U; ++r) {
+                            a[r] = __fadd_rn(__fmul_rn(q_low[h][r], k_low[r]),
+                                             __fmul_rn(q_high[h][r], k_high[r]));
+                        }
+                        #pragma unroll
+                        for (unsigned int r = 0U; r < 4U; ++r) a[r] = __fadd_rn(a[r], a[r + 4U]);
+                        #pragma unroll
+                        for (unsigned int r = 0U; r < 2U; ++r) a[r] = __fadd_rn(a[r], a[r + 2U]);
+                        v[h] = __fadd_rn(a[0], a[1]);
                     }
-                    if (lane == 0U) {
-                        scores[(first + local) * GLM53_DSA_ROWS_GROUP + local_head] =
-                            __fmul_rn(sum, GLM53_DSA_INV_SQRT_QK);
+                    // Stride 16: the lower lane half keeps heads 0,1 and the
+                    // upper half heads 2,3; each receives its partner's value.
+                    const float send0 = upper16 ? v[0] : v[2];
+                    const float send1 = upper16 ? v[1] : v[3];
+                    const float got0 = __shfl_xor_sync(0xffffffffU, send0, 16U);
+                    const float got1 = __shfl_xor_sync(0xffffffffU, send1, 16U);
+                    const float w0 = __fadd_rn(upper16 ? v[2] : v[0], got0);
+                    const float w1 = __fadd_rn(upper16 ? v[3] : v[1], got1);
+                    // Stride 8: split the remaining pair the same way.
+                    const float got = __shfl_xor_sync(0xffffffffU, upper8 ? w0 : w1, 8U);
+                    float x = __fadd_rn(upper8 ? w1 : w0, got);
+                    x = __fadd_rn(x, __shfl_xor_sync(0xffffffffU, x, 4U));
+                    x = __fadd_rn(x, __shfl_xor_sync(0xffffffffU, x, 2U));
+                    x = __fadd_rn(x, __shfl_xor_sync(0xffffffffU, x, 1U));
+                    // Lanes 0/8/16/24 hold heads 0/1/2/3 at tree index 0.
+                    if ((lane & 7U) == 0U) {
+                        scores[(first + slot) * GLM53_DSA_ROWS_GROUP + quad * 4U + (lane >> 3U)] =
+                            __fmul_rn(x, GLM53_DSA_INV_SQRT_QK);
                     }
                 }
                 __syncthreads();

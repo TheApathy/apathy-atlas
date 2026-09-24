@@ -24,7 +24,7 @@ const THREADS: u32 = 256;
 const MAX_GRID_YZ: u64 = 65_535;
 const ROWS_THREADS: u32 = 512;
 const ROWS_GROUP: u32 = 8;
-const ROWS_TILE: u32 = 12;
+const ROWS_TILE: u32 = 8;
 const SORT_WIDTH: u32 = 4_096;
 // [item][group] f32 scores | canonical item list | sort network or two KV tiles.
 const ROWS_ORDER_BYTES: u32 = 8_224;
