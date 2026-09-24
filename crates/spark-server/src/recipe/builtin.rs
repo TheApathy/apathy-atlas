@@ -31,6 +31,10 @@ pub const BUILTIN_YAML: &[(&str, &str)] = &[
         include_str!("builtin/qwen3.8-flash-next-offload-local.yaml"),
     ),
     ("glm5.3/glm-5.3-flash-exl3-local", include_str!("builtin/glm-5.3-flash-exl3-local.yaml")),
+    (
+        "glm5.3/glm-5.3-flash-exl3-dflash2-local",
+        include_str!("builtin/glm-5.3-flash-exl3-dflash2-local.yaml"),
+    ),
     ("qwen3.6/aeon-q36-27b-full-local", include_str!("builtin/aeon-q36-27b-full-local.yaml")),
 ];
 

@@ -1,0 +1,81 @@
+# Built-in recipe: GLM-5.3-Flash EXL3 2.05 bpw with DFlash2 speculative decoding.
+# Greedy output is byte-identical to the target-only recipe; speculation is admitted by
+# Glm53SpeculativeAdmission (bench/glm53-spec/evidence.json). perf/glm53-spec w4
+# (interleaved, 5 prompts): 1.38x geomean decode over target-only (code 1.68x, long
+# continuation 1.34x, short chat 1.13x). Verify width 3 drafts; the drafter proposes 8.
+recipe_version: "2"
+model: GLM-5.3-Flash-exl3-2.05bpw
+runtime: atlas
+container: local
+metadata:
+  maintainer: atlas-allmodels
+  category: agent
+  model_params: 744B
+  quantization: exl3
+  kv_dtype: bf16
+  description: |
+    GLM-5.3-Flash (KDA + DSA + mHC MoE) from the EXL3 checkpoint with the DFlash2 drafter
+    (gamma 8, verify width 3) and the exact row-batched verify. ~87 GB resident: runs alone.
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  max_model_len: 2048
+  max_prefill_tokens: 2048
+  max_batch_size: 1
+  max_num_seqs: 1
+  oom_guard_mb: 4096
+  dflash: true
+  draft_model: /home/flocka/models/GLM-5.3-Flash-DFlash2-bf582e4
+  dflash_gamma: 8
+  dflash_window_size: 2048
+  glm_dflash_max_drafts: 3
+atlas:
+  model_type: glm5_next
+  resident_gb: 91
+  headroom_gb: 10
+  run_alone: true
+  env:
+    ATLAS_GLM53_CUBLASLT_PREWARM: "1"
+    ATLAS_GLM53_EXACT_VERIFY: "1"
+    ATLAS_GLM53_EXACT_WIDE_DSA_PRECOMPUTE: "1"
+    ATLAS_GLM53_EXACT_WIDE_KDA_BATCH_COPY: "1"
+    ATLAS_GLM53_EXACT_WIDE_ROWEXACT: "1"
+    ATLAS_GLM53_EXL3_KDA_QKV_GRID_ORDER: "row-x"
+    ATLAS_GLM53_EXL3_MOE_PREFILL_DIRECT_COMBINE: "1"
+    ATLAS_GLM53_EXL3_ROUTE_PRIVATE: "1"
+    ATLAS_GLM53_EXL3_ROUTE_PRIVATE_PREFILL: "1"
+    ATLAS_GLM53_FFN_GRAPHS: "1"
+    ATLAS_GLM53_LAYER_MAJOR_PREFILL: "1"
+    ATLAS_GLM53_LAYER_MAJOR_PREFILL_ROWS: "2048"
+    # Kept off as in the measured text-only configuration; image prompts under
+    # speculation are not yet covered by the admission evidence.
+    ATLAS_GLM53_LAYER_MAJOR_VISION_PREFILL: "0"
+    ATLAS_GLM53_PARTIAL_WIDE_REPLAY: "1"
+    ATLAS_GLM53_PHASE_TIMING: "0"
+    ATLAS_GLM53_UNVALIDATED_BRINGUP: "1"
+    ATLAS_GLM53_VISION_FLASH_ATTN: "1"
+    ATLAS_GLM53_WIDE_PREFILL: "1"
+    ATLAS_GLM53_WIDE_PREFILL_ROWS: "8"
+    ATLAS_VISION_TIMING: "1"
+    ATLAS_GLM53_EXL3_MOE_CHUNK_ROWS: "64"
+    ATLAS_GLM53_EXL3_PREFILL_RECONSTRUCT: "1"
+    ATLAS_GLM53_EXL3_RECONSTRUCT_PRECISION: "f16"
+    ATLAS_GLM53_EXL3_RECONSTRUCT_DTYPE: "bf16"
+    ATLAS_GLM53_ROUTER_GEMM: "1"
+    ATLAS_GLM53_HC_PRE_GEMM: "1"
+    ATLAS_GLM53_DSA_ABSORB_GEMM: "1"
+    ATLAS_GLM53_KDA_CONV_FUSED: "1"
+    ATLAS_GLM53_DSA_DENSE_FAST: "1"
+    ATLAS_GLM53_HC_POST_PROMPT: "1"
+    # DFlash2 drafter wiring (as measured in perf/glm53-spec w3/w4).
+    ATLAS_GLM53_DFLASH2_CAPTURE_TILE128: "1"
+    ATLAS_GLM53_DFLASH2_COMMITTED_PROJECTION: "original"
+    ATLAS_GLM53_DFLASH2_DEVICE_ARGMAX: "1"
+    ATLAS_GLM53_DFLASH2_KV_PREFIX: "0"
+    ATLAS_MTP_GATE_FORCE: "1"
+    # Exact verify at row cost, and prefix commit sized to the verify width.
+    ATLAS_GLM53_EXL3_ROWBATCH: "1"
+    ATLAS_GLM53_VERIFY_DSA_PRECOMPUTE: "1"
+    ATLAS_GLM53_VERIFY_DSA_BATCH_OUTPUT: "1"
+    ATLAS_GLM53_PREFIX_COMMIT: "1"
+    ATLAS_GLM53_PREFIX_COMMIT_ROWS: "3"
