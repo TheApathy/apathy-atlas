@@ -59,21 +59,39 @@ def test(a, b, key):
     return p, len(rows)
 
 def main(base):
- for prompt in ('nouns', 'prose'):
-   plain, spec, ctrl = (load(os.path.join(base, d), prompt) for d in ('dist_plain', 'dist_dspark', 'dist_control'))
-   print(f"== prompt {prompt}: n plain {len(plain)} dspark {len(spec)} control {len(ctrl)}")
-   # A gate over too few samples cannot fail: require the full run (window10 passed vacuously on n=0).
-   ok = min(len(plain), len(spec), len(ctrl)) >= 400
-   if not ok:
-       print("   TOO FEW SAMPLES (need >= 400 per arm): the gate cannot pass")
-   for name, key in (('token1', lambda x: x[0] if x else None), ('token2', lambda x: x[1] if len(x) > 1 else None), ('pair', lambda x: x)):
-       p_s, k_s = test2(plain, spec, key)
-       p_c, k_c = test2(plain, ctrl, key)
-       print(f"{name}: dspark vs plain p={p_s:.4f} ({k_s} cats) | control vs plain p={p_c:.4g} ({k_c} cats)")
-       if name != 'token1':
-           ok &= p_s > 0.01
-   print("control FAILS (token2 or pair p < 0.01):", test2(plain, ctrl, lambda x: x[1] if len(x) > 1 else None)[0] < 0.01 or test2(plain, ctrl, lambda x: x)[0] < 0.01)
-   print("GATE", "PASS" if ok else "FAIL")
+    pyf = '/home/flocka/atlas/DSV41_PORT/oracle/ref/py_dist.json'
+    for prompt in ('nouns', 'prose'):
+        plain, spec, ctrl = (load(os.path.join(base, d), prompt) for d in ('dist_plain', 'dist_dspark', 'dist_control'))
+        py = None
+        if os.path.exists(pyf):
+            # Python's samples in the same representation as Atlas's (decoded text re-tokenized).
+            from tokenizers import Tokenizer
+            tk = Tokenizer.from_file('/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K/tokenizer.json')
+            py = [tuple(tk.encode(tk.decode(ids), add_special_tokens=False).ids[:2]) for ids in json.load(open(pyf)).get(prompt, [])]
+        print(f"== prompt {prompt}: n plain {len(plain)} dspark {len(spec)} control {len(ctrl)} python {len(py) if py is not None else '-'}")
+        # A gate over too few samples cannot fail: require the full run (window10 passed vacuously on n=0).
+        ok = min(len(plain), len(spec), len(ctrl)) >= 400
+        if not ok:
+            print("   TOO FEW SAMPLES (need >= 400 per arm): the gate cannot pass")
+        keys = (('token1', lambda x: x[0] if x else None), ('token2', lambda x: x[1] if len(x) > 1 else None), ('pair', lambda x: x))
+        for name, key in keys:
+            p_s, k_s = test2(plain, spec, key)
+            p_c, k_c = test2(plain, ctrl, key)
+            print(f"{name}: dspark vs plain p={p_s:.4f} ({k_s} cats) | control vs plain p={p_c:.4g} ({k_c} cats)")
+            if name != 'token1':
+                ok &= p_s > 0.01
+        if py is not None:
+            ok &= len(py) >= 400
+            for name, key in keys:
+                p_pp, _ = test2(py, plain, key)
+                p_pd, _ = test2(py, spec, key)
+                p_pc, _ = test2(py, ctrl, key)
+                print(f"   vs PYTHON {name}: plain p={p_pp:.4f} dspark p={p_pd:.4f} control p={p_pc:.4g}")
+                if name != 'token1':
+                    ok &= p_pp > 0.01 and p_pd > 0.01
+        tk2 = lambda x: x[1] if len(x) > 1 else None
+        print("control FAILS (token2 or pair p < 0.01):", test2(plain, ctrl, tk2)[0] < 0.01 or test2(plain, ctrl, lambda x: x)[0] < 0.01)
+        print("GATE", "PASS" if ok else "FAIL")
 
 
 if __name__ == '__main__':
