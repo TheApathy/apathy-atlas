@@ -60,8 +60,17 @@ fn every_decode_parity_route_goes_through_the_window_gated_predicate() {
     let ready = compact(SSM_DECODE);
     assert!(ready.contains("super::super::decode_tc_parity_enabled()&&super::super::ssm_proj_tc_enabled()"));
     assert!(compact(FFN).contains("crate::layers::decode_tc_parity_enabled()&&exact_ffn_tc_override()"));
-    // The engagement flag is written only by the configure hook.
+    // The engagement flag is written only by the configure hook, and only
+    // after the SSM route check: no silent per-layer fallback to K1.
     assert_eq!(LAYERS.matches("DECODE_TC_PARITY_ENGAGED.store(").count(), 1);
+    let layers = compact(LAYERS);
+    assert!(layers.contains(
+        "letmirrorable=decode_tc_parity_ssm_mirrorable(ssm_proj_tc_enabled(),ssm_qkvz_splitk(),ssm_out_splitk(),tc_nvfp4_m16_enabled(),);"
+    ));
+    assert!(layers.contains(
+        "letengaged=decode_tc_parity_engaged(requested,verify_rows)&&mirrorable;"
+    ));
+    assert!(layers.contains("!ssm_proj_tc||(qkvz_splits>0&&out_splits>0&&!tc_nvfp4_m16)"));
 }
 
 /// Every model load (first boot and each swap) passes through

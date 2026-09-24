@@ -273,6 +273,21 @@ pub const fn decode_tc_parity_engaged(requested: bool, verify_rows: Option<usize
     }
 }
 
+/// Whether single-row decode can mirror the verify's SSM projection routes.
+/// Parity mirrors only the split-K tensor-core route: with
+/// `ATLAS_SSM_PROJ_TC=1` the verify must take split-K for both qkvz and
+/// out_proj, and `ATLAS_TC_NVFP4_M16=1` would put qkvz on the m16 tile ahead
+/// of split-K. Either mismatch would leave decode on the K1 GEMV per layer
+/// while verify runs a tensor-core tile, so parity must refuse instead.
+pub const fn decode_tc_parity_ssm_mirrorable(
+    ssm_proj_tc: bool,
+    qkvz_splits: u32,
+    out_splits: u32,
+    tc_nvfp4_m16: bool,
+) -> bool {
+    !ssm_proj_tc || (qkvz_splits > 0 && out_splits > 0 && !tc_nvfp4_m16)
+}
+
 /// Set per model load by [`configure_decode_tc_parity`]; `false` until then,
 /// so a load path that never configures it fails closed.
 static DECODE_TC_PARITY_ENGAGED: std::sync::atomic::AtomicBool =
@@ -284,9 +299,25 @@ static DECODE_TC_PARITY_ENGAGED: std::sync::atomic::AtomicBool =
 /// parity is engaged. A requested parity that cannot hold is refused loudly.
 pub fn configure_decode_tc_parity(verify_rows: Option<usize>) -> bool {
     let requested = std::env::var("ATLAS_DECODE_TC_PARITY").ok().as_deref() == Some("1");
-    let engaged = decode_tc_parity_engaged(requested, verify_rows);
+    let mirrorable = decode_tc_parity_ssm_mirrorable(
+        ssm_proj_tc_enabled(),
+        ssm_qkvz_splitk(),
+        ssm_out_splitk(),
+        tc_nvfp4_m16_enabled(),
+    );
+    let engaged = decode_tc_parity_engaged(requested, verify_rows) && mirrorable;
     DECODE_TC_PARITY_ENGAGED.store(engaged, std::sync::atomic::Ordering::Relaxed);
-    if requested && !engaged {
+    if requested && !mirrorable {
+        tracing::warn!(
+            ssm_qkvz_splitk = ssm_qkvz_splitk(),
+            ssm_out_splitk = ssm_out_splitk(),
+            tc_nvfp4_m16 = tc_nvfp4_m16_enabled(),
+            "ATLAS_DECODE_TC_PARITY=1 DISABLED: ATLAS_SSM_PROJ_TC=1 needs ATLAS_SSM_QKVZ_SPLITK and \
+             ATLAS_SSM_OUT_SPLITK set (and ATLAS_TC_NVFP4_M16 off) for decode to mirror the \
+             verify's SSM projections; speculative output is NOT guaranteed identical to plain \
+             decode"
+        );
+    } else if requested && !engaged {
         tracing::warn!(
             verify_rows = ?verify_rows,
             min = TC_VERIFY_MIN_ROWS,
