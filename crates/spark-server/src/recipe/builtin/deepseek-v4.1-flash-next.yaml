@@ -41,6 +41,7 @@ atlas:
   headroom_gb: 16
   run_alone: true
   env:
+    ATLAS_BOUNDED_HOST_COPY: "1"
     ATLAS_DSV41_PACKED_KEEP: "124"
     ATLAS_DSV41_CHUNK: "2048"
     ATLAS_DSV41_DSPARK: "0"

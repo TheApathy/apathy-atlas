@@ -34,6 +34,7 @@ atlas:
   headroom_gb: 8
   run_alone: true
   env:
+    ATLAS_BOUNDED_HOST_COPY: "1"
     ATLAS_PLE_CACHE_MB: "0"
     ATLAS_QWEN4_PLE_IO_QUEUE_DEPTH: "256"
     ATLAS_QWEN4_PLE_PREFILL_BATCH: "1"
