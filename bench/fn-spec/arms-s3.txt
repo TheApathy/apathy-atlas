@@ -1,0 +1,9 @@
+C1||
+K2|--speculative --mtp-from-path /home/flocka/models/Qwen3.8-Flash-Next-Inferact-MTP --mtp-vocab 248077 --num-drafts 1|ATLAS_MTP_ACCEPT_LOG=1 ATLAS_THINK_SPEC=1
+C2||
+K5H|--speculative --mtp-from-path /home/flocka/models/Qwen3.8-Flash-Next-Inferact-MTP --mtp-vocab 248077 --num-drafts 4|ATLAS_MTP_ACCEPT_LOG=1 ATLAS_THINK_SPEC=1 ATLAS_QWEN4_K5_HYBRID=1 ATLAS_QWEN4_K5_NATIVE_MOE=1 ATLAS_QWEN4_K5_BATCH_ATTN_QKV=1 ATLAS_QWEN4_K5_BATCH_GDN=1 ATLAS_QWEN4_K5_BATCH_HYPER=1 ATLAS_QWEN4_K5_BATCH_SSM=1
+C3||
+K2X|--speculative --mtp-from-path /home/flocka/models/Qwen3.8-Flash-Next-Inferact-MTP --mtp-vocab 248077 --num-drafts 1|ATLAS_MTP_ACCEPT_LOG=1 ATLAS_THINK_SPEC=1 ATLAS_SPEC_SKIP_SSM_RESTORE_CONTROL=1
+C4||
+K2nt|--speculative --mtp-from-path /home/flocka/models/Qwen3.8-Flash-Next-Inferact-MTP --mtp-vocab 248077 --num-drafts 1|ATLAS_MTP_ACCEPT_LOG=1
+C5||

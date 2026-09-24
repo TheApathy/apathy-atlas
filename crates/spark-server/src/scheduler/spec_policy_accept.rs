@@ -262,6 +262,7 @@ pub(super) fn dflash_content_accept(
                     skip.push(t);
                 }
             }
+            super::decode_logits_seq::log_logits_fnv(a.output_tokens.len(), &row_buf);
             let tok = argmax_bf16_skip(&row_buf, &skip, vocab).unwrap_or(0);
             (tok, None)
         } else {

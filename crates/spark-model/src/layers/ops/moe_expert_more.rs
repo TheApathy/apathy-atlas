@@ -313,6 +313,115 @@ pub fn moe_expert_silu_down_shared_batch3(
         .launch(stream)
 }
 
+/// Expert-deduplicated twin of [`moe_expert_gate_up_shared_batch3`]: same
+/// grid and per-row arithmetic, each distinct expert streamed once.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_gate_up_shared_dedup(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate_packed_ptrs: DevicePtr,
+    gate_scale_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    gate_out: DevicePtr,
+    up_packed_ptrs: DevicePtr,
+    up_scale_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    up_out: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate: &QuantizedWeight,
+    sh_gate_out: DevicePtr,
+    sh_up: &QuantizedWeight,
+    sh_up_out: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    moe_expert_gate_up_shared_batch3(
+        gpu,
+        kernel,
+        input,
+        gate_packed_ptrs,
+        gate_scale_ptrs,
+        gate_scale2_vals,
+        gate_out,
+        up_packed_ptrs,
+        up_scale_ptrs,
+        up_scale2_vals,
+        up_out,
+        expert_indices,
+        sh_gate,
+        sh_gate_out,
+        sh_up,
+        sh_up_out,
+        n,
+        k,
+        top_k,
+        num_tokens,
+        stream,
+    )
+}
+
+/// Expert-deduplicated twin of [`moe_expert_silu_down_shared_batch3`]. The
+/// leader block stages SiLU(gate)*up for up to `rows_max` rows in shared
+/// memory, so the launch reserves `rows_max * k` floats.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_silu_down_shared_dedup(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    rows_max: u32,
+    gate_out: DevicePtr,
+    up_out: DevicePtr,
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_in: DevicePtr,
+    sh_up_in: DevicePtr,
+    sh_down: &QuantizedWeight,
+    sh_down_out: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        num_tokens <= rows_max,
+        "dedup MoE down: {num_tokens} rows exceed the kernel's {rows_max}-row cap"
+    );
+    let smem_bytes = rows_max as usize * k as usize * std::mem::size_of::<f32>();
+    anyhow::ensure!(
+        smem_bytes <= 48 * 1024,
+        "dedup MoE down: {smem_bytes} B of staged activations exceed 48 KiB"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), num_tokens * (top_k + 1), 1])
+        .block([128, 1, 1])
+        .shared_mem(smem_bytes as u32)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_in)
+        .arg_ptr(sh_up_in)
+        .arg_ptr(sh_down.weight)
+        .arg_ptr(sh_down.weight_scale)
+        .arg_f32(sh_down.weight_scale_2)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(num_tokens)
+        .launch(stream)
+}
+
 /// Fused weighted sum + sigmoid blend for K=3 tokens.
 ///
 /// Grid: (ceil(hidden/256), 3, 1)  Block: (256, 1, 1)

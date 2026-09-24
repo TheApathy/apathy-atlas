@@ -286,6 +286,16 @@ impl TransformerModel {
                 persistent_row_bytes,
                 stream,
             )?;
+            if !use_graphs {
+                self.log_layer_fnv(
+                    seq.seq_len,
+                    i,
+                    hidden,
+                    residual,
+                    persistent_row_bytes,
+                    stream,
+                )?;
+            }
             // Offline K=gamma parity probe: capture the single-token hidden
             // at one requested absolute position so it can be diffed against
             // `ATLAS_KGAMMA_DEBUG_DUMP` row-for-row.  The seq-len selector is
@@ -443,5 +453,41 @@ impl TransformerModel {
         seq.seq_len += 1;
 
         Ok(self.decode_logits_ptr())
+    }
+}
+
+impl TransformerModel {
+    /// `ATLAS_LAYER_FNV=1` (eager decode only): FNV-1a of the hidden and
+    /// residual rows after every layer, keyed by sequence position. Two runs of
+    /// one prompt agree up to the first (position, layer) whose hash differs,
+    /// which names the layer where a nondeterministic value first appears.
+    fn log_layer_fnv(
+        &self,
+        seq_len: usize,
+        layer: usize,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        row_bytes: usize,
+        stream: u64,
+    ) -> Result<()> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("ATLAS_LAYER_FNV").ok().as_deref() == Some("1")) {
+            return Ok(());
+        }
+        self.gpu.synchronize(stream)?;
+        let fnv = |ptr: DevicePtr| -> Result<u64> {
+            let mut buf = vec![0u8; row_bytes];
+            self.gpu.copy_d2h(ptr, &mut buf)?;
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for &byte in &buf {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+            Ok(hash)
+        };
+        let h = fnv(hidden)?;
+        let r = fnv(residual)?;
+        tracing::info!("LAYER_FNV pos={seq_len} layer={layer} hidden={h:016x} residual={r:016x}");
+        Ok(())
     }
 }

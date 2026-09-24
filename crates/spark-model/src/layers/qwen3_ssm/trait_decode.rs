@@ -159,6 +159,12 @@ impl Qwen3SsmLayer {
             attn_hyper
                 .inject_saved_batched(hidden, ssm_out, residual, num_tokens, ctx.gpu, stream)?;
         } else {
+            // The per-row route writes every intermediate; a lazy commit for
+            // this width would replay a retain buffer this path never fills.
+            anyhow::ensure!(
+                !(has_recurrent_intermediates && self.gdn_seq_lazy_engaged_inner(num_tokens)),
+                "ATLAS_SSM_GDN_LAZY is not supported on the Qwen4 per-row verify route (K={num_tokens})"
+            );
             for row in 0..num_tokens {
                 let hidden_row = hidden.offset(row * row_bytes);
                 let residual_row = residual.offset(row * row_bytes);

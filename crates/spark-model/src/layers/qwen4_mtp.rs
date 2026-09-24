@@ -52,6 +52,25 @@ pub struct Qwen4MtpHead {
     w4a16_gemv_exact_m4_k: KernelHandle,
     residual_add_k: KernelHandle,
     argmax_k: KernelHandle,
+    embed_from_argmax_k: KernelHandle,
+}
+
+/// Scratch layout of the sync-free draft chain. The single-token MoE router
+/// writes the first bytes of scratch and the per-step attention metadata
+/// starts at `CHAIN_META_OFFSET` (the same base the one-step path uses).
+const CHAIN_ARGMAX_OFFSET: usize = 16384;
+const CHAIN_TOKEN_OFFSET: usize = CHAIN_ARGMAX_OFFSET + 1024;
+const CHAIN_META_OFFSET: usize = 32768;
+
+/// Where one MTP step takes its inputs from and leaves its draft.
+#[derive(Clone, Copy)]
+struct ChainStep {
+    /// Pre-uploaded attention metadata for this step.
+    meta: DevicePtr,
+    /// Device u32 holding the previous step's argmax (None: host token).
+    device_token: Option<DevicePtr>,
+    /// Device u32 receiving this step's argmax; no host readback.
+    argmax_out: DevicePtr,
 }
 
 impl Qwen4MtpHead {
@@ -138,6 +157,9 @@ impl Qwen4MtpHead {
             w4a16_gemv_exact_m4_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch_logits_exact_m4")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
+            embed_from_argmax_k: gpu
+                .kernel("embed_from_argmax", "embed_from_argmax")
+                .unwrap_or(KernelHandle(0)),
         })
     }
 
@@ -151,6 +173,8 @@ impl Qwen4MtpHead {
         ctx: &ForwardContext,
         stream: u64,
         grammar_bitmask: Option<&[i32]>,
+        emit_draft: bool,
+        chain: Option<ChainStep>,
     ) -> Result<u32> {
         let h = ctx.config.hidden_size;
         let r = ctx.config.residual_width();
@@ -159,9 +183,22 @@ impl Qwen4MtpHead {
         let row_bytes = h * 2;
 
         let embed = ctx.buffers.ssm_qkvz();
-        let embed_src = self.embed_tokens.weight.offset(token as usize * row_bytes);
-        ctx.gpu
-            .copy_d2d_async(embed_src, embed, row_bytes, stream)?;
+        if let Some(device_token) = chain.and_then(|c| c.device_token) {
+            ops::embed_from_argmax(
+                ctx.gpu,
+                self.embed_from_argmax_k,
+                device_token,
+                self.embed_tokens.weight,
+                embed,
+                ctx.buffers.scratch().offset(CHAIN_TOKEN_OFFSET),
+                h as u32,
+                stream,
+            )?;
+        } else {
+            let embed_src = self.embed_tokens.weight.offset(token as usize * row_bytes);
+            ctx.gpu
+                .copy_d2d_async(embed_src, embed, row_bytes, stream)?;
+        }
         let normed_embed = ctx.buffers.ssm_deinterleaved();
         ops::rms_norm(
             ctx.gpu,
@@ -230,24 +267,15 @@ impl Qwen4MtpHead {
         }
 
         let mut kv_cache = self.kv_cache.lock();
-        let bs = kv_cache.block_size();
-        let blocks_needed = state.seq_len / bs + 1;
-        while state.block_table.len() < blocks_needed {
-            state.block_table.push(kv_cache.alloc_block()?);
-        }
-        let physical = state.block_table[state.seq_len / bs];
-        let slot = physical as i64 * bs as i64 + (state.seq_len % bs) as i64;
-        let meta_base = ctx.buffers.scratch().offset(32768);
-        let bt_bytes = state.block_table.len() * 4;
-        let mut packed = vec![0u8; 768 + bt_bytes];
-        packed[0..4].copy_from_slice(&(position as u32).to_le_bytes());
-        packed[256..264].copy_from_slice(&slot.to_le_bytes());
-        packed[512..516].copy_from_slice(&((state.seq_len + 1) as i32).to_le_bytes());
-        for (i, block) in state.block_table.iter().enumerate() {
-            packed[768 + i * 4..772 + i * 4].copy_from_slice(&(*block as i32).to_le_bytes());
-        }
-        ctx.gpu
-            .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(&packed, meta_base)], stream)?;
+        let meta_base = if let Some(c) = chain {
+            c.meta
+        } else {
+            let meta_base = ctx.buffers.scratch().offset(CHAIN_META_OFFSET);
+            let packed = self.step_metadata(&mut kv_cache, state, state.seq_len, position)?;
+            ctx.gpu
+                .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(&packed, meta_base)], stream)?;
+            meta_base
+        };
         let metadata = AttnMetadataDev {
             qwen4_qsa_required: false,
             positions: meta_base,
@@ -278,6 +306,14 @@ impl Qwen4MtpHead {
             stream,
         )?;
 
+        // Prompt replay only fills the MTP KV cache. It must not run the head:
+        // `buffers.logits()` still holds the target's prefill logits, which the
+        // scheduler samples the first output token from after this returns.
+        if !emit_draft {
+            state.seq_len += 1;
+            return Ok(0);
+        }
+
         let (sample_hidden, inject) = self.final_mixer.prepare_decode(
             hidden,
             ctx.buffers.residual(),
@@ -303,6 +339,18 @@ impl Qwen4MtpHead {
             h as u32,
             stream,
         )?;
+        if let Some(c) = chain {
+            ops::argmax_bf16(
+                ctx.gpu,
+                self.argmax_k,
+                logits,
+                c.argmax_out,
+                vocab as u32,
+                stream,
+            )?;
+            state.seq_len += 1;
+            return Ok(0);
+        }
         let out = ctx.buffers.scratch();
         ops::argmax_bf16(ctx.gpu, self.argmax_k, logits, out, vocab as u32, stream)?;
         let token_id = if let Some(mask) = grammar_bitmask {
@@ -329,6 +377,110 @@ impl Qwen4MtpHead {
         };
         state.seq_len += 1;
         Ok(token_id)
+    }
+
+    /// Attention metadata for the MTP step writing KV row `seq_len` at rotary
+    /// `position`, allocating its block if needed: position at +0, KV slot at
+    /// +256, sequence length at +512, block table at +768.
+    fn step_metadata(
+        &self,
+        kv_cache: &mut PagedKvCache,
+        state: &mut Qwen4MtpState,
+        seq_len: usize,
+        position: usize,
+    ) -> Result<Vec<u8>> {
+        let bs = kv_cache.block_size();
+        let blocks_needed = seq_len / bs + 1;
+        while state.block_table.len() < blocks_needed {
+            state.block_table.push(kv_cache.alloc_block()?);
+        }
+        let physical = state.block_table[seq_len / bs];
+        let slot = physical as i64 * bs as i64 + (seq_len % bs) as i64;
+        let bt_bytes = state.block_table.len() * 4;
+        let mut packed = vec![0u8; 768 + bt_bytes];
+        packed[0..4].copy_from_slice(&(position as u32).to_le_bytes());
+        packed[256..264].copy_from_slice(&slot.to_le_bytes());
+        packed[512..516].copy_from_slice(&((seq_len + 1) as i32).to_le_bytes());
+        for (i, block) in state.block_table.iter().enumerate() {
+            packed[768 + i * 4..772 + i * 4].copy_from_slice(&(*block as i32).to_le_bytes());
+        }
+        Ok(packed)
+    }
+
+    /// Greedy draft chain with one metadata upload and one readback: each
+    /// step's argmax stays on the device and feeds the next step's embedding
+    /// gather, so the host never waits between drafts. Same arithmetic per
+    /// step as the one-step path.
+    #[allow(clippy::too_many_arguments)]
+    fn propose_chain(
+        &self,
+        last_token: u32,
+        target_hidden: DevicePtr,
+        position: usize,
+        num_drafts: usize,
+        state: &mut Qwen4MtpState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Vec<u32>> {
+        let scratch = ctx.buffers.scratch();
+        let first_seq_len = state.seq_len;
+        let mut uploads: Vec<Vec<u8>> = Vec::with_capacity(num_drafts);
+        {
+            let mut kv_cache = self.kv_cache.lock();
+            // Allocate every step's block first so all steps share one table.
+            let last = first_seq_len + num_drafts - 1;
+            self.step_metadata(&mut kv_cache, state, last, position + num_drafts - 1)?;
+            for step in 0..num_drafts {
+                uploads.push(self.step_metadata(
+                    &mut kv_cache,
+                    state,
+                    first_seq_len + step,
+                    position + step,
+                )?);
+            }
+        }
+        let stride = uploads[0].len().next_multiple_of(256);
+        ensure!(
+            CHAIN_META_OFFSET + num_drafts * stride <= ctx.buffers.sizes().scratch
+                && CHAIN_ARGMAX_OFFSET + num_drafts * 4 <= CHAIN_TOKEN_OFFSET,
+            "Qwen4 MTP draft chain of {num_drafts} steps does not fit the scratch layout"
+        );
+        let mut packed = vec![0u8; num_drafts * stride];
+        for (step, upload) in uploads.iter().enumerate() {
+            packed[step * stride..step * stride + upload.len()].copy_from_slice(upload);
+        }
+        let meta_base = scratch.offset(CHAIN_META_OFFSET);
+        ctx.gpu
+            .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(&packed, meta_base)], stream)?;
+
+        let argmax_base = scratch.offset(CHAIN_ARGMAX_OFFSET);
+        let mut hidden = target_hidden;
+        for step in 0..num_drafts {
+            let chain = ChainStep {
+                meta: meta_base.offset(step * stride),
+                device_token: (step > 0).then(|| argmax_base.offset((step - 1) * 4)),
+                argmax_out: argmax_base.offset(step * 4),
+            };
+            self.forward_one(
+                last_token,
+                hidden,
+                position + step,
+                state,
+                ctx,
+                stream,
+                None,
+                true,
+                Some(chain),
+            )?;
+            hidden = ctx.buffers.hidden_states();
+        }
+        ctx.gpu.synchronize(stream)?;
+        let mut bytes = vec![0u8; num_drafts * 4];
+        ctx.gpu.copy_d2h(argmax_base, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect())
     }
 }
 
@@ -361,6 +513,23 @@ impl DraftProposer for Qwen4MtpHead {
             .as_any_mut()
             .downcast_mut::<Qwen4MtpState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid Qwen4 MTP proposer state"))?;
+        if grammar_bitmask.is_none()
+            && num_drafts > 0
+            && self.embed_from_argmax_k.0 != 0
+            && std::env::var("ATLAS_QWEN4_MTP_CHAIN").ok().as_deref() == Some("1")
+        {
+            let drafts = self.propose_chain(
+                last_token,
+                target_hidden,
+                position,
+                num_drafts,
+                state,
+                ctx,
+                stream,
+            )?;
+            state.last_num_drafted = drafts.len();
+            return Ok(drafts);
+        }
         let mut drafts = Vec::with_capacity(num_drafts);
         let mut token = last_token;
         let mut hidden = target_hidden;
@@ -373,6 +542,8 @@ impl DraftProposer for Qwen4MtpHead {
                 ctx,
                 stream,
                 grammar_bitmask,
+                true,
+                None,
             )?;
             drafts.push(token);
             hidden = ctx.buffers.hidden_states();
@@ -427,6 +598,8 @@ impl DraftProposer for Qwen4MtpHead {
                 state,
                 ctx,
                 stream,
+                None,
+                false,
                 None,
             )?;
         }

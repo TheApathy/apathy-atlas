@@ -511,15 +511,27 @@ impl TransformerModel {
                         let h_inter =
                             self.ssm_pool
                                 .h_intermediate(ssm_layer_idx, slot, last_inter_slot);
-                        // canonical → live (h_state read by next forward)
-                        self.gpu
-                            .copy_d2d_async(h_inter, ssm.h_state, h_bytes, stream)?;
-                        self.gpu
-                            .copy_d2d_async(conv_inter, ssm.conv_state, conv_bytes, stream)?;
-                        // canonical → checkpoint (for any future rollback)
-                        self.gpu.copy_d2d_async(h_inter, h_ckpt, h_bytes, stream)?;
-                        self.gpu
-                            .copy_d2d_async(conv_inter, conv_ckpt, conv_bytes, stream)?;
+                        // The skip-restore control deliberately leaves both
+                        // the live state and the checkpoint (the next verify
+                        // re-seeds live from it) at their post-verify values,
+                        // so decoding continues from a state that is wrong
+                        // for the accepted prefix. The exact spec==plain gate
+                        // must FAIL with it set.
+                        if !skip_restore_control() {
+                            // canonical → live (h_state read by next forward)
+                            self.gpu
+                                .copy_d2d_async(h_inter, ssm.h_state, h_bytes, stream)?;
+                            self.gpu.copy_d2d_async(
+                                conv_inter,
+                                ssm.conv_state,
+                                conv_bytes,
+                                stream,
+                            )?;
+                            // canonical → checkpoint (for any future rollback)
+                            self.gpu.copy_d2d_async(h_inter, h_ckpt, h_bytes, stream)?;
+                            self.gpu
+                                .copy_d2d_async(conv_inter, conv_ckpt, conv_bytes, stream)?;
+                        }
                     }
                 }
 
@@ -542,4 +554,19 @@ impl TransformerModel {
         }
         Ok(())
     }
+}
+
+/// `ATLAS_SPEC_SKIP_SSM_RESTORE_CONTROL=1`: negative control for the exact
+/// speculative gate. Partial accepts skip the intermediate -> live recurrent
+/// state restore, so decoding continues from a state that includes rejected
+/// drafts. Never set outside a gate run.
+fn skip_restore_control() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        let on = std::env::var("ATLAS_SPEC_SKIP_SSM_RESTORE_CONTROL").ok().as_deref() == Some("1");
+        if on {
+            tracing::warn!("ATLAS_SPEC_SKIP_SSM_RESTORE_CONTROL=1: recurrent restore DISABLED (negative control)");
+        }
+        on
+    })
 }
