@@ -12,6 +12,20 @@ use anyhow::Result;
 
 use super::*;
 
+/// `ATLAS_MOE_T_LANES=1` routes unified-layout decode through the
+/// lane-parallel `_t_lanes` kernels, which match the untransposed decode
+/// kernels bit for bit (the default `_t` kernels do not).
+fn t_lanes_selected() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("ATLAS_MOE_T_LANES").ok().as_deref() == Some("1");
+        if on {
+            tracing::info!("ENGAGED ATLAS_MOE_T_LANES: exact lane-parallel transposed decode MoE");
+        }
+        on
+    })
+}
+
 impl MoeLayer {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn dispatch_unified_t_decode(
@@ -47,9 +61,34 @@ impl MoeLayer {
         let sh_gate_t = self.shared_gate_t.as_ref().unwrap_or(&null_qw);
         let sh_up_t = self.shared_up_t.as_ref().unwrap_or(&null_qw);
         let sh_down_t = self.shared_down_t.as_ref().unwrap_or(&null_qw);
-        ops::moe_expert_gate_up_shared_t(
+        let lanes = t_lanes_selected();
+        if lanes {
+            anyhow::ensure!(
+                self.moe_expert_gate_up_shared_t_lanes_k.0 != 0
+                    && self.moe_expert_silu_down_shared_t_lanes_k.0 != 0,
+                "ATLAS_MOE_T_LANES=1 but this target's moe_shared_expert_fused_t module has no _t_lanes kernels"
+            );
+        }
+        let (gate_up_k, silu_down_k, out_block, threads) = if lanes {
+            (
+                self.moe_expert_gate_up_shared_t_lanes_k,
+                self.moe_expert_silu_down_shared_t_lanes_k,
+                ops::T_LANES_OUT_BLOCK,
+                ops::T_LANES_THREADS,
+            )
+        } else {
+            (
+                self.moe_expert_gate_up_shared_t_k,
+                self.moe_expert_silu_down_shared_t_k,
+                ops::T_BLOCK,
+                ops::T_BLOCK,
+            )
+        };
+        ops::moe_expert_gate_up_shared_t_shape(
             ctx.gpu,
-            self.moe_expert_gate_up_shared_t_k,
+            gate_up_k,
+            out_block,
+            threads,
             expert_input,
             gate_t.packed_ptrs,
             gate_t.scale_ptrs,
@@ -69,9 +108,11 @@ impl MoeLayer {
             top_k,
             stream,
         )?;
-        ops::moe_expert_silu_down_shared_t(
+        ops::moe_expert_silu_down_shared_t_shape(
             ctx.gpu,
-            self.moe_expert_silu_down_shared_t_k,
+            silu_down_k,
+            out_block,
+            threads,
             expert_gate_out,
             expert_up_out,
             down_t.packed_ptrs,

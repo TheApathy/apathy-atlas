@@ -204,3 +204,26 @@ the 16-slot Marconi pool, 1818 MB, is dead weight). Expect low-water +1.6 GB on 
   geomean 1.055x. Recipe bar (geomean >= 1.10, worst >= 0.92): MISS. Pre-registered code 1.30-1.38x:
   HIT; prose 0.90-1.0x: HIT.
 - Low-water: plain 13 GB, spec 8 GB (static, reached at end of load). No load hang (2 loads).
+
+# r5 — recipe env (env-fn.txt) + spec, binary r4 (MTP compact exemption; K5 native MoE fails closed
+under unified layout, so RS runs K5 hybrid WITHOUT K5_NATIVE_MOE: MoE via forward_k3+forward_k2 _t).
+R1 RS R2, 5 prompts x 5 reps, LOGITS_FNV.
+- RS loads (the compact guard no longer trips). 85%.
+- RS logits bit-identical to plain rows on clean trials. 50% (the K2/K3 _t batch kernels have never
+  been checked per-row against the _t decode kernel).
+- RS code_py 1.15-1.35x over the 32-33 tok/s recipe base. 50%.
+
+## r5 outcome (spark-r4, recipe env, --ssm-cache-slots 16)
+- R1 (recipe plain): 32.5-32.8 tok/s all prompts, low-water 12 GB.
+- RS: LOADED (compact guard exemption works: "Listening"), then the watchdog killed it at 7 GB
+  MemAvailable during the first request's prefill (12 GB after load -> 7). No spec numbers.
+# r6 — recipe env, --ssm-cache-slots 2 on all arms (dead Marconi pool, +2 GB measured on plain),
+R1 RS2 R2, watchdog floor 8 GB. Expect RS2 low-water ~9 GB (survives), R ~14 GB.
+
+# r7 — K4 hybrid route (binary r5b, dd4126bfb), empty env, --ssm-cache-slots 2 all arms
+C1 K5 C2 K4 C3 K4X, 5 prompts x 5 reps, LOGITS_FNV.
+- K4 logits bit-identical to plain on clean trials (same exact-rows family as K5). 70%.
+- K4X (adds ATLAS_QWEN4_K5_BATCH_CONV, the batched conv F41 excluded) diverges from plain in
+  logits on most trials: the negative control for the gate. 60% (if it does NOT, find another).
+- K4 vs K5: chat/prose better (less wasted verify), code worse; K4 geomean >= K5 geomean. 50%.
+- Spec low-water with slots 2: >= 10 GB. 60%.

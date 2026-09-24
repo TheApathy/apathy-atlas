@@ -292,7 +292,14 @@ pub fn moe_transpose_u8_batched(
 // block — more blocks per silu_down/gate_up call → higher SM occupancy on
 // GB10 (only 25 SMs, so larger blocks under-utilise). Each thread owns one
 // output regardless of block size.
-pub(super) const T_BLOCK: u32 = 32;
+pub(crate) const T_BLOCK: u32 = 32;
+
+/// Outputs per block and threads per block of the lane-parallel `_t_lanes`
+/// decode kernels (`moe_expert_*_shared_t_lanes_o4t16u1`: 32 K-lanes x 16
+/// threads x 4 outputs). They reproduce the untransposed decode kernels'
+/// arithmetic bit for bit on the transposed layout.
+pub const T_LANES_OUT_BLOCK: u32 = 64;
+pub const T_LANES_THREADS: u32 = 512;
 
 /// NVFP4 fused gate+up GEMV (transposed weight). Single-token decode.
 #[allow(clippy::too_many_arguments)]
@@ -318,9 +325,44 @@ pub fn moe_expert_gate_up_shared_t(
     top_k: u32,
     stream: u64,
 ) -> Result<()> {
+    moe_expert_gate_up_shared_t_shape(
+        gpu, kernel, T_BLOCK, T_BLOCK, input, gate_packed_t_ptrs, gate_scale_t_ptrs,
+        gate_scale2_vals, gate_out, up_packed_t_ptrs, up_scale_t_ptrs, up_scale2_vals, up_out,
+        expert_indices, sh_gate_t, sh_gate_out, sh_up_t, sh_up_out, n, k, top_k, stream,
+    )
+}
+
+/// `moe_expert_gate_up_shared_t` with an explicit launch shape: `out_block`
+/// outputs per block, `threads` threads per block. The `_t_lanes` kernels
+/// use (`T_LANES_OUT_BLOCK`, `T_LANES_THREADS`).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_gate_up_shared_t_shape(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    out_block: u32,
+    threads: u32,
+    input: DevicePtr,
+    gate_packed_t_ptrs: DevicePtr,
+    gate_scale_t_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    gate_out: DevicePtr,
+    up_packed_t_ptrs: DevicePtr,
+    up_scale_t_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    up_out: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_t: &QuantizedWeight,
+    sh_gate_out: DevicePtr,
+    sh_up_t: &QuantizedWeight,
+    sh_up_out: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), top_k + 1, 2])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, out_block), top_k + 1, 2])
+        .block([threads, 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_packed_t_ptrs)
         .arg_ptr(gate_scale_t_ptrs)
@@ -366,10 +408,40 @@ pub fn moe_expert_silu_down_shared_t(
     top_k: u32,
     stream: u64,
 ) -> Result<()> {
+    moe_expert_silu_down_shared_t_shape(
+        gpu, kernel, T_BLOCK, T_BLOCK, gate_out, up_out, packed_t_ptrs, scale_t_ptrs, scale2_vals,
+        output, expert_indices, sh_gate_in, sh_up_in, sh_down_t, sh_down_out, n, k, top_k, stream,
+    )
+}
+
+/// `moe_expert_silu_down_shared_t` with an explicit launch shape (see
+/// `moe_expert_gate_up_shared_t_shape`).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_silu_down_shared_t_shape(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    out_block: u32,
+    threads: u32,
+    gate_out: DevicePtr,
+    up_out: DevicePtr,
+    packed_t_ptrs: DevicePtr,
+    scale_t_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_in: DevicePtr,
+    sh_up_in: DevicePtr,
+    sh_down_t: &QuantizedWeight,
+    sh_down_out: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    stream: u64,
+) -> Result<()> {
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), top_k + 1, 1])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, out_block), top_k + 1, 1])
+        .block([threads, 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)
         .arg_ptr(up_out)

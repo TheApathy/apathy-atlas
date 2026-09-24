@@ -198,6 +198,12 @@ impl MoeLayer {
                 .kernel("moe_shared_expert_fused_t", "moe_expert_gate_up_shared_t")?,
             moe_expert_silu_down_shared_t_k: gpu
                 .kernel("moe_shared_expert_fused_t", "moe_expert_silu_down_shared_t")?,
+            moe_expert_gate_up_shared_t_lanes_k: gpu
+                .kernel("moe_shared_expert_fused_t", "moe_expert_gate_up_shared_t_lanes_o4t16u1")
+                .unwrap_or(KernelHandle(0)),
+            moe_expert_silu_down_shared_t_lanes_k: gpu
+                .kernel("moe_shared_expert_fused_t", "moe_expert_silu_down_shared_t_lanes_o4t16u1")
+                .unwrap_or(KernelHandle(0)),
             moe_expert_gate_up_shared_batch2_t_k: gpu.kernel(
                 "moe_shared_expert_fused_batch2_t",
                 "moe_expert_gate_up_shared_batch2_t",

@@ -147,6 +147,11 @@ pub struct MoeLayer {
     // the weight loader produces transposed-only pointer tables.
     moe_expert_gate_up_shared_t_k: KernelHandle,
     moe_expert_silu_down_shared_t_k: KernelHandle,
+    /// Lane-parallel exact twins of the two kernels above (see
+    /// `ops::T_LANES_OUT_BLOCK`); KernelHandle(0) where the target's module
+    /// does not carry them.
+    moe_expert_gate_up_shared_t_lanes_k: KernelHandle,
+    moe_expert_silu_down_shared_t_lanes_k: KernelHandle,
     moe_expert_gate_up_shared_batch2_t_k: KernelHandle,
     moe_expert_silu_down_shared_batch2_t_k: KernelHandle,
     moe_expert_gate_up_shared_batch3_t_k: KernelHandle,

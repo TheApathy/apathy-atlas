@@ -265,3 +265,293 @@ extern "C" __global__ void moe_expert_silu_down_shared_t(
         C[(unsigned long long)expert_slot * N + n] = __float2bfloat16(acc);
     }
 }
+
+// ── Lane-parallel transposed decode kernels (exact twins of the [N, K/2] ──
+// ── decode kernels moe_expert_gate_up_shared / moe_expert_silu_down_shared) ──
+//
+// The one-thread-per-output kernels above walk all of K serially with
+// single-byte loads and are latency bound. These twins reproduce the
+// UNTRANSPOSED decode kernels' arithmetic bit for bit on the transposed
+// layout: each output's 32 K-lanes (lane l owns k16 = l, l+32, ...) compute the
+// same per-lane partial with the same expression, in the same k16 order, and
+// the partials are combined by the same tree the reference's __shfl_down_sync
+// reduction evaluates (offsets 16, 8, 4, 2, 1 as seen by lane 0).
+//
+// Block: 32 K-lanes x TPL threads; each thread owns OPT adjacent outputs,
+// loaded as one OPT-byte word, so a warp reads 32/TPL rows of TPL*OPT
+// contiguous bytes. UNR k16 steps are loaded before any is accumulated, to
+// keep more loads in flight; accumulation order is unchanged.
+// Grid: gate_up (ceil(N/(TPL*OPT)), top_k+1, 2); silu_down (.., top_k+1, 1).
+
+#define T_LANES_K 32
+
+template <int OPT> struct TLanesWord;
+template <> struct TLanesWord<1> { typedef unsigned char T; };
+template <> struct TLanesWord<2> { typedef unsigned short T; };
+template <> struct TLanesWord<4> { typedef unsigned int T; };
+
+template <int OPT>
+__device__ __forceinline__ unsigned int t_lanes_load(const unsigned char* __restrict__ row, unsigned int n0,
+                                                     unsigned int N) {
+    if (n0 + OPT <= N && (((unsigned long long)(row + n0)) % OPT) == 0)
+        return *(const typename TLanesWord<OPT>::T*)(row + n0);
+    unsigned int w = 0;
+    #pragma unroll
+    for (int o = 0; o < OPT; o++)
+        if (n0 + o < N) w |= (unsigned int)row[n0 + o] << (8 * o);
+    return w;
+}
+
+template <int OB>
+__device__ __forceinline__ float t_lanes_tree(float (*part)[OB + 1], unsigned int c) {
+    float v[T_LANES_K];
+    #pragma unroll
+    for (int l = 0; l < T_LANES_K; l++) v[l] = part[l][c];
+    #pragma unroll
+    for (int off = T_LANES_K / 2; off > 0; off >>= 1) {
+        #pragma unroll
+        for (int l = 0; l < off; l++) v[l] = v[l] + v[l + off];
+    }
+    return v[0];
+}
+
+// One lane's partials for OPT outputs. ACT(k) yields the two activations of
+// packed byte b of k16 (as floats) exactly as the reference computes them.
+template <int OPT, int UNR, class Act>
+__device__ __forceinline__ void t_lanes_accumulate(const unsigned char* __restrict__ B_packed,
+                                                   const unsigned char* __restrict__ B_scale, float s2,
+                                                   const float* __restrict__ s_lut, unsigned int l,
+                                                   unsigned int n0, unsigned int N, unsigned int K,
+                                                   Act act, float acc[OPT]) {
+    const unsigned int K16 = K / 16;
+    for (unsigned int kb = l; kb < K16; kb += T_LANES_K * UNR) {
+        unsigned int sw[UNR], pw[UNR][8];
+        #pragma unroll
+        for (int u = 0; u < UNR; u++) {
+            const unsigned int k16 = kb + u * T_LANES_K;
+            if (k16 < K16) {
+                sw[u] = t_lanes_load<OPT>(B_scale + (unsigned long long)k16 * N, n0, N);
+                #pragma unroll
+                for (int b = 0; b < 8; b++)
+                    pw[u][b] = t_lanes_load<OPT>(B_packed + (unsigned long long)(k16 * 8 + b) * N, n0, N);
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < UNR; u++) {
+            const unsigned int k16 = kb + u * T_LANES_K;
+            if (k16 >= K16) break;
+            float sc[OPT];
+            #pragma unroll
+            for (int o = 0; o < OPT; o++) {
+                __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = (unsigned char)(sw[u] >> (8 * o));
+                sc[o] = (float)fp8 * s2;
+            }
+            #pragma unroll
+            for (int b = 0; b < 8; b++) {
+                float al, ah;
+                act(k16, b, al, ah);
+                #pragma unroll
+                for (int o = 0; o < OPT; o++) {
+                    const unsigned int byte = (pw[u][b] >> (8 * o)) & 0xFF;
+                    const float wl = s_lut[byte & 0xF] * sc[o], wh = s_lut[byte >> 4] * sc[o];
+                    acc[o] += al * wl + ah * wh;
+                }
+            }
+        }
+    }
+}
+
+template <int OPT, int TPL, int UNR>
+__device__ __forceinline__ void gate_up_t_lanes_body(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_t_ptrs,
+    const unsigned long long* __restrict__ gate_scale_t_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    __nv_bfloat16* __restrict__ gate_out,
+    const unsigned long long* __restrict__ up_packed_t_ptrs,
+    const unsigned long long* __restrict__ up_scale_t_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ up_out,
+    const unsigned int* __restrict__ expert_indices,
+    const unsigned char* __restrict__ sh_gate_t_packed,
+    const unsigned char* __restrict__ sh_gate_t_scale,
+    float sh_gate_s2,
+    __nv_bfloat16* __restrict__ sh_gate_out,
+    const unsigned char* __restrict__ sh_up_t_packed,
+    const unsigned char* __restrict__ sh_up_t_scale,
+    float sh_up_s2,
+    __nv_bfloat16* __restrict__ sh_up_out,
+    unsigned int N, unsigned int K, unsigned int top_k
+) {
+    constexpr unsigned int OB = TPL * OPT;
+    const unsigned int expert_slot = blockIdx.y;
+    const unsigned int proj = blockIdx.z;
+    const bool is_shared = (expert_slot == top_k);
+    const unsigned int q = threadIdx.x % TPL;
+    const unsigned int l = threadIdx.x / TPL;
+    const unsigned int n_block = blockIdx.x * OB;
+    const unsigned int n0 = n_block + q * OPT;
+
+    const unsigned char* B_packed;
+    const unsigned char* B_scale;
+    float s2;
+    __nv_bfloat16* C;
+    if (is_shared) {
+        B_packed = proj == 0 ? sh_gate_t_packed : sh_up_t_packed;
+        B_scale = proj == 0 ? sh_gate_t_scale : sh_up_t_scale;
+        s2 = proj == 0 ? sh_gate_s2 : sh_up_s2;
+        C = proj == 0 ? sh_gate_out : sh_up_out;
+    } else {
+        const unsigned int expert_id = expert_indices[expert_slot];
+        B_packed = (const unsigned char*)(proj == 0 ? gate_packed_t_ptrs : up_packed_t_ptrs)[expert_id];
+        B_scale = (const unsigned char*)(proj == 0 ? gate_scale_t_ptrs : up_scale_t_ptrs)[expert_id];
+        s2 = (proj == 0 ? gate_scale2_vals : up_scale2_vals)[expert_id];
+        C = (proj == 0 ? gate_out : up_out) + (unsigned long long)expert_slot * N;
+    }
+    if (B_packed == 0) {
+        if (threadIdx.x < OB && n_block + threadIdx.x < N) C[n_block + threadIdx.x] = __float2bfloat16(0.0f);
+        return;
+    }
+
+    __shared__ float s_lut[16];
+    __shared__ float part[T_LANES_K][OB + 1];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT_T[threadIdx.x];
+    __syncthreads();
+
+    float acc[OPT];
+    #pragma unroll
+    for (int o = 0; o < OPT; o++) acc[o] = 0.0f;
+    if (n0 < N) {
+        const unsigned int* A32 = (const unsigned int*)A;
+        auto act = [&](unsigned int k16, int b, float& al, float& ah) {
+            const unsigned int raw = A32[k16 * 8 + b];
+            __nv_bfloat16 lo, hi;
+            *(unsigned short*)&lo = (unsigned short)(raw & 0xFFFF);
+            *(unsigned short*)&hi = (unsigned short)(raw >> 16);
+            al = __bfloat162float(lo);
+            ah = __bfloat162float(hi);
+        };
+        t_lanes_accumulate<OPT, UNR>(B_packed, B_scale, s2, s_lut, l, n0, N, K, act, acc);
+    }
+    #pragma unroll
+    for (int o = 0; o < OPT; o++) part[l][q * OPT + o] = acc[o];
+    __syncthreads();
+    for (unsigned int c = threadIdx.x; c < OB; c += blockDim.x)
+        if (n_block + c < N) C[n_block + c] = __float2bfloat16(t_lanes_tree<OB>(part, c));
+}
+
+template <int OPT, int TPL, int UNR>
+__device__ __forceinline__ void silu_down_t_lanes_body(
+    const __nv_bfloat16* __restrict__ gate_out,
+    const __nv_bfloat16* __restrict__ up_out,
+    const unsigned long long* __restrict__ packed_t_ptrs,
+    const unsigned long long* __restrict__ scale_t_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const unsigned int* __restrict__ expert_indices,
+    const __nv_bfloat16* __restrict__ sh_gate_in,
+    const __nv_bfloat16* __restrict__ sh_up_in,
+    const unsigned char* __restrict__ sh_down_t_packed,
+    const unsigned char* __restrict__ sh_down_t_scale,
+    float sh_down_s2,
+    __nv_bfloat16* __restrict__ sh_down_out,
+    unsigned int N, unsigned int K, unsigned int top_k
+) {
+    constexpr unsigned int OB = TPL * OPT;
+    const unsigned int expert_slot = blockIdx.y;
+    const bool is_shared = (expert_slot == top_k);
+    const unsigned int q = threadIdx.x % TPL;
+    const unsigned int l = threadIdx.x / TPL;
+    const unsigned int n_block = blockIdx.x * OB;
+    const unsigned int n0 = n_block + q * OPT;
+
+    const unsigned char* B_packed;
+    const unsigned char* B_scale;
+    float s2;
+    const __nv_bfloat16* g_ptr;
+    const __nv_bfloat16* u_ptr;
+    __nv_bfloat16* out;
+    if (is_shared) {
+        B_packed = sh_down_t_packed; B_scale = sh_down_t_scale; s2 = sh_down_s2;
+        g_ptr = sh_gate_in; u_ptr = sh_up_in; out = sh_down_out;
+    } else {
+        const unsigned int expert_id = expert_indices[expert_slot];
+        B_packed = (const unsigned char*)packed_t_ptrs[expert_id];
+        B_scale = (const unsigned char*)scale_t_ptrs[expert_id];
+        s2 = scale2_vals[expert_id];
+        g_ptr = gate_out + (unsigned long long)expert_slot * K;
+        u_ptr = up_out + (unsigned long long)expert_slot * K;
+        out = C + (unsigned long long)expert_slot * N;
+    }
+    if (B_packed == 0) {
+        if (threadIdx.x < OB && n_block + threadIdx.x < N) out[n_block + threadIdx.x] = __float2bfloat16(0.0f);
+        return;
+    }
+
+    __shared__ float s_lut[16];
+    __shared__ float part[T_LANES_K][OB + 1];
+    extern __shared__ float s_act[];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT_T[threadIdx.x];
+    for (unsigned int i = threadIdx.x; i < K; i += blockDim.x) {
+        float gf = __bfloat162float(g_ptr[i]);
+        float uf = __bfloat162float(u_ptr[i]);
+        s_act[i] = (gf / (1.0f + __expf(-gf))) * uf;
+    }
+    __syncthreads();
+
+    float acc[OPT];
+    #pragma unroll
+    for (int o = 0; o < OPT; o++) acc[o] = 0.0f;
+    if (n0 < N) {
+        auto act = [&](unsigned int k16, int b, float& al, float& ah) {
+            al = s_act[k16 * 16 + b * 2];
+            ah = s_act[k16 * 16 + b * 2 + 1];
+        };
+        t_lanes_accumulate<OPT, UNR>(B_packed, B_scale, s2, s_lut, l, n0, N, K, act, acc);
+    }
+    #pragma unroll
+    for (int o = 0; o < OPT; o++) part[l][q * OPT + o] = acc[o];
+    __syncthreads();
+    for (unsigned int c = threadIdx.x; c < OB; c += blockDim.x)
+        if (n_block + c < N) out[n_block + c] = __float2bfloat16(t_lanes_tree<OB>(part, c));
+}
+
+#define T_LANES_GU_PARAMS \
+    const __nv_bfloat16* __restrict__ A, const unsigned long long* __restrict__ gate_packed_t_ptrs, \
+    const unsigned long long* __restrict__ gate_scale_t_ptrs, const float* __restrict__ gate_scale2_vals, \
+    __nv_bfloat16* __restrict__ gate_out, const unsigned long long* __restrict__ up_packed_t_ptrs, \
+    const unsigned long long* __restrict__ up_scale_t_ptrs, const float* __restrict__ up_scale2_vals, \
+    __nv_bfloat16* __restrict__ up_out, const unsigned int* __restrict__ expert_indices, \
+    const unsigned char* __restrict__ sh_gate_t_packed, const unsigned char* __restrict__ sh_gate_t_scale, \
+    float sh_gate_s2, __nv_bfloat16* __restrict__ sh_gate_out, const unsigned char* __restrict__ sh_up_t_packed, \
+    const unsigned char* __restrict__ sh_up_t_scale, float sh_up_s2, __nv_bfloat16* __restrict__ sh_up_out, \
+    unsigned int N, unsigned int K, unsigned int top_k
+#define T_LANES_GU_ARGS \
+    A, gate_packed_t_ptrs, gate_scale_t_ptrs, gate_scale2_vals, gate_out, up_packed_t_ptrs, up_scale_t_ptrs, \
+    up_scale2_vals, up_out, expert_indices, sh_gate_t_packed, sh_gate_t_scale, sh_gate_s2, sh_gate_out, \
+    sh_up_t_packed, sh_up_t_scale, sh_up_s2, sh_up_out, N, K, top_k
+#define T_LANES_DN_PARAMS \
+    const __nv_bfloat16* __restrict__ gate_out, const __nv_bfloat16* __restrict__ up_out, \
+    const unsigned long long* __restrict__ packed_t_ptrs, const unsigned long long* __restrict__ scale_t_ptrs, \
+    const float* __restrict__ scale2_vals, __nv_bfloat16* __restrict__ C, const unsigned int* __restrict__ expert_indices, \
+    const __nv_bfloat16* __restrict__ sh_gate_in, const __nv_bfloat16* __restrict__ sh_up_in, \
+    const unsigned char* __restrict__ sh_down_t_packed, const unsigned char* __restrict__ sh_down_t_scale, \
+    float sh_down_s2, __nv_bfloat16* __restrict__ sh_down_out, unsigned int N, unsigned int K, unsigned int top_k
+#define T_LANES_DN_ARGS \
+    gate_out, up_out, packed_t_ptrs, scale_t_ptrs, scale2_vals, C, expert_indices, sh_gate_in, sh_up_in, \
+    sh_down_t_packed, sh_down_t_scale, sh_down_s2, sh_down_out, N, K, top_k
+
+// Variant name suffix: o<OPT>t<TPL>u<UNR>. Block = 32*TPL threads.
+#define T_LANES_VARIANT(OPT, TPL, UNR) \
+    extern "C" __global__ void __launch_bounds__(32 * TPL) \
+    moe_expert_gate_up_shared_t_lanes_o##OPT##t##TPL##u##UNR(T_LANES_GU_PARAMS) { \
+        gate_up_t_lanes_body<OPT, TPL, UNR>(T_LANES_GU_ARGS); } \
+    extern "C" __global__ void __launch_bounds__(32 * TPL) \
+    moe_expert_silu_down_shared_t_lanes_o##OPT##t##TPL##u##UNR(T_LANES_DN_PARAMS) { \
+        silu_down_t_lanes_body<OPT, TPL, UNR>(T_LANES_DN_ARGS); }
+
+T_LANES_VARIANT(4, 16, 1)
+T_LANES_VARIANT(4, 16, 2)
+T_LANES_VARIANT(4, 32, 1)
+T_LANES_VARIANT(2, 32, 1)
+T_LANES_VARIANT(2, 32, 2)
