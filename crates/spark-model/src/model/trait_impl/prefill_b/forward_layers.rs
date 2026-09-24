@@ -323,6 +323,30 @@ impl TransformerModel {
         if let Some(receipt) = prefill_receipt {
             receipt.finish()?;
         }
+        // Diagnostic (default off): ATLAS_PREFILL_HIDDEN_DUMP_ALL=<dir> writes this
+        // chunk's post-layer residual stream (every row, native residual dtype),
+        // for EVERY chunk including prefill-as-decode single rows, so chunked and
+        // one-token-at-a-time scoring can be compared per position offline.
+        if let Ok(dir) = std::env::var("ATLAS_PREFILL_HIDDEN_DUMP_ALL")
+            && !dir.is_empty()
+        {
+            self.gpu.synchronize(stream)?;
+            let rw = self.config.residual_width();
+            let mut buf = vec![0u8; proc_count * rw * fp32];
+            self.gpu.copy_d2h(hidden, &mut buf)?;
+            std::fs::create_dir_all(&dir).ok();
+            // A new request starts at position 0; number requests so several
+            // prompts can share one dump directory.
+            static REQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if effective_seq_len_start == 0 {
+                REQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let req = REQ.load(std::sync::atomic::Ordering::Relaxed);
+            let name = format!(
+                "req{req}_hidden_start{effective_seq_len_start}_rows{proc_count}_h{rw}_elem{fp32}.bin"
+            );
+            std::fs::write(std::path::Path::new(&dir).join(name), &buf).ok();
+        }
         // Every layer of this chunk has captured; advance the DFlash ring so
         // the next chunk's capture starts at the right absolute cursor.
         self.update_dflash_ctx_len_after_prefill(seq, effective_seq_len_start, proc_count)?;
