@@ -250,7 +250,7 @@ fn typed_views_keep_real_parent_allocation_and_live_context_bounds() {
         ".arena",
         ".plan.known_bytes",
         ".logits",
-        "GLM53_EXL3_MAX_WIDE_ROWS",
+        ".max_wide_rows()",
         "VOCAB",
         "position",
         ".checked_mul(",

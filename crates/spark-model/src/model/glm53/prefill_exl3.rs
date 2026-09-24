@@ -19,7 +19,7 @@ use crate::layers::ops::{with_glm53_exact_wide_prefill, with_glm53_layer_major_p
 use super::target_model_exl3::Glm53Exl3Model;
 
 const MAX_WIDE_ROWS: usize = 8;
-const MAX_LAYER_MAJOR_ROWS: usize = 2_048;
+const DEFAULT_LAYER_MAJOR_ROWS: usize = 2_048;
 const VOCAB: usize = 154_880;
 const BF16_BYTES: usize = 2;
 
@@ -56,14 +56,10 @@ pub(super) fn requested_wide_prefill(
         "ATLAS_GLM53_LAYER_MAJOR_VISION_PREFILL requires ATLAS_GLM53_LAYER_MAJOR_PREFILL=1"
     );
     if layer_major && (!has_prepared_images || mixed_layer_major) {
-        let rows = std::env::var("ATLAS_GLM53_LAYER_MAJOR_PREFILL_ROWS")
-            .ok()
-            .map(|value| value.parse::<usize>())
-            .transpose()?
-            .unwrap_or(MAX_LAYER_MAJOR_ROWS);
+        let rows = layer_major_rows_env()?;
         ensure!(
-            matches!(rows, 16 | 32 | 64 | 128 | 256 | 512 | 1_024 | 2_048),
-            "ATLAS_GLM53_LAYER_MAJOR_PREFILL_ROWS must be 16, 32, 64, 128, 256, 512, 1024, or 2048"
+            !has_prepared_images || rows <= DEFAULT_LAYER_MAJOR_ROWS,
+            "GLM mixed image layer-major prefill admits at most 2048 rows"
         );
         return Ok(Some(WidePrefillConfig {
             rows,
@@ -86,6 +82,34 @@ pub(super) fn requested_wide_prefill(
         rows,
         layer_major: false,
     }))
+}
+
+fn layer_major_rows_env() -> Result<usize> {
+    let rows = std::env::var("ATLAS_GLM53_LAYER_MAJOR_PREFILL_ROWS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(DEFAULT_LAYER_MAJOR_ROWS);
+    ensure!(
+        matches!(
+            rows,
+            16 | 32 | 64 | 128 | 256 | 512 | 1_024 | 2_048 | 4_096 | 8_192
+        ),
+        "ATLAS_GLM53_LAYER_MAJOR_PREFILL_ROWS must be 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, or 8192"
+    );
+    Ok(rows)
+}
+
+/// The prompt chunk the target lays its wide scratch out for, latched at load.
+/// Text layer-major prefill is the only consumer of chunks above 2048 rows.
+pub(super) fn configured_layer_major_rows() -> Result<u32> {
+    let layer_major = std::env::var("ATLAS_GLM53_LAYER_MAJOR_PREFILL").as_deref() == Ok("1");
+    let rows = if layer_major {
+        layer_major_rows_env()?
+    } else {
+        DEFAULT_LAYER_MAJOR_ROWS
+    };
+    Ok(u32::try_from(rows.max(DEFAULT_LAYER_MAJOR_ROWS))?)
 }
 
 pub(super) fn mixed_prefill_rows(config: Option<WidePrefillConfig>) -> Result<usize> {
@@ -119,9 +143,9 @@ fn chunk_ranges(tokens: usize, max_rows: usize) -> Result<Vec<Range<usize>>> {
     ensure!(
         matches!(
             max_rows,
-            2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 | 1_024 | 2_048
+            2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 | 1_024 | 2_048 | 4_096 | 8_192
         ),
-        "GLM EXL3 prefill rows must be 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, or 2048"
+        "GLM EXL3 prefill rows must be 2, 4, 8, 16, ..., 2048, 4096, or 8192"
     );
     let mut chunks = Vec::with_capacity(tokens.div_ceil(max_rows));
     let mut start = 0usize;

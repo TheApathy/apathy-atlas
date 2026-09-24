@@ -14,10 +14,12 @@ use crate::weight_loader::{
 
 pub const GLM53_EXL3_MAX_INPUT_F16_BYTES: usize = 16_384 * 2;
 pub const GLM53_EXL3_MAX_OUTPUT_F16_BYTES: usize = 154_880 * 2;
-/// Maximum explicit-default-off layer-major prompt chunk. The exact verifier
-/// continues to admit at most eight rows; only the dedicated prompt scope uses
-/// the larger scratch prefixes.
-pub const GLM53_EXL3_MAX_WIDE_ROWS: usize = 2_048;
+/// Hard ceiling on one layer-major prompt chunk. The exact verifier continues
+/// to admit at most eight rows; only the dedicated prompt scope uses the larger
+/// scratch prefixes, which the target sizes for its configured chunk.
+pub const GLM53_EXL3_MAX_WIDE_ROWS: usize = 8_192;
+/// The prompt chunk scratch is laid out for unless a larger one is configured.
+pub const GLM53_EXL3_DEFAULT_WIDE_ROWS: usize = 2_048;
 pub const GLM53_EXL3_MAX_WIDE_INPUT_F16_BYTES: usize =
     GLM53_EXL3_MAX_WIDE_ROWS * GLM53_EXL3_MAX_INPUT_F16_BYTES;
 pub const GLM53_EXL3_MAX_WIDE_OUTPUT_F16_BYTES: usize =

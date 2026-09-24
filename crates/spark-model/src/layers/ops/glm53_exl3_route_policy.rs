@@ -5,7 +5,10 @@
 use anyhow::{Context, Result, bail, ensure};
 use std::ffi::OsStr;
 
-const MAX_ROWS: u32 = 2048;
+// Mirrors GLM53_EXL3_MAX_WIDE_ROWS / _DEFAULT_WIDE_ROWS; this file is also
+// compiled standalone by tests/glm53_exl3_route_policy.rs.
+const MAX_ROWS: u32 = 8192;
+const DEFAULT_ROWS: u32 = 2048;
 const SMALL_ROWS: u32 = 8;
 const ROUTES: u64 = 8;
 const ROUTE_BYTES: u64 = 4096 * size_of::<f32>() as u64;
@@ -53,8 +56,13 @@ impl Glm53Exl3RoutePolicy {
     }
 
     pub const fn scratch_private_bytes(self) -> u64 {
-        let rows = if self.prefill { MAX_ROWS } else { SMALL_ROWS };
-        rows as u64 * ROUTES * ROUTE_BYTES
+        self.scratch_private_bytes_rows(DEFAULT_ROWS as u64)
+    }
+
+    /// Private route scratch for a prompt scratch laid out for `wide_rows`.
+    pub const fn scratch_private_bytes_rows(self, wide_rows: u64) -> u64 {
+        let rows = if self.prefill { wide_rows } else { SMALL_ROWS as u64 };
+        rows * ROUTES * ROUTE_BYTES
     }
 
     pub const fn prefill_enabled(self) -> bool {

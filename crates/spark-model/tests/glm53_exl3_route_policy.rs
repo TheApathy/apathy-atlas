@@ -115,7 +115,7 @@ fn every_policy_rejects_invalid_geometry_before_selecting_or_sizing() {
         policy(Some("1"), None),
         policy(Some("1"), Some("1")),
     ] {
-        for rows in [0, 2049, u32::MAX] {
+        for rows in [0, 8193, u32::MAX] {
             assert!(got.private_for(rows).is_err(), "rows={rows}");
             assert!(got.private_bytes(rows).is_err(), "rows={rows}");
         }

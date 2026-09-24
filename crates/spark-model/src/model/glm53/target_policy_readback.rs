@@ -76,7 +76,7 @@ impl Glm53Exl3Model {
             .checked_sub(self.logits.0)
             .context("GLM logits source precedes allocation")?;
         let offset = usize::try_from(offset)?;
-        let allocation = GLM53_EXL3_MAX_WIDE_ROWS as usize * VOCAB as usize * 2;
+        let allocation = self.scratch.max_wide_rows() as usize * VOCAB as usize * 2;
         ensure!(
             offset % 2 == 0
                 && offset

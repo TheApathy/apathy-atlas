@@ -240,8 +240,8 @@ __device__ __forceinline__ void atlas_glm53_exl3_build_chunks_private_mx(
         *chunk_count = 0;
         if (*status == 0)
         {
-            bool valid = experts == 288 && pairs > 0 && pairs <= 2048 * 8 &&
-                         pairs % 8 == 0 && max_chunks > 0 && max_chunks <= 1312;
+            bool valid = experts == 288 && pairs > 0 && pairs <= 8192 * 8 &&
+                         pairs % 8 == 0 && max_chunks > 0 && max_chunks <= 4384;
             uint32_t total = 0;
             uint32_t chunks = 0;
             if (valid)

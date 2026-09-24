@@ -59,7 +59,7 @@ pub(super) fn resolve(
             let row_bytes = (VOCAB as usize)
                 .checked_mul(2)
                 .context("logit row bytes overflow")?;
-            let bytes = GLM53_EXL3_MAX_WIDE_ROWS
+            let bytes = (model.scratch.max_wide_rows() as usize)
                 .checked_mul(row_bytes)
                 .context("logit allocation overflow")?;
             let offset = (row as usize)

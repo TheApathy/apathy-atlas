@@ -186,7 +186,7 @@ fn plan_pins_1m_extents_and_rejects_fp8_or_wrong_geometry() {
 
 #[test]
 fn head_transpose_admits_m2048_and_rejects_m2049_before_enqueue() {
-    assert!(CUDA_SOURCE.contains("#define GLM53_DSA_MAX_QUERIES 2048U"));
+    assert!(CUDA_SOURCE.contains("#define GLM53_DSA_MAX_QUERIES 8192U"));
     assert!(CUDA_SOURCE.contains("rows > GLM53_DSA_MAX_QUERIES"));
     assert!(!CUDA_SOURCE.contains("rows > 8U"));
     let gpu = MockGpuBackend::new();

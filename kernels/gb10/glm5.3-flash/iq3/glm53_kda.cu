@@ -70,7 +70,7 @@ atlas_glm53_kda_split_qkv(
         __nv_bfloat16 * __restrict__ key,
         __nv_bfloat16 * __restrict__ value,
         unsigned int tokens) {
-    if (tokens == 0U || tokens > 2048U) return;
+    if (tokens == 0U || tokens > 8192U) return;
     const unsigned long long values =
         (unsigned long long) tokens * GLM53_KDA_QKV_DIM;
     unsigned long long index =

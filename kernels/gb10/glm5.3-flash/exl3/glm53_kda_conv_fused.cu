@@ -33,7 +33,7 @@
 #define GF_CONV_STREAMS 3U
 #define GF_CONV_KERNEL 4U
 #define GF_CONV_MAX_BATCH 64U
-#define GF_CONV_MAX_QUERIES 2048U
+#define GF_CONV_MAX_QUERIES 8192U
 
 extern "C" __global__ void __launch_bounds__(GF_CONV_THREADS, 4)
 atlas_glm53_kda_conv_f32_stage_fused(

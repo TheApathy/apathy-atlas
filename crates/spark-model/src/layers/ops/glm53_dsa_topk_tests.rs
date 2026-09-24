@@ -314,7 +314,7 @@ fn cuda_contract(source: &str) -> bool {
     CUDA_SEAMS
         .iter()
         .all(|seam| source.matches(seam).count() == 1)
-        && source.contains("#define GLM53_DSA_MAX_QUERIES 2048U")
+        && source.contains("#define GLM53_DSA_MAX_QUERIES 8192U")
         && source.contains("const float * __restrict__ scores")
         && !source.contains("scores[row * pool_count + pool] =")
 }

@@ -295,7 +295,12 @@ impl Glm53Exl3Model {
             .alloc(usize::try_from(plan.known_bytes)?)
             .context("GLM EXL3 arena allocation")?;
         gpu.memset(arena, 0, usize::try_from(plan.known_bytes)?)?;
-        let scratch_extent = Glm53WalkScratch::required_bytes_with_route_policy(route_policy);
+        let wide_extent = Glm53WideExtent::for_rows(
+            super::prefill_exl3::configured_layer_major_rows()?,
+            positions,
+        )?;
+        let wide_rows = usize::try_from(wide_extent.rows)?;
+        let scratch_extent = Glm53WalkScratch::required_bytes_with_extent(route_policy, wide_extent);
         let scratch_bytes = usize::try_from(scratch_extent)?
             .checked_add(256)
             .context("GLM EXL3 aligned scratch allocation overflow")?;
@@ -308,8 +313,12 @@ impl Glm53Exl3Model {
                 .context("GLM EXL3 scratch alignment overflow")?
                 & !255,
         );
-        let scratch =
-            Glm53WalkScratch::bind_with_route_policy(scratch_base, scratch_extent, route_policy)?;
+        let scratch = Glm53WalkScratch::bind_with_extent(
+            scratch_base,
+            scratch_extent,
+            route_policy,
+            wide_extent,
+        )?;
         cublaslt_prewarm.initialize(
             gpu.as_ref(),
             scratch_base,
@@ -327,13 +336,12 @@ impl Glm53Exl3Model {
                 Glm53LayerHyperOperands::resolve_exl3(index, &layer.hyper, &layer.norms)
             })
             .collect::<Result<Vec<_>>>()?;
-        let wide_schedule = Glm53TargetSchedule::new(Glm53TargetGeometry::exact(u32::try_from(
-            GLM53_EXL3_MAX_WIDE_ROWS,
-        )?))?;
+        let wide_schedule =
+            Glm53TargetSchedule::new(Glm53TargetGeometry::exact(u32::try_from(wide_rows)?))?;
         let wide_workspace_bytes = usize::try_from(wide_schedule.workspace.arena_bytes)? + 256;
         let wide_workspace_allocation = gpu.alloc(wide_workspace_bytes)?;
         gpu.memset(wide_workspace_allocation, 0, wide_workspace_bytes)?;
-        let logits = gpu.alloc(GLM53_EXL3_MAX_WIDE_ROWS * VOCAB as usize * 2)?;
+        let logits = gpu.alloc(wide_rows * VOCAB as usize * 2)?;
         let dflash2_argmax_allocation = gpu.alloc(DFLASH2_ARGMAX_BYTES)?;
         gpu.memset(dflash2_argmax_allocation, 0, DFLASH2_ARGMAX_BYTES)?;
         let dflash2_argmax_kernel = gpu.kernel("glm53_kda", "atlas_glm53_argmax_bf16_rows")?;
@@ -375,9 +383,7 @@ impl Glm53Exl3Model {
             }),
             live_sequence: AtomicBool::new(false),
             verify_binding_owner: VerifyBindingOwner::new(),
-            verify_readback: Mutex::new(OwnedReadback::new(
-                GLM53_EXL3_MAX_WIDE_ROWS as usize * VOCAB as usize * 2,
-            )?),
+            verify_readback: Mutex::new(OwnedReadback::new(wide_rows * VOCAB as usize * 2)?),
             vision_catalog,
             prepared_vision: Mutex::new(PreparedOwner::new()),
             prefill_capture_bank: Mutex::new(CaptureBankOwner::new()),

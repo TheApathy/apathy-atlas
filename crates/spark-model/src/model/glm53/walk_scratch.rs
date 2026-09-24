@@ -43,8 +43,7 @@ use spark_runtime::gpu::DevicePtr;
 use crate::layers::Glm53SerialMoeBuffers;
 use crate::layers::ops::{GLM53_EXL3_RECONSTRUCT_MAX_BYTES, 
     GLM53_EXL3_LOCK_BYTES, GLM53_EXL3_MAX_INPUT_F16_BYTES, GLM53_EXL3_MAX_OUTPUT_F16_BYTES,
-    GLM53_EXL3_MAX_WIDE_INPUT_F16_BYTES, GLM53_EXL3_MAX_WIDE_OUTPUT_F16_BYTES,
-    GLM53_EXL3_MAX_WIDE_ROWS, GLM53_EXL3_MOE_LOCK_BYTES, GgmlIqBuffer, Glm53Exl3Buffer,
+    GLM53_EXL3_DEFAULT_WIDE_ROWS, GLM53_EXL3_MAX_WIDE_ROWS, GLM53_EXL3_MOE_LOCK_BYTES, GgmlIqBuffer, Glm53Exl3Buffer,
     Glm53Exl3MoeScratch, Glm53Exl3ProjectionScratch, Glm53Exl3RoutePolicy,
 };
 
@@ -52,13 +51,73 @@ use super::arena::{GLM53_T1_TRANSIENT_BYTES, GLM53_T1_WORKSPACE_BYTES};
 
 const ALIGNMENT: u64 = 256;
 const MAX_WIDE_ROWS: u32 = GLM53_EXL3_MAX_WIDE_ROWS as u32;
-const MAX_WIDE_ROWS_U64: u64 = GLM53_EXL3_MAX_WIDE_ROWS as u64;
 
 /// One DSA layer's raw index tail: TAIL_CAPACITY rows of INDEX_DIM bf16.
 const DSA_TAIL_BYTES: u64 = spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY as u64 * 128 * 2;
-/// A chunk can begin with three carried tail rows, so M2048 completes at most
-/// floor((2048 + 3) / 4) = 512 fresh k-pools.
-const DSA_MAX_WIDE_COMPLETE_POOLS: u64 = (MAX_WIDE_ROWS_U64 + 3) / 4;
+/// Row extent of the layer-major prompt scratch, latched once at model load.
+///
+/// `rows` is the largest prompt chunk the scratch admits (the configured
+/// `ATLAS_GLM53_LAYER_MAJOR_PREFILL_ROWS`, 2048 by default) and
+/// `score_row_bytes` is one DSA score row. The default reproduces the historic
+/// max-M2048 layout byte for byte; larger chunks scale every per-row table and
+/// size the score row by the served context instead of the 1M maximum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Glm53WideExtent {
+    pub rows: u64,
+    pub score_row_bytes: u64,
+}
+
+impl Glm53WideExtent {
+    pub const DEFAULT: Self = Self {
+        rows: GLM53_EXL3_DEFAULT_WIDE_ROWS as u64,
+        score_row_bytes: GLM53_DSA_MAX_POOLS * 4,
+    };
+
+    /// `rows` prompt rows over a `capacity`-position sequence. The default
+    /// row count keeps the full-context score row so its layout is unchanged.
+    pub fn for_rows(rows: u32, capacity: u32) -> Result<Self> {
+        ensure!(
+            rows.is_power_of_two() && (16..=MAX_WIDE_ROWS).contains(&rows),
+            "GLM wide scratch rows must be a power of two in 16..={MAX_WIDE_ROWS}"
+        );
+        if u64::from(rows) <= Self::DEFAULT.rows {
+            return Ok(Self::DEFAULT);
+        }
+        // One f32 per k-pool (kpool 4) over the served context, never below
+        // the eight-row exact-wide path's full-context rows.
+        let score_row_bytes = u64::from(capacity).div_ceil(4) * 4;
+        ensure!(
+            score_row_bytes <= GLM53_DSA_MAX_POOLS * 4,
+            "GLM wide scratch capacity exceeds the DSA pool space"
+        );
+        Ok(Self {
+            rows: u64::from(rows),
+            score_row_bytes,
+        })
+    }
+
+    /// A chunk can begin with three carried tail rows, so M rows complete at
+    /// most floor((M + 3) / 4) fresh k-pools.
+    const fn complete_pools(self) -> u64 {
+        (self.rows + 3) / 4
+    }
+
+    const fn moe_pairs(self) -> u64 {
+        self.rows * 8
+    }
+
+    const fn moe_chunks(self) -> u64 {
+        self.moe_pairs().div_ceil(16) + 288
+    }
+
+    /// Bytes of the DSA score buffer: `rows` score rows, but always at least
+    /// the eight full-context rows the exact-wide verifier slices exactly.
+    const fn score_bytes(self) -> u64 {
+        let rows = self.rows * self.score_row_bytes;
+        let exact_wide = 8 * GLM53_DSA_MAX_POOLS * 4;
+        if rows > exact_wide { rows } else { exact_wide }
+    }
+}
 
 /// Cumulative offsets of each table inside the concatenated `bound[..]`.
 ///
@@ -109,20 +168,23 @@ const _: () = {
 };
 
 /// Prompt-scope original-basis F16 weight staging (appended; nothing moves).
-const EXL3_RECONSTRUCT_SCRATCH: [(&str, u64); 3] = [
-    (
-        "exl3_reconstruct_weight_f16",
-        GLM53_EXL3_RECONSTRUCT_MAX_BYTES as u64,
-    ),
-    // Prompt-scope F32 activation staging (router logits GEMM input; mHC
-    // mixing GEMM output): 2048 x 4096 f32.
-    ("exl3_prompt_f32_scratch", MAX_WIDE_ROWS_U64 * 4_096 * 4),
-    // Second reconstruct staging slot so reconstruct(i+1) can overlap GEMM(i).
-    (
-        "exl3_reconstruct_weight_f16_b",
-        GLM53_EXL3_RECONSTRUCT_MAX_BYTES as u64,
-    ),
-];
+const fn exl3_reconstruct_scratch(e: Glm53WideExtent) -> [(&'static str, u64); 3] {
+    [
+        (
+            "exl3_reconstruct_weight_f16",
+            GLM53_EXL3_RECONSTRUCT_MAX_BYTES as u64,
+        ),
+        // Prompt-scope F32 activation staging (router logits GEMM input; mHC
+        // mixing GEMM output): 2048 x 4096 f32.
+        ("exl3_prompt_f32_scratch", e.rows * 4_096 * 4),
+        // Second reconstruct staging slot so reconstruct(i+1) can overlap GEMM(i).
+        (
+            "exl3_reconstruct_weight_f16_b",
+            GLM53_EXL3_RECONSTRUCT_MAX_BYTES as u64,
+        ),
+    ]
+}
+const EXL3_RECONSTRUCT_SCRATCH: [(&str, u64); 3] = exl3_reconstruct_scratch(Glm53WideExtent::DEFAULT);
 
 /// Exact extents `Glm53SerialMoeKernels::execute` requires, in placement order.
 /// Names match the op's buffer struct so a mismatch is greppable.
@@ -255,165 +317,184 @@ const EXL3_SCRATCH: [(&str, u64); 4] = [
 /// Max-M2048 device-routed EXL3 MoE scratch. Appended after every established
 /// slot and prefix-sliced to the active row count by the executor. DFlash K8
 /// consumes the same first-eight-row prefixes as before.
-const EXL3_MOE_MAX_PAIRS: u64 = MAX_WIDE_ROWS_U64 * 8;
-const EXL3_MOE_MAX_CHUNKS: u64 = EXL3_MOE_MAX_PAIRS.div_ceil(16) + 288;
-const EXL3_MOE_SCRATCH: [(&str, u64); 10] = [
-    ("exl3_moe_expert_count_i64", 2_312),
-    ("exl3_moe_token_sorted_i64", MAX_WIDE_ROWS_U64 * 8 * 8),
-    ("exl3_moe_weight_sorted_f16", MAX_WIDE_ROWS_U64 * 8 * 2),
-    (
-        "exl3_moe_temp_state_g_f16",
-        8 * MAX_WIDE_ROWS_U64 * 4_096 * 2,
-    ),
-    (
-        "exl3_moe_temp_state_u_f16",
-        8 * MAX_WIDE_ROWS_U64 * 4_096 * 2,
-    ),
-    (
-        "exl3_moe_temp_intermediate_g_f16",
-        8 * MAX_WIDE_ROWS_U64 * 2_048 * 2,
-    ),
-    (
-        "exl3_moe_temp_intermediate_u_f16",
-        8 * MAX_WIDE_ROWS_U64 * 2_048 * 2,
-    ),
-    ("exl3_moe_output_f32", MAX_WIDE_ROWS_U64 * 4_096 * 4),
-    ("exl3_moe_route_status_u32", 4),
-    ("exl3_moe_locks_i32", GLM53_EXL3_MOE_LOCK_BYTES as u64),
-];
+const fn exl3_moe_scratch(e: Glm53WideExtent) -> [(&'static str, u64); 10] {
+    [
+        ("exl3_moe_expert_count_i64", 2_312),
+        ("exl3_moe_token_sorted_i64", e.rows * 8 * 8),
+        ("exl3_moe_weight_sorted_f16", e.rows * 8 * 2),
+        (
+            "exl3_moe_temp_state_g_f16",
+            8 * e.rows * 4_096 * 2,
+        ),
+        (
+            "exl3_moe_temp_state_u_f16",
+            8 * e.rows * 4_096 * 2,
+        ),
+        (
+            "exl3_moe_temp_intermediate_g_f16",
+            8 * e.rows * 2_048 * 2,
+        ),
+        (
+            "exl3_moe_temp_intermediate_u_f16",
+            8 * e.rows * 2_048 * 2,
+        ),
+        ("exl3_moe_output_f32", e.rows * 4_096 * 4),
+        ("exl3_moe_route_status_u32", 4),
+        ("exl3_moe_locks_i32", GLM53_EXL3_MOE_LOCK_BYTES as u64),
+    ]
+}
+const EXL3_MOE_SCRATCH: [(&str, u64); 10] = exl3_moe_scratch(Glm53WideExtent::DEFAULT);
 
 /// Staged expert-major descriptors append after all established scratch slots,
 /// so enabling the experiment cannot silently rebind an existing consumer.
-const EXL3_MOE_STAGED_SCRATCH: [(&str, u64); 6] = [
-    ("exl3_moe_pair_expert_u32", EXL3_MOE_MAX_PAIRS * 4),
-    ("exl3_moe_chunk_expert_u32", EXL3_MOE_MAX_CHUNKS * 4),
-    ("exl3_moe_chunk_start_u32", EXL3_MOE_MAX_CHUNKS * 4),
-    ("exl3_moe_chunk_rows_u32", EXL3_MOE_MAX_CHUNKS * 4),
-    ("exl3_moe_chunk_count_u32", 4),
-    // Legacy K8 extent; layout() substitutes the latched prefill extent only
-    // for this final slot, preserving every preceding consumer's address.
-    (
-        "exl3_moe_route_private_f32",
-        Glm53Exl3RoutePolicy::legacy().scratch_private_bytes(),
-    ),
-];
+const fn exl3_moe_staged_scratch(e: Glm53WideExtent) -> [(&'static str, u64); 6] {
+    [
+        ("exl3_moe_pair_expert_u32", e.moe_pairs() * 4),
+        ("exl3_moe_chunk_expert_u32", e.moe_chunks() * 4),
+        ("exl3_moe_chunk_start_u32", e.moe_chunks() * 4),
+        ("exl3_moe_chunk_rows_u32", e.moe_chunks() * 4),
+        ("exl3_moe_chunk_count_u32", 4),
+        // Legacy K8 extent; layout() substitutes the latched prefill extent only
+        // for this final slot, preserving every preceding consumer's address.
+        (
+            "exl3_moe_route_private_f32",
+            Glm53Exl3RoutePolicy::legacy().scratch_private_bytes(),
+        ),
+    ]
+}
+const EXL3_MOE_STAGED_SCRATCH: [(&str, u64); 6] = exl3_moe_staged_scratch(Glm53WideExtent::DEFAULT);
 
 /// Separate max-M2048 projection scratch, appended so no established T1 slot
 /// moves. Locks retain the upstream fixed ABI; activation storage scales by M.
-const EXL3_WIDE_SCRATCH: [(&str, u64); 4] = [
-    (
-        "exl3_wide_input_f16",
-        GLM53_EXL3_MAX_WIDE_INPUT_F16_BYTES as u64,
-    ),
-    (
-        "exl3_wide_output_f16",
-        GLM53_EXL3_MAX_WIDE_OUTPUT_F16_BYTES as u64,
-    ),
-    ("exl3_wide_locks_i32", GLM53_EXL3_LOCK_BYTES as u64),
-    (
-        "exl3_wide_input_hadamard_f16",
-        GLM53_EXL3_MAX_WIDE_INPUT_F16_BYTES as u64,
-    ),
-];
+const fn exl3_wide_scratch(e: Glm53WideExtent) -> [(&'static str, u64); 4] {
+    [
+        (
+            "exl3_wide_input_f16",
+            e.rows * GLM53_EXL3_MAX_INPUT_F16_BYTES as u64,
+        ),
+        (
+            "exl3_wide_output_f16",
+            e.rows * GLM53_EXL3_MAX_OUTPUT_F16_BYTES as u64,
+        ),
+        ("exl3_wide_locks_i32", GLM53_EXL3_LOCK_BYTES as u64),
+        (
+            "exl3_wide_input_hadamard_f16",
+            e.rows * GLM53_EXL3_MAX_INPUT_F16_BYTES as u64,
+        ),
+    ]
+}
+const EXL3_WIDE_SCRATCH: [(&str, u64); 4] = exl3_wide_scratch(Glm53WideExtent::DEFAULT);
 
 /// EXL3 dense intermediates for the maximum prompt chunk. The Q8 slot is absent:
 /// compressed EXL3 projections consume the shared projection scratch above.
-const EXL3_WIDE_DENSE_SCRATCH: [(&str, u64); 3] = [
-    ("exl3_wide_dense_gate_bf16", MAX_WIDE_ROWS_U64 * 12_288 * 2),
-    ("exl3_wide_dense_up_bf16", MAX_WIDE_ROWS_U64 * 12_288 * 2),
-    (
-        "exl3_wide_dense_swiglu_bf16",
-        MAX_WIDE_ROWS_U64 * 12_288 * 2,
-    ),
-];
+const fn exl3_wide_dense_scratch(e: Glm53WideExtent) -> [(&'static str, u64); 3] {
+    [
+        ("exl3_wide_dense_gate_bf16", e.rows * 12_288 * 2),
+        ("exl3_wide_dense_up_bf16", e.rows * 12_288 * 2),
+        (
+            "exl3_wide_dense_swiglu_bf16",
+            e.rows * 12_288 * 2,
+        ),
+    ]
+}
+const EXL3_WIDE_DENSE_SCRATCH: [(&str, u64); 3] = exl3_wide_dense_scratch(Glm53WideExtent::DEFAULT);
 
 /// Router and shared-expert buffers for the maximum prompt chunk. Routed-expert
 /// intermediates live in `EXL3_MOE_SCRATCH`; only the fused path uses these.
-const EXL3_WIDE_ROUTER_MOE_SCRATCH: [(&str, u64); 10] = [
-    ("exl3_wide_router_logits_f32", MAX_WIDE_ROWS_U64 * 288 * 4),
-    ("exl3_wide_router_probs_f32", MAX_WIDE_ROWS_U64 * 288 * 4),
-    ("exl3_wide_router_biased_f32", MAX_WIDE_ROWS_U64 * 288 * 4),
-    ("exl3_wide_route_ids_u32", MAX_WIDE_ROWS_U64 * 8 * 4),
-    ("exl3_wide_route_weights_f32", MAX_WIDE_ROWS_U64 * 8 * 4),
-    ("exl3_wide_shared_gate_bf16", MAX_WIDE_ROWS_U64 * 2_048 * 2),
-    ("exl3_wide_shared_up_bf16", MAX_WIDE_ROWS_U64 * 2_048 * 2),
-    (
-        "exl3_wide_shared_swiglu_bf16",
-        MAX_WIDE_ROWS_U64 * 2_048 * 2,
-    ),
-    ("exl3_wide_shared_bf16", MAX_WIDE_ROWS_U64 * 4_096 * 2),
-    ("exl3_wide_unused_q8", 1),
-];
+const fn exl3_wide_router_moe_scratch(e: Glm53WideExtent) -> [(&'static str, u64); 10] {
+    [
+        ("exl3_wide_router_logits_f32", e.rows * 288 * 4),
+        ("exl3_wide_router_probs_f32", e.rows * 288 * 4),
+        ("exl3_wide_router_biased_f32", e.rows * 288 * 4),
+        ("exl3_wide_route_ids_u32", e.rows * 8 * 4),
+        ("exl3_wide_route_weights_f32", e.rows * 8 * 4),
+        ("exl3_wide_shared_gate_bf16", e.rows * 2_048 * 2),
+        ("exl3_wide_shared_up_bf16", e.rows * 2_048 * 2),
+        (
+            "exl3_wide_shared_swiglu_bf16",
+            e.rows * 2_048 * 2,
+        ),
+        ("exl3_wide_shared_bf16", e.rows * 4_096 * 2),
+        ("exl3_wide_unused_q8", 1),
+    ]
+}
+const EXL3_WIDE_ROUTER_MOE_SCRATCH: [(&str, u64); 10] = exl3_wide_router_moe_scratch(Glm53WideExtent::DEFAULT);
 
 /// KDA intermediates for one causal prompt chunk.
-const EXL3_WIDE_KDA_SCRATCH: [(&str, u64); 17] = [
-    ("exl3_wide_kda_q_proj_bf16", MAX_WIDE_ROWS_U64 * 16_384),
-    ("exl3_wide_kda_k_proj_bf16", MAX_WIDE_ROWS_U64 * 16_384),
-    ("exl3_wide_kda_v_proj_bf16", MAX_WIDE_ROWS_U64 * 16_384),
-    ("exl3_wide_kda_q_conv_bf16", MAX_WIDE_ROWS_U64 * 16_384),
-    ("exl3_wide_kda_k_conv_bf16", MAX_WIDE_ROWS_U64 * 16_384),
-    ("exl3_wide_kda_v_conv_bf16", MAX_WIDE_ROWS_U64 * 16_384),
-    ("exl3_wide_kda_f_a_bf16", MAX_WIDE_ROWS_U64 * 256),
-    ("exl3_wide_kda_f_b_bf16", MAX_WIDE_ROWS_U64 * 16_384),
-    ("exl3_wide_kda_log_decay_f32", MAX_WIDE_ROWS_U64 * 32_768),
-    ("exl3_wide_kda_beta_proj_bf16", MAX_WIDE_ROWS_U64 * 128),
-    ("exl3_wide_kda_beta_bf16", MAX_WIDE_ROWS_U64 * 128),
-    ("exl3_wide_kda_g_a_bf16", MAX_WIDE_ROWS_U64 * 256),
-    ("exl3_wide_kda_g_b_bf16", MAX_WIDE_ROWS_U64 * 16_384),
-    (
-        "exl3_wide_kda_recurrent_out_bf16",
-        MAX_WIDE_ROWS_U64 * 16_384,
-    ),
-    ("exl3_wide_kda_gated_bf16", MAX_WIDE_ROWS_U64 * 16_384),
-    ("exl3_wide_kda_unused_q8", 1),
-    (
-        "exl3_wide_kda_combined_qkv_bf16",
-        MAX_WIDE_ROWS_U64 * 3 * 16_384,
-    ),
-];
+const fn exl3_wide_kda_scratch(e: Glm53WideExtent) -> [(&'static str, u64); 17] {
+    [
+        ("exl3_wide_kda_q_proj_bf16", e.rows * 16_384),
+        ("exl3_wide_kda_k_proj_bf16", e.rows * 16_384),
+        ("exl3_wide_kda_v_proj_bf16", e.rows * 16_384),
+        ("exl3_wide_kda_q_conv_bf16", e.rows * 16_384),
+        ("exl3_wide_kda_k_conv_bf16", e.rows * 16_384),
+        ("exl3_wide_kda_v_conv_bf16", e.rows * 16_384),
+        ("exl3_wide_kda_f_a_bf16", e.rows * 256),
+        ("exl3_wide_kda_f_b_bf16", e.rows * 16_384),
+        ("exl3_wide_kda_log_decay_f32", e.rows * 32_768),
+        ("exl3_wide_kda_beta_proj_bf16", e.rows * 128),
+        ("exl3_wide_kda_beta_bf16", e.rows * 128),
+        ("exl3_wide_kda_g_a_bf16", e.rows * 256),
+        ("exl3_wide_kda_g_b_bf16", e.rows * 16_384),
+        (
+            "exl3_wide_kda_recurrent_out_bf16",
+            e.rows * 16_384,
+        ),
+        ("exl3_wide_kda_gated_bf16", e.rows * 16_384),
+        ("exl3_wide_kda_unused_q8", 1),
+        (
+            "exl3_wide_kda_combined_qkv_bf16",
+            e.rows * 3 * 16_384,
+        ),
+    ]
+}
+const EXL3_WIDE_KDA_SCRATCH: [(&str, u64); 17] = exl3_wide_kda_scratch(Glm53WideExtent::DEFAULT);
 
 /// DSA verifier-chunk intermediates, including row/head transposition and
 /// query metadata that the persistent one-row cache ABI cannot hold.
-const EXL3_WIDE_DSA_SCRATCH: [(&str, u64); 26] = [
-    ("exl3_wide_dsa_qr_bf16", MAX_WIDE_ROWS_U64 * 3_072),
-    ("exl3_wide_dsa_qr_norm_bf16", MAX_WIDE_ROWS_U64 * 3_072),
-    ("exl3_wide_dsa_q_b_bf16", MAX_WIDE_ROWS_U64 * 32_768),
-    ("exl3_wide_dsa_absorbed_q_bf16", MAX_WIDE_ROWS_U64 * 65_536),
-    ("exl3_wide_dsa_kv_cmpr_bf16", MAX_WIDE_ROWS_U64 * 1_024),
-    ("exl3_wide_dsa_kv_cmpr_norm_bf16", MAX_WIDE_ROWS_U64 * 1_024),
-    ("exl3_wide_dsa_index_k_bf16", MAX_WIDE_ROWS_U64 * 256),
-    ("exl3_wide_dsa_index_k_norm_bf16", MAX_WIDE_ROWS_U64 * 256),
-    ("exl3_wide_dsa_index_g_bf16", MAX_WIDE_ROWS_U64 * 256),
-    ("exl3_wide_dsa_index_q_bf16", MAX_WIDE_ROWS_U64 * 8_192),
-    ("exl3_wide_dsa_head_weights_bf16", MAX_WIDE_ROWS_U64 * 64),
-    ("exl3_wide_dsa_scores_f32", MAX_WIDE_ROWS_U64 * 1_048_576),
-    (
-        "exl3_wide_dsa_selected_indices_i32",
-        MAX_WIDE_ROWS_U64 * 8_204,
-    ),
-    (
-        "exl3_wide_dsa_weighted_latent_bf16",
-        MAX_WIDE_ROWS_U64 * 65_536,
-    ),
-    ("exl3_wide_dsa_unabsorbed_bf16", MAX_WIDE_ROWS_U64 * 32_768),
-    (
-        "exl3_wide_dsa_pool_keys_bf16",
-        DSA_MAX_WIDE_COMPLETE_POOLS * 128 * 2,
-    ),
-    (
-        "exl3_wide_dsa_pool_validity_u8",
-        DSA_MAX_WIDE_COMPLETE_POOLS,
-    ),
-    ("exl3_wide_dsa_tail_keys_bf16", DSA_TAIL_BYTES),
-    ("exl3_wide_dsa_tail_gates_bf16", DSA_TAIL_BYTES),
-    ("exl3_wide_dsa_unused_q8", 1),
-    ("exl3_wide_dsa_head_major_large", MAX_WIDE_ROWS_U64 * 65_536),
-    ("exl3_wide_dsa_head_major_small", MAX_WIDE_ROWS_U64 * 32_768),
-    ("exl3_wide_dsa_sequence_length_u32", 4),
-    ("exl3_wide_dsa_query_positions_u32", MAX_WIDE_ROWS_U64 * 4),
-    ("exl3_wide_dsa_query_validity_u8", MAX_WIDE_ROWS_U64),
-    ("exl3_wide_dsa_tail_validity_u8", 3),
-];
+const fn exl3_wide_dsa_scratch(e: Glm53WideExtent) -> [(&'static str, u64); 26] {
+    [
+        ("exl3_wide_dsa_qr_bf16", e.rows * 3_072),
+        ("exl3_wide_dsa_qr_norm_bf16", e.rows * 3_072),
+        ("exl3_wide_dsa_q_b_bf16", e.rows * 32_768),
+        ("exl3_wide_dsa_absorbed_q_bf16", e.rows * 65_536),
+        ("exl3_wide_dsa_kv_cmpr_bf16", e.rows * 1_024),
+        ("exl3_wide_dsa_kv_cmpr_norm_bf16", e.rows * 1_024),
+        ("exl3_wide_dsa_index_k_bf16", e.rows * 256),
+        ("exl3_wide_dsa_index_k_norm_bf16", e.rows * 256),
+        ("exl3_wide_dsa_index_g_bf16", e.rows * 256),
+        ("exl3_wide_dsa_index_q_bf16", e.rows * 8_192),
+        ("exl3_wide_dsa_head_weights_bf16", e.rows * 64),
+        ("exl3_wide_dsa_scores_f32", e.score_bytes()),
+        (
+            "exl3_wide_dsa_selected_indices_i32",
+            e.rows * 8_204,
+        ),
+        (
+            "exl3_wide_dsa_weighted_latent_bf16",
+            e.rows * 65_536,
+        ),
+        ("exl3_wide_dsa_unabsorbed_bf16", e.rows * 32_768),
+        (
+            "exl3_wide_dsa_pool_keys_bf16",
+            e.complete_pools() * 128 * 2,
+        ),
+        (
+            "exl3_wide_dsa_pool_validity_u8",
+            e.complete_pools(),
+        ),
+        ("exl3_wide_dsa_tail_keys_bf16", DSA_TAIL_BYTES),
+        ("exl3_wide_dsa_tail_gates_bf16", DSA_TAIL_BYTES),
+        ("exl3_wide_dsa_unused_q8", 1),
+        ("exl3_wide_dsa_head_major_large", e.rows * 65_536),
+        ("exl3_wide_dsa_head_major_small", e.rows * 32_768),
+        ("exl3_wide_dsa_sequence_length_u32", 4),
+        ("exl3_wide_dsa_query_positions_u32", e.rows * 4),
+        ("exl3_wide_dsa_query_validity_u8", e.rows),
+        ("exl3_wide_dsa_tail_validity_u8", 3),
+    ]
+}
+const EXL3_WIDE_DSA_SCRATCH: [(&str, u64); 26] = exl3_wide_dsa_scratch(Glm53WideExtent::DEFAULT);
 
 /// The largest k-pool count the score buffer is sized for: full 1M / kpool 4.
 pub const GLM53_DSA_MAX_POOLS: u64 = 262_144;
@@ -427,6 +508,7 @@ const _: () = {
 #[derive(Debug, Clone, Copy)]
 pub struct Glm53WalkScratch {
     exl3_route_policy: Glm53Exl3RoutePolicy,
+    extent: Glm53WideExtent,
     router_logits_f32: GgmlIqBuffer,
     route_ids_u32: GgmlIqBuffer,
     route_weights_f32: GgmlIqBuffer,
@@ -528,28 +610,30 @@ fn align_up(value: u64) -> u64 {
     (value + ALIGNMENT - 1) & !(ALIGNMENT - 1)
 }
 
-fn layout(policy: Glm53Exl3RoutePolicy) -> impl Iterator<Item = (&'static str, u64)> {
+fn layout(
+    policy: Glm53Exl3RoutePolicy,
+    e: Glm53WideExtent,
+) -> impl Iterator<Item = (&'static str, u64)> {
     MOE_SCRATCH
-        .iter()
-        .chain(DENSE_SCRATCH.iter())
-        .chain(KDA_SCRATCH.iter())
-        .chain(DSA_SCRATCH.iter())
-        .chain(ROUTER_DIAG_SCRATCH.iter())
-        .chain(GROUPED_MOE_SCRATCH.iter())
-        .chain(EXL3_SCRATCH.iter())
-        .chain(EXL3_MOE_SCRATCH.iter())
-        .chain(EXL3_WIDE_SCRATCH.iter())
-        .chain(EXL3_WIDE_DENSE_SCRATCH.iter())
-        .chain(EXL3_WIDE_ROUTER_MOE_SCRATCH.iter())
-        .chain(EXL3_WIDE_KDA_SCRATCH.iter())
-        .chain(EXL3_WIDE_DSA_SCRATCH.iter())
-        .chain(EXL3_MOE_STAGED_SCRATCH.iter())
-        .chain(EXL3_RECONSTRUCT_SCRATCH.iter())
-        .copied()
+        .into_iter()
+        .chain(DENSE_SCRATCH.into_iter())
+        .chain(KDA_SCRATCH.into_iter())
+        .chain(DSA_SCRATCH.into_iter())
+        .chain(ROUTER_DIAG_SCRATCH.into_iter())
+        .chain(GROUPED_MOE_SCRATCH.into_iter())
+        .chain(EXL3_SCRATCH.into_iter())
+        .chain(exl3_moe_scratch(e).into_iter())
+        .chain(exl3_wide_scratch(e).into_iter())
+        .chain(exl3_wide_dense_scratch(e).into_iter())
+        .chain(exl3_wide_router_moe_scratch(e).into_iter())
+        .chain(exl3_wide_kda_scratch(e).into_iter())
+        .chain(exl3_wide_dsa_scratch(e).into_iter())
+        .chain(exl3_moe_staged_scratch(e).into_iter())
+        .chain(exl3_reconstruct_scratch(e).into_iter())
         .enumerate()
         .map(move |(index, (name, bytes))| {
             let bytes = if index == EXL3_MOE_STAGED_OFFSET + EXL3_MOE_STAGED_SCRATCH.len() - 1 {
-                policy.scratch_private_bytes()
+                policy.scratch_private_bytes_rows(e.rows)
             } else {
                 bytes
             };
@@ -571,8 +655,17 @@ impl Glm53WalkScratch {
         bytes: u64,
         policy: Glm53Exl3RoutePolicy,
     ) -> Result<Self> {
+        Self::bind_with_extent(base, bytes, policy, Glm53WideExtent::DEFAULT)
+    }
+
+    pub fn bind_with_extent(
+        base: DevicePtr,
+        bytes: u64,
+        policy: Glm53Exl3RoutePolicy,
+        extent: Glm53WideExtent,
+    ) -> Result<Self> {
         ensure!(!base.is_null(), "GLM walk scratch base is NULL");
-        let required = Self::required_bytes_with_route_policy(policy);
+        let required = Self::required_bytes_with_extent(policy, extent);
         ensure!(
             bytes >= required,
             "GLM walk scratch allocation is {bytes} bytes, need {required}"
@@ -595,7 +688,7 @@ impl Glm53WalkScratch {
         // layer is one or the other, but overlapping them would make a
         // scheduling bug silently read another layer's activations instead of
         // failing, and there is a megabyte to spare.
-        for (name, bytes) in layout(policy) {
+        for (name, bytes) in layout(policy, extent) {
             let offset = align_up(cursor);
             let end = offset
                 .checked_add(bytes)
@@ -617,6 +710,7 @@ impl Glm53WalkScratch {
 
         Ok(Self {
             exl3_route_policy: policy,
+            extent,
             router_logits_f32: bound[0],
             route_ids_u32: bound[1],
             route_weights_f32: bound[2],
@@ -700,9 +794,10 @@ impl Glm53WalkScratch {
         &self,
         rows: u32,
     ) -> Result<(GgmlIqBuffer, GgmlIqBuffer, GgmlIqBuffer)> {
+        let max_rows = self.max_wide_rows();
         ensure!(
-            (1..=MAX_WIDE_ROWS).contains(&rows),
-            "GLM router scratch rows must be 1..={MAX_WIDE_ROWS}"
+            (1..=max_rows).contains(&rows),
+            "GLM router scratch rows must be 1..={max_rows}"
         );
         if rows == 1 {
             return Ok(self.router_scratch());
@@ -725,9 +820,10 @@ impl Glm53WalkScratch {
     }
 
     pub fn router_scores_rows(&self, rows: u32) -> Result<(GgmlIqBuffer, GgmlIqBuffer)> {
+        let max_rows = self.max_wide_rows();
         ensure!(
-            (1..=MAX_WIDE_ROWS).contains(&rows),
-            "GLM router score rows must be 1..={MAX_WIDE_ROWS}"
+            (1..=max_rows).contains(&rows),
+            "GLM router score rows must be 1..={max_rows}"
         );
         if rows == 1 {
             return Ok(self.router_scores());
@@ -745,9 +841,10 @@ impl Glm53WalkScratch {
         input: GgmlIqBuffer,
         output: GgmlIqBuffer,
     ) -> Result<Glm53SerialMoeBuffers> {
+        let max_rows = self.max_wide_rows();
         ensure!(
-            (1..=MAX_WIDE_ROWS).contains(&rows),
-            "GLM MoE scratch rows must be 1..={MAX_WIDE_ROWS}"
+            (1..=max_rows).contains(&rows),
+            "GLM MoE scratch rows must be 1..={max_rows}"
         );
         if rows == 1 {
             return Ok(self.moe_buffers(input, output));
@@ -801,9 +898,10 @@ impl Glm53WalkScratch {
 
     /// Select the immutable T1 layout or the appended max-M2048 layout.
     pub fn exl3_projection_scratch_rows(&self, rows: u32) -> Result<Glm53Exl3ProjectionScratch> {
+        let max_rows = self.max_wide_rows();
         ensure!(
-            (1..=MAX_WIDE_ROWS).contains(&rows),
-            "GLM EXL3 scratch rows must be 1..={MAX_WIDE_ROWS}"
+            (1..=max_rows).contains(&rows),
+            "GLM EXL3 scratch rows must be 1..={max_rows}"
         );
         if rows == 1 {
             return Ok(self.exl3_projection_scratch());
@@ -858,9 +956,10 @@ impl Glm53WalkScratch {
     }
 
     pub fn dense_buffers_rows(&self, rows: u32) -> Result<Glm53DenseFfnBuffers> {
+        let max_rows = self.max_wide_rows();
         ensure!(
-            (1..=MAX_WIDE_ROWS).contains(&rows),
-            "GLM dense scratch rows must be 1..={MAX_WIDE_ROWS}"
+            (1..=max_rows).contains(&rows),
+            "GLM dense scratch rows must be 1..={max_rows}"
         );
         if rows == 1 {
             return Ok(self.dense_buffers());
@@ -902,9 +1001,10 @@ impl Glm53WalkScratch {
     }
 
     pub fn kda_buffers_rows(&self, rows: u32) -> Result<Glm53KdaScratchBuffers> {
+        let max_rows = self.max_wide_rows();
         ensure!(
-            (1..=MAX_WIDE_ROWS).contains(&rows),
-            "GLM KDA scratch rows must be 1..={MAX_WIDE_ROWS}"
+            (1..=max_rows).contains(&rows),
+            "GLM KDA scratch rows must be 1..={max_rows}"
         );
         if rows == 1 {
             return Ok(self.kda_buffers());
@@ -977,9 +1077,10 @@ impl Glm53WalkScratch {
     }
 
     pub fn dsa_buffers_rows(&self, rows: u32) -> Result<Glm53DsaScratchBuffers> {
+        let max_rows = self.max_wide_rows();
         ensure!(
-            (1..=MAX_WIDE_ROWS).contains(&rows),
-            "GLM DSA scratch rows must be 1..={MAX_WIDE_ROWS}"
+            (1..=max_rows).contains(&rows),
+            "GLM DSA scratch rows must be 1..={max_rows}"
         );
         if rows == 1 {
             return Ok(self.dsa_buffers());
@@ -998,7 +1099,16 @@ impl Glm53WalkScratch {
             index_g_bf16: b(8, 256)?,
             index_q_bf16: b(9, 8_192)?,
             head_weights_bf16: b(10, 64)?,
-            scores_f32: b(11, 1_048_576)?,
+            // The exact-wide verifier (<= 8 rows) slices full-context score
+            // rows exactly; layer-major chunks use the latched score row.
+            scores_f32: b(
+                11,
+                if rows <= 8 {
+                    1_048_576
+                } else {
+                    usize::try_from(self.extent.score_row_bytes)?
+                },
+            )?,
             selected_indices_i32: b(12, 8_204)?,
             weighted_latent_bf16: b(13, 65_536)?,
             unabsorbed_bf16: b(14, 32_768)?,
@@ -1025,14 +1135,31 @@ impl Glm53WalkScratch {
         self.exl3_route_policy
     }
 
+    /// The largest prompt chunk this scratch was laid out for.
+    pub fn max_wide_rows(&self) -> u32 {
+        self.extent.rows as u32
+    }
+
+    /// One layer-major DSA score row, in bytes.
+    pub fn score_row_bytes(&self) -> u64 {
+        self.extent.score_row_bytes
+    }
+
     /// Total scratch actually consumed, for residency accounting and tests.
     pub fn used_bytes() -> u64 {
         Self::required_bytes_with_route_policy(Glm53Exl3RoutePolicy::legacy())
     }
 
     pub fn required_bytes_with_route_policy(policy: Glm53Exl3RoutePolicy) -> u64 {
+        Self::required_bytes_with_extent(policy, Glm53WideExtent::DEFAULT)
+    }
+
+    pub fn required_bytes_with_extent(
+        policy: Glm53Exl3RoutePolicy,
+        extent: Glm53WideExtent,
+    ) -> u64 {
         let mut cursor = 0u64;
-        for (_, bytes) in layout(policy) {
+        for (_, bytes) in layout(policy, extent) {
             cursor = align_up(cursor) + bytes;
         }
         cursor
