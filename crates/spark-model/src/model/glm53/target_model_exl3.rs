@@ -340,7 +340,10 @@ impl Glm53Exl3Model {
         let (prefix_commit_allocation, prefix_commit, prefix_kda_kernels) =
             if super::prefix_commit::prefix_commit_enabled() {
                 use super::prefix_commit::PrefixCommitBuffers;
-                let bytes = PrefixCommitBuffers::BYTES + 256;
+                let kda_rows = super::prefix_commit::kda_snapshot_rows_from(
+                    std::env::var("ATLAS_GLM53_PREFIX_COMMIT_ROWS").ok().as_deref(),
+                )?;
+                let bytes = PrefixCommitBuffers::bytes(kda_rows) + 256;
                 let allocation = gpu
                     .alloc(bytes)
                     .context("GLM prefix-commit snapshot allocation")?;
@@ -352,7 +355,7 @@ impl Glm53Exl3Model {
                 );
                 (
                     allocation,
-                    Some(PrefixCommitBuffers::bind(base)?),
+                    Some(PrefixCommitBuffers::bind(base, kda_rows)?),
                     Some(super::kda_attention::Glm53KdaAttentionKernels::load(gpu.as_ref())?),
                 )
             } else {
@@ -439,6 +442,39 @@ impl Glm53Exl3Model {
                 line.push_str(&format!(" o{ordinal}.{name}={:016x}", hasher.finish()));
             }
         }
+        // DSA: every layer's committed latent rows and complete pools up to
+        // `position`, and the prior tail carry. Rows past `position` are not
+        // part of the committed state and are excluded.
+        let latent_bytes = usize::try_from(position)? * 1024;
+        let pools = usize::try_from(position / 4)?;
+        for (ordinal, cache) in self.dsa_cache.iter().enumerate() {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for (buffer, bytes) in [
+                (cache.latent_cache_bf16, latent_bytes),
+                (cache.pool_keys_bf16, pools * 256),
+                (cache.pool_validity_u8, pools),
+                (cache.prior_tail_keys_bf16, cache.prior_tail_keys_bf16.bytes),
+                (cache.prior_tail_gates_bf16, cache.prior_tail_gates_bf16.bytes),
+                (cache.prior_tail_validity_u8, cache.prior_tail_validity_u8.bytes),
+            ] {
+                ensure!(bytes <= buffer.bytes, "GLM state hash: DSA extent");
+                let mut host = vec![0u8; bytes];
+                if bytes > 0 {
+                    self.gpu.copy_d2h(buffer.ptr, &mut host)?;
+                }
+                hasher.write(&host);
+            }
+            line.push_str(&format!(" d{ordinal}={:016x}", hasher.finish()));
+            // The validity byte of the first pool past the committed ones,
+            // reported separately: a rejected draft row that completed a pool
+            // must not leave its validity behind.
+            if pools < cache.pool_validity_u8.bytes {
+                let mut ahead = [0u8; 1];
+                self.gpu
+                    .copy_d2h(cache.pool_validity_u8.ptr.offset(pools), &mut ahead)?;
+                line.push_str(&format!(" d{ordinal}ahead={}", ahead[0]));
+            }
+        }
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -490,8 +526,14 @@ impl Glm53Exl3Model {
             state.nonce
         };
         let gpu = self.gpu.as_ref();
+        // Gate control only: commit the KDA state one row PAST the accepted
+        // prefix (an accept-path off-by-one). Must fail the output and state gates.
+        let extra_row = std::env::var("ATLAS_GLM53_SPEC_CONTROL_COMMIT_EXTRA_ROW").as_deref()
+            == Ok("1")
+            && rows + 1 < total_rows;
+        let kda_row = if extra_row { rows } else { rows - 1 };
         for state in &self.kda_states {
-            let snapshot = prefix.kda_row(state.ordinal(), rows - 1)?;
+            let snapshot = prefix.kda_row(state.ordinal(), kda_row)?;
             gpu.copy_d2d_async(snapshot.ptr, state.persistent().ptr, snapshot.bytes, stream)?;
         }
         let buffers = self.scratch.kda_buffers_rows(total_u32)?;

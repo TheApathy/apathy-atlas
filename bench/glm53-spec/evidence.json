@@ -1,0 +1,26 @@
+{
+  "chunked_prefill_covered": false,
+  "control_extra_row_fails_identity": true,
+  "control_extra_row_fails_state": true,
+  "control_legacy_restage_fails_identity": true,
+  "control_legacy_restage_fails_state": true,
+  "identity_binary_sha256": "2f429c39934ca98a2ce57558d531561e0e3b361accf9d769aebe527a32bdf8ae",
+  "identity_prompts": [
+    "code2",
+    "long",
+    "prose",
+    "short",
+    "think"
+  ],
+  "identity_trials_differ": 0,
+  "identity_trials_equal": 35,
+  "kernel_harness_bit_identical": true,
+  "perturbed_prompt_control_differs": true,
+  "schema": "atlas.glm53.speculative_admission.v1",
+  "scope": "greedy",
+  "state_binary_sha256": "93d924fb7229e428af5c9d6c417c84babe9c0e1e02bd42d4c4b3cb5e34531f1b",
+  "state_full_positions_equal": 350,
+  "state_gate_passed": true,
+  "state_layers": "kda 0/17/33 conv+recurrent; dsa 0..10 latent/pools/tail + pool-ahead validity",
+  "state_prefix_positions_equal": 439
+}
