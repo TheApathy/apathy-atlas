@@ -239,8 +239,9 @@ atlas_glm53_dsa_selected_attention_bf16(
 // chunks, bit-identical by construction. The selected set is per ROW, not per
 // head, so one CTA canonicalizes it once and serves all 64 heads in groups of
 // GLM53_DSA_ROWS_GROUP (the reference re-sorts it 64 times and walks every item
-// with a 256-thread tree reduction and nine barriers). Every rounding step of
-// the reference is reproduced in the same order:
+// with a 256-thread tree reduction and nine barriers). Selected latent rows are
+// staged through shared memory in double-buffered cp.async tiles. Every
+// rounding step of the reference is reproduced in the same order:
 //  * score: partial[l] = q[l]*k[l] + q[l+256]*k[l+256] (no FMA), reduced by the
 //    same halving tree (strides 128..1). A warp holds partial[j + 32r] in lane
 //    j, register r, so strides 128/64/32 are in-register and 16..1 are
@@ -251,9 +252,38 @@ atlas_glm53_dsa_selected_attention_bf16(
 //    fadd(sum, p*v) serially in ascending item order, as the reference does.
 #define GLM53_DSA_ROWS_THREADS 512U
 #define GLM53_DSA_ROWS_GROUP 8U
+#define GLM53_DSA_ROWS_TILE 12U
+// [item][GROUP] f32 scores | canonical item list | sort network / 2 KV tiles
+#define GLM53_DSA_ROWS_SCORE_BYTES (GLM53_DSA_SELECTED * GLM53_DSA_ROWS_GROUP * 4U)
+#define GLM53_DSA_ROWS_ORDER_BYTES 8224U
+#define GLM53_DSA_ROWS_TILE_BYTES (GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT * 2U)
+#define GLM53_DSA_ROWS_SCRATCH_BYTES \
+    (2U * GLM53_DSA_ROWS_TILE_BYTES > GLM53_DSA_SORT_WIDTH * 4U ? \
+     2U * GLM53_DSA_ROWS_TILE_BYTES : GLM53_DSA_SORT_WIDTH * 4U)
 #define GLM53_DSA_ROWS_SHARED \
-    (GLM53_DSA_SORT_WIDTH * 4U + GLM53_DSA_ROWS_GROUP * GLM53_DSA_SELECTED * 4U + \
-     GLM53_DSA_ROWS_GROUP * 4U)
+    (GLM53_DSA_ROWS_SCORE_BYTES + GLM53_DSA_ROWS_ORDER_BYTES + GLM53_DSA_ROWS_SCRATCH_BYTES)
+
+__device__ __forceinline__ void glm53_dsa_rows_cp16(void * shared, const void * global) {
+    const unsigned address = (unsigned)__cvta_generic_to_shared(shared);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(address), "l"(global));
+}
+
+// Stage items [first, first + n) of the canonical list into one tile.
+__device__ __forceinline__ void glm53_dsa_rows_stage(
+        __nv_bfloat16 * tile, const __nv_bfloat16 * cache,
+        const unsigned int * ordered, unsigned int first, unsigned int n,
+        unsigned int thread) {
+    const unsigned int chunks_per_item = GLM53_DSA_LATENT * 2U / 16U;
+    for (unsigned int chunk = thread; chunk < n * chunks_per_item;
+         chunk += GLM53_DSA_ROWS_THREADS) {
+        const unsigned int item = chunk / chunks_per_item;
+        const unsigned int column = (chunk % chunks_per_item) * 8U;
+        glm53_dsa_rows_cp16(
+            tile + item * GLM53_DSA_LATENT + column,
+            cache + (unsigned long long)ordered[first + item] * GLM53_DSA_LATENT + column);
+    }
+    asm volatile("cp.async.commit_group;");
+}
 
 extern "C" __global__ void __launch_bounds__(GLM53_DSA_ROWS_THREADS, 1)
 atlas_glm53_dsa_selected_attention_rows_bf16(
@@ -279,10 +309,14 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
         gridDim.z != 1U) {
         return;
     }
-    extern __shared__ unsigned char rows_shared[];
-    unsigned int * ordered = (unsigned int *)rows_shared;
-    float * scores = (float *)(ordered + GLM53_DSA_SORT_WIDTH);
-    float * denominators = scores + GLM53_DSA_ROWS_GROUP * GLM53_DSA_SELECTED;
+    extern __shared__ __align__(16) unsigned char rows_shared[];
+    float * scores = (float *)rows_shared;
+    unsigned int * ordered =
+        (unsigned int *)(rows_shared + GLM53_DSA_ROWS_SCORE_BYTES);
+    unsigned int * network = (unsigned int *)(rows_shared + GLM53_DSA_ROWS_SCORE_BYTES +
+                                              GLM53_DSA_ROWS_ORDER_BYTES);
+    __nv_bfloat16 * tiles = (__nv_bfloat16 *)network;
+    __shared__ float denominators[GLM53_DSA_ROWS_GROUP];
     __shared__ unsigned int unique_count;
 
     const unsigned long long row = blockIdx.x;
@@ -317,7 +351,7 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
                 }
             }
         }
-        ordered[slot] = admitted;
+        network[slot] = admitted;
     }
     __syncthreads();
     for (unsigned int width = 2U; width <= GLM53_DSA_SORT_WIDTH; width <<= 1U) {
@@ -328,32 +362,50 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
                 if (right > left) {
                     const bool ascending = (left & width) == 0U;
                     const bool swap = ascending
-                        ? ordered[left] > ordered[right]
-                        : ordered[left] < ordered[right];
+                        ? network[left] > network[right]
+                        : network[left] < network[right];
                     if (swap) {
-                        const unsigned int held = ordered[left];
-                        ordered[left] = ordered[right];
-                        ordered[right] = held;
+                        const unsigned int held = network[left];
+                        network[left] = network[right];
+                        network[right] = held;
                     }
                 }
             }
             __syncthreads();
         }
     }
-    if (thread == 0U) {
-        unsigned int count = 0U;
-        unsigned int previous = GLM53_DSA_INVALID;
-        for (unsigned int slot = 0U; slot < GLM53_DSA_SORT_WIDTH; ++slot) {
-            const unsigned int candidate = ordered[slot];
-            if (candidate == GLM53_DSA_INVALID) {
-                break;
-            }
-            if (count == 0U || candidate != previous) {
-                ordered[count++] = candidate;
-                previous = candidate;
-            }
+    // Sorted ascending with INVALID last: an entry survives dedupe when it is
+    // valid and differs from its predecessor. Its output slot is the number of
+    // survivors before it, a block-wide exclusive prefix count.
+    {
+        __shared__ unsigned int warp_counts[GLM53_DSA_ROWS_THREADS / 32U];
+        const unsigned int per_thread = GLM53_DSA_SORT_WIDTH / GLM53_DSA_ROWS_THREADS;
+        unsigned int keep[GLM53_DSA_SORT_WIDTH / GLM53_DSA_ROWS_THREADS];
+        unsigned int value[GLM53_DSA_SORT_WIDTH / GLM53_DSA_ROWS_THREADS];
+        unsigned int local = 0U;
+        #pragma unroll
+        for (unsigned int e = 0U; e < per_thread; ++e) {
+            const unsigned int slot = thread * per_thread + e;
+            value[e] = network[slot];
+            keep[e] = value[e] != GLM53_DSA_INVALID &&
+                (slot == 0U || network[slot - 1U] != value[e]) ? 1U : 0U;
+            local += keep[e];
         }
-        unique_count = count;
+        unsigned int inclusive = local;
+        #pragma unroll
+        for (unsigned int offset = 1U; offset < 32U; offset <<= 1U) {
+            const unsigned int other = __shfl_up_sync(0xffffffffU, inclusive, offset);
+            if (lane >= offset) inclusive += other;
+        }
+        if (lane == 31U) warp_counts[warp] = inclusive;
+        __syncthreads();
+        unsigned int before = inclusive - local;
+        for (unsigned int w = 0U; w < warp; ++w) before += warp_counts[w];
+        #pragma unroll
+        for (unsigned int e = 0U; e < per_thread; ++e) {
+            if (keep[e] != 0U) ordered[before++] = value[e];
+        }
+        if (thread == GLM53_DSA_ROWS_THREADS - 1U) unique_count = before;
     }
     __syncthreads();
     const unsigned int count = unique_count;
@@ -366,12 +418,10 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
     }
     const __nv_bfloat16 * cache =
         latent_cache + batch_index * (unsigned long long)kv_capacity * GLM53_DSA_LATENT;
+    const unsigned int tile_count = (count + GLM53_DSA_ROWS_TILE - 1U) / GLM53_DSA_ROWS_TILE;
 
-    // Scores are stored item-major, [item][GROUP], so the weighted-latent
-    // pass reads a whole group's probabilities with two 16-byte loads.
     for (unsigned int group = 0U; group < GLM53_DSA_HEADS; group += GLM53_DSA_ROWS_GROUP) {
-        // Scores: two warps per head, alternating items; four items in flight
-        // per warp so the L2 latency of one key row overlaps the next three.
+        // Scores: two warps per head, alternating items within each tile.
         {
             const unsigned int local_head = warp % GLM53_DSA_ROWS_GROUP;
             const unsigned int parity = warp / GLM53_DSA_ROWS_GROUP;
@@ -384,32 +434,33 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
                 q_low[r] = __bfloat162float(query[lane + 32U * r]);
                 q_high[r] = __bfloat162float(query[lane + 32U * r + 256U]);
             }
-            for (unsigned int base = parity; base < count; base += 8U) {
-                __nv_bfloat16 k_low[4][8];
-                __nv_bfloat16 k_high[4][8];
-                #pragma unroll
-                for (unsigned int u = 0U; u < 4U; ++u) {
-                    const unsigned int item = base + 2U * u;
-                    if (item < count) {
-                        const __nv_bfloat16 * key = cache +
-                            (unsigned long long)ordered[item] * GLM53_DSA_LATENT;
-                        #pragma unroll
-                        for (unsigned int r = 0U; r < 8U; ++r) {
-                            k_low[u][r] = key[lane + 32U * r];
-                            k_high[u][r] = key[lane + 32U * r + 256U];
-                        }
-                    }
+            glm53_dsa_rows_stage(tiles, cache, ordered, 0U,
+                                 min(count, GLM53_DSA_ROWS_TILE), thread);
+            for (unsigned int t = 0U; t < tile_count; ++t) {
+                const unsigned int first = t * GLM53_DSA_ROWS_TILE;
+                const unsigned int n = min(count - first, GLM53_DSA_ROWS_TILE);
+                if (t + 1U < tile_count) {
+                    const unsigned int next = first + GLM53_DSA_ROWS_TILE;
+                    glm53_dsa_rows_stage(
+                        tiles + ((t + 1U) & 1U) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT,
+                        cache, ordered, next, min(count - next, GLM53_DSA_ROWS_TILE),
+                        thread);
+                    asm volatile("cp.async.wait_group 1;");
+                } else {
+                    asm volatile("cp.async.wait_group 0;");
                 }
-                #pragma unroll
-                for (unsigned int u = 0U; u < 4U; ++u) {
-                    const unsigned int item = base + 2U * u;
-                    if (item >= count) break;
+                __syncthreads();
+                const __nv_bfloat16 * tile =
+                    tiles + (t & 1U) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT;
+                for (unsigned int local = parity; local < n; local += 2U) {
+                    const __nv_bfloat16 * key = tile + local * GLM53_DSA_LATENT;
                     float a[8];
                     #pragma unroll
                     for (unsigned int r = 0U; r < 8U; ++r) {
                         a[r] = __fadd_rn(
-                            __fmul_rn(q_low[r], __bfloat162float(k_low[u][r])),
-                            __fmul_rn(q_high[r], __bfloat162float(k_high[u][r])));
+                            __fmul_rn(q_low[r], __bfloat162float(key[lane + 32U * r])),
+                            __fmul_rn(q_high[r],
+                                      __bfloat162float(key[lane + 32U * r + 256U])));
                     }
                     #pragma unroll
                     for (unsigned int r = 0U; r < 4U; ++r) a[r] = __fadd_rn(a[r], a[r + 4U]);
@@ -421,13 +472,13 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
                         sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffU, sum, offset));
                     }
                     if (lane == 0U) {
-                        scores[item * GLM53_DSA_ROWS_GROUP + local_head] =
+                        scores[(first + local) * GLM53_DSA_ROWS_GROUP + local_head] =
                             __fmul_rn(sum, GLM53_DSA_INV_SQRT_QK);
                     }
                 }
+                __syncthreads();
             }
         }
-        __syncthreads();
         // Maximum (order-free) per head.
         if (warp < GLM53_DSA_ROWS_GROUP) {
             float maximum = -FLT_MAX;
@@ -443,6 +494,9 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
             if (lane == 0U) denominators[warp] = maximum;
         }
         __syncthreads();
+        // Prefetch the first value tile while the softmax runs.
+        glm53_dsa_rows_stage(tiles, cache, ordered, 0U,
+                             min(count, GLM53_DSA_ROWS_TILE), thread);
         for (unsigned int index = thread; index < GLM53_DSA_ROWS_GROUP * count;
              index += GLM53_DSA_ROWS_THREADS) {
             scores[index] = expf(__fsub_rn(
@@ -464,44 +518,45 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
             scores[index] = __bfloat162float(__float2bfloat16_rn(
                 scores[index] / denominators[index % GLM53_DSA_ROWS_GROUP]));
         }
-        __syncthreads();
-        // Weighted latent: thread owns one column for every head of the group,
-        // four items' values in flight, accumulation still strictly in order.
+        // Weighted latent: thread owns one column for every head of the group;
+        // accumulation stays strictly in ascending item order.
         {
             const unsigned int column = thread;
             float sums[GLM53_DSA_ROWS_GROUP];
             #pragma unroll
             for (unsigned int h = 0U; h < GLM53_DSA_ROWS_GROUP; ++h) sums[h] = 0.0f;
-            unsigned int item = 0U;
-            for (; item + 4U <= count; item += 4U) {
-                float value[4];
-                #pragma unroll
-                for (unsigned int u = 0U; u < 4U; ++u) {
-                    value[u] = __bfloat162float(cache[
-                        (unsigned long long)ordered[item + u] * GLM53_DSA_LATENT + column]);
+            for (unsigned int t = 0U; t < tile_count; ++t) {
+                const unsigned int first = t * GLM53_DSA_ROWS_TILE;
+                const unsigned int n = min(count - first, GLM53_DSA_ROWS_TILE);
+                if (t + 1U < tile_count) {
+                    const unsigned int next = first + GLM53_DSA_ROWS_TILE;
+                    glm53_dsa_rows_stage(
+                        tiles + ((t + 1U) & 1U) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT,
+                        cache, ordered, next, min(count - next, GLM53_DSA_ROWS_TILE),
+                        thread);
+                    asm volatile("cp.async.wait_group 1;");
+                } else {
+                    asm volatile("cp.async.wait_group 0;");
                 }
-                #pragma unroll
-                for (unsigned int u = 0U; u < 4U; ++u) {
-                    const float4 p0 = *(const float4 *)(scores + (item + u) * GLM53_DSA_ROWS_GROUP);
-                    const float4 p1 = *(const float4 *)(scores + (item + u) * GLM53_DSA_ROWS_GROUP + 4U);
-                    sums[0] = __fadd_rn(sums[0], __fmul_rn(p0.x, value[u]));
-                    sums[1] = __fadd_rn(sums[1], __fmul_rn(p0.y, value[u]));
-                    sums[2] = __fadd_rn(sums[2], __fmul_rn(p0.z, value[u]));
-                    sums[3] = __fadd_rn(sums[3], __fmul_rn(p0.w, value[u]));
-                    sums[4] = __fadd_rn(sums[4], __fmul_rn(p1.x, value[u]));
-                    sums[5] = __fadd_rn(sums[5], __fmul_rn(p1.y, value[u]));
-                    sums[6] = __fadd_rn(sums[6], __fmul_rn(p1.z, value[u]));
-                    sums[7] = __fadd_rn(sums[7], __fmul_rn(p1.w, value[u]));
+                __syncthreads();
+                const __nv_bfloat16 * tile =
+                    tiles + (t & 1U) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT;
+                for (unsigned int local = 0U; local < n; ++local) {
+                    const float value =
+                        __bfloat162float(tile[local * GLM53_DSA_LATENT + column]);
+                    const float * p = scores + (first + local) * GLM53_DSA_ROWS_GROUP;
+                    const float4 p0 = *(const float4 *)p;
+                    const float4 p1 = *(const float4 *)(p + 4U);
+                    sums[0] = __fadd_rn(sums[0], __fmul_rn(p0.x, value));
+                    sums[1] = __fadd_rn(sums[1], __fmul_rn(p0.y, value));
+                    sums[2] = __fadd_rn(sums[2], __fmul_rn(p0.z, value));
+                    sums[3] = __fadd_rn(sums[3], __fmul_rn(p0.w, value));
+                    sums[4] = __fadd_rn(sums[4], __fmul_rn(p1.x, value));
+                    sums[5] = __fadd_rn(sums[5], __fmul_rn(p1.y, value));
+                    sums[6] = __fadd_rn(sums[6], __fmul_rn(p1.z, value));
+                    sums[7] = __fadd_rn(sums[7], __fmul_rn(p1.w, value));
                 }
-            }
-            for (; item < count; ++item) {
-                const float value = __bfloat162float(cache[
-                    (unsigned long long)ordered[item] * GLM53_DSA_LATENT + column]);
-                #pragma unroll
-                for (unsigned int h = 0U; h < GLM53_DSA_ROWS_GROUP; ++h) {
-                    sums[h] = __fadd_rn(sums[h], __fmul_rn(
-                        scores[item * GLM53_DSA_ROWS_GROUP + h], value));
-                }
+                __syncthreads();
             }
             #pragma unroll
             for (unsigned int h = 0U; h < GLM53_DSA_ROWS_GROUP; ++h) {
@@ -510,7 +565,6 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
                     __float2bfloat16_rn(sums[h]);
             }
         }
-        __syncthreads();
     }
 }
 

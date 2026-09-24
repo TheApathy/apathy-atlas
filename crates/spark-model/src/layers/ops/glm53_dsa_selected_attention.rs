@@ -24,8 +24,16 @@ const THREADS: u32 = 256;
 const MAX_GRID_YZ: u64 = 65_535;
 const ROWS_THREADS: u32 = 512;
 const ROWS_GROUP: u32 = 8;
+const ROWS_TILE: u32 = 12;
 const SORT_WIDTH: u32 = 4_096;
-const ROWS_SHARED_BYTES: u32 = SORT_WIDTH * 4 + ROWS_GROUP * SELECTED * 4 + ROWS_GROUP * 4;
+// [item][group] f32 scores | canonical item list | sort network or two KV tiles.
+const ROWS_ORDER_BYTES: u32 = 8_224;
+const ROWS_SCRATCH_BYTES: u32 = if 2 * ROWS_TILE * LATENT * 2 > SORT_WIDTH * 4 {
+    2 * ROWS_TILE * LATENT * 2
+} else {
+    SORT_WIDTH * 4
+};
+const ROWS_SHARED_BYTES: u32 = SELECTED * ROWS_GROUP * 4 + ROWS_ORDER_BYTES + ROWS_SCRATCH_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glm53DsaSelectedStorage {
