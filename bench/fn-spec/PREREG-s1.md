@@ -183,3 +183,24 @@ C1 ALL C2 ALLZ C3 GATE C4 ALLF. Predictions carried over from s8/s9:
 - GATE: 1.25x / 1.16x / 0.87x / 0.90x, worse than ALLZ everywhere (pre-registered chat >= 0.97x: MISS).
 - ALLF (first-wins control): pending on the lock at report time.
 - ALLF (first-wins control) ran 00:52Z: think_code == fd692dc8 (the 'times' divergence) 5/5 -> the control FAILS as required; the tie fix is the cause of think exactness (pre-registered 90%: HIT).
+
+# r2 — rebased onto integrate/all-models 671bab612 (engine-wide FIRST-wins greedy; H2D fix
+7131b6942), last-wins kernel DROPPED; binary spark-r2 (ef11d213). Arms C1 ALLZ C2, 5 prompts
+(prose added for the recipe criterion), 5 reps, LOGITS_FNV on all, watchdog floor 8 GB.
+- think_code and code_py: ALLZ sha == plain sha on every clean trial; FNV rows bit-identical. 85%.
+- ALLZ code_py 1.30-1.38x, prose 0.90-1.0x. 60%.
+- No load hang on this binary (it has the pinned-bounce H2D fix). 80%.
+# r3 — footprint (spark-r2, --ssm-cache-slots 2 for both arms; prefix cache is inert for qwen4 so
+the 16-slot Marconi pool, 1818 MB, is dead weight). Expect low-water +1.6 GB on both arms (plain
+~15.5, spec ~10.6 GB), speed and outputs unchanged. Spec still < 12 GB -> further cut needed.
+
+## r2 outcome (spark-r2, first-wins engine-wide, last-wins kernel dropped)
+- Plain C1/C2: 10/10 identical text per prompt (race not hit in text; C1 code_py warmup diverged in
+  logits at row 57 only).
+- ALLZ: 24/30 trials text AND logits bit-identical to plain rep1 at every row; 6/30 diverge at a
+  random row (51, 177, 23, 72, 314, think) — race signature, 4 change text. Pre-registered 85%
+  exact: PARTIAL (exact wherever the race did not hit).
+- Speed vs C1/C2: code_py 1.327x, code_rs 1.175x, chat 0.897x, think 1.013x, prose 0.924x;
+  geomean 1.055x. Recipe bar (geomean >= 1.10, worst >= 0.92): MISS. Pre-registered code 1.30-1.38x:
+  HIT; prose 0.90-1.0x: HIT.
+- Low-water: plain 13 GB, spec 8 GB (static, reached at end of load). No load hang (2 loads).

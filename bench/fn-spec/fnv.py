@@ -35,9 +35,14 @@ def requests(arm_dir: Path):
 d = Path(sys.argv[1])
 ref_arm = sys.argv[2]
 arms = sys.argv[3:] or [ref_arm]
+# Reference trial per prompt: rep REF_REP (default 1) of the reference arm,
+# so a race-hit warmup cannot become the reference.
+import os
+ref_rep = os.environ.get("REF_REP", "1")
 ref = {}
 for trial, rows in requests(d / ref_arm):
-    ref.setdefault(trial["prompt"], rows)
+    if str(trial["rep"]) == ref_rep:
+        ref.setdefault(trial["prompt"], rows)
 for arm in arms:
     for trial, rows in requests(d / arm):
         base = ref[trial["prompt"]]
