@@ -18,6 +18,25 @@ const MAX_QUERIES: u32 = GLM53_EXL3_MAX_WIDE_ROWS as u32;
 const MAX_POOLS: u32 = 262_144;
 const THREADS: u32 = INDEX_DIM;
 const MAX_GRID_YZ: u64 = 65_535;
+const ROWS_THREADS: u32 = 256;
+
+/// `ATLAS_GLM53_DSA_SCORE_ROWS=1`: row-shared pooled-key scoring, one CTA per
+/// query row. Bit-identical to the per-(row, pool) reference kernel.
+fn score_rows() -> Result<bool> {
+    use std::sync::OnceLock;
+    static ON: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
+    ON.get_or_init(|| match std::env::var("ATLAS_GLM53_DSA_SCORE_ROWS") {
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v == "0" => Ok(false),
+        Ok(other) => Err(format!(
+            "ATLAS_GLM53_DSA_SCORE_ROWS must be 0 or 1, got {other:?}"
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(format!("ATLAS_GLM53_DSA_SCORE_ROWS: {e}")),
+    })
+    .clone()
+    .map_err(anyhow::Error::msg)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Glm53DsaScorePlan {
@@ -113,12 +132,14 @@ pub struct Glm53DsaScoreBuffers {
 
 pub struct Glm53DsaScoreKernel {
     score: KernelHandle,
+    rows_score: KernelHandle,
 }
 
 impl Glm53DsaScoreKernel {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
         Ok(Self {
             score: gpu.kernel("glm53_dsa_score", "atlas_glm53_dsa_score_bf16")?,
+            rows_score: gpu.kernel("glm53_dsa_score", "atlas_glm53_dsa_score_rows_bf16")?,
         })
     }
 
@@ -131,9 +152,19 @@ impl Glm53DsaScoreKernel {
     ) -> Result<()> {
         plan.validate()?;
         validate_buffers(plan, buffers)?;
-        KernelLaunch::new(gpu, self.score)
-            .grid([plan.grid_x, plan.grid_y, plan.grid_z])
-            .block([THREADS, 1, 1])
+        let (kernel, grid, block) = if score_rows()? {
+            // One CTA per query row; bit-identical (see the .cu header).
+            let rows = plan
+                .batch
+                .checked_mul(plan.queries)
+                .context("GLM DSA score row overflow")?;
+            (self.rows_score, [rows, 1, 1], ROWS_THREADS)
+        } else {
+            (self.score, [plan.grid_x, plan.grid_y, plan.grid_z], THREADS)
+        };
+        KernelLaunch::new(gpu, kernel)
+            .grid(grid)
+            .block([block, 1, 1])
             .arg_ptr(buffers.queries_bf16.ptr)
             .arg_ptr(buffers.head_weights_bf16.ptr)
             .arg_ptr(buffers.pool_keys_bf16.ptr)

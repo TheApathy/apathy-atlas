@@ -235,6 +235,245 @@ atlas_glm53_dsa_selected_attention_bf16(
         __float2bfloat16_rn(second_sum);
 }
 
+// Row-shared rewrite of atlas_glm53_dsa_selected_attention_bf16 for prompt
+// chunks, bit-identical by construction. The selected set is per ROW, not per
+// head, so one CTA canonicalizes it once and serves all 64 heads in groups of
+// GLM53_DSA_ROWS_GROUP (the reference re-sorts it 64 times and walks every item
+// with a 256-thread tree reduction and nine barriers). Every rounding step of
+// the reference is reproduced in the same order:
+//  * score: partial[l] = q[l]*k[l] + q[l+256]*k[l+256] (no FMA), reduced by the
+//    same halving tree (strides 128..1). A warp holds partial[j + 32r] in lane
+//    j, register r, so strides 128/64/32 are in-register and 16..1 are
+//    shuffles pairing exactly the reference's operands; then * 1/16.
+//  * softmax: max is order-free; exponentials use the same expf; the
+//    denominator is the reference's serial ascending-item sum.
+//  * probability = bf16(exp / denominator); each output column accumulates
+//    fadd(sum, p*v) serially in ascending item order, as the reference does.
+#define GLM53_DSA_ROWS_THREADS 512U
+#define GLM53_DSA_ROWS_GROUP 8U
+#define GLM53_DSA_ROWS_SHARED \
+    (GLM53_DSA_SORT_WIDTH * 4U + GLM53_DSA_ROWS_GROUP * GLM53_DSA_SELECTED * 4U + \
+     GLM53_DSA_ROWS_GROUP * 4U)
+
+extern "C" __global__ void __launch_bounds__(GLM53_DSA_ROWS_THREADS, 1)
+atlas_glm53_dsa_selected_attention_rows_bf16(
+        const __nv_bfloat16 * __restrict__ absorbed_query,
+        const __nv_bfloat16 * __restrict__ latent_cache,
+        const int * __restrict__ selected_indices,
+        const unsigned int * __restrict__ sequence_lengths,
+        const unsigned int * __restrict__ query_positions,
+        const unsigned char * __restrict__ query_validity,
+        __nv_bfloat16 * __restrict__ output_weighted_latent,
+        unsigned int batch, unsigned int query_count,
+        unsigned int kv_capacity) {
+    const unsigned long long rows =
+        (unsigned long long)batch * query_count;
+    if (absorbed_query == nullptr || latent_cache == nullptr ||
+        selected_indices == nullptr || sequence_lengths == nullptr ||
+        query_positions == nullptr || query_validity == nullptr ||
+        output_weighted_latent == nullptr || batch == 0U ||
+        query_count == 0U || query_count > GLM53_DSA_MAX_QUERIES ||
+        kv_capacity == 0U || kv_capacity > GLM53_DSA_MAX_POSITIONS ||
+        blockDim.x != GLM53_DSA_ROWS_THREADS ||
+        (unsigned long long)gridDim.x != rows || gridDim.y != 1U ||
+        gridDim.z != 1U) {
+        return;
+    }
+    extern __shared__ unsigned char rows_shared[];
+    unsigned int * ordered = (unsigned int *)rows_shared;
+    float * scores = (float *)(ordered + GLM53_DSA_SORT_WIDTH);
+    float * denominators = scores + GLM53_DSA_ROWS_GROUP * GLM53_DSA_SELECTED;
+    __shared__ unsigned int unique_count;
+
+    const unsigned long long row = blockIdx.x;
+    const unsigned int thread = threadIdx.x;
+    const unsigned int lane = thread & 31U;
+    const unsigned int warp = thread >> 5U;
+    const unsigned long long row_base = row * GLM53_DSA_HEADS * GLM53_DSA_LATENT;
+
+    const unsigned long long batch_index = row / query_count;
+    const unsigned int sequence_length = sequence_lengths[batch_index];
+    const unsigned int query_position = query_positions[row];
+    if (query_validity[row] == 0U || sequence_length == 0U ||
+        sequence_length > kv_capacity || query_position >= sequence_length) {
+        for (unsigned int i = thread; i < GLM53_DSA_HEADS * GLM53_DSA_LATENT;
+             i += GLM53_DSA_ROWS_THREADS) {
+            output_weighted_latent[row_base + i] = __float2bfloat16_rn(0.0f);
+        }
+        return;
+    }
+
+    for (unsigned int slot = thread; slot < GLM53_DSA_SORT_WIDTH;
+         slot += GLM53_DSA_ROWS_THREADS) {
+        unsigned int admitted = GLM53_DSA_INVALID;
+        if (slot < GLM53_DSA_SELECTED) {
+            const int raw = selected_indices[row * GLM53_DSA_SELECTED + slot];
+            if (raw >= 0) {
+                const unsigned int candidate = (unsigned int)raw;
+                if (candidate < sequence_length &&
+                    candidate <= query_position &&
+                    candidate < kv_capacity) {
+                    admitted = candidate;
+                }
+            }
+        }
+        ordered[slot] = admitted;
+    }
+    __syncthreads();
+    for (unsigned int width = 2U; width <= GLM53_DSA_SORT_WIDTH; width <<= 1U) {
+        for (unsigned int stride = width >> 1U; stride != 0U; stride >>= 1U) {
+            for (unsigned int left = thread; left < GLM53_DSA_SORT_WIDTH;
+                 left += GLM53_DSA_ROWS_THREADS) {
+                const unsigned int right = left ^ stride;
+                if (right > left) {
+                    const bool ascending = (left & width) == 0U;
+                    const bool swap = ascending
+                        ? ordered[left] > ordered[right]
+                        : ordered[left] < ordered[right];
+                    if (swap) {
+                        const unsigned int held = ordered[left];
+                        ordered[left] = ordered[right];
+                        ordered[right] = held;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    if (thread == 0U) {
+        unsigned int count = 0U;
+        unsigned int previous = GLM53_DSA_INVALID;
+        for (unsigned int slot = 0U; slot < GLM53_DSA_SORT_WIDTH; ++slot) {
+            const unsigned int candidate = ordered[slot];
+            if (candidate == GLM53_DSA_INVALID) {
+                break;
+            }
+            if (count == 0U || candidate != previous) {
+                ordered[count++] = candidate;
+                previous = candidate;
+            }
+        }
+        unique_count = count;
+    }
+    __syncthreads();
+    const unsigned int count = unique_count;
+    if (count == 0U) {
+        for (unsigned int i = thread; i < GLM53_DSA_HEADS * GLM53_DSA_LATENT;
+             i += GLM53_DSA_ROWS_THREADS) {
+            output_weighted_latent[row_base + i] = __float2bfloat16_rn(0.0f);
+        }
+        return;
+    }
+    const __nv_bfloat16 * cache =
+        latent_cache + batch_index * (unsigned long long)kv_capacity * GLM53_DSA_LATENT;
+
+    for (unsigned int group = 0U; group < GLM53_DSA_HEADS; group += GLM53_DSA_ROWS_GROUP) {
+        // Scores: two warps per head, alternating items.
+        {
+            const unsigned int local_head = warp % GLM53_DSA_ROWS_GROUP;
+            const unsigned int parity = warp / GLM53_DSA_ROWS_GROUP;
+            const __nv_bfloat16 * query = absorbed_query + row_base +
+                (unsigned long long)(group + local_head) * GLM53_DSA_LATENT;
+            float q_low[8];
+            float q_high[8];
+            #pragma unroll
+            for (unsigned int r = 0U; r < 8U; ++r) {
+                q_low[r] = __bfloat162float(query[lane + 32U * r]);
+                q_high[r] = __bfloat162float(query[lane + 32U * r + 256U]);
+            }
+            float * head_scores = scores + local_head * GLM53_DSA_SELECTED;
+            for (unsigned int item = parity; item < count; item += 2U) {
+                const __nv_bfloat16 * key =
+                    cache + (unsigned long long)ordered[item] * GLM53_DSA_LATENT;
+                float a[8];
+                #pragma unroll
+                for (unsigned int r = 0U; r < 8U; ++r) {
+                    a[r] = __fadd_rn(
+                        __fmul_rn(q_low[r], __bfloat162float(key[lane + 32U * r])),
+                        __fmul_rn(q_high[r],
+                                  __bfloat162float(key[lane + 32U * r + 256U])));
+                }
+                #pragma unroll
+                for (unsigned int r = 0U; r < 4U; ++r) a[r] = __fadd_rn(a[r], a[r + 4U]);
+                #pragma unroll
+                for (unsigned int r = 0U; r < 2U; ++r) a[r] = __fadd_rn(a[r], a[r + 2U]);
+                float sum = __fadd_rn(a[0], a[1]);
+                #pragma unroll
+                for (unsigned int offset = 16U; offset != 0U; offset >>= 1U) {
+                    sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffU, sum, offset));
+                }
+                if (lane == 0U) {
+                    head_scores[item] = __fmul_rn(sum, GLM53_DSA_INV_SQRT_QK);
+                }
+            }
+        }
+        __syncthreads();
+        // Maximum (order-free) per head: two warps per head reduce halves.
+        if (warp < GLM53_DSA_ROWS_GROUP) {
+            const float * head_scores = scores + warp * GLM53_DSA_SELECTED;
+            float maximum = -FLT_MAX;
+            for (unsigned int item = lane; item < count; item += 32U) {
+                if (head_scores[item] > maximum) maximum = head_scores[item];
+            }
+            #pragma unroll
+            for (unsigned int offset = 16U; offset != 0U; offset >>= 1U) {
+                maximum = fmaxf(maximum,
+                                __shfl_xor_sync(0xffffffffU, maximum, offset));
+            }
+            if (lane == 0U) denominators[warp] = maximum;
+        }
+        __syncthreads();
+        for (unsigned int index = thread; index < GLM53_DSA_ROWS_GROUP * count;
+             index += GLM53_DSA_ROWS_THREADS) {
+            const unsigned int local_head = index / count;
+            const unsigned int item = index % count;
+            float * score = scores + local_head * GLM53_DSA_SELECTED + item;
+            *score = expf(__fsub_rn(*score, denominators[local_head]));
+        }
+        __syncthreads();
+        if (thread < GLM53_DSA_ROWS_GROUP) {
+            const float * head_scores = scores + thread * GLM53_DSA_SELECTED;
+            float denominator = 0.0f;
+            for (unsigned int item = 0U; item < count; ++item) {
+                denominator = __fadd_rn(denominator, head_scores[item]);
+            }
+            denominators[thread] = denominator;
+        }
+        __syncthreads();
+        for (unsigned int index = thread; index < GLM53_DSA_ROWS_GROUP * count;
+             index += GLM53_DSA_ROWS_THREADS) {
+            const unsigned int local_head = index / count;
+            float * score = scores + local_head * GLM53_DSA_SELECTED + index % count;
+            *score = __bfloat162float(
+                __float2bfloat16_rn(*score / denominators[local_head]));
+        }
+        __syncthreads();
+        // Weighted latent: thread owns one column for every head of the group.
+        {
+            const unsigned int column = thread;
+            float sums[GLM53_DSA_ROWS_GROUP];
+            #pragma unroll
+            for (unsigned int h = 0U; h < GLM53_DSA_ROWS_GROUP; ++h) sums[h] = 0.0f;
+            for (unsigned int item = 0U; item < count; ++item) {
+                const float value = __bfloat162float(
+                    cache[(unsigned long long)ordered[item] * GLM53_DSA_LATENT + column]);
+                #pragma unroll
+                for (unsigned int h = 0U; h < GLM53_DSA_ROWS_GROUP; ++h) {
+                    sums[h] = __fadd_rn(sums[h], __fmul_rn(
+                        scores[h * GLM53_DSA_SELECTED + item], value));
+                }
+            }
+            #pragma unroll
+            for (unsigned int h = 0U; h < GLM53_DSA_ROWS_GROUP; ++h) {
+                output_weighted_latent[row_base +
+                    (unsigned long long)(group + h) * GLM53_DSA_LATENT + column] =
+                    __float2bfloat16_rn(sums[h]);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // Before the selector becomes sparse, its top-512 pools cover the entire
 // causal prefix (2048 pooled tokens plus the three raw-tail slots). Reuse the
 // shipping GB10 HDIM=512 FlashAttention compute for that exact dense region:

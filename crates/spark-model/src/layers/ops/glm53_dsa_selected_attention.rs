@@ -22,6 +22,10 @@ const MAX_QUERIES: u32 = GLM53_EXL3_MAX_WIDE_ROWS as u32;
 const MAX_POSITIONS: u32 = 1_048_576;
 const THREADS: u32 = 256;
 const MAX_GRID_YZ: u64 = 65_535;
+const ROWS_THREADS: u32 = 512;
+const ROWS_GROUP: u32 = 8;
+const SORT_WIDTH: u32 = 4_096;
+const ROWS_SHARED_BYTES: u32 = SORT_WIDTH * 4 + ROWS_GROUP * SELECTED * 4 + ROWS_GROUP * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glm53DsaSelectedStorage {
@@ -156,6 +160,7 @@ pub struct Glm53DsaHeadTransposeBuffers {
 
 pub struct Glm53DsaSelectedAttentionKernel {
     attention: KernelHandle,
+    rows_attention: KernelHandle,
     dense_causal: KernelHandle,
     transpose_heads: KernelHandle,
 }
@@ -166,6 +171,10 @@ impl Glm53DsaSelectedAttentionKernel {
             attention: gpu.kernel(
                 "glm53_dsa_selected_attention",
                 "atlas_glm53_dsa_selected_attention_bf16",
+            )?,
+            rows_attention: gpu.kernel(
+                "glm53_dsa_selected_attention",
+                "atlas_glm53_dsa_selected_attention_rows_bf16",
             )?,
             dense_causal: gpu.kernel(
                 "glm53_dsa_selected_attention",
@@ -248,6 +257,29 @@ impl Glm53DsaSelectedAttentionKernel {
     ) -> Result<()> {
         plan.validate()?;
         validate_buffers(plan, buffers)?;
+        if selected_rows()? {
+            // One CTA per row serves all 64 heads; bit-identical to the
+            // per-(row, head) reference below (see the .cu header).
+            let rows = plan
+                .batch
+                .checked_mul(plan.queries)
+                .context("GLM DSA selected-attention row overflow")?;
+            return KernelLaunch::new(gpu, self.rows_attention)
+                .grid([rows, 1, 1])
+                .block([ROWS_THREADS, 1, 1])
+                .shared_mem(ROWS_SHARED_BYTES)
+                .arg_ptr(buffers.absorbed_query_bf16.ptr)
+                .arg_ptr(buffers.latent_cache_bf16.ptr)
+                .arg_ptr(buffers.selected_indices_i32.ptr)
+                .arg_ptr(buffers.sequence_lengths_u32.ptr)
+                .arg_ptr(buffers.query_positions_u32.ptr)
+                .arg_ptr(buffers.query_validity_u8.ptr)
+                .arg_ptr(buffers.output_weighted_latent_bf16.ptr)
+                .arg_u32(plan.batch)
+                .arg_u32(plan.queries)
+                .arg_u32(plan.kv_capacity)
+                .launch(stream);
+        }
         KernelLaunch::new(gpu, self.attention)
             .grid([HEADS, plan.grid_y, plan.grid_z])
             .block([THREADS, 1, 1])
@@ -305,6 +337,24 @@ impl Glm53DsaSelectedAttentionKernel {
             .arg_u32(u32::from(to_head_major))
             .launch(stream)
     }
+}
+
+/// `ATLAS_GLM53_DSA_SELECTED_ROWS=1`: row-shared selected attention, one CTA
+/// per query row for all heads. Bit-identical to the per-(row, head) kernel.
+fn selected_rows() -> Result<bool> {
+    use std::sync::OnceLock;
+    static ON: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
+    ON.get_or_init(|| match std::env::var("ATLAS_GLM53_DSA_SELECTED_ROWS") {
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v == "0" => Ok(false),
+        Ok(other) => Err(format!(
+            "ATLAS_GLM53_DSA_SELECTED_ROWS must be 0 or 1, got {other:?}"
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(format!("ATLAS_GLM53_DSA_SELECTED_ROWS: {e}")),
+    })
+    .clone()
+    .map_err(anyhow::Error::msg)
 }
 
 /// `ATLAS_GLM53_DSA_DENSE_FAST=1`: single-KV-tile, bank-conflict-free

@@ -37,7 +37,7 @@ use super::prefill_capture_owner::CaptureBankOwner;
 use super::prefill_owner_exl3::PreparedOwner;
 use super::target_model::{Glm53AdmissionScope, Glm53Model};
 use super::verify_policy_binding::VerifyBindingOwner;
-use super::walk_scratch::Glm53WalkScratch;
+use super::walk_scratch::{Glm53WalkScratch, Glm53WideExtent};
 use super::workspace_binding::Glm53BoundWorkspace;
 
 const VOCAB: u32 = 154_880;
