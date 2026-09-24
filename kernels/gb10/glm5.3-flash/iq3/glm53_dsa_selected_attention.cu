@@ -367,8 +367,11 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
     const __nv_bfloat16 * cache =
         latent_cache + batch_index * (unsigned long long)kv_capacity * GLM53_DSA_LATENT;
 
+    // Scores are stored item-major, [item][GROUP], so the weighted-latent
+    // pass reads a whole group's probabilities with two 16-byte loads.
     for (unsigned int group = 0U; group < GLM53_DSA_HEADS; group += GLM53_DSA_ROWS_GROUP) {
-        // Scores: two warps per head, alternating items.
+        // Scores: two warps per head, alternating items; four items in flight
+        // per warp so the L2 latency of one key row overlaps the next three.
         {
             const unsigned int local_head = warp % GLM53_DSA_ROWS_GROUP;
             const unsigned int parity = warp / GLM53_DSA_ROWS_GROUP;
@@ -381,39 +384,56 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
                 q_low[r] = __bfloat162float(query[lane + 32U * r]);
                 q_high[r] = __bfloat162float(query[lane + 32U * r + 256U]);
             }
-            float * head_scores = scores + local_head * GLM53_DSA_SELECTED;
-            for (unsigned int item = parity; item < count; item += 2U) {
-                const __nv_bfloat16 * key =
-                    cache + (unsigned long long)ordered[item] * GLM53_DSA_LATENT;
-                float a[8];
+            for (unsigned int base = parity; base < count; base += 8U) {
+                __nv_bfloat16 k_low[4][8];
+                __nv_bfloat16 k_high[4][8];
                 #pragma unroll
-                for (unsigned int r = 0U; r < 8U; ++r) {
-                    a[r] = __fadd_rn(
-                        __fmul_rn(q_low[r], __bfloat162float(key[lane + 32U * r])),
-                        __fmul_rn(q_high[r],
-                                  __bfloat162float(key[lane + 32U * r + 256U])));
+                for (unsigned int u = 0U; u < 4U; ++u) {
+                    const unsigned int item = base + 2U * u;
+                    if (item < count) {
+                        const __nv_bfloat16 * key = cache +
+                            (unsigned long long)ordered[item] * GLM53_DSA_LATENT;
+                        #pragma unroll
+                        for (unsigned int r = 0U; r < 8U; ++r) {
+                            k_low[u][r] = key[lane + 32U * r];
+                            k_high[u][r] = key[lane + 32U * r + 256U];
+                        }
+                    }
                 }
                 #pragma unroll
-                for (unsigned int r = 0U; r < 4U; ++r) a[r] = __fadd_rn(a[r], a[r + 4U]);
-                #pragma unroll
-                for (unsigned int r = 0U; r < 2U; ++r) a[r] = __fadd_rn(a[r], a[r + 2U]);
-                float sum = __fadd_rn(a[0], a[1]);
-                #pragma unroll
-                for (unsigned int offset = 16U; offset != 0U; offset >>= 1U) {
-                    sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffU, sum, offset));
-                }
-                if (lane == 0U) {
-                    head_scores[item] = __fmul_rn(sum, GLM53_DSA_INV_SQRT_QK);
+                for (unsigned int u = 0U; u < 4U; ++u) {
+                    const unsigned int item = base + 2U * u;
+                    if (item >= count) break;
+                    float a[8];
+                    #pragma unroll
+                    for (unsigned int r = 0U; r < 8U; ++r) {
+                        a[r] = __fadd_rn(
+                            __fmul_rn(q_low[r], __bfloat162float(k_low[u][r])),
+                            __fmul_rn(q_high[r], __bfloat162float(k_high[u][r])));
+                    }
+                    #pragma unroll
+                    for (unsigned int r = 0U; r < 4U; ++r) a[r] = __fadd_rn(a[r], a[r + 4U]);
+                    #pragma unroll
+                    for (unsigned int r = 0U; r < 2U; ++r) a[r] = __fadd_rn(a[r], a[r + 2U]);
+                    float sum = __fadd_rn(a[0], a[1]);
+                    #pragma unroll
+                    for (unsigned int offset = 16U; offset != 0U; offset >>= 1U) {
+                        sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffU, sum, offset));
+                    }
+                    if (lane == 0U) {
+                        scores[item * GLM53_DSA_ROWS_GROUP + local_head] =
+                            __fmul_rn(sum, GLM53_DSA_INV_SQRT_QK);
+                    }
                 }
             }
         }
         __syncthreads();
-        // Maximum (order-free) per head: two warps per head reduce halves.
+        // Maximum (order-free) per head.
         if (warp < GLM53_DSA_ROWS_GROUP) {
-            const float * head_scores = scores + warp * GLM53_DSA_SELECTED;
             float maximum = -FLT_MAX;
             for (unsigned int item = lane; item < count; item += 32U) {
-                if (head_scores[item] > maximum) maximum = head_scores[item];
+                const float value = scores[item * GLM53_DSA_ROWS_GROUP + warp];
+                if (value > maximum) maximum = value;
             }
             #pragma unroll
             for (unsigned int offset = 16U; offset != 0U; offset >>= 1U) {
@@ -425,42 +445,62 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
         __syncthreads();
         for (unsigned int index = thread; index < GLM53_DSA_ROWS_GROUP * count;
              index += GLM53_DSA_ROWS_THREADS) {
-            const unsigned int local_head = index / count;
-            const unsigned int item = index % count;
-            float * score = scores + local_head * GLM53_DSA_SELECTED + item;
-            *score = expf(__fsub_rn(*score, denominators[local_head]));
+            scores[index] = expf(__fsub_rn(
+                scores[index], denominators[index % GLM53_DSA_ROWS_GROUP]));
         }
         __syncthreads();
         if (thread < GLM53_DSA_ROWS_GROUP) {
-            const float * head_scores = scores + thread * GLM53_DSA_SELECTED;
             float denominator = 0.0f;
+            #pragma unroll 8
             for (unsigned int item = 0U; item < count; ++item) {
-                denominator = __fadd_rn(denominator, head_scores[item]);
+                denominator = __fadd_rn(
+                    denominator, scores[item * GLM53_DSA_ROWS_GROUP + thread]);
             }
             denominators[thread] = denominator;
         }
         __syncthreads();
         for (unsigned int index = thread; index < GLM53_DSA_ROWS_GROUP * count;
              index += GLM53_DSA_ROWS_THREADS) {
-            const unsigned int local_head = index / count;
-            float * score = scores + local_head * GLM53_DSA_SELECTED + index % count;
-            *score = __bfloat162float(
-                __float2bfloat16_rn(*score / denominators[local_head]));
+            scores[index] = __bfloat162float(__float2bfloat16_rn(
+                scores[index] / denominators[index % GLM53_DSA_ROWS_GROUP]));
         }
         __syncthreads();
-        // Weighted latent: thread owns one column for every head of the group.
+        // Weighted latent: thread owns one column for every head of the group,
+        // four items' values in flight, accumulation still strictly in order.
         {
             const unsigned int column = thread;
             float sums[GLM53_DSA_ROWS_GROUP];
             #pragma unroll
             for (unsigned int h = 0U; h < GLM53_DSA_ROWS_GROUP; ++h) sums[h] = 0.0f;
-            for (unsigned int item = 0U; item < count; ++item) {
-                const float value = __bfloat162float(
-                    cache[(unsigned long long)ordered[item] * GLM53_DSA_LATENT + column]);
+            unsigned int item = 0U;
+            for (; item + 4U <= count; item += 4U) {
+                float value[4];
+                #pragma unroll
+                for (unsigned int u = 0U; u < 4U; ++u) {
+                    value[u] = __bfloat162float(cache[
+                        (unsigned long long)ordered[item + u] * GLM53_DSA_LATENT + column]);
+                }
+                #pragma unroll
+                for (unsigned int u = 0U; u < 4U; ++u) {
+                    const float4 p0 = *(const float4 *)(scores + (item + u) * GLM53_DSA_ROWS_GROUP);
+                    const float4 p1 = *(const float4 *)(scores + (item + u) * GLM53_DSA_ROWS_GROUP + 4U);
+                    sums[0] = __fadd_rn(sums[0], __fmul_rn(p0.x, value[u]));
+                    sums[1] = __fadd_rn(sums[1], __fmul_rn(p0.y, value[u]));
+                    sums[2] = __fadd_rn(sums[2], __fmul_rn(p0.z, value[u]));
+                    sums[3] = __fadd_rn(sums[3], __fmul_rn(p0.w, value[u]));
+                    sums[4] = __fadd_rn(sums[4], __fmul_rn(p1.x, value[u]));
+                    sums[5] = __fadd_rn(sums[5], __fmul_rn(p1.y, value[u]));
+                    sums[6] = __fadd_rn(sums[6], __fmul_rn(p1.z, value[u]));
+                    sums[7] = __fadd_rn(sums[7], __fmul_rn(p1.w, value[u]));
+                }
+            }
+            for (; item < count; ++item) {
+                const float value = __bfloat162float(cache[
+                    (unsigned long long)ordered[item] * GLM53_DSA_LATENT + column]);
                 #pragma unroll
                 for (unsigned int h = 0U; h < GLM53_DSA_ROWS_GROUP; ++h) {
                     sums[h] = __fadd_rn(sums[h], __fmul_rn(
-                        scores[h * GLM53_DSA_SELECTED + item], value));
+                        scores[item * GLM53_DSA_ROWS_GROUP + h], value));
                 }
             }
             #pragma unroll
