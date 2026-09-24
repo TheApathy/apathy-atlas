@@ -420,15 +420,17 @@ impl Glm53HyperKernels {
                 .arg_f32(HC_EPS)
                 .launch(stream);
         }
-        spark_runtime::cublaslt::f32_gemm_act_weight_t(
-            buffers.streams_f32.ptr.0,
-            buffers.function_f32.ptr.0,
-            buffers.mixed_f32.ptr.0,
-            plan.tokens,
-            MIX,
-            HC * HIDDEN,
-            stream,
-        )?;
+        for (first, rows) in super::glm53_gemm_row_slices(plan.tokens) {
+            spark_runtime::cublaslt::f32_gemm_act_weight_t(
+                buffers.streams_f32.ptr.0 + u64::from(first) * u64::from(HC * HIDDEN) * 4,
+                buffers.function_f32.ptr.0,
+                buffers.mixed_f32.ptr.0 + u64::from(first) * u64::from(MIX) * 4,
+                rows,
+                MIX,
+                HC * HIDDEN,
+                stream,
+            )?;
+        }
         let kernel = gpu.kernel("glm53_prompt_glue", "atlas_glm53_hc_pre_mixed")?;
         KernelLaunch::new(gpu, kernel)
             .grid([plan.tokens, 1, 1])

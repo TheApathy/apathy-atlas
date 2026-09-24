@@ -46,6 +46,7 @@ use spark_runtime::kernel_args::KernelLaunch;
 use spark_runtime::weights::gguf::GgmlType;
 
 use crate::layers::ops::{
+    glm53_gemm_row_slices,
     GLM53_EXL3_MAX_WIDE_ROWS, GgmlIqBuffer, GgmlIqMmqKernels, Glm53DsaHeadTransposeBuffers,
     Glm53DsaLatentAppendBuffers, Glm53DsaLatentAppendKernel, Glm53DsaLatentAppendPlan,
     Glm53DsaLatentAppendStorage, Glm53DsaNormProjectionBuffers, Glm53DsaNormProjectionKernels,
@@ -658,24 +659,28 @@ impl Glm53DsaAttentionKernels {
                         >= rows as usize * HEADS as usize * LATENT as usize * 2,
                 "GLM EXL3 DSA strided key bank extent drift"
             );
-            spark_runtime::cublaslt::bf16_gemm_batched(
-                buffers.q_b_bf16.ptr.0,
-                weight.0,
-                buffers.absorbed_q_bf16.ptr.0,
-                rows,
-                LATENT,
-                HEAD_DIM,
-                false,
-                spark_runtime::cublaslt::StridedBatch {
-                    count: i32::try_from(HEADS)?,
-                    stride_act: i64::from(HEAD_DIM),
-                    stride_weight: 2 * i64::from(HEAD_DIM) * i64::from(LATENT),
-                    stride_out: i64::from(LATENT),
-                    ld_act: i64::from(HEADS) * i64::from(HEAD_DIM),
-                    ld_out: i64::from(HEADS) * i64::from(LATENT),
-                },
-                stream,
-            )?;
+            for (first, slice_rows) in glm53_gemm_row_slices(rows) {
+                spark_runtime::cublaslt::bf16_gemm_batched(
+                    buffers.q_b_bf16.ptr.0
+                        + u64::from(first) * u64::from(HEADS * HEAD_DIM) * 2,
+                    weight.0,
+                    buffers.absorbed_q_bf16.ptr.0
+                        + u64::from(first) * u64::from(HEADS * LATENT) * 2,
+                    slice_rows,
+                    LATENT,
+                    HEAD_DIM,
+                    false,
+                    spark_runtime::cublaslt::StridedBatch {
+                        count: i32::try_from(HEADS)?,
+                        stride_act: i64::from(HEAD_DIM),
+                        stride_weight: 2 * i64::from(HEAD_DIM) * i64::from(LATENT),
+                        stride_out: i64::from(LATENT),
+                        ld_act: i64::from(HEADS) * i64::from(HEAD_DIM),
+                        ld_out: i64::from(HEADS) * i64::from(LATENT),
+                    },
+                    stream,
+                )?;
+            }
         } else {
         self.selected.transpose_heads(
             gpu,
@@ -2010,24 +2015,28 @@ impl Glm53DsaAttentionKernels {
                         >= rows as usize * HEADS as usize * HEAD_DIM as usize * 2,
                 "GLM EXL3 DSA strided value bank extent drift"
             );
-            spark_runtime::cublaslt::bf16_gemm_batched(
-                buffers.weighted_latent_bf16.ptr.0,
-                weight.0,
-                buffers.unabsorbed_bf16.ptr.0,
-                rows,
-                HEAD_DIM,
-                LATENT,
-                true,
-                spark_runtime::cublaslt::StridedBatch {
-                    count: i32::try_from(HEADS)?,
-                    stride_act: i64::from(LATENT),
-                    stride_weight: 2 * i64::from(HEAD_DIM) * i64::from(LATENT),
-                    stride_out: i64::from(HEAD_DIM),
-                    ld_act: i64::from(HEADS) * i64::from(LATENT),
-                    ld_out: i64::from(HEADS) * i64::from(HEAD_DIM),
-                },
-                stream,
-            )?;
+            for (first, slice_rows) in glm53_gemm_row_slices(rows) {
+                spark_runtime::cublaslt::bf16_gemm_batched(
+                    buffers.weighted_latent_bf16.ptr.0
+                        + u64::from(first) * u64::from(HEADS * LATENT) * 2,
+                    weight.0,
+                    buffers.unabsorbed_bf16.ptr.0
+                        + u64::from(first) * u64::from(HEADS * HEAD_DIM) * 2,
+                    slice_rows,
+                    HEAD_DIM,
+                    LATENT,
+                    true,
+                    spark_runtime::cublaslt::StridedBatch {
+                        count: i32::try_from(HEADS)?,
+                        stride_act: i64::from(LATENT),
+                        stride_weight: 2 * i64::from(HEAD_DIM) * i64::from(LATENT),
+                        stride_out: i64::from(HEAD_DIM),
+                        ld_act: i64::from(HEADS) * i64::from(LATENT),
+                        ld_out: i64::from(HEADS) * i64::from(HEAD_DIM),
+                    },
+                    stream,
+                )?;
+            }
             launches += 1;
         } else {
         if rows > 1 {

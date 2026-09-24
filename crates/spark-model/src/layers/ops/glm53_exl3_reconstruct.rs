@@ -319,15 +319,17 @@ pub fn launch_reconstructed(
     )?;
     match dtype {
         StagingDtype::F16 => {
-            spark_runtime::cublaslt::f16_gemm_act_weight(
-                scratch.input_f16.ptr.0,
-                staging.ptr.0,
-                scratch.output_f16.ptr.0,
-                plan.rows,
-                n,
-                k,
-                stream,
-            )?;
+            for (first, rows) in super::glm53_gemm_row_slices(plan.rows) {
+                spark_runtime::cublaslt::f16_gemm_act_weight(
+                    scratch.input_f16.ptr.0 + u64::from(first) * u64::from(k) * 2,
+                    staging.ptr.0,
+                    scratch.output_f16.ptr.0 + u64::from(first) * u64::from(n) * 2,
+                    rows,
+                    n,
+                    k,
+                    stream,
+                )?;
+            }
             casts.f16_to_bf16(
                 gpu,
                 Glm53Exl3CastPlan::new(plan.rows, n)?,
@@ -337,15 +339,17 @@ pub fn launch_reconstructed(
             )?;
         }
         StagingDtype::Bf16 => {
-            spark_runtime::cublaslt::bf16_gemm_act_weight(
-                buffers.input_bf16.ptr.0,
-                staging.ptr.0,
-                buffers.output_bf16.ptr.0,
-                plan.rows,
-                n,
-                k,
-                stream,
-            )?;
+            for (first, rows) in super::glm53_gemm_row_slices(plan.rows) {
+                spark_runtime::cublaslt::bf16_gemm_act_weight(
+                    buffers.input_bf16.ptr.0 + u64::from(first) * u64::from(k) * 2,
+                    staging.ptr.0,
+                    buffers.output_bf16.ptr.0 + u64::from(first) * u64::from(n) * 2,
+                    rows,
+                    n,
+                    k,
+                    stream,
+                )?;
+            }
         }
     }
     if let Some(ov) = ov {

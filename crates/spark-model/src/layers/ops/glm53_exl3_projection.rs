@@ -20,6 +20,17 @@ pub const GLM53_EXL3_MAX_OUTPUT_F16_BYTES: usize = 154_880 * 2;
 pub const GLM53_EXL3_MAX_WIDE_ROWS: usize = 8_192;
 /// The prompt chunk scratch is laid out for unless a larger one is configured.
 pub const GLM53_EXL3_DEFAULT_WIDE_ROWS: usize = 2_048;
+
+/// cuBLASLt picks its kernel by M, and kernels differ in summation order. A
+/// chunk wider than the default issues its GEMMs in default-chunk row slices
+/// `(first_row, rows)` so it reproduces default-chunk prefill bit for bit.
+pub fn glm53_gemm_row_slices(rows: u32) -> impl Iterator<Item = (u32, u32)> {
+    let slice = GLM53_EXL3_DEFAULT_WIDE_ROWS as u32;
+    (0..rows.div_ceil(slice)).map(move |index| {
+        let first = index * slice;
+        (first, (rows - first).min(slice))
+    })
+}
 pub const GLM53_EXL3_MAX_WIDE_INPUT_F16_BYTES: usize =
     GLM53_EXL3_MAX_WIDE_ROWS * GLM53_EXL3_MAX_INPUT_F16_BYTES;
 pub const GLM53_EXL3_MAX_WIDE_OUTPUT_F16_BYTES: usize =
@@ -246,15 +257,18 @@ impl Glm53Exl3Projection<'_> {
                             .context("GLM EXL3 native weight extent overflow")?,
                     "GLM EXL3 native weight byte extent drift"
                 );
-                spark_runtime::cublaslt::bf16_gemm_act_weight_t(
-                    buffers.input_bf16.ptr.0,
-                    tensor.ptr().0,
-                    buffers.output_bf16.ptr.0,
-                    plan.rows,
-                    plan.output,
-                    plan.input,
-                    stream,
-                )
+                for (first, rows) in glm53_gemm_row_slices(plan.rows) {
+                    spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+                        buffers.input_bf16.ptr.0 + u64::from(first) * u64::from(plan.input) * 2,
+                        tensor.ptr().0,
+                        buffers.output_bf16.ptr.0 + u64::from(first) * u64::from(plan.output) * 2,
+                        rows,
+                        plan.output,
+                        plan.input,
+                        stream,
+                    )?;
+                }
+                Ok(())
             }
             Self::NativeBf16ActWeight(tensor) => {
                 ensure!(
@@ -265,15 +279,18 @@ impl Glm53Exl3Projection<'_> {
                             .context("GLM EXL3 native act-weight extent overflow")?,
                     "GLM EXL3 native act-weight byte extent drift"
                 );
-                spark_runtime::cublaslt::bf16_gemm_act_weight(
-                    buffers.input_bf16.ptr.0,
-                    tensor.ptr().0,
-                    buffers.output_bf16.ptr.0,
-                    plan.rows,
-                    plan.output,
-                    plan.input,
-                    stream,
-                )
+                for (first, rows) in glm53_gemm_row_slices(plan.rows) {
+                    spark_runtime::cublaslt::bf16_gemm_act_weight(
+                        buffers.input_bf16.ptr.0 + u64::from(first) * u64::from(plan.input) * 2,
+                        tensor.ptr().0,
+                        buffers.output_bf16.ptr.0 + u64::from(first) * u64::from(plan.output) * 2,
+                        rows,
+                        plan.output,
+                        plan.input,
+                        stream,
+                    )?;
+                }
+                Ok(())
             }
         }
     }
