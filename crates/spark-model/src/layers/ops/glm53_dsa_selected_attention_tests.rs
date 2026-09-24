@@ -9,6 +9,15 @@ const HOST_SOURCE: &str = include_str!("glm53_dsa_selected_attention.rs");
 const CUDA_SOURCE: &str =
     include_str!("../../../../../kernels/gb10/glm5.3-flash/iq3/glm53_dsa_selected_attention.cu");
 
+/// The per-(row, head) reference kernel's source: the file minus the
+/// row-shared rewrite, which deliberately repeats the reference's signature
+/// and arithmetic tokens.
+fn reference_cuda() -> String {
+    let start = CUDA_SOURCE.find("// Row-shared rewrite").unwrap();
+    let end = CUDA_SOURCE.find("// Before the selector becomes sparse").unwrap();
+    format!("{}{}", &CUDA_SOURCE[..start], &CUDA_SOURCE[end..])
+}
+
 fn bf(value: f32) -> f32 {
     bf16::from_f32(value).to_f32()
 }
@@ -123,9 +132,10 @@ fn reference(
 
 #[test]
 fn plan_pins_1m_extents_and_rejects_fp8_or_wrong_geometry() {
+    // The historic default prompt chunk; MAX_QUERIES itself is now 8192.
     let plan = Glm53DsaSelectedAttentionPlan::new(
         1,
-        MAX_QUERIES,
+        2_048,
         1_048_576,
         64,
         512,
@@ -432,6 +442,8 @@ fn swap_unique(source: &str, left: &str, right: &str) -> String {
 
 #[test]
 fn launch_argument_chain_matches_cuda_signature_and_rejects_swaps() {
+    let reference = reference_cuda();
+    let cuda_source = reference.as_str();
     const HOST_ARG_CHAIN: &str = r#".arg_ptr(buffers.absorbed_query_bf16.ptr)
             .arg_ptr(buffers.latent_cache_bf16.ptr)
             .arg_ptr(buffers.selected_indices_i32.ptr)
@@ -454,13 +466,14 @@ fn launch_argument_chain_matches_cuda_signature_and_rejects_swaps() {
     fn abi_contract(host: &str, cuda: &str) -> bool {
         host.contains(HOST_ARG_CHAIN) && cuda.contains(CUDA_SIGNATURE)
     }
-    let sparse_start = HOST_SOURCE.find("pub fn launch(").unwrap();
+    // The reference launch: after the row-shared early return.
+    let sparse_start = HOST_SOURCE.find("KernelLaunch::new(gpu, self.attention)").unwrap();
     let sparse_end = HOST_SOURCE[sparse_start..]
         .find("pub fn transpose_heads(")
         .map(|offset| sparse_start + offset)
         .unwrap();
     let sparse_host = &HOST_SOURCE[sparse_start..sparse_end];
-    assert!(abi_contract(sparse_host, CUDA_SOURCE));
+    assert!(abi_contract(sparse_host, cuda_source));
 
     let host_pointer_swaps = [
         (
@@ -475,7 +488,7 @@ fn launch_argument_chain_matches_cuda_signature_and_rejects_swaps() {
     for (left, right) in host_pointer_swaps {
         assert!(!abi_contract(
             &swap_unique(sparse_host, left, right),
-            CUDA_SOURCE,
+            cuda_source,
         ));
     }
     for (left, right) in [
@@ -484,7 +497,7 @@ fn launch_argument_chain_matches_cuda_signature_and_rejects_swaps() {
     ] {
         assert!(!abi_contract(
             &swap_unique(sparse_host, left, right),
-            CUDA_SOURCE,
+            cuda_source,
         ));
     }
 
@@ -501,16 +514,16 @@ fn launch_argument_chain_matches_cuda_signature_and_rejects_swaps() {
     for (left, right) in cuda_pointer_swaps {
         assert!(!abi_contract(
             sparse_host,
-            &swap_unique(CUDA_SOURCE, left, right),
+            &swap_unique(cuda_source, left, right),
         ));
     }
     for cuda_scalar_swap in [
-        CUDA_SOURCE.replacen(
+        cuda_source.replacen(
             "unsigned int batch, unsigned int query_count,",
             "unsigned int query_count, unsigned int batch,",
             1,
         ),
-        CUDA_SOURCE.replacen(
+        cuda_source.replacen(
             "unsigned int batch, unsigned int query_count,\n        unsigned int kv_capacity",
             "unsigned int kv_capacity, unsigned int query_count,\n        unsigned int batch",
             1,
@@ -522,6 +535,8 @@ fn launch_argument_chain_matches_cuda_signature_and_rejects_swaps() {
 
 #[test]
 fn cuda_source_pins_sort_unique_causal_and_bf16_probability_chronology() {
+    let reference = reference_cuda();
+    let cuda_source = reference.as_str();
     const REQUIRED: &[&str] = &[
         "slot < GLM53_DSA_SELECTED",
         "candidate < sequence_length",
@@ -549,9 +564,9 @@ fn cuda_source_pins_sort_unique_causal_and_bf16_probability_chronology() {
             && !source.contains("malloc(")
             && !source.contains("for (unsigned int token = 0U; token < sequence_length")
     }
-    assert_eq!(CUDA_SOURCE.matches("item < unique_count").count(), 4);
-    assert!(source_contract(CUDA_SOURCE));
+    assert_eq!(cuda_source.matches("item < unique_count").count(), 4);
+    assert!(source_contract(cuda_source));
     for required in REQUIRED {
-        assert!(!source_contract(&CUDA_SOURCE.replacen(required, "", 1)));
+        assert!(!source_contract(&cuda_source.replacen(required, "", 1)));
     }
 }

@@ -458,10 +458,10 @@ mod tests {
                 &gpu,
                 rows,
                 Glm53KdaQkvBuffers {
-                    combined_bf16: at(0x1000_0000, 3 * plane_bytes),
-                    query_bf16: at(0x2000_0000, plane_bytes),
-                    key_bf16: at(0x3000_0000, plane_bytes),
-                    value_bf16: at(0x4000_0000, plane_bytes),
+                    combined_bf16: at(0x1_0000_0000, 3 * plane_bytes),
+                    query_bf16: at(0x2_0000_0000, plane_bytes),
+                    key_bf16: at(0x3_0000_0000, plane_bytes),
+                    value_bf16: at(0x4_0000_0000, plane_bytes),
                 },
                 0,
             )
@@ -473,10 +473,10 @@ mod tests {
                     &gpu,
                     rows + 1,
                     Glm53KdaQkvBuffers {
-                        combined_bf16: at(0x1000_0000, 3 * plane_bytes),
-                        query_bf16: at(0x2000_0000, plane_bytes),
-                        key_bf16: at(0x3000_0000, plane_bytes),
-                        value_bf16: at(0x4000_0000, plane_bytes),
+                        combined_bf16: at(0x1_0000_0000, 3 * plane_bytes),
+                        query_bf16: at(0x2_0000_0000, plane_bytes),
+                        key_bf16: at(0x3_0000_0000, plane_bytes),
+                        value_bf16: at(0x4_0000_0000, plane_bytes),
                     },
                     0,
                 )

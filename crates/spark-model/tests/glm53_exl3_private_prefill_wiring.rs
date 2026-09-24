@@ -62,8 +62,8 @@ fn target_latches_policy_and_owned_scratch_extent_before_first_allocation() {
         ".validate_moe_mode(",
         "build_moe_pointer_tables(",
     );
-    assert!(constructor.contains("Glm53WalkScratch::required_bytes_with_route_policy("));
-    assert!(constructor.contains("Glm53WalkScratch::bind_with_route_policy("));
+    assert!(constructor.contains("Glm53WalkScratch::required_bytes_with_extent(route_policy,"));
+    assert!(constructor.contains("Glm53WalkScratch::bind_with_extent("));
     assert!(target.contains("scratch_bytes:u64") || target.contains("scratch_bytes:usize"));
     let reset = source("model/glm53/target_vision_exl3.rs");
     let reset = body(&reset, "reset_sequence");

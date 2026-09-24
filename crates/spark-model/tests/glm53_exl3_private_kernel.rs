@@ -227,7 +227,7 @@ fn selected_plan_must_match_latched_policy_even_when_all_buffers_match_forged_pl
 #[test]
 fn invalid_geometry_and_derived_plan_fields_fail_before_any_gpu_effect() {
     let (gpu, k) = load(true, true);
-    for rows in [0, 2049, u32::MAX] {
+    for rows in [0, 8193, u32::MAX] {
         assert!(k.plan(rows).is_err());
     }
     for mutation in 0..7 {

@@ -153,7 +153,7 @@ fn rolling_network(scores: &[f32], valid: &[bool]) -> Vec<u32> {
 
 #[test]
 fn plan_pins_exact_1m_geometry_and_extents() {
-    let plan = Glm53DsaTopkPlan::new(1, MAX_QUERIES, 262_144, 1_048_576, 2_048, 4, true).unwrap();
+    let plan = Glm53DsaTopkPlan::new(1, 2_048, 262_144, 1_048_576, 2_048, 4, true).unwrap();
     assert_eq!((plan.grid_y, plan.grid_z), (2_048, 1));
     assert_eq!(plan.score_bytes, 2_147_483_648);
     assert_eq!(plan.pool_validity_bytes, 262_144);

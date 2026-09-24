@@ -268,7 +268,7 @@ mod tests {
         const CUDA: &str =
             include_str!("../../../../../kernels/gb10/glm5.3-flash/iq3/glm53_dsa_score.cu");
         assert!(CUDA.contains("#define GLM53_DSA_MAX_QUERIES 8192U"));
-        let plan = Glm53DsaScorePlan::new(1, MAX_QUERIES, 262_144, 32, 128).unwrap();
+        let plan = Glm53DsaScorePlan::new(1, 2_048, 262_144, 32, 128).unwrap();
         assert_eq!((plan.grid_x, plan.grid_y, plan.grid_z), (262_144, 2_048, 1));
         assert_eq!(plan.query_bytes, 16_777_216);
         assert_eq!(plan.head_weight_bytes, 131_072);

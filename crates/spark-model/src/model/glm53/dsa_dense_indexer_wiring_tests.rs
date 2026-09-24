@@ -132,8 +132,8 @@ fn density_is_shared_and_sparse_consumers_and_persistent_publications_survive() 
         "buffers.tail_gates_bf16.ptr,cache.prior_tail_gates_bf16.ptr",
         "cache.out_tail_validity_u8.ptr,cache.prior_tail_validity_u8.ptr",
         "self.score.launch(",
-        "queries_bf16:buffers.index_q_bf16",
-        "head_weights_bf16:buffers.head_weights_bf16",
+        "queries_bf16:rows_from(buffers.index_q_bf16,",
+        "head_weights_bf16:rows_from(buffers.head_weights_bf16,",
         "self.topk.launch(",
         "self.selected.launch(gpu,selected_plan,selected_buffers,stream)",
     ] {

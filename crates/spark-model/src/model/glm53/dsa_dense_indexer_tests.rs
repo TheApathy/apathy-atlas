@@ -77,7 +77,7 @@ fn m1_and_exact_small_m_do_not_enter_layer_major_skip() {
 fn invalid_geometry_fails_before_a_plan_can_authorize_effects() {
     for (rows, position, capacity, layer_major) in [
         (0, 0, 2048, true),
-        (2049, 0, 4096, true),
+        (8193, 0, 16384, true),
         (9, 0, 2048, false),
         (2, 0, 0, true),
         (2, 2047, 2048, true),

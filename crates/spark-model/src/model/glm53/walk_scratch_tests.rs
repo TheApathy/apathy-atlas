@@ -173,13 +173,13 @@ fn k8_exl3_prefixes_remain_exact_append_only_and_disjoint() {
     let s = scratch();
     let t1 = s.exl3_projection_scratch();
     let wide = s.exl3_projection_scratch_rows(8).unwrap();
-    assert_eq!(wide.input_f16.bytes, GLM53_EXL3_MAX_WIDE_INPUT_F16_BYTES);
-    assert_eq!(wide.output_f16.bytes, GLM53_EXL3_MAX_WIDE_OUTPUT_F16_BYTES);
+    // The default extent lays the wide projection scratch out for 2048 rows.
+    let wide_input = GLM53_EXL3_DEFAULT_WIDE_ROWS * GLM53_EXL3_MAX_INPUT_F16_BYTES;
+    let wide_output = GLM53_EXL3_DEFAULT_WIDE_ROWS * GLM53_EXL3_MAX_OUTPUT_F16_BYTES;
+    assert_eq!(wide.input_f16.bytes, wide_input);
+    assert_eq!(wide.output_f16.bytes, wide_output);
     assert_eq!(wide.locks_i32.bytes, GLM53_EXL3_LOCK_BYTES);
-    assert_eq!(
-        wide.input_hadamard_f16.bytes,
-        GLM53_EXL3_MAX_WIDE_INPUT_F16_BYTES
-    );
+    assert_eq!(wide.input_hadamard_f16.bytes, wide_input);
     assert!(
         t1.input_hadamard_f16.ptr.0 + t1.input_hadamard_f16.bytes as u64 <= wide.input_f16.ptr.0
     );
@@ -217,7 +217,7 @@ fn k8_exl3_prefixes_remain_exact_append_only_and_disjoint() {
 #[test]
 fn m2048_layer_major_scratch_exposes_exact_prefixes() {
     let s = scratch();
-    let rows = MAX_WIDE_ROWS;
+    let rows = s.max_wide_rows();
     let input = GgmlIqBuffer {
         ptr: DevicePtr(0x9000_0000),
         bytes: rows as usize * 4_096 * 2,
