@@ -40,6 +40,15 @@ pub const ENGRAM_DEBUG_ENV: &str = "ATLAS_DSV41_ENGRAM_DEBUG";
 /// Legacy policy only: prompts at least this long prefill in `max_chunk` pieces; shorter ones in
 /// [`SHORT_CHUNK`].
 pub const LONG_PROMPT: usize = 6144;
+
+/// `ATLAS_DSV41_TRIM_LAST=1`: the replay's last layer runs its post-attention path (mHC, MoE,
+/// shared expert) for the last row only -- the only row whose layer-39 output is consumed.
+pub const TRIM_LAST_ENV: &str = "ATLAS_DSV41_TRIM_LAST";
+
+fn trim_last_enabled() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var(TRIM_LAST_ENV).as_deref() == Ok("1"))
+}
 /// Legacy policy only: the chunk for prompts under [`LONG_PROMPT`] tokens.
 pub const SHORT_CHUNK: usize = 2048;
 /// Balanced chunks are rounded up to a multiple of this.
