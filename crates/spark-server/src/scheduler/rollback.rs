@@ -84,6 +84,35 @@ pub enum RollbackFallback {
     /// or its token-indexed sidecars are not exactly aligned. Rewinding that
     /// history would require restoring more state than this rollback owns.
     UnsafeObservableHistory,
+    /// Hybrid (SSM) model whose decode-rollback ring is not configured at
+    /// all (`decode_rollback_ring_slots() == 0`, the trait default), so
+    /// there is no snapshot machinery to consult and never will be for
+    /// this sequence.
+    ///
+    /// This is the same hazard as [`RollbackFallback::NoSsmSnapshot`] and
+    /// is declined for the same reason, but it was previously MISSED:
+    /// `hybrid` was `has_ssm_layers() && ring.is_enabled()`, so a model
+    /// with recurrent state and a disabled ring evaluated `hybrid` to
+    /// false and fell through to the pure-attention branch, rolling the
+    /// token buffer back with `ssm_slot = None` and skipping the restore
+    /// entirely — precisely the corruption `NoSsmSnapshot` exists to
+    /// prevent. GLM-5.3 is exactly this shape: `has_ssm_layers()` is true
+    /// (34 of 45 layers carry recurrent KDA state, and the DSA pools are
+    /// not rewindable either) and it does not override
+    /// `decode_rollback_ring_slots`.
+    LayerStateNotRewindable,
+}
+
+/// Whether a rollback must be declined outright: the model carries
+/// per-sequence state that lowering `seq_len` cannot rewind, and there is no
+/// snapshot ring to restore that state from.
+///
+/// Kept as a pure predicate so the truth table can be pinned without building
+/// an `ActiveSeq`. The case that motivates it is `(true, false)` — recurrent
+/// state, no ring — which previously fell through to the pure-attention
+/// branch and rolled back without restoring anything.
+pub(crate) fn state_not_rewindable(has_ssm_layers: bool, ring_enabled: bool) -> bool {
+    has_ssm_layers && !ring_enabled
 }
 
 /// Whether the sole pre-commit caller can rewind this generated history
@@ -228,7 +257,15 @@ pub fn rollback_to_boundary(
     // A hybrid model needs the SSM state rewound too — restrict boundary
     // selection to one with a live snapshot. `has_ssm_layers()` false
     // (pure attention) keeps the original any-boundary search.
-    let hybrid = model.has_ssm_layers() && a.ssm_rollback_ring.is_enabled();
+    // Lowering `seq_len` is an exact rewind for a paged KV cache and WRONG
+    // for any layer carrying non-rewindable per-sequence state. If the model
+    // has such state and no ring to restore it from, decline: a rollback here
+    // would truncate the tokens while leaving the recurrence conditioned on
+    // the tail it just discarded.
+    if state_not_rewindable(model.has_ssm_layers(), a.ssm_rollback_ring.is_enabled()) {
+        return RollbackOutcome::Fallback(RollbackFallback::LayerStateNotRewindable);
+    }
+    let hybrid = model.has_ssm_layers();
     let (boundary_idx, ssm_slot) = if hybrid {
         match find_last_boundary_with_snapshot(
             &a.output_tokens,

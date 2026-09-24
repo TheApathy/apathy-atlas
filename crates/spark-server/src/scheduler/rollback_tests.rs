@@ -12,7 +12,7 @@
 use super::super::ssm_decode_ring::SsmDecodeRing;
 use super::{
     RollbackFallback, RollbackOutcome, find_last_boundary, find_last_boundary_with_snapshot,
-    rewind_buffers,
+    rewind_buffers, state_not_rewindable,
 };
 
 // ── boundary detection ──────────────────────────────────────────────
@@ -252,4 +252,48 @@ fn rom_head_absent_by_default() {
     // fall back to the F2 confidence heuristic. (Process-global OnceLock;
     // this test does not install a head.)
     assert!(super::rom_head().is_none());
+}
+
+// ── non-rewindable layer state ──────────────────────────────────────
+
+#[test]
+fn recurrent_state_without_a_ring_declines_the_rollback() {
+    // The case this guard exists for, and the one that used to fall
+    // through: a model with recurrent per-sequence state and no decode
+    // ring. GLM-5.3 is exactly this — `has_ssm_layers()` is true (34 of
+    // 45 layers carry KDA recurrence) and it does not override
+    // `decode_rollback_ring_slots`, so it inherits the trait default of 0
+    // and the ring reports itself disabled. Rolling back here truncates
+    // the token buffer while leaving the recurrence conditioned on the
+    // tail that was just discarded.
+    assert!(state_not_rewindable(true, false));
+}
+
+#[test]
+fn rewindable_configurations_are_left_alone() {
+    // Pure attention: lowering seq_len IS an exact rewind, with or
+    // without a ring.
+    assert!(!state_not_rewindable(false, false));
+    assert!(!state_not_rewindable(false, true));
+    // Recurrent state WITH a ring: the snapshot path handles it, and
+    // declines on its own with NoSsmSnapshot if no boundary has a live
+    // snapshot. This guard must not pre-empt that.
+    assert!(!state_not_rewindable(true, true));
+}
+
+#[test]
+fn not_rewindable_is_distinct_from_the_other_declines() {
+    for other in [
+        RollbackFallback::Disabled,
+        RollbackFallback::StreamUnsafe,
+        RollbackFallback::CapReached,
+        RollbackFallback::NoBoundary,
+        RollbackFallback::NoSsmSnapshot,
+    ] {
+        assert_ne!(
+            RollbackOutcome::Fallback(RollbackFallback::LayerStateNotRewindable),
+            RollbackOutcome::Fallback(other),
+            "LayerStateNotRewindable must be reportable on its own",
+        );
+    }
 }
