@@ -31,8 +31,7 @@ use crate::main_modules::AppState;
 use crate::main_modules::serve_phases;
 use crate::tokenizer::ChatTokenizer;
 use crate::{
-    conversation_store, rate_limiter, response_store, scheduler, scheduling_policy,
-    session_manager,
+    conversation_store, rate_limiter, response_store, scheduler, scheduling_policy, session_manager,
 };
 
 /// State that OUTLIVES any model and must be carried across a swap.
@@ -84,7 +83,6 @@ impl Carried {
         }
     }
 }
-
 
 /// What one load hands back: a model ready to serve, and the thread serving it.
 ///
@@ -218,15 +216,17 @@ pub(crate) fn load_model(
             None
         };
     let is_glm53_exl3 = glm53_exl3_files.is_some();
-    // GLM's DFlash2 proposer and its scheduler policy driver were not ported
-    // onto this engine's scheduler (integrate/all-models); refuse instead of
-    // silently serving the legacy drafter against a GLM target.
-    if config.model_type == "glm5_next" && (args.dflash || args.speculative) {
-        anyhow::bail!(
-            "GLM-5.3 speculative decoding (--dflash/--speculative) is not available in this \
-             build; serve GLM-5.3 target-only"
-        );
-    }
+    // GLM-5.3 speculates only through its own DFlash2 drafter and policy
+    // verifier (EXL3 checkpoint, `--dflash --dflash-gamma 8`); the generic
+    // MTP/DFlash proposers never run against a GLM target.
+    let glm_dflash_max_drafts = serve_phases::resolve_glm_dflash(
+        &config.model_type,
+        is_glm53_exl3,
+        args.dflash,
+        args.speculative,
+        args.dflash_gamma,
+        args.glm_dflash_max_drafts,
+    )?;
 
     let context_extension = super::context_extension::apply_context_extension(
         &mut config,
@@ -358,7 +358,9 @@ pub(crate) fn load_model(
         } else {
             atlas_kernels::available_targets()
                 .into_iter()
-                .find(|t| t.target.model == ptx_set.target.model && t.target.quant == required_quant)
+                .find(|t| {
+                    t.target.model == ptx_set.target.model && t.target.quant == required_quant
+                })
                 .with_context(|| {
                     format!(
                         "GLM-5.3 serving selected the {required_quant} physical source, but this \
@@ -690,8 +692,18 @@ pub(crate) fn load_model(
         layer_dtypes,
         hss_cache_blocks_per_seq: _,
     } = serve_phases::resolve_kv_cache_config(&args, &config, ptx_set.behavior.default_kv_dtype)?;
-    let dflash_drafter_state =
-        serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref(), dspark_verify_mode)?;
+    // GLM-5.3's DFlash2 drafter is owned by the GLM model (installed by its
+    // factory below), not by the generic DFlash builder.
+    let glm53_dflash2_dir = if is_glm53_exl3 && args.dflash {
+        Some(serve_phases::resolve_dflash_drafter_dir(&args, &ptx_set)?)
+    } else {
+        None
+    };
+    let dflash_drafter_state = if glm53_dflash2_dir.is_some() {
+        None
+    } else {
+        serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref(), dspark_verify_mode)?
+    };
     let dflash_donor_state = serve_phases::load_dflash_donor(&args, gpu.as_ref())?;
     if let Some((_, drafter_config)) = dflash_drafter_state.as_ref() {
         args.dflash_gamma = Some(drafter_config.resolve_draft_count(args.dflash_gamma)?);
@@ -741,7 +753,7 @@ pub(crate) fn load_model(
             exl3_store,
             gpu,
             args.max_seq_len,
-            None,
+            glm53_dflash2_dir.as_deref(),
         )
         .context("building the GLM-5.3 EXL3 model")?
     } else if let Some((profile, gguf_store)) = glm53_gguf {
@@ -884,7 +896,12 @@ pub(crate) fn load_model(
     // number of speculative tokens, not verify width K. DFlash currently owns
     // its configured block width internally, but keep the scheduler value in
     // the same unit for early-exit and future proposer implementations.
-    let num_drafts = if args.dflash {
+    let num_drafts = if let Some(limit) = glm_dflash_max_drafts {
+        tracing::info!(
+            "GLM DFlash2 verify width: {limit} drafts; the checkpoint still proposes a block of 8"
+        );
+        limit
+    } else if args.dflash {
         args.dflash_gamma.unwrap_or(15).max(1)
     } else {
         args.num_drafts

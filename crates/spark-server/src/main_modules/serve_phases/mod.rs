@@ -6,12 +6,13 @@
 
 mod build;
 mod config;
+mod glm_dflash;
 mod kernel_gate;
 mod kv_cache;
 mod preflight;
 mod runtime;
-mod target_store;
 mod sampling_audit;
+mod target_store;
 mod tokenizer_runtime;
 mod topology;
 mod vision_context;
@@ -53,6 +54,7 @@ pub(super) use config::{
     apply_model_default_num_drafts, cap_vocab_size_to_tokenizer, load_model_config,
     merge_sidecar_quant_config, resolve_model_dir,
 };
+pub(super) use glm_dflash::resolve_glm_dflash;
 pub(super) use kernel_gate::check_and_exit;
 pub(super) use kv_cache::{
     KvCacheConfig, PrefillBudget, resolve_kv_cache_config, resolve_prefill_budget,
@@ -71,6 +73,7 @@ pub(super) use topology::{Topology, init_nccl_comm, resolve_topology};
 pub(super) use vision_context::text_only_yarn_context;
 pub(super) use weights::{
     auto_detect_weight_prefix, load_dflash_donor, load_dflash_drafter, load_weight_store,
+    resolve_dflash_drafter_dir,
 };
 
 #[cfg(test)]

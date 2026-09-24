@@ -381,6 +381,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub dflash_gamma: Option<usize>,
 
+    /// GLM-5.3 DFlash2 only: drafts the target verifies per step (1..=7).
+    /// The checkpoint still proposes its trained block of 8 (`--dflash-gamma
+    /// 8`); this bounds the verify width, which is the step's cost. Size
+    /// `ATLAS_GLM53_PREFIX_COMMIT_ROWS` to at least this value.
+    #[arg(long)]
+    pub glm_dflash_max_drafts: Option<u8>,
+
     /// DSpark target-verify planner: `static`, `cap-accept`, or `compact`.
     /// Only `static` is currently supported. It verifies the full gamma+1
     /// window and deliberately skips confidence scoring, matching SGLang PR

@@ -357,6 +357,25 @@ pub(crate) fn auto_detect_weight_prefix(
     }
 }
 
+/// Resolve the DFlash drafter checkpoint directory without loading it (the
+/// GLM-5.3 model installs its own DFlash2 drafter from this directory).
+pub(crate) fn resolve_dflash_drafter_dir(
+    args: &cli::ServeArgs,
+    ptx_set: &atlas_kernels::TargetPtxSet,
+) -> Result<std::path::PathBuf> {
+    let drafter_id = args
+        .draft_model
+        .clone()
+        .or_else(|| ptx_set.dflash.as_ref().map(|d| d.draft_model.to_string()))
+        .context(
+            "--dflash set but no drafter HF id provided: pass --draft-model <ID> \
+             or use a target whose MODEL.toml has a [dflash] section",
+        )?;
+    tracing::info!("DFlash: resolving drafter '{drafter_id}'");
+    crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
+        .context("Failed to resolve DFlash drafter checkpoint")
+}
+
 pub(crate) fn load_dflash_drafter(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
