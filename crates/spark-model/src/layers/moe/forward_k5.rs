@@ -17,8 +17,8 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<()> {
         anyhow::ensure!(
-            matches!(rows, 5 | 9),
-            "Qwen4 exact MoE requires 5 or 9 rows"
+            matches!(rows, 4 | 5 | 9),
+            "Qwen4 exact MoE requires 4, 5 or 9 rows"
         );
         anyhow::ensure!(
             ctx.comm.is_none_or(|comm| comm.world_size() == 1),

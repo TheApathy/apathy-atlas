@@ -38,8 +38,7 @@ impl Qwen3SsmLayer {
         let row_bytes = ctx.config.residual_width() * 2;
         let core_bytes = h * 2;
         let eps = ctx.config.rms_norm_eps as f32;
-        let hybrid_k5 = matches!(num_tokens, 5 | 9)
-            && std::env::var("ATLAS_QWEN4_K5_HYBRID").ok().as_deref() == Some("1");
+        let hybrid_k5 = crate::layers::qwen4_hybrid_rows(num_tokens);
         let exact_hyper_k5 =
             hybrid_k5 && std::env::var("ATLAS_QWEN4_K5_BATCH_HYPER").ok().as_deref() != Some("1");
         let legacy_batch_ssm =
@@ -250,7 +249,7 @@ impl Qwen3SsmLayer {
         match num_tokens {
             2 => self.ffn.forward_k2(ffn_inputs, ctx, stream)?,
             3 => self.ffn.forward_k3(ffn_inputs, ctx, stream)?,
-            5 | 9 if hybrid_k5 => self
+            4 | 5 | 9 if hybrid_k5 => self
                 .ffn
                 .forward_qwen4_exact_rows(ffn_inputs, num_tokens, ctx, stream)?,
             n => self.ffn.forward_prefill(ffn_inputs, n, ctx, stream)?,

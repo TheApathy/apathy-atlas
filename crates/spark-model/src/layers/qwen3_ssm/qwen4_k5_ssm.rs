@@ -16,7 +16,7 @@ pub(super) enum Qwen4ExactSsmRowsRoute {
 impl Qwen4ExactSsmRowsRoute {
     fn admits(self, rows: usize) -> bool {
         match self {
-            Self::LegacyK5OrK9 => matches!(rows, 5 | 9),
+            Self::LegacyK5OrK9 => matches!(rows, 4 | 5 | 9),
             Self::NativeK16 => rows == 16,
         }
     }
@@ -74,7 +74,7 @@ pub(super) fn qwen4_exact_ssm_rows_route(
 ) -> Option<Qwen4ExactSsmRowsRoute> {
     if rows == 16 && k16_requested && k16_exact_requested && has_recurrent_intermediates {
         Some(Qwen4ExactSsmRowsRoute::NativeK16)
-    } else if matches!(rows, 5 | 9) && legacy_hybrid && legacy_batch_ssm {
+    } else if matches!(rows, 4 | 5 | 9) && legacy_hybrid && legacy_batch_ssm {
         Some(Qwen4ExactSsmRowsRoute::LegacyK5OrK9)
     } else {
         None

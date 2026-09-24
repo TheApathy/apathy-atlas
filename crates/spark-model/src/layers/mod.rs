@@ -2026,10 +2026,17 @@ impl FfnComponent {
         stream: u64,
     ) -> Result<()> {
         anyhow::ensure!(
-            matches!(rows, 5 | 9),
-            "Qwen4 exact FFN requires 5 or 9 rows"
+            matches!(rows, 4 | 5 | 9),
+            "Qwen4 exact FFN requires 4, 5 or 9 rows"
         );
-        if std::env::var("ATLAS_QWEN4_K5_NATIVE_MOE").ok().as_deref() == Some("1")
+        let native = std::env::var("ATLAS_QWEN4_K5_NATIVE_MOE").ok().as_deref() == Some("1");
+        // K=4 has no split fallback; only the native exact kernels keep its
+        // rows byte-identical to one-token decode.
+        anyhow::ensure!(
+            rows != 4 || native,
+            "Qwen4 exact K4 FFN requires ATLAS_QWEN4_K5_NATIVE_MOE=1"
+        );
+        if native
             && let Self::Moe(moe) = self
         {
             return moe.forward_qwen4_exact(input, rows, ctx, stream);
@@ -2146,4 +2153,13 @@ mod sparse_thresh_tests {
         assert!((parse_sparse_thresh_pct(f32::NAN) - 0.01).abs() < 1e-9);
         assert!((parse_sparse_thresh_pct(f32::INFINITY) - 0.01).abs() < 1e-9);
     }
+}
+
+/// Rows the Qwen4 exact hybrid verify route admits. `ATLAS_QWEN4_K5_HYBRID=1`
+/// admits K=5 and K=9; `ATLAS_QWEN4_K4_HYBRID=1` additionally admits K=4
+/// (`--num-drafts 3`). Process-constant, so graph capture sees one answer.
+pub(crate) fn qwen4_hybrid_rows(rows: usize) -> bool {
+    let k5 = std::env::var("ATLAS_QWEN4_K5_HYBRID").ok().as_deref() == Some("1");
+    let k4 = std::env::var("ATLAS_QWEN4_K4_HYBRID").ok().as_deref() == Some("1");
+    k5 && (matches!(rows, 5 | 9) || (rows == 4 && k4))
 }

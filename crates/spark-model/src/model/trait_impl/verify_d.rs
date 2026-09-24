@@ -184,6 +184,7 @@ fn qwen4_verify_layer_route(
     identity: Qwen4VerifyRouteIdentity,
     frame_k: usize,
     k5_hybrid_enabled: bool,
+    k4_hybrid_enabled: bool,
     k16_batched_requested: bool,
 ) -> std::result::Result<Option<Qwen4VerifyLayerRoute>, &'static str> {
     if k16_batched_requested {
@@ -210,6 +211,7 @@ fn qwen4_verify_layer_route(
     let route = match frame_k {
         2 | 3 => Qwen4VerifyLayerRoute::QualifiedBatched,
         5 if k5_hybrid_enabled => Qwen4VerifyLayerRoute::QualifiedBatched,
+        4 if k5_hybrid_enabled && k4_hybrid_enabled => Qwen4VerifyLayerRoute::QualifiedBatched,
         16 if k16_batched_requested => Qwen4VerifyLayerRoute::ExperimentalK16Batched,
         _ => Qwen4VerifyLayerRoute::RowSerialOracle,
     };
@@ -273,6 +275,7 @@ impl TransformerModel {
             },
             k,
             k5_hybrid_enabled,
+            std::env::var("ATLAS_QWEN4_K4_HYBRID").ok().as_deref() == Some("1"),
             k16_batched_requested,
         )
         .map_err(anyhow::Error::msg)?;
@@ -2039,6 +2042,7 @@ mod qwen4_verify_route_tests {
             NATIVE_K16,
             frame_k,
             k5_hybrid_enabled,
+            false,
             k16_batched_requested,
         )
         .unwrap()
@@ -2127,6 +2131,25 @@ mod qwen4_verify_route_tests {
     }
 
     #[test]
+    fn k4_hybrid_needs_both_opt_ins_and_is_shape_exact() {
+        let k4 = |frame_k, k5, k4| {
+            qwen4_verify_layer_route(NATIVE_K16, frame_k, k5, k4, false)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(k4(4, true, true), Qwen4VerifyLayerRoute::QualifiedBatched);
+        assert_eq!(k4(4, true, false), Qwen4VerifyLayerRoute::RowSerialOracle);
+        assert_eq!(k4(4, false, true), Qwen4VerifyLayerRoute::RowSerialOracle);
+        for physical_k in [1, 6, 7, 8, 15, 16, 17] {
+            assert_eq!(
+                k4(physical_k, true, true),
+                Qwen4VerifyLayerRoute::RowSerialOracle,
+                "K4 opt-in leaked to physical K={physical_k}"
+            );
+        }
+    }
+
+    #[test]
     fn k16_request_rejects_every_wrong_runtime_identity() {
         let invalid = [
             Qwen4VerifyRouteIdentity {
@@ -2157,7 +2180,7 @@ mod qwen4_verify_route_tests {
 
         for identity in invalid {
             assert!(
-                qwen4_verify_layer_route(identity, 16, false, true).is_err(),
+                qwen4_verify_layer_route(identity, 16, false, false, true).is_err(),
                 "invalid identity unexpectedly admitted: {identity:?}"
             );
         }
@@ -2173,7 +2196,7 @@ mod qwen4_verify_route_tests {
         };
         for frame_k in 1..=17 {
             assert_eq!(
-                qwen4_verify_layer_route(generic, frame_k, false, false).unwrap(),
+                qwen4_verify_layer_route(generic, frame_k, false, false, false).unwrap(),
                 None
             );
         }
@@ -2185,10 +2208,10 @@ mod qwen4_verify_route_tests {
             active_proposer_physical_k: Some(16),
         };
         assert_eq!(
-            qwen4_verify_layer_route(dense_donor_qwen4, 16, false, false).unwrap(),
+            qwen4_verify_layer_route(dense_donor_qwen4, 16, false, false, false).unwrap(),
             Some(Qwen4VerifyLayerRoute::RowSerialOracle)
         );
-        assert!(qwen4_verify_layer_route(dense_donor_qwen4, 16, false, true).is_err());
+        assert!(qwen4_verify_layer_route(dense_donor_qwen4, 16, false, false, true).is_err());
     }
 
     #[test]

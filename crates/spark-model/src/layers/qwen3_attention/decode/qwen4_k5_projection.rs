@@ -132,6 +132,9 @@ impl Qwen3AttentionLayer {
             == Some("1");
         let route = if rows == 32 && crate::layers::qwen4_prefill_moe::attn16::core32_selected()? {
             Some(Qwen4ExactQkvRowsRoute::K32)
+        } else if rows == 4 && legacy_k5_k9_enabled && crate::layers::qwen4_hybrid_rows(4) {
+            // The K4 hybrid shares the K5/K9 exact-rows projection family.
+            Some(Qwen4ExactQkvRowsRoute::LegacyK5K9)
         } else {
             qwen4_exact_qkv_rows_route(rows, legacy_k5_k9_enabled, qwen4_k16_exact_requested()?)
         };
