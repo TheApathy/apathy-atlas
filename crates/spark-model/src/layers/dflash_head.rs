@@ -1527,7 +1527,8 @@ mod draft_kv_storage_contract_tests {
         ] {
             assert!(head.contains(required), "head is missing `{required}`");
         }
-        assert!(prefill.matches(".plan_append_at(").count() >= 3);
+        assert!(prefill.matches(".plan_append_at(").count() >= 2);
+        assert!(prefill.contains(".advanced_after_chunk("));
         assert!(prefill.contains(".plan_gather("));
         assert!(propose.contains(".plan_append_at("));
         assert!(propose.contains(".physical_slot_for("));
