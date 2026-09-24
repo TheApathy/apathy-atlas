@@ -26,10 +26,11 @@ const ROWS_THREADS: u32 = 512;
 const ROWS_GROUP: u32 = 8;
 const ROWS_TILE: u32 = 8;
 const SORT_WIDTH: u32 = 4_096;
-// [item][group] f32 scores | canonical item list | sort network or two KV tiles.
+// [item][group] f32 scores | canonical item list | sort network or the KV tile ring.
 const ROWS_ORDER_BYTES: u32 = 8_224;
-const ROWS_SCRATCH_BYTES: u32 = if 2 * ROWS_TILE * LATENT * 2 > SORT_WIDTH * 4 {
-    2 * ROWS_TILE * LATENT * 2
+const ROWS_STAGES: u32 = 3;
+const ROWS_SCRATCH_BYTES: u32 = if ROWS_STAGES * ROWS_TILE * LATENT * 2 > SORT_WIDTH * 4 {
+    ROWS_STAGES * ROWS_TILE * LATENT * 2
 } else {
     SORT_WIDTH * 4
 };

@@ -256,13 +256,14 @@ atlas_glm53_dsa_selected_attention_bf16(
 #define GLM53_DSA_ROWS_THREADS 512U
 #define GLM53_DSA_ROWS_GROUP 8U
 #define GLM53_DSA_ROWS_TILE 8U
-// [item][GROUP] f32 scores | canonical item list | sort network / 2 KV tiles
+// [item][GROUP] f32 scores | canonical item list | sort network / KV tile ring
 #define GLM53_DSA_ROWS_SCORE_BYTES (GLM53_DSA_SELECTED * GLM53_DSA_ROWS_GROUP * 4U)
 #define GLM53_DSA_ROWS_ORDER_BYTES 8224U
 #define GLM53_DSA_ROWS_TILE_BYTES (GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT * 2U)
+#define GLM53_DSA_ROWS_STAGES 3U
 #define GLM53_DSA_ROWS_SCRATCH_BYTES \
-    (2U * GLM53_DSA_ROWS_TILE_BYTES > GLM53_DSA_SORT_WIDTH * 4U ? \
-     2U * GLM53_DSA_ROWS_TILE_BYTES : GLM53_DSA_SORT_WIDTH * 4U)
+    (GLM53_DSA_ROWS_STAGES * GLM53_DSA_ROWS_TILE_BYTES > GLM53_DSA_SORT_WIDTH * 4U ? \
+     GLM53_DSA_ROWS_STAGES * GLM53_DSA_ROWS_TILE_BYTES : GLM53_DSA_SORT_WIDTH * 4U)
 #define GLM53_DSA_ROWS_SHARED \
     (GLM53_DSA_ROWS_SCORE_BYTES + GLM53_DSA_ROWS_ORDER_BYTES + GLM53_DSA_ROWS_SCRATCH_BYTES)
 
@@ -286,6 +287,42 @@ __device__ __forceinline__ void glm53_dsa_rows_stage(
             cache + (unsigned long long)ordered[first + item] * GLM53_DSA_LATENT + column);
     }
     asm volatile("cp.async.commit_group;");
+}
+
+// Ring of GLM53_DSA_ROWS_STAGES tiles: tiles 0..STAGES-2 are requested up
+// front; entering tile t requests tile t+STAGES-1 into the slot tile t-1 freed
+// (the caller's trailing barrier) and waits for tile t only.
+__device__ __forceinline__ void glm53_dsa_rows_prefetch(
+        __nv_bfloat16 * tiles, const __nv_bfloat16 * cache,
+        const unsigned int * ordered, unsigned int count, unsigned int tile_count,
+        unsigned int thread) {
+    for (unsigned int t = 0U; t + 1U < GLM53_DSA_ROWS_STAGES && t < tile_count; ++t) {
+        const unsigned int first = t * GLM53_DSA_ROWS_TILE;
+        glm53_dsa_rows_stage(tiles + t * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT, cache,
+                             ordered, first, min(count - first, GLM53_DSA_ROWS_TILE), thread);
+    }
+}
+
+__device__ __forceinline__ void glm53_dsa_rows_advance(
+        __nv_bfloat16 * tiles, const __nv_bfloat16 * cache,
+        const unsigned int * ordered, unsigned int count, unsigned int tile_count,
+        unsigned int t, unsigned int thread) {
+    const unsigned int ahead = t + GLM53_DSA_ROWS_STAGES - 1U;
+    if (ahead < tile_count) {
+        const unsigned int first = ahead * GLM53_DSA_ROWS_TILE;
+        glm53_dsa_rows_stage(
+            tiles + (ahead % GLM53_DSA_ROWS_STAGES) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT,
+            cache, ordered, first, min(count - first, GLM53_DSA_ROWS_TILE), thread);
+    }
+    // Groups complete in order; the ones younger than tile t may stay pending.
+    const unsigned int pending = min(tile_count - 1U - t, GLM53_DSA_ROWS_STAGES - 1U);
+    if (pending >= 2U) {
+        asm volatile("cp.async.wait_group 2;");
+    } else if (pending == 1U) {
+        asm volatile("cp.async.wait_group 1;");
+    } else {
+        asm volatile("cp.async.wait_group 0;");
+    }
 }
 
 extern "C" __global__ void __launch_bounds__(GLM53_DSA_ROWS_THREADS, 1)
@@ -443,25 +480,15 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
             }
             const bool upper16 = (lane & 16U) != 0U;
             const bool upper8 = (lane & 8U) != 0U;
-            glm53_dsa_rows_stage(tiles, cache, ordered, 0U,
-                                 min(count, GLM53_DSA_ROWS_TILE), thread);
+            glm53_dsa_rows_prefetch(tiles, cache, ordered, count, tile_count, thread);
             for (unsigned int t = 0U; t < tile_count; ++t) {
                 const unsigned int first = t * GLM53_DSA_ROWS_TILE;
                 const unsigned int n = min(count - first, GLM53_DSA_ROWS_TILE);
-                if (t + 1U < tile_count) {
-                    const unsigned int next = first + GLM53_DSA_ROWS_TILE;
-                    glm53_dsa_rows_stage(
-                        tiles + ((t + 1U) & 1U) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT,
-                        cache, ordered, next, min(count - next, GLM53_DSA_ROWS_TILE),
-                        thread);
-                    asm volatile("cp.async.wait_group 1;");
-                } else {
-                    asm volatile("cp.async.wait_group 0;");
-                }
+                glm53_dsa_rows_advance(tiles, cache, ordered, count, tile_count, t, thread);
                 __syncthreads();
                 if (slot < n) {
                     const __nv_bfloat16 * key = tiles +
-                        (t & 1U) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT +
+                        (t % GLM53_DSA_ROWS_STAGES) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT +
                         slot * GLM53_DSA_LATENT;
                     float k_low[8];
                     float k_high[8];
@@ -523,9 +550,8 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
             if (lane == 0U) denominators[warp] = maximum;
         }
         __syncthreads();
-        // Prefetch the first value tile while the softmax runs.
-        glm53_dsa_rows_stage(tiles, cache, ordered, 0U,
-                             min(count, GLM53_DSA_ROWS_TILE), thread);
+        // Prefetch the first value tiles while the softmax runs.
+        glm53_dsa_rows_prefetch(tiles, cache, ordered, count, tile_count, thread);
         for (unsigned int index = thread; index < GLM53_DSA_ROWS_GROUP * count;
              index += GLM53_DSA_ROWS_THREADS) {
             scores[index] = expf(__fsub_rn(
@@ -557,19 +583,10 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
             for (unsigned int t = 0U; t < tile_count; ++t) {
                 const unsigned int first = t * GLM53_DSA_ROWS_TILE;
                 const unsigned int n = min(count - first, GLM53_DSA_ROWS_TILE);
-                if (t + 1U < tile_count) {
-                    const unsigned int next = first + GLM53_DSA_ROWS_TILE;
-                    glm53_dsa_rows_stage(
-                        tiles + ((t + 1U) & 1U) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT,
-                        cache, ordered, next, min(count - next, GLM53_DSA_ROWS_TILE),
-                        thread);
-                    asm volatile("cp.async.wait_group 1;");
-                } else {
-                    asm volatile("cp.async.wait_group 0;");
-                }
+                glm53_dsa_rows_advance(tiles, cache, ordered, count, tile_count, t, thread);
                 __syncthreads();
                 const __nv_bfloat16 * tile =
-                    tiles + (t & 1U) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT;
+                    tiles + (t % GLM53_DSA_ROWS_STAGES) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT;
                 for (unsigned int local = 0U; local < n; ++local) {
                     const float value =
                         __bfloat162float(tile[local * GLM53_DSA_LATENT + column]);
