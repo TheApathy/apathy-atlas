@@ -25,6 +25,7 @@
 
 pub(crate) mod block_mgmt;
 pub(crate) mod control_engagement;
+pub(crate) mod ctx_checkpoint;
 pub(crate) mod drop;
 pub(crate) mod early_exit;
 pub(crate) mod env_diag;

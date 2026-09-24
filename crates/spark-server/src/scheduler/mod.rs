@@ -15,6 +15,7 @@
 // ── Submodules (split for ≤500 LoC files) ──────────────────────────────────
 mod cfg_jump_forward;
 mod confidence;
+pub(crate) mod ctx_cache;
 mod decode_logits_content;
 mod decode_logits_seq;
 mod decode_logits_step;

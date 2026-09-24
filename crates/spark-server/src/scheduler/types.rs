@@ -34,6 +34,8 @@ pub(super) struct PrefillInProgress {
     pub session_hash: u64,
     pub seq: SequenceState,
     pub chunk_offset: usize,
+    /// Gate reference mode: a chunk must end exactly here (0 = none).
+    pub ctx_split_at: usize,
     pub max_tokens: usize,
     pub min_tokens: usize,
     pub eos_tokens: Vec<u32>,

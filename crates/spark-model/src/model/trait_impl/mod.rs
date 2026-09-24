@@ -231,6 +231,24 @@ impl Model for TransformerModel {
     fn cache_sequence(&self, seq: &SequenceState) {
         self.cache_sequence_dispatch(seq)
     }
+    fn ctx_geometry(&self) -> Option<String> {
+        self.ctx_geometry_dispatch()
+    }
+    fn ctx_capture(
+        &self,
+        seq: &SequenceState,
+        stream: u64,
+    ) -> Result<Option<spark_runtime::ctx_store::CtxSnapshot>> {
+        self.ctx_capture_dispatch(seq, stream)
+    }
+    fn ctx_restore(
+        &self,
+        snap: &spark_runtime::ctx_store::CtxSnapshot,
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<()> {
+        self.ctx_restore_dispatch(snap, seq, stream)
+    }
     fn free_sequence(&self, seq: &mut SequenceState) -> Result<()> {
         self.free_sequence_dispatch(seq)
     }

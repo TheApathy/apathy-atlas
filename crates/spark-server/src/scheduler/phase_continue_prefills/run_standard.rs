@@ -64,6 +64,9 @@ pub(super) fn run_standard_chunk_loop(
     if !is_last && chunk_len >= 4 {
         chunk_len = (chunk_len / 4) * 4;
     }
+    // A forced context-checkpoint boundary is hit exactly, after alignment.
+    let chunk_len = super::super::ctx_cache::clamp_to_split(p.chunk_offset, chunk_len, p.ctx_split_at);
+    let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
 
     // ── Mixed forward: fuse prefill chunk + decode in one pass ──
     // ATLAS_BISECT_NO_MIX=1 forces this branch to false so we can
@@ -112,6 +115,9 @@ pub(super) fn run_standard_chunk_loop(
                     }
                     let _ = model.record_event(prefill_event, prefill_stream);
                     let _ = model.stream_wait_event(model.default_stream(), prefill_event);
+                    let total = p.prompt_tokens.len();
+                    super::super::ctx_cache::dump_logits(model, result.prefill_logits, total);
+                    super::super::ctx_cache::after_prefill(model, &p.seq, prefill_stream);
                     match sample_token_with_logprobs(
                         model,
                         result.prefill_logits,
@@ -196,6 +202,9 @@ pub(super) fn run_standard_chunk_loop(
             if is_last {
                 let _ = model.record_event(prefill_event, prefill_stream);
                 let _ = model.stream_wait_event(model.default_stream(), prefill_event);
+                let total = p.prompt_tokens.len();
+                super::super::ctx_cache::dump_logits(model, logits, total);
+                super::super::ctx_cache::after_prefill(model, &p.seq, prefill_stream);
                 match sample_token_with_logprobs(
                     model,
                     logits,

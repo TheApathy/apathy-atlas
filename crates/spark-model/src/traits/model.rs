@@ -1139,6 +1139,34 @@ pub trait Model: Send + Sync {
     /// Default no-op (non-DFlash / non-tree backends).
     fn set_dflash_accepted_compact(&self, _seq: &mut SequenceState, _accepted_compact: &[usize]) {}
 
+    /// Geometry of the state `ctx_capture` produces, folded into the
+    /// context-checkpoint key. `None` when this model cannot checkpoint.
+    fn ctx_geometry(&self) -> Option<String> {
+        None
+    }
+
+    /// Capture the complete state of `seq` right after its prompt prefill
+    /// (`seq.tokens` covers exactly the prefilled prompt). `Ok(None)` when
+    /// this model or sequence is not checkpointable.
+    fn ctx_capture(
+        &self,
+        _seq: &SequenceState,
+        _stream: u64,
+    ) -> Result<Option<spark_runtime::ctx_store::CtxSnapshot>> {
+        Ok(None)
+    }
+
+    /// Restore a captured state into a freshly allocated `seq`, leaving it as
+    /// if its first `snap.tokens.len()` tokens had just been prefilled.
+    fn ctx_restore(
+        &self,
+        _snap: &spark_runtime::ctx_store::CtxSnapshot,
+        _seq: &mut SequenceState,
+        _stream: u64,
+    ) -> Result<()> {
+        bail!("context checkpoints are not supported by this model")
+    }
+
     /// Save KV blocks + SSM state to writer. Does NOT free resources.
     ///
     /// Format: `[KV layers × blocks × (K + V)]` then `[SSM layers × (h + conv)]`.

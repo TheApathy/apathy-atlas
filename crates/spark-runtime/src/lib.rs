@@ -4,6 +4,7 @@
 #![deny(clippy::all)]
 
 pub mod buffers;
+pub mod ctx_store;
 #[cfg(feature = "cuda")]
 pub mod cublaslt;
 // Metal/no-cuda builds get unreachable stubs so spark-model's unconditional

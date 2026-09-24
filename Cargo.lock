@@ -2383,6 +2383,7 @@ dependencies = [
  "anyhow",
  "atlas-core",
  "atlas-kernels",
+ "crc32fast",
  "cudarc",
  "dispatch2",
  "half",
@@ -2397,6 +2398,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

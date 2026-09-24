@@ -104,7 +104,6 @@ pub fn start_chunked_prefill(
     let request_start = Instant::now();
     let total = prompt_tokens.len();
     let chunk_len = total.min(max_prefill_tokens);
-    let is_last = chunk_len >= total;
 
     let pstep_on = std::env::var("ATLAS_PREFILL_PHASE_PROFILE").ok().as_deref() == Some("1");
     let mut pstep_ms: Vec<(&str, f64)> = Vec::new();
@@ -141,6 +140,14 @@ pub fn start_chunked_prefill(
     seq.qwen4_qsa_required = request_can_reach_qwen4_qsa(total, max_tokens);
     pstep_mark!("alloc_sequence");
 
+    // On-disk context checkpoint: restore a checkpointed prompt prefix and
+    // start prefill after it (or, in gate reference mode, split there).
+    let ctx_start = super::ctx_cache::try_restore(model, &prompt_tokens, &mut seq, prefill_stream);
+    let chunk_start = ctx_start.start;
+    let chunk_len = super::ctx_cache::first_chunk_len(ctx_start, total, max_prefill_tokens);
+    let is_last = chunk_start + chunk_len >= total;
+    pstep_mark!("ctx_restore");
+
     // Guard: free SSM slot on any error after allocation.
     let prefill_result = (|| -> Result<DevicePtr> {
         // Vision: encode images and store embeddings for chunk 0 token overwrite.
@@ -162,7 +169,7 @@ pub fn start_chunked_prefill(
         let r = model.prefill_chunk(
             &prompt_tokens,
             &mut seq,
-            0,
+            chunk_start,
             chunk_len,
             is_last,
             prefill_stream,
@@ -190,6 +197,15 @@ pub fn start_chunked_prefill(
         }
     };
 
+    // A chunk that starts after a restored checkpoint is a continuation
+    // chunk: normalise SSM state exactly as the continuation loop does after
+    // every chunk, so the restored run matches a split full prefill.
+    if chunk_start > 0
+        && let Err(e) = model.normalize_ssm_states(&seq, prefill_stream)
+    {
+        tracing::warn!("SSM state normalization failed: {e:#}");
+    }
+
     // Sync prefill stream before sampling or returning to decode.
     // Record event on prefill stream, make default stream wait.
     if let Err(e) = model.record_event(prefill_event, prefill_stream) {
@@ -208,6 +224,11 @@ pub fn start_chunked_prefill(
             prev = *t;
         }
         tracing::info!("PREFILL_STEPS | {}", joined.join(" "));
+    }
+
+    if is_last {
+        super::ctx_cache::dump_logits(model, logits, total);
+        super::ctx_cache::after_prefill(model, &seq, prefill_stream);
     }
 
     if is_last {
@@ -422,7 +443,8 @@ pub fn start_chunked_prefill(
             prompt_tokens,
             session_hash: req_session_hash,
             seq,
-            chunk_offset: chunk_len,
+            chunk_offset: chunk_start + chunk_len,
+            ctx_split_at: ctx_start.split_at,
             max_tokens,
             min_tokens: req_min_tokens,
             eos_tokens: eos_tokens.to_vec(),

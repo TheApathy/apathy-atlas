@@ -787,6 +787,20 @@ pub(crate) fn load_model(
     }
     let model = model_opt.expect("head retains model on rank 0");
 
+    // On-disk context checkpoints (ATLAS_CTX_CACHE=1). Re-initialised on every
+    // load so a model swap never sees another model's checkpoints.
+    crate::scheduler::ctx_cache::init(
+        &*model,
+        &crate::scheduler::ctx_cache::ServeIdentity {
+            model_dir: &model_dir,
+            draft_model: args.draft_model.as_deref(),
+            kernel_target: &ptx_set.target.model,
+            kv_cache_dtype: &args.kv_cache_dtype,
+            block_size: args.block_size,
+            max_prefill_tokens: args.max_prefill_tokens,
+        },
+    );
+
     // TQ+ InnerQ: opt-in via `TURBO_INNERQ=N` (N = calibration token count).
     // Once enabled, the kernel-side apply pass starts accumulating K² stats
     // and the scheduler polls `maybe_finalize` per prefill chunk; once N
