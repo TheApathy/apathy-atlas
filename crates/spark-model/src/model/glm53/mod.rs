@@ -70,6 +70,7 @@ mod kda_state_binding;
 mod kernels;
 mod mhc_expansion;
 mod model_impl;
+mod target_only_admission;
 mod walk_dump;
 mod walk_scratch;
 pub(crate) mod walk_timing;
@@ -86,9 +87,12 @@ pub use kda_state_binding::Glm53KdaScratchState;
 pub use kernels::{GLM53_REQUIRED_CAPABILITIES, Glm53KernelAdmission, Glm53RuntimeCapability};
 pub use mhc_expansion::{GLM53_MHC_FUNCTION_F32_BYTES, Glm53HyperBranch, Glm53MhcExpanded};
 pub use model_impl::{Glm53ModelPhase, Glm53TargetModelRequest, reject_unwired_phase};
-pub use target_model::{GLM53_BRINGUP_ENV, Glm53Model};
+pub use target_model::{GLM53_BRINGUP_ENV, Glm53AdmissionScope, Glm53Model};
 pub use target_model_exl3::Glm53Exl3Model;
 pub use target_model_exl3::{Glm53StateProbe, StateProbeDescriptor, StateProbeRegion};
+pub use target_only_admission::{
+    GLM53_NEGATIVE_CONTROL_ENV, Glm53GateMetrics, Glm53TargetOnlyAdmission, Glm53TargetOnlyEvidence,
+};
 
 /// Fully owned but currently unreachable admitted object. Construction performs
 /// only CPU validation; the capability gate fails before this value can exist.
@@ -242,7 +246,11 @@ mod tests {
         );
         // And the model must refuse to construct on that basis alone. This is
         // the assertion that replaces the old source-text check.
-        let refusal = format!("{:#}", target_model::Glm53Model::admit().unwrap_err());
+        let refusal = format!(
+            "{:#}",
+            target_model::Glm53Model::admit(target_model::Glm53AdmissionScope::Speculative)
+                .unwrap_err()
+        );
         assert!(
             refusal.contains("admission is closed"),
             "refusal must name the closed gate: {refusal}"

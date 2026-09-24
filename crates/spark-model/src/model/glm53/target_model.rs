@@ -4,14 +4,21 @@
 //!
 //! # Admission
 //!
-//! Construction is gated. [`Glm53KernelAdmission`] is the reviewed control and
-//! is still `[false; 6]`, so the default path refuses. Bring-up is reachable
-//! only through the explicit `ATLAS_GLM53_UNVALIDATED_BRINGUP=1` escape, which
-//! logs a loud warning and exists for one purpose: to run the port against the
-//! llama.cpp `glm5next` oracle so the capability reviews have evidence to work
-//! from. **Output from that path has been compared to nothing and must not be
-//! quoted as a result.** Precedent for a named experimental gate is
-//! `ATLAS_EXPERIMENTAL_NATIVE_QWEN4_DFLASH`.
+//! Construction is gated per [`Glm53AdmissionScope`]:
+//!
+//! - **EXL3 target-only** is admitted by [`Glm53TargetOnlyAdmission`], which
+//!   holds a recorded comparison of this build's prefill and decode logits
+//!   against an independent ExLlamaV3 implementation of the same checkpoint,
+//!   plus a negative control that had to fail the same bounds.
+//! - **Speculative** runtimes (DFlash2) and the **GGUF** target stay behind
+//!   [`Glm53KernelAdmission`], the six-capability census of the receipt-verified
+//!   executor, which is still `[false; 6]`.
+//!
+//! A closed scope is reachable only through the explicit
+//! `ATLAS_GLM53_UNVALIDATED_BRINGUP=1` escape, which logs a loud warning.
+//! **Output from a scope that is running on the escape has been compared to
+//! nothing and must not be quoted as a result.** Precedent for a named
+//! experimental gate is `ATLAS_EXPERIMENTAL_NATIVE_QWEN4_DFLASH`.
 //!
 //! # Commit
 //!
@@ -20,14 +27,15 @@
 //! when a step is accepted. This model runs without speculation, so every step
 //! is accepted and [`Glm53Model::commit_accepted`] performs the accept-path
 //! effects directly rather than through the receipt-verified transaction in
-//! `device_completion` / `t1_state_transaction`. That shortcut is the single
-//! largest reason the bring-up path is not a validated path: it publishes state
-//! without the completion receipts the design requires. It is confined to this
-//! function and is unreachable with admission closed.
+//! `device_completion` / `t1_state_transaction`. It publishes state without
+//! the completion receipts a SPECULATIVE walk requires, which is why speculation
+//! stays behind [`Glm53KernelAdmission`]. For a non-speculative walk the commit
+//! is unconditional, and its correctness is what the EXL3 target-only evidence
+//! measures (a negative control that skips it must fail that gate).
 
 use std::sync::Mutex;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::gguf::GgmlType;
 
@@ -46,6 +54,9 @@ use super::kda_attention::Glm53KdaConvSlots;
 use super::kda_state_binding::Glm53KdaScratchState;
 use super::kernels::Glm53KernelAdmission;
 use super::mhc_expansion::Glm53MhcExpanded;
+use super::target_only_admission::{
+    GLM53_NEGATIVE_CONTROL_ENV, Glm53TargetOnlyAdmission, negative_control_active,
+};
 use super::walk_dump::{Glm53DumpDtype, Glm53WalkDump};
 
 /// The KDA convolution-state carry across positions.
@@ -80,6 +91,20 @@ use super::walk_scratch::Glm53WalkScratch;
 
 /// The env escape that admits the unvalidated bring-up path.
 pub const GLM53_BRINGUP_ENV: &str = "ATLAS_GLM53_UNVALIDATED_BRINGUP";
+
+/// Which claim a construction or installation needs admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Glm53AdmissionScope {
+    /// The GGUF target. No reference evidence is recorded for it, so it stays
+    /// behind the six-capability gate.
+    GgufTargetOnly,
+    /// The EXL3 target without speculation: every step is accepted.
+    /// Admitted by [`Glm53TargetOnlyAdmission`].
+    Exl3TargetOnly,
+    /// Any speculative runtime (DFlash2). Needs the receipt-verified executor
+    /// that [`Glm53KernelAdmission`] names.
+    Speculative,
+}
 
 const VOCAB: u32 = 154_880;
 const HIDDEN: u32 = 4_096;
@@ -145,26 +170,53 @@ impl Glm53Model {
         std::env::var(GLM53_BRINGUP_ENV).is_ok_and(|value| value == "1")
     }
 
-    /// Refuse unless admission is open or the bring-up escape is set.
+    /// Refuse unless `scope`'s admission is open or the bring-up escape is set.
     ///
     /// Kept separate from construction so a caller can report the reason
     /// without allocating an arena first.
-    pub fn admit() -> Result<()> {
-        if Glm53KernelAdmission::current().validate().is_ok() {
+    pub fn admit(scope: Glm53AdmissionScope) -> Result<()> {
+        let gate = match scope {
+            Glm53AdmissionScope::GgufTargetOnly | Glm53AdmissionScope::Speculative => {
+                Glm53KernelAdmission::current().validate()
+            }
+            Glm53AdmissionScope::Exl3TargetOnly => {
+                if negative_control_active()? {
+                    Err(anyhow!(
+                        "{GLM53_NEGATIVE_CONTROL_ENV} deliberately corrupts the commit and is \
+                         never admitted"
+                    ))
+                } else {
+                    Glm53TargetOnlyAdmission::current().validate()
+                }
+            }
+        };
+        let Err(reason) = gate else {
+            if scope == Glm53AdmissionScope::Exl3TargetOnly
+                && let Some(evidence) = Glm53TargetOnlyAdmission::current().evidence()
+            {
+                tracing::info!(
+                    "GLM-5.3 EXL3 target-only admission open: reference {} on build {}, \
+                     prefill agreement {:.4} KL {:.5}, decode agreement {:.4} KL {:.5}",
+                    evidence.reference,
+                    evidence.build_commit,
+                    evidence.prefill.argmax_agreement_excl_ties,
+                    evidence.prefill.mean_kl,
+                    evidence.decode.argmax_agreement_excl_ties,
+                    evidence.decode.mean_kl,
+                );
+            }
             return Ok(());
-        }
+        };
         if Self::bringup_escape_set() {
             tracing::warn!(
-                "GLM-5.3 is running through {GLM53_BRINGUP_ENV}=1. Kernel admission is CLOSED: \
-                 no capability has been reviewed, the accept path publishes state without \
-                 completion receipts, and this output has been compared against nothing. Do not \
+                "GLM-5.3 {scope:?} is running through {GLM53_BRINGUP_ENV}=1 with its admission \
+                 CLOSED ({reason:#}). This output has not been validated for this scope. Do not \
                  quote any accuracy or speed number produced on this path."
             );
             return Ok(());
         }
         bail!(
-            "GLM-5.3 kernel admission is closed and {GLM53_BRINGUP_ENV} is not set; \
-             see Glm53KernelAdmission for the capabilities awaiting review"
+            "GLM-5.3 {scope:?} admission is closed and {GLM53_BRINGUP_ENV} is not set: {reason:#}"
         );
     }
 
@@ -194,7 +246,7 @@ impl Glm53Model {
         weights: Glm53TargetRuntimeWeights,
         positions: u32,
     ) -> Result<Self> {
-        Self::admit()?;
+        Self::admit(Glm53AdmissionScope::GgufTargetOnly)?;
         let plan = Glm53ArenaPlan::for_context(positions)?;
         let arena_bytes = usize::try_from(plan.known_bytes)?;
 

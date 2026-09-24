@@ -35,7 +35,7 @@ use super::partial_replay::PartialReplaySetting;
 use super::phase_timing::{HostClock, Phase, PhaseRecorder, TimingContext, TimingSetting};
 use super::prefill_capture_owner::CaptureBankOwner;
 use super::prefill_owner_exl3::PreparedOwner;
-use super::target_model::Glm53Model;
+use super::target_model::{Glm53AdmissionScope, Glm53Model};
 use super::verify_policy_binding::VerifyBindingOwner;
 use super::walk_scratch::Glm53WalkScratch;
 use super::workspace_binding::Glm53BoundWorkspace;
@@ -154,6 +154,9 @@ pub struct Glm53Exl3Model {
     prefix_commit: Option<super::prefix_commit::PrefixCommitBuffers>,
     prefix_commit_allocation: DevicePtr,
     prefix_kda_kernels: Option<super::kda_attention::Glm53KdaAttentionKernels>,
+    /// `ATLAS_GLM53_NEGATIVE_CONTROL=skip-kda-commit`: the admission gate's
+    /// deliberately broken arm. Admission refuses while it is set.
+    negative_control: bool,
 }
 
 impl Glm53Exl3Model {
@@ -264,7 +267,8 @@ impl Glm53Exl3Model {
         vision_catalog: Option<Glm53Exl3VisionCatalog>,
         positions: u32,
     ) -> Result<Self> {
-        Glm53Model::admit()?;
+        Glm53Model::admit(Glm53AdmissionScope::Exl3TargetOnly)?;
+        let negative_control = super::target_only_admission::negative_control_active()?;
         let cublaslt_prewarm = super::cublaslt_prewarm::Setting::from_env()?;
         let ffn_graphs = super::ffn_graph_runtime::FfnGraphs::from_env()?;
         let route_policy = Glm53Exl3RoutePolicy::parse(
@@ -408,6 +412,7 @@ impl Glm53Exl3Model {
             prefix_commit,
             prefix_commit_allocation,
             prefix_kda_kernels,
+            negative_control,
         })
     }
 
@@ -599,11 +604,8 @@ impl Glm53Exl3Model {
     }
 
     pub fn install_dflash2(&self, root: &Path) -> Result<()> {
-        // Speculation is admitted on its own evidence record, never on the
-        // target-only admission (see `speculative_admission`).
-        super::speculative_admission::GLM53_SPECULATIVE_EVIDENCE
-            .validate()
-            .context("GLM-5.3 speculative admission")?;
+        // Target-only admission says nothing about the speculative path.
+        Glm53Model::admit(Glm53AdmissionScope::Speculative)?;
         let mut guard = self.dflash2.lock().unwrap();
         ensure!(guard.is_none(), "GLM DFlash2 runtime is already installed");
         *guard = Some(Glm53Dflash2Runtime::load(
@@ -731,6 +733,11 @@ impl Glm53Exl3Model {
     }
 
     fn commit_accepted(&self, stream: u64) -> Result<()> {
+        if self.negative_control {
+            // Admission gate negative control: the KDA carry never advances.
+            // Refused by admission; reachable only on the bring-up escape.
+            return Ok(());
+        }
         for state in &self.kda_states {
             let staged = state.buffer();
             self.gpu
@@ -860,6 +867,7 @@ impl Glm53Exl3Model {
             self.commit_accepted(stream)?;
         }
         self.gpu.synchronize(stream)?;
+        target_staged_exl3::dump_last_row_logits(self.gpu.as_ref(), self.logits, 1)?;
         self.state.lock().unwrap().position = position + 1;
         self.state_hash_probe(position + 1, "walk", stream)?;
         if let Some(runtime) = self.dflash2.lock().unwrap().as_mut() {

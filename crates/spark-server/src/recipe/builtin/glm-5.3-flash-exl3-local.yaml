@@ -1,7 +1,8 @@
 # Built-in recipe: GLM-5.3-Flash EXL3 2.05 bpw, target-only. all-models matrix: logits
 # bit-identical to the perf/glm-5.3-flash-prefill-20260920 tip, prefill 908 tok/s at 2047,
 # decode 14.2 tok/s. Speculation (DFlash2) is not ported and is refused at load; it measured
-# slower than target-only on this checkpoint anyway.
+# slower than target-only on this checkpoint anyway. Admitted through Glm53TargetOnlyAdmission
+# (reference evidence in bench/glm53_admission/evidence.json), not the unvalidated escape.
 recipe_version: "2"
 model: GLM-5.3-Flash-exl3-2.05bpw
 runtime: atlas
@@ -46,7 +47,6 @@ atlas:
     ATLAS_GLM53_LAYER_MAJOR_VISION_PREFILL: "0"
     ATLAS_GLM53_PARTIAL_WIDE_REPLAY: "1"
     ATLAS_GLM53_PHASE_TIMING: "0"
-    ATLAS_GLM53_UNVALIDATED_BRINGUP: "1"
     ATLAS_GLM53_VISION_FLASH_ATTN: "1"
     ATLAS_GLM53_WIDE_PREFILL: "1"
     ATLAS_GLM53_WIDE_PREFILL_ROWS: "8"

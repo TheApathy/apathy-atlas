@@ -153,9 +153,14 @@ impl Glm53Exl3Model {
 
 /// Correctness oracle (private tree): when `ATLAS_GLM53_LOGITS_DUMP=<dir>` is
 /// set, write the last row's BF16 logits (154,880 x 2 bytes, raw) after every
-/// staged forward as `<dir>/logits-<n>.bf16`. One synchronous 310 KB D2H copy
-/// after the existing completion fence; never on by default.
-fn dump_last_row_logits(gpu: &dyn GpuBackend, logits: DevicePtr, rows: u32) -> Result<()> {
+/// staged forward and every decode walk as `<dir>/logits-<n>.bf16`. One
+/// synchronous 310 KB D2H copy after the existing completion fence; never on by
+/// default.
+pub(super) fn dump_last_row_logits(
+    gpu: &dyn GpuBackend,
+    logits: DevicePtr,
+    rows: u32,
+) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let Some(dir) = std::env::var_os("ATLAS_GLM53_LOGITS_DUMP") else {
