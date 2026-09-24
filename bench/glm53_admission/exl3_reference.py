@@ -48,6 +48,8 @@ def main():
     ap.add_argument("prompts")
     ap.add_argument("out_dir")
     ap.add_argument("--cap-gb", type=float, default=40.0)
+    ap.add_argument("--causality-probe", action="store_true",
+                    help="per module, max |state| difference over the rows prompts 0 and 1 share")
     args = ap.parse_args()
 
     prompts = json.load(open(args.prompts))
@@ -65,6 +67,13 @@ def main():
 
     states = [torch.tensor([p["ids"]], dtype=torch.long) for p in prompts]
     params = [{} for _ in prompts]
+    shared = 0
+    if args.causality_probe:
+        a, b = prompts[0]["ids"], prompts[1]["ids"]
+        while shared < min(len(a), len(b)) and a[shared] == b[shared]:
+            shared += 1
+        if shared == 0:
+            sys.exit("refusing: --causality-probe needs prompts 0 and 1 to share a prefix")
     low_water = mem_available_gb()
     started = time.time()
     last = len(model.modules) - 1
@@ -79,11 +88,20 @@ def main():
         module.unload()
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
-        low_water = min(low_water, mem_available_gb())
+        now = mem_available_gb()
+        low_water = min(low_water, now)
+        probe = ""
+        if shared:
+            # Rows before the first differing token must be identical in a causal model.
+            sa, sb = states[0], states[1]
+            seq = len(prompts[0]["ids"])
+            axis = next(d for d in range(sa.dim()) if sa.shape[d] == seq)
+            ra, rb = sa.narrow(axis, 0, shared).float(), sb.narrow(axis, 0, shared).float()
+            probe = f" shared_rows={shared} max|d|={(ra - rb).abs().max().item():.3e}"
         print(
             f"[{time.time() - started:7.1f}s] module {idx:2d}/{last} {module.key} "
             f"peak_alloc={torch.cuda.max_memory_allocated(device) / 1024**3:.2f}GB "
-            f"mem_avail_low={low_water:.1f}GB",
+            f"mem_avail={now:.1f}GB mem_avail_low={low_water:.1f}GB{probe}",
             flush=True,
         )
 

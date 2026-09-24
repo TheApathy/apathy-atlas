@@ -84,7 +84,40 @@ pub struct Glm53TargetOnlyEvidence {
 }
 
 /// Recorded evidence for the EXL3 target-only path. `None` means closed.
-pub(crate) const GLM53_EXL3_TARGET_ONLY_EVIDENCE: Option<Glm53TargetOnlyEvidence> = None;
+/// Gate run 2026-09-24 on `spark-gate-fde50c6`: 4 prompts x 1023 prefill rows
+/// and 4 x 65 greedy decode steps against the reference; the controls were
+/// skip-kda-commit on 256-row prefill chunks and on decode.
+pub(crate) const GLM53_EXL3_TARGET_ONLY_EVIDENCE: Option<Glm53TargetOnlyEvidence> =
+    Some(Glm53TargetOnlyEvidence {
+        build_commit: "fde50c600",
+        binary_sha256: "866a99f1a7c60e202b4405ce11fceaff53fb2e12287e889101465763c4ec581c",
+        reference: "exllamav3 e648f1a1 glm5_next, streaming uncached",
+        prompts_sha256: "41ba4af22334504114bbda4493a5ffd7d8a3901f8877e89fbee4ce52ec5ccfa0",
+        prefill: Glm53GateMetrics {
+            prompts: 4,
+            positions: 4092,
+            argmax_agreement_excl_ties: 0.9640306122448979,
+            mean_kl: 0.023254699287861613,
+            top1_delta_abs: Some(0.0009775171065493637),
+            nll_delta_rel: Some(0.0004379956401634977),
+        },
+        decode: Glm53GateMetrics {
+            prompts: 4,
+            positions: 260,
+            argmax_agreement_excl_ties: 0.9803149606299213,
+            mean_kl: 0.00919001405966067,
+            top1_delta_abs: None,
+            nll_delta_rel: None,
+        },
+        control: Glm53GateMetrics {
+            prompts: 4,
+            positions: 4092,
+            argmax_agreement_excl_ties: 0.8515784114052953,
+            mean_kl: 0.3100568705031267,
+            top1_delta_abs: Some(0.024682306940371435),
+            nll_delta_rel: Some(0.10141025200264409),
+        },
+    });
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Glm53TargetOnlyAdmission {

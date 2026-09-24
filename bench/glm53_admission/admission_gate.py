@@ -30,6 +30,7 @@ import numpy as np
 
 V = 154_880
 MIN_AGREE, MAX_KL, MAX_TOP1, MAX_NLL_REL, MIN_PROMPTS = 0.90, 0.05, 0.01, 0.02, 3
+SPARSE_FROM = 2048  # past this many positions DSA top-512 pools no longer cover everything
 
 
 def unavailable(msg):
@@ -85,25 +86,44 @@ def tied(x):
     return top2[:, 0] == top2[:, 1]
 
 
-def score(ref, atl, truth):
-    """Per-row stats for one prompt. truth is None for free-running decode."""
-    rlp, alp = log_softmax(ref), log_softmax(atl)
-    ties = tied(atl) | tied(f32_to_bf16_rne(ref))
-    live = ~ties
-    agree = (ref.argmax(1) == atl.argmax(1))[live]
-    kl = (np.exp(rlp) * (rlp - alp)).sum(1)
-    out = {"rows": int(len(ref)), "tied_rows": int(ties.sum()),
-           "agree_sum": float(agree.sum()), "agree_n": int(live.sum()), "kl_sum": float(kl.sum()),
-           "kl_max": float(kl.max())}
-    if truth is not None:
-        idx = np.arange(len(truth))
-        out.update({
-            "top1_ref": float((ref.argmax(1) == truth).mean()),
-            "top1_atlas": float((atl.argmax(1) == truth).mean()),
-            "nll_ref": float(-rlp[idx, truth].mean()),
-            "nll_atlas": float(-alp[idx, truth].mean()),
-        })
+ROW_CHUNK = 256  # rows per log-softmax pass: keeps host memory flat at 8K rows
+
+
+def per_row(ref, atl, truth):
+    """Per-row scalars for one prompt, computed ROW_CHUNK rows at a time. On GB10
+    host RAM is GPU memory, so an 8K x 154,880 float64 pass must never be whole."""
+    out = {k: [] for k in ("kl", "tied", "agree", "top1_ref", "top1_atlas", "nll_ref", "nll_atlas")}
+    for lo in range(0, len(ref), ROW_CHUNK):
+        r, a = ref[lo:lo + ROW_CHUNK], atl[lo:lo + ROW_CHUNK]
+        rlp, alp = log_softmax(r), log_softmax(a)
+        out["kl"].append((np.exp(rlp) * (rlp - alp)).sum(1))
+        out["tied"].append(tied(a) | tied(f32_to_bf16_rne(r)))
+        out["agree"].append(r.argmax(1) == a.argmax(1))
+        if truth is not None:
+            t = truth[lo:lo + ROW_CHUNK]
+            idx = np.arange(len(t))
+            out["top1_ref"].append(r.argmax(1) == t)
+            out["top1_atlas"].append(a.argmax(1) == t)
+            out["nll_ref"].append(-rlp[idx, t])
+            out["nll_atlas"].append(-alp[idx, t])
+    return {k: np.concatenate(v) for k, v in out.items() if v}
+
+
+def summarize(rows, name, lo=0, hi=None):
+    """Per-prompt totals over rows [lo, hi) (row i predicts token i + 1)."""
+    sel = slice(lo, hi)
+    live = ~rows["tied"][sel]
+    out = {"name": name, "rows": int(len(rows["kl"][sel])), "tied_rows": int((~live).sum()),
+           "agree_sum": float(rows["agree"][sel][live].sum()), "agree_n": int(live.sum()),
+           "kl_sum": float(rows["kl"][sel].sum()), "kl_max": float(rows["kl"][sel].max())}
+    if "top1_ref" in rows:
+        for k in ("top1_ref", "top1_atlas", "nll_ref", "nll_atlas"):
+            out[k] = float(rows[k][sel].mean())
     return out
+
+
+def score(ref, atl, truth):
+    return summarize(per_row(ref, atl, truth), "")
 
 
 def aggregate(per, with_truth):
@@ -161,9 +181,9 @@ def run_prefill(prompts_path, ref_dir, atlas_dir):
         atl = np.concatenate(parts)
         ref = load_ref(ref_dir, i, n)
         truth = np.array(p["ids"][1:])
-        s = score(ref[:-1], atl[:-1], truth)
-        s["name"] = p["name"]
-        per.append(s)
+        rows = per_row(ref[:-1], atl[:-1], truth)
+        del ref, atl, parts
+        per.append((p["name"], rows))
     if c != len(chunks):
         unavailable(f"{len(chunks) - c} unexplained Atlas dumps after the prompts")
     return per, True
@@ -182,9 +202,7 @@ def run_decode(seq_path, ref_dir, atlas_dir):
         k = len(atl)
         if plen - 1 + k > n:
             unavailable(f"sequence {i}: {k} Atlas rows exceed the reference")
-        st = score(ref[plen - 1: plen - 1 + k], atl, None)
-        st["name"] = s["name"]
-        per.append(st)
+        per.append((s["name"], per_row(ref[plen - 1: plen - 1 + k], atl, None)))
     return per, False
 
 
@@ -219,18 +237,37 @@ def main():
         per, with_truth = run_decode(spec, ref_dir, atlas_dir)
     else:
         unavailable(f"unknown mode {mode}")
-    m = aggregate(per, with_truth)
+    whole = [summarize(rows, name) for name, rows in per]
+    m = aggregate(whole, with_truth)
     fails = verdict(m)
-    for p in per:
+    # Secondary views, reported and recorded but not the headline verdict:
+    # rows >= 4 (the reference is not causal at the first rows; see
+    # kl_outliers.py) and, for long prompts, the sparse-DSA regime past 2048.
+    buckets = {"rows_4_plus": (4, None)}
+    longest = max(len(rows["kl"]) for _, rows in per)
+    if longest > SPARSE_FROM:
+        buckets["rows_below_2048"] = (0, SPARSE_FROM)
+        buckets["rows_2048_plus"] = (SPARSE_FROM, None)
+    views = {}
+    for label, (lo, hi) in buckets.items():
+        views[label] = aggregate([summarize(rows, name, lo, hi) for name, rows in per], with_truth)
+        views[label]["fails"] = verdict(views[label])
+    for p in whole:
         a = p["agree_sum"] / max(p["agree_n"], 1)
         print(f"  {p['name']:>14}: rows={p['rows']} agree={a:.4f} ties={p['tied_rows']} "
               f"meanKL={p['kl_sum'] / p['rows']:.5f} maxKL={p['kl_max']:.3f}"
               + (f" top1 ref/atl={p['top1_ref']:.4f}/{p['top1_atlas']:.4f}"
                  f" nll ref/atl={p['nll_ref']:.4f}/{p['nll_atlas']:.4f}" if with_truth else ""))
     print(json.dumps(m, indent=2))
+    for label, v in views.items():
+        print(f"  view {label}: positions={v['positions']} agree={v['argmax_agreement_excl_ties']:.4f} "
+              f"meanKL={v['mean_kl']:.5f} maxKL={v['max_kl']:.3f}"
+              + (f" top1_delta={v['top1_delta_abs']:.4f} nll_delta_rel={v['nll_delta_rel']:.4f}" if with_truth else "")
+              + (" PASS" if not v["fails"] else " FAIL: " + "; ".join(v["fails"])))
     print("PASS" if not fails else "FAIL: " + "; ".join(fails))
     if out:
-        json.dump({"mode": mode, "metrics": m, "per_prompt": per, "fails": fails}, open(out, "w"), indent=2)
+        json.dump({"mode": mode, "metrics": m, "views": views, "per_prompt": whole, "fails": fails},
+                  open(out, "w"), indent=2)
     sys.exit(0 if not fails else 1)
 
 

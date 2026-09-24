@@ -55,11 +55,14 @@ def dumps(d):
     return sorted(out)
 
 
-def last_row_argmax_last_max(path, rows):
-    """The server's greedy pick: Iterator::max_by keeps the LAST exact maximum."""
+def last_row_argmax(path, rows):
+    """The server's greedy pick on this path: the device argmax keeps the FIRST
+    exact maximum (measured on a bf16 tie at decode step 9 of code_rust; the
+    host Iterator::max_by path keeps the last). The text check below catches a
+    wrong rule."""
     u = np.fromfile(path, dtype=np.uint16)[(rows - 1) * V:rows * V]
     x = (u.astype(np.uint32) << 16).view(np.float32)
-    return int(V - 1 - np.argmax(x[::-1]))
+    return int(np.argmax(x))
 
 
 def main():
@@ -68,6 +71,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--port", type=int, default=8894)
     ap.add_argument("--env", action="append", default=[])
+    ap.add_argument("--argv-override", action="append", default=[],
+                    help="recipe default override passed to generate.py, e.g. max_model_len=9216")
     ap.add_argument("--prefill")
     ap.add_argument("--decode")
     ap.add_argument("--decode-prefix", type=int, default=512)
@@ -79,7 +84,7 @@ def main():
     os.makedirs(args.out, exist_ok=False)
     logits_dir = os.path.join(args.out, "logits")
     env_lines = generate("env")
-    argv = generate("argv", f"port={args.port}")
+    argv = generate("argv", f"port={args.port}", *args.argv_override)
     extra = list(args.env) + [f"ATLAS_GLM53_LOGITS_DUMP={logits_dir}", "ATLAS_GLM53_LOGITS_DUMP_ALL=1",
                               "ATLAS_GLM53_EXL3_LAST_ROW_HEAD=0"]
     env = {"HOME": os.environ["HOME"], "LANG": "C.UTF-8",
@@ -95,7 +100,7 @@ def main():
                                                                 if k.startswith("ATLAS_"))}, f, indent=2)
     server = subprocess.Popen([args.bin, *argv], env=env, stdout=open(log_path, "w"),
                               stderr=subprocess.STDOUT)
-    run = {"escape_in_env": escape, "extra_env": list(args.env)}
+    run = {"escape_in_env": escape, "extra_env": list(args.env), "argv_override": list(args.argv_override)}
     try:
         for _ in range(900):
             if server.poll() is not None:
@@ -131,13 +136,15 @@ def main():
                 new = dumps(logits_dir)[seen:]
                 seen += len(new)
                 text = r["choices"][0]["text"]
-                generated = [last_row_argmax_last_max(f, rows) for _, rows, f in new]
+                generated = [last_row_argmax(f, rows) for _, rows, f in new]
                 # The prefill's first dump row covers the prompt; the rest are one per walk.
+                # The server's text drops the continuation's leading whitespace.
+                same_text = tok.decode(generated).lstrip() == text.lstrip()
                 ok = (len(new) == r["usage"]["completion_tokens"]
                       and new[0][1] == len(prefix) and all(rows == 1 for _, rows, _ in new[1:])
-                      and tok.decode(generated) == text)
+                      and same_text)
                 print(f"decode {p['name']}: dumps={len(new)} completion_tokens={r['usage']['completion_tokens']} "
-                      f"ids_reproduce_text={tok.decode(generated) == text}", flush=True)
+                      f"ids_reproduce_text={same_text}", flush=True)
                 if not ok:
                     sys.exit(f"decode capture for {p['name']} does not account for the response: "
                              f"{[(n, rows) for n, rows, _ in new][:4]}... text={text[:80]!r}")

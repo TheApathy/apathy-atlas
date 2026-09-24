@@ -17,6 +17,8 @@ for arm in "$@"; do
     control256)     python3 $HERE/atlas_driver.py --bin "$BIN" --out "$ROOT/$arm" --prefill $P --env $ESC --env $R256 --env $CTL ;;
     decode)         python3 $HERE/atlas_driver.py --bin "$BIN" --out "$ROOT/$arm" --decode $P --env $ESC ;;
     control-decode) python3 $HERE/atlas_driver.py --bin "$BIN" --out "$ROOT/$arm" --decode $P --env $ESC --env $CTL ;;
+    long4096)       python3 $HERE/atlas_driver.py --bin "$BIN" --out "$ROOT/$arm" --prefill $HERE/prompts_4096.json --env $ESC --argv-override max_model_len=9216 ;;
+    long8192)       python3 $HERE/atlas_driver.py --bin "$BIN" --out "$ROOT/$arm" --prefill $HERE/prompts_8192.json --env $ESC --argv-override max_model_len=9216 ;;
     # No escape, no extra switches: the recipe exactly as shipped.
     final)          python3 $HERE/atlas_driver.py --bin "$BIN" --out "$ROOT/$arm" --prefill $P ;;
     final-decode)   python3 $HERE/atlas_driver.py --bin "$BIN" --out "$ROOT/$arm" --decode $P ;;
