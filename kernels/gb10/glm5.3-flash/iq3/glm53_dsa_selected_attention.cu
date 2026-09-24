@@ -255,11 +255,10 @@ atlas_glm53_dsa_selected_attention_bf16(
 //    fadd(sum, p*v) serially in ascending item order, as the reference does.
 #define GLM53_DSA_ROWS_THREADS 512U
 #define GLM53_DSA_ROWS_GROUP 8U
-#define GLM53_DSA_ROWS_TILE 16U
-// [item][GROUP] f32 scores | sort network / 2 KV tiles. The canonical item
-// list is written back over this row's (already consumed) selected indices.
+#define GLM53_DSA_ROWS_TILE 8U
+// [item][GROUP] f32 scores | canonical item list | sort network / 2 KV tiles
 #define GLM53_DSA_ROWS_SCORE_BYTES (GLM53_DSA_SELECTED * GLM53_DSA_ROWS_GROUP * 4U)
-#define GLM53_DSA_ROWS_ORDER_BYTES 0U
+#define GLM53_DSA_ROWS_ORDER_BYTES 8224U
 #define GLM53_DSA_ROWS_TILE_BYTES (GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT * 2U)
 #define GLM53_DSA_ROWS_SCRATCH_BYTES \
     (2U * GLM53_DSA_ROWS_TILE_BYTES > GLM53_DSA_SORT_WIDTH * 4U ? \
@@ -284,7 +283,7 @@ __device__ __forceinline__ void glm53_dsa_rows_stage(
         const unsigned int column = (chunk % chunks_per_item) * 8U;
         glm53_dsa_rows_cp16(
             tile + item * GLM53_DSA_LATENT + column,
-            cache + (unsigned long long)__ldcg(ordered + first + item) * GLM53_DSA_LATENT + column);
+            cache + (unsigned long long)ordered[first + item] * GLM53_DSA_LATENT + column);
     }
     asm volatile("cp.async.commit_group;");
 }
@@ -293,7 +292,7 @@ extern "C" __global__ void __launch_bounds__(GLM53_DSA_ROWS_THREADS, 1)
 atlas_glm53_dsa_selected_attention_rows_bf16(
         const __nv_bfloat16 * __restrict__ absorbed_query,
         const __nv_bfloat16 * __restrict__ latent_cache,
-        int * __restrict__ selected_indices,
+        const int * __restrict__ selected_indices,
         const unsigned int * __restrict__ sequence_lengths,
         const unsigned int * __restrict__ query_positions,
         const unsigned char * __restrict__ query_validity,
@@ -315,10 +314,8 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
     }
     extern __shared__ __align__(16) unsigned char rows_shared[];
     float * scores = (float *)rows_shared;
-    // The row's selected indices are read into the sort network before the
-    // canonical list is written back over them; later reads bypass L1.
     unsigned int * ordered =
-        (unsigned int *)(selected_indices + blockIdx.x * (unsigned long long)GLM53_DSA_SELECTED);
+        (unsigned int *)(rows_shared + GLM53_DSA_ROWS_SCORE_BYTES);
     unsigned int * network = (unsigned int *)(rows_shared + GLM53_DSA_ROWS_SCORE_BYTES +
                                               GLM53_DSA_ROWS_ORDER_BYTES);
     __nv_bfloat16 * tiles = (__nv_bfloat16 *)network;
@@ -427,8 +424,8 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
     const unsigned int tile_count = (count + GLM53_DSA_ROWS_TILE - 1U) / GLM53_DSA_ROWS_TILE;
 
     for (unsigned int group = 0U; group < GLM53_DSA_HEADS; group += GLM53_DSA_ROWS_GROUP) {
-        // Scores: warp w scores heads 4*(w&1)..+3 of the group for tile items
-        // w>>1 and (w>>1)+8; one staged key row feeds four dots.
+        // Scores: warp w scores heads 4*(w&1)..+3 of the group for tile item
+        // w>>1; one staged key row feeds four dots.
         {
             const unsigned int quad = warp & 1U;
             const unsigned int slot = warp >> 1U;
@@ -462,10 +459,10 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
                     asm volatile("cp.async.wait_group 0;");
                 }
                 __syncthreads();
-                for (unsigned int local = slot; local < n; local += 8U) {
+                if (slot < n) {
                     const __nv_bfloat16 * key = tiles +
                         (t & 1U) * GLM53_DSA_ROWS_TILE * GLM53_DSA_LATENT +
-                        local * GLM53_DSA_LATENT;
+                        slot * GLM53_DSA_LATENT;
                     float k_low[8];
                     float k_high[8];
                     #pragma unroll
@@ -504,7 +501,7 @@ atlas_glm53_dsa_selected_attention_rows_bf16(
                     x = __fadd_rn(x, __shfl_xor_sync(0xffffffffU, x, 1U));
                     // Lanes 0/8/16/24 hold heads 0/1/2/3 at tree index 0.
                     if ((lane & 7U) == 0U) {
-                        scores[(first + local) * GLM53_DSA_ROWS_GROUP + quad * 4U + (lane >> 3U)] =
+                        scores[(first + slot) * GLM53_DSA_ROWS_GROUP + quad * 4U + (lane >> 3U)] =
                             __fmul_rn(x, GLM53_DSA_INV_SQRT_QK);
                     }
                 }
