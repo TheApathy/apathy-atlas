@@ -39,7 +39,21 @@ pub(crate) struct Glm53SpeculativeEvidence {
     pub control_extra_row_fails_identity: bool,
     pub kernel_harness_bit_identical: bool,
     pub chunked_prefill_covered: bool,
+    /// FNV-1a 64 over the speculation-path sources the evidence was measured
+    /// with ([`SPEC_SOURCES`]); a unit test fails when they change without
+    /// the evidence being regenerated.
+    pub spec_source_fnv1a64: &'static str,
 }
+
+/// Sources whose behaviour the speculative evidence certifies, as repo-relative
+/// paths. `make_evidence.py` hashes the same list in the same order.
+pub(crate) const SPEC_SOURCES: [&str; 5] = [
+    "crates/spark-model/src/model/glm53/verify_policy_transaction.rs",
+    "crates/spark-model/src/model/glm53/prefix_commit.rs",
+    "crates/spark-model/src/model/glm53/dsa_policy_execution.rs",
+    "kernels/gb10/glm5.3-flash/exl3/glm53_exl3_rowexact.cuh",
+    "crates/spark-server/src/scheduler/glm53_policy_driver.rs",
+];
 
 /// Measured 2026-09-23/24 (windows w4 and w5, perf/glm53-spec-meas binaries).
 /// Regenerate on the binary being admitted before relying on it.
@@ -62,6 +76,7 @@ pub(crate) const GLM53_SPECULATIVE_EVIDENCE: Glm53SpeculativeEvidence = Glm53Spe
     control_extra_row_fails_identity: true,
     kernel_harness_bit_identical: true,
     chunked_prefill_covered: false,
+    spec_source_fnv1a64: "17e50e906ca7a1dc",
 };
 
 /// The speculation gate controls (`bench/glm53-spec`) that deliberately break

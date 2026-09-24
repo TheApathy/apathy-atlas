@@ -18,6 +18,7 @@
   "perturbed_prompt_control_differs": true,
   "schema": "atlas.glm53.speculative_admission.v1",
   "scope": "greedy",
+  "spec_source_fnv1a64": "17e50e906ca7a1dc",
   "state_binary_sha256": "93d924fb7229e428af5c9d6c417c84babe9c0e1e02bd42d4c4b3cb5e34531f1b",
   "state_full_positions_equal": 350,
   "state_gate_passed": true,

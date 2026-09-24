@@ -11,6 +11,25 @@ Counts are recomputed from the receipts, never typed by hand.
 import glob, json, os, re, subprocess, sys
 
 ident, state, out = sys.argv[1:4]
+REPO = sys.argv[4] if len(sys.argv) > 4 else os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# Same list and order as SPEC_SOURCES in speculative_admission.rs.
+SPEC_SOURCES = [
+    "crates/spark-model/src/model/glm53/verify_policy_transaction.rs",
+    "crates/spark-model/src/model/glm53/prefix_commit.rs",
+    "crates/spark-model/src/model/glm53/dsa_policy_execution.rs",
+    "kernels/gb10/glm5.3-flash/exl3/glm53_exl3_rowexact.cuh",
+    "crates/spark-server/src/scheduler/glm53_policy_driver.rs",
+]
+
+
+def spec_source_hash():
+    h = 0xCBF29CE484222325
+    for path in SPEC_SOURCES:
+        for part in (path.encode(), b"\0", open(os.path.join(REPO, path), "rb").read(), b"\0"):
+            for byte in part:
+                h ^= byte
+                h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -79,6 +98,7 @@ ev = {
     "control_extra_row_fails_identity": ctl_ident["Cext"],
     "kernel_harness_bit_identical": "RESULT: BIT-IDENTICAL" in open(os.path.join(ident, "..", "w3", "pre_cmd.log")).read(),
     "chunked_prefill_covered": False,
+    "spec_source_fnv1a64": spec_source_hash(),
 }
 json.dump(ev, open(out, "w"), indent=2, sort_keys=True)
 open(out, "a").write("\n")
