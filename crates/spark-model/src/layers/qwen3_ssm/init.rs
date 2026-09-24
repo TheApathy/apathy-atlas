@@ -431,6 +431,11 @@ impl Qwen3SsmLayer {
                 gpu.alloc_host_pinned(64 * std::mem::size_of::<u64>())?,
             )),
             ba_gates_prefill_k: gpu.kernel("ssm_preprocess", "dense_gemm_ba_gates_prefill")?,
+            ba_gates_prefill_rows_k: super::super::try_kernel(
+                gpu,
+                "ssm_preprocess",
+                "dense_gemm_ba_gates_prefill_rows8",
+            ),
             conv1d_prefill_k: gpu.kernel("causal_conv1d", "causal_conv1d_update_prefill")?,
             conv1d_prefill_zcopy_k: super::super::try_kernel(
                 gpu,
