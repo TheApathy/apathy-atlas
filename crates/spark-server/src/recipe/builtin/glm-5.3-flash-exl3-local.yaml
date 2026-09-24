@@ -30,6 +30,7 @@ atlas:
   headroom_gb: 10
   run_alone: true
   env:
+    ATLAS_BOUNDED_HOST_COPY: "1"
     ATLAS_GLM53_CUBLASLT_PREWARM: "1"
     ATLAS_GLM53_EXACT_VERIFY: "1"
     ATLAS_GLM53_EXACT_WIDE_DSA_PRECOMPUTE: "1"

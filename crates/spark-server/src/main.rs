@@ -104,6 +104,14 @@ pub type ModelBehavior = atlas_kernels::ModelBehavior;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Diagnostic: with kernel.yama.ptrace_scope=1 only an ancestor may attach
+    // a debugger. ATLAS_ALLOW_PTRACE=1 lets a same-user watchdog capture
+    // `gdb -p <pid> -batch -ex "thread apply all bt"` from a stalled load.
+    #[cfg(target_os = "linux")]
+    if std::env::var("ATLAS_ALLOW_PTRACE").ok().as_deref() == Some("1") {
+        // PR_SET_PTRACER = 0x59616d61, PR_SET_PTRACER_ANY = -1.
+        unsafe { libc::prctl(0x5961_6d61, -1i64 as libc::c_ulong, 0, 0, 0) };
+    }
     // Parse BEFORE subscriber install so the TUI gate can see `--no-tui`.
     // clap emits no tracing events, so plain-mode output is unchanged.
     let cli = Cli::parse();

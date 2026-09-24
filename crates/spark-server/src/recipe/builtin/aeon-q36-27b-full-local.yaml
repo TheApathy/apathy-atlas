@@ -23,3 +23,5 @@ atlas:
   model_type: qwen3_5
   resident_gb: 66
   headroom_gb: 8
+  env:
+    ATLAS_BOUNDED_HOST_COPY: "1"
