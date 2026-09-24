@@ -11,6 +11,7 @@ use std::ffi::c_void;
 use anyhow::{Result, bail};
 use atlas_core::registry::AtlasRegistry;
 
+mod bounded_copy;
 mod gpu_impl;
 mod transform_cache_identity;
 
@@ -28,6 +29,7 @@ unsafe extern "C" {
         stream: u64,
     ) -> i32;
     pub(super) fn cuMemcpyDtoDAsync_v2(dst: u64, src: u64, bytes: usize, stream: u64) -> i32;
+    pub(super) fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: u64, bytes: usize, stream: u64) -> i32;
     pub(super) fn cuStreamIsCapturing(hStream: u64, captureStatus: *mut u32) -> i32;
     pub(super) fn cuStreamSynchronize(stream: u64) -> i32;
     pub(super) fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> i32;

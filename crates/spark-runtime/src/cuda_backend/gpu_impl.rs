@@ -184,6 +184,9 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
+        if super::bounded_copy::enabled() {
+            return super::bounded_copy::h2d(src, dst.0, self.default_stream);
+        }
         // This API accepts any Rust slice, including ordinary pageable memory.
         // CUDA's async host-copy APIs require page-locked storage; use the
         // synchronous driver call for this intentionally blocking interface.
@@ -204,6 +207,9 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()> {
+        if super::bounded_copy::enabled() {
+            return super::bounded_copy::d2h(src.0, dst, self.default_stream);
+        }
         // `dst` is not required to be page-locked. The synchronous API is the
         // CUDA-supported path for arbitrary pageable host buffers and returns
         // only after the bytes are safe for the caller to read.
@@ -224,6 +230,9 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn copy_d2h_on_stream(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
+        if super::bounded_copy::enabled() {
+            return super::bounded_copy::d2h(src.0, dst, stream);
+        }
         // This is a blocking API over an arbitrary host slice. Drain the
         // producer stream for ordering, then use the pageable-safe synchronous
         // copy. The coalesced pair API below uses the same safe ordering.
@@ -390,6 +399,9 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn synchronize(&self, stream: u64) -> Result<()> {
+        if super::bounded_copy::enabled() && !self.stream_is_capturing(stream) {
+            return super::bounded_copy::drain(stream, "synchronize");
+        }
         let status = unsafe { cuStreamSynchronize(stream) };
         if status != 0 {
             bail!("cuStreamSynchronize failed: {}", cuda_error_text(status));
@@ -513,6 +525,9 @@ impl GpuBackend for AtlasCudaBackend {
         let status = unsafe { cuMemsetD8Async(ptr.0, value, bytes, self.default_stream) };
         if status != 0 {
             bail!("cuMemsetD8Async failed: status {status}");
+        }
+        if super::bounded_copy::enabled() {
+            return super::bounded_copy::drain(self.default_stream, "memset");
         }
         let sync = unsafe { cuStreamSynchronize(self.default_stream) };
         if sync != 0 {
