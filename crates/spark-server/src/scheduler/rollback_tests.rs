@@ -285,7 +285,7 @@ fn rewindable_configurations_are_left_alone() {
 fn not_rewindable_is_distinct_from_the_other_declines() {
     for other in [
         RollbackFallback::Disabled,
-        RollbackFallback::StreamUnsafe,
+        RollbackFallback::UnsafeObservableHistory,
         RollbackFallback::CapReached,
         RollbackFallback::NoBoundary,
         RollbackFallback::NoSsmSnapshot,
