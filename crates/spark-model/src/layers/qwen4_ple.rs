@@ -140,7 +140,8 @@ mod runtime {
     use spark_runtime::gpu::{DevicePtr, GpuBackend, HostToDeviceCopy, KernelHandle};
     use spark_runtime::kernel_args::KernelLaunch;
     use spark_runtime::weights::{WeightDtype, WeightStore};
-    use spark_storage::ple_offload::{PleIoMode, PleOffloadReader};
+    use spark_storage::ple_offload::{PleIoMode, PleNvfp4Row, PleOffloadReader};
+    use std::sync::Arc;
     use std::ffi::CString;
     use std::fs::{self, DirBuilder, File, OpenOptions};
     use std::io::{Read, Write};
@@ -891,11 +892,62 @@ mod runtime {
         }
     }
 
+    /// `ATLAS_QWEN4_PLE_PREFILL_STREAM`: 1 = prefill rows read with the ring
+    /// kept full (`read_rows_streamed`), 2 = that plus the read started on a
+    /// helper thread before layer 0. Same bytes as the windowed read either way.
+    pub fn prefill_stream_level() -> u8 {
+        static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *LEVEL.get_or_init(|| match std::env::var("ATLAS_QWEN4_PLE_PREFILL_STREAM").as_deref() {
+            Ok("1") => 1,
+            Ok("2") => 2,
+            _ => 0,
+        })
+    }
+
+    fn prefill_stream_selected() -> bool {
+        prefill_stream_level() >= 1
+    }
+
+    fn read_prefill_rows(
+        hasher: &Qwen4PleHasher,
+        reader: &Mutex<PleOffloadReader>,
+        current_tokens: &[u32],
+        prior_tokens: &[u32],
+        streamed: bool,
+    ) -> Result<Vec<PleNvfp4Row>> {
+        let request: Vec<_> = hasher
+            .select_prefill(current_tokens, prior_tokens)
+            .iter()
+            .map(|selection| (selection.shard, selection.row))
+            .collect();
+        ensure!(
+            request.len() == current_tokens.len() * QWEN4_PLE_HEADS,
+            "Qwen4 PLE prefill selection extent mismatch"
+        );
+        let mut reader = reader.lock();
+        if streamed {
+            reader.read_rows_streamed(&request)
+        } else {
+            reader.read_rows_windowed(&request)
+        }
+    }
+
+    /// PLE rows being read on a helper thread (see `begin_prefill_read`).
+    pub struct PlePrefillRead(Result<std::thread::JoinHandle<Result<Vec<PleNvfp4Row>>>>);
+
+    impl PlePrefillRead {
+        fn join(self) -> Result<Vec<PleNvfp4Row>> {
+            self.0?
+                .join()
+                .map_err(|_| anyhow::anyhow!("Qwen4 PLE prefill read thread panicked"))?
+        }
+    }
+
     /// Atlas-native sparse PLE runtime. Only the 16 selected NVFP4 rows are
     /// staged per token; the 320M-row table remains in the O_DIRECT sidecar.
     pub struct Qwen4PleLayer {
-        hasher: Qwen4PleHasher,
-        reader: Mutex<PleOffloadReader>,
+        hasher: Arc<Qwen4PleHasher>,
+        reader: Arc<Mutex<PleOffloadReader>>,
         scratch_submit: Mutex<()>,
         scratch_event: u64,
         scratch_poisoned: AtomicBool,
@@ -1018,8 +1070,8 @@ mod runtime {
             .with_context(|| format!("open Qwen4 PLE offload manifest {manifest}"))?;
             let residual = config.residual_width();
             let layer = Self {
-                hasher,
-                reader: Mutex::new(reader),
+                hasher: Arc::new(hasher),
+                reader: Arc::new(Mutex::new(reader)),
                 scratch_submit: Mutex::new(()),
                 scratch_event: gpu.create_event()?,
                 scratch_poisoned: AtomicBool::new(false),
@@ -1187,9 +1239,28 @@ mod runtime {
             gpu.record_event(self.scratch_event, stream)
         }
 
+        /// Start reading a prefill chunk's PLE rows on a helper thread. The rows
+        /// depend only on token ids, so the caller issues this before layer 0
+        /// and the O_DIRECT reads overlap the GPU work that precedes the PLE
+        /// join (embedding + layer 0). Pass the handle to [`Self::forward_prefill`].
+        pub fn begin_prefill_read(&self, current_tokens: &[u32], prior_tokens: &[u32]) -> PlePrefillRead {
+            let hasher = Arc::clone(&self.hasher);
+            let reader = Arc::clone(&self.reader);
+            let current = current_tokens.to_vec();
+            let prior = prior_tokens.to_vec();
+            PlePrefillRead(
+                std::thread::Builder::new()
+                    .name("ple-prefill-read".into())
+                    .spawn(move || read_prefill_rows(&hasher, &reader, &current, &prior, true))
+                    .map_err(anyhow::Error::from),
+            )
+        }
+
         /// Fetch and inject a complete contiguous prefill chunk. Sparse row
         /// I/O remains host-driven, but every dense projection and PLE join is
         /// issued once for the whole chunk instead of once per token.
+        /// `prefetched` must come from [`Self::begin_prefill_read`] for the same
+        /// tokens; without it the rows are read here.
         #[allow(clippy::too_many_arguments)]
         pub fn forward_prefill(
             &self,
@@ -1200,6 +1271,7 @@ mod runtime {
             reset_state: bool,
             gpu: &dyn GpuBackend,
             stream: u64,
+            prefetched: Option<PlePrefillRead>,
         ) -> Result<()> {
             ensure!(
                 slot_idx < self.max_batch_size,
@@ -1226,18 +1298,18 @@ mod runtime {
                 !self.scratch_poisoned.load(Ordering::Acquire),
                 "Qwen4 PLE shared scratch is poisoned after an unfenceable GPU failure"
             );
-            let selections = self.hasher.select_prefill(current_tokens, prior_tokens);
-            let request: Vec<_> = selections
-                .iter()
-                .map(|selection| (selection.shard, selection.row))
-                .collect();
+            let rows = match prefetched {
+                Some(read) => read.join()?,
+                None => read_prefill_rows(
+                    &self.hasher,
+                    &self.reader,
+                    current_tokens,
+                    prior_tokens,
+                    prefill_stream_selected(),
+                )?,
+            };
             ensure!(
-                request.len() == num_tokens * QWEN4_PLE_HEADS,
-                "Qwen4 PLE prefill selection extent mismatch"
-            );
-            let rows = self.reader.lock().read_rows_windowed(&request)?;
-            ensure!(
-                rows.len() == request.len(),
+                rows.len() == num_tokens * QWEN4_PLE_HEADS,
                 "Qwen4 PLE prefill read extent mismatch"
             );
 
@@ -2120,7 +2192,7 @@ mod runtime {
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
-pub use runtime::Qwen4PleLayer;
+pub use runtime::{PlePrefillRead, Qwen4PleLayer, prefill_stream_level};
 
 #[cfg(test)]
 mod tests {

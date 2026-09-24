@@ -72,6 +72,7 @@ impl Qwen3AttentionLayer {
         // with the selector on, every prompt whose length was not a multiple
         // of 16 used to error out.
         if crate::layers::qwen4_fast_proj::selection()?.attn
+            && exact_attn16
             && num_tokens.is_multiple_of(16)
             && num_tokens <= 2048
         {

@@ -33,6 +33,7 @@ impl TransformerModel {
         use_mrope: bool,
         needs_paged: bool,
         stream: u64,
+        ple_prefetch: Option<(usize, usize, crate::layers::qwen4_ple::PlePrefillRead)>,
     ) -> Result<()> {
         let h = self.config.hidden_size;
         let fp32 = if self.config.use_fp32_residual() {
@@ -113,6 +114,11 @@ impl TransformerModel {
             None
         };
         let mut layer_times: Vec<u128> = Vec::new();
+        // A PLE row read started before the embedding (level 2) is only valid
+        // for the exact token range this chunk ends up processing.
+        let mut ple_prefetch = ple_prefetch.and_then(|(start, len, read)| {
+            (start == effective_seq_len_start && len == proc_count).then_some(read)
+        });
         for (i, layer) in self.layers.iter().enumerate() {
             if i == 1
                 && let Some(ple) = &self.qwen4_ple
@@ -141,6 +147,7 @@ impl TransformerModel {
                         effective_seq_len_start == 0,
                         self.gpu.as_ref(),
                         stream,
+                        ple_prefetch.take(),
                     )?;
                 } else {
                     let mut history = prior.to_vec();

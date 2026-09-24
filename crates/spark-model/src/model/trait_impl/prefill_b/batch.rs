@@ -312,6 +312,7 @@ impl TransformerModel {
                 use_mrope,
                 needs_paged,
                 stream,
+                None,
             )?;
 
             // Phase 5: update sequence state.

@@ -73,7 +73,55 @@ fn parse_core32(
     Ok(selected)
 }
 
+/// Turns the whole fast-prefill family off on this thread until the guard
+/// drops (see [`super::family_suppressed`]). A prefill that `admit_surface`
+/// rejects (a prompt longer than one chunk, a warm continuation, vision,
+/// high-speed-swap) takes the ordinary prefill path instead of failing the
+/// request; prompts the family admits are untouched.
+#[must_use]
+pub(crate) struct SuppressGuard(bool);
+
+impl Drop for SuppressGuard {
+    fn drop(&mut self) {
+        super::set_family_suppressed(self.0);
+    }
+}
+
+fn suppressed() -> bool {
+    super::family_suppressed()
+}
+
+/// Admit this prefill surface to the family, or suppress the family for the
+/// rest of the caller's scope (returned guard) when it cannot serve it.
+pub(crate) fn admit_or_suppress(
+    has_vision: bool,
+    sequence_start: usize,
+    chunk_start: usize,
+    chunk_rows: usize,
+    total_rows: usize,
+    high_speed_swap: bool,
+) -> Result<Option<SuppressGuard>> {
+    if !selected()? {
+        return Ok(None);
+    }
+    match admit_surface(has_vision, sequence_start, chunk_start, chunk_rows, total_rows, high_speed_swap) {
+        Ok(()) => Ok(None),
+        Err(reason) => {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::warn!(
+                    "{SELECTOR}: fast-prefill family suppressed for this prefill ({reason:#}); using the ordinary prefill path (logged once)"
+                )
+            });
+            Ok(Some(SuppressGuard(super::set_family_suppressed(true))))
+        }
+    }
+}
+
 pub(crate) fn selected() -> Result<bool> {
+    if suppressed() {
+        return Ok(false);
+    }
     match std::env::var(SELECTOR) {
         Ok(value) => parse(Some(&value)),
         Err(std::env::VarError::NotPresent) => parse(None),
@@ -82,6 +130,9 @@ pub(crate) fn selected() -> Result<bool> {
 }
 
 pub(crate) fn device_selected() -> Result<bool> {
+    if suppressed() {
+        return Ok(false);
+    }
     let core = selected()?;
     match std::env::var(DEVICE_SELECTOR) {
         Ok(value) => parse_device(Some(&value), core),
@@ -91,6 +142,9 @@ pub(crate) fn device_selected() -> Result<bool> {
 }
 
 pub(crate) fn hc_selected() -> Result<bool> {
+    if suppressed() {
+        return Ok(false);
+    }
     let core = selected()?;
     let device = device_selected()?;
     match std::env::var(HC_SELECTOR) {
@@ -101,6 +155,9 @@ pub(crate) fn hc_selected() -> Result<bool> {
 }
 
 pub(crate) fn core32_selected() -> Result<bool> {
+    if suppressed() {
+        return Ok(false);
+    }
     let core = selected()?;
     let device = device_selected()?;
     let hc = hc_selected()?;

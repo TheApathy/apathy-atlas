@@ -22,6 +22,23 @@ pub(crate) const EXACT_QKV16_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_ATTN_QKV16";
 pub(crate) const EXACT_O16_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_ATTN_O16";
 const EXACT_K16_SELECTOR: &str = "ATLAS_QWEN4_K16_EXACT";
 
+thread_local! {
+    static FAMILY_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True while [`attn16::admit_or_suppress`] has turned the whole fast-prefill
+/// family (F8 MoE batch, HC/SSM exact, compact MoE, QKV16/O16, CORE16 and its
+/// dependents) off for the prefill running on this thread. Every family
+/// selector then reads as absent, so the request takes the ordinary prefill
+/// path instead of failing admission.
+pub(crate) fn family_suppressed() -> bool {
+    FAMILY_SUPPRESSED.with(std::cell::Cell::get)
+}
+
+fn set_family_suppressed(on: bool) -> bool {
+    FAMILY_SUPPRESSED.with(|s| s.replace(on))
+}
+
 pub(crate) fn hyper_check_selected() -> Result<bool> {
     plan::parse_selector(env_value(HYPER_CHECK_SELECTOR)?.as_deref())
         .map_err(|error| anyhow::anyhow!("{HYPER_CHECK_SELECTOR}: {error}"))
@@ -33,6 +50,11 @@ pub(crate) fn hyper_selected() -> Result<bool> {
 }
 
 fn env_value(name: &str) -> Result<Option<String>> {
+    // The PLE whole-prompt batch handles continuation chunks itself; only its
+    // composition with the F8 path (PLE_COMPOSITION_SELECTOR) is family-scoped.
+    if family_suppressed() && name != PLE_SELECTOR {
+        return Ok(None);
+    }
     match std::env::var(name) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
@@ -57,7 +79,11 @@ pub(crate) fn exact_o16_selected() -> Result<bool> {
 
 /// Called before embedding, buffer writes, or recurrent-state changes.
 pub(crate) fn admit_request(config: &ModelConfig, rows: usize, start: usize) -> Result<()> {
-    crate::layers::moe::qwen4_prefill_compact::admit_request(config, rows, start)?;
+    // The compact MoE GEMM is row-independent and stays on under suppression;
+    // each <=2048-row chunk is still admitted by its own validate_context.
+    if !family_suppressed() {
+        crate::layers::moe::qwen4_prefill_compact::admit_request(config, rows, start)?;
+    }
     crate::layers::qwen3_ssm::qwen4_prefill_exact::admit_request(config, rows, start)?;
     let hyper = hyper_selected()?;
     ensure!(

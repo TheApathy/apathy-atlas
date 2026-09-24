@@ -51,17 +51,15 @@ impl TransformerModel {
         let n = tokens.len();
         self.validate_vision_prompt(tokens, 0, n)?;
         self.admit_rotary_prompt(tokens, seq, 0)?;
-        if crate::layers::qwen4_prefill_moe::attn16::selected()? {
-            let high_speed_swap = self.kv_cache.lock().config().cache_blocks_per_seq.is_some();
-            crate::layers::qwen4_prefill_moe::attn16::admit_surface(
-                self.vision_prompt_present(tokens),
-                seq.seq_len,
-                0,
-                n,
-                n,
-                high_speed_swap,
-            )?;
-        }
+        let high_speed_swap = self.kv_cache.lock().config().cache_blocks_per_seq.is_some();
+        let _attn16_suppressed = crate::layers::qwen4_prefill_moe::attn16::admit_or_suppress(
+            self.vision_prompt_present(tokens),
+            seq.seq_len,
+            0,
+            n,
+            n,
+            high_speed_swap,
+        )?;
         if self.config.mrope_interleaved && self.vision_prompt_present(tokens) {
             return self.prefill_chunk(tokens, seq, 0, n, true, stream);
         }
@@ -280,8 +278,12 @@ impl TransformerModel {
         {
             if self.config.is_qwen4_exp() {
                 let row_bytes = self.config.residual_width() * 2;
-                for (row, &token) in proc_tokens.iter().enumerate() {
-                    self.embed(token, hidden.offset(row * row_bytes), stream)?;
+                if Self::qwen4_embed_batch_selected() {
+                    self.embed_qwen4_batch(proc_tokens, hidden, stream)?;
+                } else {
+                    for (row, &token) in proc_tokens.iter().enumerate() {
+                        self.embed(token, hidden.offset(row * row_bytes), stream)?;
+                    }
                 }
             } else {
                 let token_ids_bytes: &[u8] = unsafe {
@@ -459,6 +461,7 @@ impl TransformerModel {
                         seq_len_start == 0,
                         self.gpu.as_ref(),
                         stream,
+                        None,
                     )?;
                 } else {
                     for (row, &token) in proc_tokens.iter().enumerate() {

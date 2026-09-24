@@ -111,6 +111,22 @@ impl Qwen3AttentionLayer {
         // the attention core and gate are deferred to one full-prefill launch.
         let flash = qwen4_flash_attn::selected() && self.prefill_attn_k.0 != 0;
         let mut tile_start = 0;
+        if flash
+            && let Some(device) = attn16_device
+            && super::prefill_moe_attn16::fullrow_selected()
+        {
+            self.prefill_moe_attn_fullrow_prep(
+                packed_inputs,
+                qkv,
+                qkv_row_bytes,
+                num_tokens,
+                kv_cache,
+                ctx,
+                stream,
+                device,
+            )?;
+            tile_start = num_tokens;
+        }
         while tile_start < num_tokens {
             let tile_rows = if attn32 && num_tokens - tile_start >= 32 { 32 } else { 16 };
             self.prefill_moe_attn16(

@@ -382,6 +382,111 @@ impl PleOffloadReader {
         Ok(rows)
     }
 
+    /// Same rows, same bytes, same caller order as [`Self::read_rows_windowed`],
+    /// but pages are deduplicated across the WHOLE selection and the ring is
+    /// kept full: each completion's buffer is refilled with the next page at
+    /// once, instead of draining a 256-read window before submitting the next.
+    /// A 2048-token prefill is 32,768 rows in 128 windows, and waiting for
+    /// each window's slowest read left the ring mostly empty.
+    pub fn read_rows_streamed(
+        &mut self,
+        selections: &[(usize, usize)],
+    ) -> Result<Vec<PleNvfp4Row>> {
+        ensure!(!selections.is_empty(), "PLE offload selection is empty");
+        let mut unique = Vec::<(usize, usize)>::new();
+        let mut lookup = HashMap::<(usize, usize), usize>::new();
+        // Per unique page: the (request_index, slot, scale2) rows it serves.
+        let mut waiters = Vec::<Vec<(usize, usize, f32)>>::new();
+        let mut output = vec![None; selections.len()];
+        for (request_index, &(shard_idx, row)) in selections.iter().enumerate() {
+            let (shard_rows, scale2) = self
+                .shards
+                .get(shard_idx)
+                .map(|shard| (shard.rows, shard.scale2))
+                .with_context(|| format!("PLE shard {shard_idx} out of range"))?;
+            ensure!(
+                row < shard_rows,
+                "PLE row {row} out of range for shard {shard_idx}"
+            );
+            let key = (shard_idx, row / EXPECTED_RECORDS_PER_PAGE);
+            let slot = row % EXPECTED_RECORDS_PER_PAGE;
+            if let Some(record) = self.cached_record(key, slot) {
+                output[request_index] = Some(PleNvfp4Row { record, scale2 });
+                continue;
+            }
+            let index = *lookup.entry(key).or_insert_with(|| {
+                unique.push(key);
+                waiters.push(Vec::new());
+                unique.len() - 1
+            });
+            waiters[index].push((request_index, slot, scale2));
+        }
+
+        let mut free: Vec<usize> = (0..self.queue_depth).rev().collect();
+        let mut next = 0usize;
+        let mut in_flight = 0usize;
+        let mut done = 0usize;
+        while done < unique.len() {
+            let mut submitted = 0usize;
+            while next < unique.len() {
+                let Some(buffer) = free.pop() else { break };
+                let (shard_idx, page) = unique[next];
+                let fd = raw_fd(&self.shards[shard_idx].file);
+                let entry = opcode::ReadFixed::new(
+                    types::Fd(fd),
+                    self.pages[buffer].ptr,
+                    EXPECTED_PAGE_BYTES as u32,
+                    buffer as u16,
+                )
+                .offset((page * EXPECTED_PAGE_BYTES) as u64)
+                .build()
+                .user_data(((next as u64) << 16) | buffer as u64);
+                unsafe { self.ring.submission().push(&entry) }
+                    .map_err(|_| anyhow::anyhow!("PLE io_uring submission queue full"))?;
+                next += 1;
+                submitted += 1;
+            }
+            in_flight += submitted;
+            ensure!(in_flight > 0, "PLE streamed read stalled with nothing in flight");
+            self.ring
+                .submit_and_wait(1)
+                .context("submit PLE streamed reads")?;
+            let completions: Vec<(u64, i32)> = self
+                .ring
+                .completion()
+                .map(|entry| (entry.user_data(), entry.result()))
+                .collect();
+            for (tag, result) in completions {
+                let (index, buffer) = ((tag >> 16) as usize, (tag & 0xffff) as usize);
+                ensure!(
+                    index < unique.len() && buffer < self.queue_depth,
+                    "PLE io_uring returned invalid tag {tag}"
+                );
+                ensure!(
+                    result == EXPECTED_PAGE_BYTES as i32,
+                    "PLE read {index} returned {result}, expected {EXPECTED_PAGE_BYTES}"
+                );
+                for &(request_index, slot, scale2) in &waiters[index] {
+                    output[request_index] = Some(PleNvfp4Row {
+                        record: self.pages[buffer].record(slot),
+                        scale2,
+                    });
+                }
+                let source = AlignedPageRef {
+                    ptr: self.pages[buffer].ptr,
+                };
+                self.cache_page_ref(unique[index], source);
+                free.push(buffer);
+                in_flight -= 1;
+                done += 1;
+            }
+        }
+        output
+            .into_iter()
+            .map(|row| row.context("PLE streamed read left an empty row"))
+            .collect()
+    }
+
     fn cache_page_ref(&mut self, key: (usize, usize), source: AlignedPageRef) {
         if self.cache_capacity_pages == 0 {
             return;

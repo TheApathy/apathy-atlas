@@ -45,11 +45,13 @@ impl TransformerModel {
         // residual_width row with its embedding repeated across all streams.
         if self.config.is_qwen4_exp() {
             let row_bytes = self.config.residual_width() * 2;
-            for (row, &token) in tokens[chunk_start..chunk_start + chunk_len]
-                .iter()
-                .enumerate()
-            {
-                self.embed(token, hidden_dst.offset(row * row_bytes), stream)?;
+            let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
+            if Self::qwen4_embed_batch_selected() {
+                self.embed_qwen4_batch(chunk_tokens, hidden_dst, stream)?;
+            } else {
+                for (row, &token) in chunk_tokens.iter().enumerate() {
+                    self.embed(token, hidden_dst.offset(row * row_bytes), stream)?;
+                }
             }
         } else {
             // Upload token IDs to device and do a single batched embed kernel launch

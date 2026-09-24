@@ -71,8 +71,8 @@ impl DeviceKernels {
             "device16 MRoPE theta is invalid"
         );
         ensure!(
-            rows == 16 || rows == 32,
-            "device attention rows must be 16 or 32"
+            rows == 16 || rows == 32 || (rows.is_multiple_of(16) && rows <= 2048),
+            "device attention rows must be 16, 32, or a whole <=2048-row chunk"
         );
         let qkv_bytes = usize::try_from(rows)?
             .checked_mul(usize::try_from(row_stride_bf16)?)

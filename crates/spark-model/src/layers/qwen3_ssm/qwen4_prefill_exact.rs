@@ -12,16 +12,25 @@ const CHECK_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_SSM_CHECK";
 const GRID32_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_SSM_GRID32";
 
 pub(crate) fn check_selected() -> Result<bool> {
+    if crate::layers::qwen4_prefill_moe::family_suppressed() {
+        return Ok(false);
+    }
     parse_selector(std::env::var_os(CHECK_SELECTOR).as_deref())
         .map_err(|error| anyhow::anyhow!("{CHECK_SELECTOR}: {error}"))
 }
 
 pub(crate) fn selected() -> Result<bool> {
+    if crate::layers::qwen4_prefill_moe::family_suppressed() {
+        return Ok(false);
+    }
     parse_selector(std::env::var_os(SELECTOR).as_deref())
         .map_err(|error| anyhow::anyhow!("{SELECTOR}: {error}"))
 }
 
 pub(crate) fn grid32_selected() -> Result<bool> {
+    if crate::layers::qwen4_prefill_moe::family_suppressed() {
+        return Ok(false);
+    }
     parse_selector(std::env::var_os(GRID32_SELECTOR).as_deref())
         .map_err(|error| anyhow::anyhow!("{GRID32_SELECTOR}: {error}"))
 }

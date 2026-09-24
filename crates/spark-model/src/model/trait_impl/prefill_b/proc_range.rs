@@ -91,11 +91,13 @@ impl TransformerModel {
                 let uncached_count = chunk_len - skip_in_chunk;
                 if self.config.is_qwen4_exp() {
                     let row_bytes = self.config.residual_width() * 2;
-                    for (row, &token) in tokens[uncached_start..uncached_start + uncached_count]
-                        .iter()
-                        .enumerate()
-                    {
-                        self.embed(token, hidden.offset(row * row_bytes), stream)?;
+                    let chunk_tokens = &tokens[uncached_start..uncached_start + uncached_count];
+                    if Self::qwen4_embed_batch_selected() {
+                        self.embed_qwen4_batch(chunk_tokens, hidden, stream)?;
+                    } else {
+                        for (row, &token) in chunk_tokens.iter().enumerate() {
+                            self.embed(token, hidden.offset(row * row_bytes), stream)?;
+                        }
                     }
                     return Ok(ProcRange::Compute {
                         proc_start: uncached_start,

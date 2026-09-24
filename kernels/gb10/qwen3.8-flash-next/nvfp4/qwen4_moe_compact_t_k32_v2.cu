@@ -1014,6 +1014,217 @@ void qwen4_moe_compact_t_gemm_k32_v4(
         __syncthreads();
     }
 }
+// V6: V4 with the MMAs of padding rows skipped. The v3/v4 tile is 64 rows split
+// into four 16-row warp slices (warp_m). An expert with fewer routed pairs than
+// the tile leaves whole slices past M_expert; their accumulators are never stored
+// (the epilogue guards r0v/r1v), so the ldmatrix + mma work for those slices is
+// dead. A slice is skipped only when its FIRST row is invalid (warp-uniform), so
+// every stored output runs exactly V4's instruction sequence. Loads, dequant and
+// barriers are unchanged (the whole CTA still cooperates on them).
+//
+// (V4 notes follow.) V4: byte-for-byte the V3 arithmetic and loop order. The ONLY change is that the
+// dequantized-B staging buffer sBf loses its (unused) double-buffer dimension.
+// The `__syncthreads()` at the top of each kt iteration already separates iteration
+// kt+1's dequant writes from iteration kt's mma reads, so the second buffer was never
+// providing a hazard guarantee -- it was costing 8,704 B of shared memory per CTA.
+// 40,608 -> 31,904 B/CTA takes the SM from 2 resident CTAs (16 warps) to 3 (24 warps).
+// Bit-exact with V3: same operands, same order, same BF16 roundings.
+extern "C" __global__ __launch_bounds__(256, 3)
+void qwen4_moe_compact_t_gemm_k32_v6(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ packed_ptrs,
+    const unsigned long long* __restrict__ scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    const oi640::Contract* __restrict__ contract,
+    const oi640::Workspace* __restrict__ workspace,
+    int* status,
+    unsigned int N,
+    unsigned int K
+) {
+    if (gridDim.x != oi640::FIXED_GRID || gridDim.y != 1 || gridDim.z != 1 ||
+        blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1) {
+        if (threadIdx.x == 0) oi640::fail(status, oi640::ERR_GEOMETRY);
+        return;
+    }
+    const bool shape = (N == oi640::INTER && K == oi640::HIDDEN) ||
+        (N == oi640::HIDDEN && K == oi640::INTER);
+    if (!shape || A == nullptr || packed_ptrs == nullptr || scale_ptrs == nullptr ||
+        scale2_vals == nullptr || C == nullptr || expert_offsets == nullptr ||
+        sorted_token_ids == nullptr || !oi640::contract_ok(contract) ||
+        !oi640::workspace_ok(workspace, contract) || status == nullptr ||
+        status[0] != oi640::PLANNED) {
+        if (threadIdx.x == 0) oi640::fail(status, oi640::ERR_ABI);
+        return;
+    }
+    // Raw pipeline stages (cp.async targets) + double-buffered dequantized B.
+    __shared__ __align__(16) __nv_bfloat16 sA[STAGES][oi640::TILE_M][A_STRIDE];
+    __shared__ __align__(16) unsigned char sB[STAGES][16][B3_STRIDE];
+    __shared__ __align__(16) unsigned char sS[STAGES][2][S3_STRIDE];
+    __shared__ __align__(16) __nv_bfloat16 sBf[oi640::STEP_K][BF3_STRIDE];
+    __shared__ float s_lut[16];
+
+    const unsigned n_tiles = (N + TN3 - 1) / TN3;
+    const unsigned task_count = workspace->work_count * n_tiles;
+    const unsigned tid = threadIdx.x;
+    const unsigned warp_id = tid >> 5;
+    const unsigned lane = tid & 31;
+    const unsigned warp_m = (warp_id & 3) * 16;
+    const unsigned warp_n = (warp_id >> 2) * 64;
+    const unsigned group_id = lane >> 2;
+    const unsigned tig = lane & 3;
+    const unsigned KT = K / oi640::STEP_K;
+    const bool gather = (K == oi640::HIDDEN);
+    if (tid < 16) s_lut[tid] = V2_E2M1_LUT[tid];
+    // Dequant assignment: thread -> column n = tid & 63, packed rows 8*(tid>>6) .. +8
+    // (16 k values) of the 32-deep stage.
+    const unsigned dq_n = tid & 127;
+    const unsigned dq_r0 = (tid >> 7) * 8;
+    __syncthreads();
+
+    for (unsigned task = blockIdx.x; task < task_count; task += gridDim.x) {
+        const oi640::WorkItem item = workspace->items[task / n_tiles];
+        const unsigned cta_n = (task % n_tiles) * TN3;
+        if (item.expert >= oi640::EXPERTS) {
+            if (tid == 0) oi640::fail(status, oi640::ERR_PLAN);
+            return;
+        }
+        const int m_start = expert_offsets[item.expert];
+        const int m_end = expert_offsets[item.expert + 1];
+        const int local = static_cast<int>(item.m_tile * oi640::TILE_M);
+        const int M_expert = m_end - m_start;
+        const unsigned char* B = reinterpret_cast<const unsigned char*>(packed_ptrs[item.expert]);
+        const unsigned char* S = reinterpret_cast<const unsigned char*>(scale_ptrs[item.expert]);
+        const float scale2 = scale2_vals[item.expert];
+        if (m_start < 0 || m_end < m_start || local < 0 || local >= M_expert ||
+            B == nullptr || S == nullptr || !isfinite(scale2)) {
+            if (tid == 0) oi640::fail(status, oi640::ERR_POINTER);
+            return;
+        }
+        const unsigned cta_m = static_cast<unsigned>(m_start + local);
+        const bool warp_live = static_cast<int>(warp_m) + local < M_expert;
+
+        const __nv_bfloat16* a_src[1];
+        bool a_ok[1];
+        unsigned a_row[1], a_cc[1];
+        #pragma unroll
+        for (int i = 0; i < 1; ++i) {
+            const unsigned c = tid;
+            a_row[i] = c >> 2;
+            a_cc[i] = c & 3;
+            const bool ok = (local + static_cast<int>(a_row[i])) < M_expert;
+            const unsigned ar = ok
+                ? (gather ? static_cast<unsigned>(sorted_token_ids[cta_m + a_row[i]]) : cta_m + a_row[i])
+                : 0u;
+            a_ok[i] = ok;
+            a_src[i] = A + static_cast<unsigned long long>(ar) * K + a_cc[i] * 8;
+        }
+
+        auto load_stage = [&](unsigned stage, unsigned kt) {
+            const unsigned k_base = kt * oi640::STEP_K;
+            cp_async_16(&sA[stage][a_row[0]][a_cc[0] * 8], a_src[0] + k_base, a_ok[0]);
+            if (tid < 128) {
+                const unsigned r = tid >> 3, cc = tid & 7;
+                cp_async_16(&sB[stage][r][cc * 16],
+                            B + static_cast<unsigned long long>(k_base / 2 + r) * N + cta_n + cc * 16, true);
+            } else if (tid < 144) {
+                const unsigned t = tid - 128;
+                const unsigned r = t >> 3, cc = t & 7;
+                cp_async_16(&sS[stage][r][cc * 16],
+                            S + static_cast<unsigned long long>(k_base / 16 + r) * N + cta_n + cc * 16, true);
+            }
+        };
+
+        float acc[8][4];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+
+        #pragma unroll
+        for (unsigned s = 0; s < STAGES - 1; ++s) {
+            if (s < KT) load_stage(s, s);
+            cp_async_commit();
+        }
+
+        for (unsigned kt = 0; kt < KT; ++kt) {
+            cp_async_wait<STAGES - 2>();
+            __syncthreads();
+            {
+                const unsigned nk = kt + STAGES - 1;
+                if (nk < KT) load_stage(nk % STAGES, nk);
+                cp_async_commit();
+            }
+            const unsigned st = kt % STAGES;
+            // Cooperative dequant of the 32x64 B slice: same per-element
+            // arithmetic and BF16 rounding as the V1 kernel's smem_B fill.
+            {
+                // packed rows dq_r0..dq_r0+7 -> k = 2*row, 2*row+1; scale row = k/16.
+                #pragma unroll
+                for (unsigned rr = 0; rr < 8; ++rr) {
+                    const unsigned pr = dq_r0 + rr;
+                    const unsigned k = pr * 2;
+                    __nv_fp8_e4m3 fp8;
+                    *reinterpret_cast<unsigned char*>(&fp8) = sS[st][k >> 4][dq_n];
+                    const float f = static_cast<float>(fp8);
+                    const unsigned char pb = sB[st][pr][dq_n];
+                    sBf[k][dq_n] = __float2bfloat16(s_lut[pb & 15] * f * scale2);
+                    sBf[k + 1][dq_n] = __float2bfloat16(s_lut[pb >> 4] * f * scale2);
+                }
+            }
+            __syncthreads();
+            if (!warp_live) continue;
+            #pragma unroll
+            for (unsigned k_sub = 0; k_sub < oi640::STEP_K; k_sub += 16) {
+                unsigned a0, a1, a2, a3;
+                {
+                    const unsigned row = warp_m + (lane & 15);
+                    const unsigned col = k_sub + ((lane >> 4) << 3);
+                    const unsigned addr = static_cast<unsigned>(
+                        __cvta_generic_to_shared(&sA[st][row][col]));
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                                 : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr));
+                }
+                #pragma unroll
+                for (int np = 0; np < 4; ++np) {
+                    // Two n-tiles per ldmatrix.x4.trans: matrices (k0-7,n0), (k8-15,n0), (k0-7,n1), (k8-15,n1).
+                    unsigned b00, b01, b10, b11;
+                    const unsigned row = k_sub + (lane & 7) + (((lane >> 3) & 1) << 3);
+                    const unsigned col = warp_n + (np * 2 + (lane >> 4)) * 8;
+                    const unsigned addr = static_cast<unsigned>(
+                        __cvta_generic_to_shared(&sBf[row][col]));
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                                 : "=r"(b00), "=r"(b01), "=r"(b10), "=r"(b11) : "r"(addr));
+                    const int nt0 = np * 2, nt1 = np * 2 + 1;
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                        :"=f"(acc[nt0][0]),"=f"(acc[nt0][1]),"=f"(acc[nt0][2]),"=f"(acc[nt0][3])
+                        :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b00),"r"(b01),
+                         "f"(acc[nt0][0]),"f"(acc[nt0][1]),"f"(acc[nt0][2]),"f"(acc[nt0][3]));
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                        :"=f"(acc[nt1][0]),"=f"(acc[nt1][1]),"=f"(acc[nt1][2]),"=f"(acc[nt1][3])
+                        :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b10),"r"(b11),
+                         "f"(acc[nt1][0]),"f"(acc[nt1][1]),"f"(acc[nt1][2]),"f"(acc[nt1][3]));
+                }
+            }
+        }
+        cp_async_wait<0>();
+
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const unsigned c0 = cta_n + warp_n + nt * 8 + tig * 2, c1 = c0 + 1;
+            const unsigned r0 = cta_m + warp_m + group_id, r1 = r0 + 8;
+            const bool r0v = static_cast<int>(warp_m + group_id) + local < M_expert;
+            const bool r1v = static_cast<int>(warp_m + group_id + 8) + local < M_expert;
+            if (r0v && c0 < N) C[static_cast<unsigned long long>(r0) * N + c0] = __float2bfloat16(acc[nt][0]);
+            if (r0v && c1 < N) C[static_cast<unsigned long long>(r0) * N + c1] = __float2bfloat16(acc[nt][1]);
+            if (r1v && c0 < N) C[static_cast<unsigned long long>(r1) * N + c0] = __float2bfloat16(acc[nt][2]);
+            if (r1v && c1 < N) C[static_cast<unsigned long long>(r1) * N + c1] = __float2bfloat16(acc[nt][3]);
+        }
+        __syncthreads();
+    }
+}
 // V5: byte-for-byte the V2 arithmetic, tile shape (64x64), thread count (128) and
 // 3-stage cp.async depth. The ONLY change is dropping sBf's unused double-buffer
 // dimension: 28,960 -> 24,352 B/CTA, which takes the SM from 3 resident CTAs

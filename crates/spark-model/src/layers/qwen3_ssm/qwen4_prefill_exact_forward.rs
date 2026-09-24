@@ -30,8 +30,23 @@ fn conv_parallel_kernels(gpu: &dyn GpuBackend) -> Result<(KernelHandle, KernelHa
 }
 
 fn gdn_lazyfinal_selected() -> bool {
-    static SEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SEL.get_or_init(|| matches!(std::env::var(GDN_LAZYFINAL_SELECTOR).ok().as_deref(), Some("1") | Some("2")))
+    gdn_lazyfinal_kernel_name().is_some()
+}
+
+/// 1 = register twin, 2 = its prefetch twin, 3 = H truly in registers (the
+/// `_regfinal` H array sits in a local-memory stack frame), 4/5 = 3 plus the
+/// token stream staged 15/8 tokens at a time through shared memory. All five
+/// share the arithmetic order of the nosnap kernel.
+fn gdn_lazyfinal_kernel_name() -> Option<&'static str> {
+    static SEL: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *SEL.get_or_init(|| match std::env::var(GDN_LAZYFINAL_SELECTOR).ok().as_deref() {
+        Some("1") => Some("gated_delta_rule_prefill_f32_sequence_regfinal"),
+        Some("2") => Some("gated_delta_rule_prefill_f32_sequence_regfinal_pf"),
+        Some("3") => Some("gated_delta_rule_prefill_f32_sequence_regfinal_full"),
+        Some("4") => Some("gated_delta_rule_prefill_f32_sequence_regfinal_chunk15"),
+        Some("5") => Some("gated_delta_rule_prefill_f32_sequence_regfinal_chunk8"),
+        _ => None,
+    })
 }
 
 impl Qwen3SsmLayer {
@@ -145,11 +160,7 @@ impl Qwen3SsmLayer {
                     ctx.gpu
                         .kernel(
                             "gated_delta_rule_prefill_regfinal",
-                            if std::env::var(GDN_LAZYFINAL_SELECTOR).ok().as_deref() == Some("2") {
-                                "gated_delta_rule_prefill_f32_sequence_regfinal_pf"
-                            } else {
-                                "gated_delta_rule_prefill_f32_sequence_regfinal"
-                            },
+                            gdn_lazyfinal_kernel_name().expect("selected"),
                         )
                         .map_err(|e| e.to_string())
                 })
@@ -157,7 +168,10 @@ impl Qwen3SsmLayer {
                 .map_err(|e| anyhow::anyhow!("{GDN_LAZYFINAL_SELECTOR}: kernel unavailable: {e}"))?;
             static LOGGED: std::sync::Once = std::sync::Once::new();
             LOGGED.call_once(|| {
-                tracing::info!("SSM_PREFILL_GDN_REGFINAL_ENGAGED selector={GDN_LAZYFINAL_SELECTOR} rows={rows}");
+                tracing::info!(
+                    "SSM_PREFILL_GDN_REGFINAL_ENGAGED selector={GDN_LAZYFINAL_SELECTOR} kernel={} rows={rows}",
+                    gdn_lazyfinal_kernel_name().unwrap_or("?")
+                );
             });
             k
         } else {

@@ -166,6 +166,61 @@ impl TransformerModel {
         }
     }
 
+    /// `ATLAS_QWEN4_PREFILL_EMBED_BATCH=1`: embed a whole prefill chunk with
+    /// one gather + one expand launch instead of a D2D copy + expand launch
+    /// per token. Both paths are pure copies of the same BF16 rows.
+    pub(super) fn qwen4_embed_batch_selected() -> bool {
+        static SEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SEL.get_or_init(|| std::env::var("ATLAS_QWEN4_PREFILL_EMBED_BATCH").ok().as_deref() == Some("1"))
+    }
+
+    /// Batched twin of calling [`Self::embed`] for each of `tokens` into
+    /// consecutive `[hc_count, hidden_size]` rows of `output`.
+    pub(super) fn embed_qwen4_batch(
+        &self,
+        tokens: &[u32],
+        output: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let n = tokens.len();
+        let h = self.config.hidden_size;
+        anyhow::ensure!(n > 0, "Qwen4 batched embed needs at least one token");
+        anyhow::ensure!(
+            self.buffers.sizes().scratch >= n * 4 && self.buffers.sizes().norm_output >= n * h * 2,
+            "Qwen4 batched embed scratch is undersized for {n} tokens"
+        );
+        let token_ids_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, n * 4) };
+        let token_ids_dev = self.buffers.scratch();
+        let staged = self.buffers.norm_output();
+        self.gpu.copy_h2d_group_on_stream(
+            &[spark_runtime::gpu::HostToDeviceCopy::new(token_ids_bytes, token_ids_dev)],
+            stream,
+        )?;
+        let gather = self.gpu.kernel("embed_from_argmax", "batched_embed")?;
+        crate::layers::ops::batched_embed(
+            self.gpu.as_ref(),
+            gather,
+            token_ids_dev,
+            self.embed_tokens.weight,
+            staged,
+            n as u32,
+            h as u32,
+            stream,
+        )?;
+        let kernel = self
+            .gpu
+            .kernel("qwen4_hyper", "qwen4_hc_expand_embedding")?;
+        KernelLaunch::new(self.gpu.as_ref(), kernel)
+            .grid([n as u32, div_ceil(self.config.residual_width() as u32, 256), 1])
+            .block([256, 1, 1])
+            .arg_ptr(staged)
+            .arg_ptr(output)
+            .arg_u32(h as u32)
+            .arg_u32(self.config.hc_count as u32)
+            .launch(stream)
+    }
+
     /// Expand one BF16 `[hidden_size]` embedding into Qwen4's
     /// `[hc_count, hidden_size]` residual-stream layout.
     pub(super) fn expand_qwen4_embedding(

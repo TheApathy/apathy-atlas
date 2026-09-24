@@ -11,7 +11,123 @@ use super::prefill_moe_attn16_device::{DeviceKernels, expand_or_copy_metadata, m
 use crate::layer::{AttnMetadataDev, ForwardContext};
 use crate::layers::{ops, qwen4_prefill_moe};
 
+/// `ATLAS_QWEN4_PREFILL_ATTN_FULLROW=1` (with the flash core): run the
+/// per-tile QSA / MRoPE / KV-write stages once over the whole chunk.
+pub(super) fn fullrow_selected() -> bool {
+    static SEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SEL.get_or_init(|| std::env::var("ATLAS_QWEN4_PREFILL_ATTN_FULLROW").ok().as_deref() == Some("1"))
+}
+
 impl Qwen3AttentionLayer {
+    /// Whole-chunk twin of the `skip_core` half of [`Self::prefill_moe_attn16`]
+    /// (the flash-core path). Each stage is the same kernel the tile loop
+    /// launches, with a grid over every row instead of one 16-row tile: the
+    /// QSA projection/pool/norm/rope/store are per-row or per-4-row-group, the
+    /// ring keeps only the last group either way, MRoPE is per row, and the
+    /// KV write is per token. No stage reads another tile's output, so the
+    /// stage-major order is equivalent to the tile-major one. The metadata
+    /// expansion is skipped: only the paged core (not run here) reads it.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prefill_moe_attn_fullrow_prep(
+        &self,
+        packed_inputs: DevicePtr,
+        qkv: DevicePtr,
+        qkv_row_bytes: usize,
+        rows: usize,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+        device: DeviceKernels,
+    ) -> Result<()> {
+        ensure!(
+            rows.is_multiple_of(16) && rows > 0 && rows <= 2048,
+            "full-row attention prep requires a 16-row multiple <= 2048 (got {rows})"
+        );
+        let metadata = ctx
+            .attn_metadata
+            .ok_or_else(|| anyhow::anyhow!("full-row attention prep requires paged metadata"))?;
+        ensure!(
+            self.kv_dtype == KvCacheDtype::Bf16 && metadata.num_seqs == 1,
+            "full-row attention prep requires C1 BF16 paged metadata"
+        );
+        ensure!(
+            self.gated && self.mrope_interleaved && self.rope_mrope_interleaved_k.0 != 0,
+            "full-row attention prep requires gated Qwen4 MRoPE attention"
+        );
+        let h = ctx.config.hidden_size;
+        let nq = ctx.config.num_attention_heads as u32;
+        let nkv = ctx.config.num_key_value_heads as u32;
+        let hd = ctx.config.head_dim as u32;
+        let q_proj_dim = nq * hd * 2;
+        let kv_dim = nkv * hd;
+        let row_stride = u32::try_from(qkv_row_bytes / 2)?;
+        ensure!(
+            row_stride == q_proj_dim + 2 * kv_dim,
+            "full-row attention prep QKV stride mismatch"
+        );
+        if metadata.qwen4_qsa_required {
+            let qsa = self
+                .qwen4_qsa
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("full-row attention prep requires QSA"))?;
+            qsa.validate_exact_group4()?;
+            qsa.update_prefill_exact_tile(
+                packed_inputs,
+                0,
+                rows,
+                kv_cache,
+                metadata,
+                h as u32,
+                ctx.config.rms_norm_eps as f32,
+                ctx.config.rope_theta as f32,
+                ctx.config.rotary_dim() as u32,
+                ctx.gpu,
+                stream,
+            )?;
+        }
+        mrope_or_scalar(
+            Some(device),
+            ctx.gpu,
+            self.rope_mrope_interleaved_k,
+            qkv,
+            qkv_row_bytes,
+            metadata.positions,
+            metadata.positions_h,
+            metadata.positions_w,
+            row_stride,
+            q_proj_dim,
+            nq,
+            nkv,
+            hd,
+            ctx.config.rotary_dim() as u32,
+            ctx.config.rope_theta as f32,
+            rows as u32,
+            stream,
+        )?;
+        let k = qkv.offset(q_proj_dim as usize * 2);
+        let v = k.offset(kv_dim as usize * 2);
+        self.write_kv_cache(
+            ctx.gpu,
+            k,
+            v,
+            kv_cache,
+            metadata.slot,
+            rows as u32,
+            nkv,
+            hd,
+            kv_cache.block_size() as u32,
+            row_stride,
+            row_stride,
+            stream,
+            false,
+        )?;
+        static ENGAGED: std::sync::Once = std::sync::Once::new();
+        ENGAGED.call_once(|| {
+            tracing::warn!("ENGAGED ATLAS_QWEN4_PREFILL_ATTN_FULLROW: whole-chunk QSA + MRoPE + KV write rows={rows}")
+        });
+        Ok(())
+    }
+
     pub(super) fn preflight_moe_attn16(
         &self,
         kv_cache: &PagedKvCache,

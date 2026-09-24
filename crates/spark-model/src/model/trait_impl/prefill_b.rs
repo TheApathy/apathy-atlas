@@ -122,17 +122,15 @@ impl TransformerModel {
         let total = tokens.len();
         self.validate_vision_prompt(tokens, chunk_start, chunk_len)?;
         self.admit_rotary_prompt(tokens, seq, chunk_start)?;
-        if crate::layers::qwen4_prefill_moe::attn16::selected()? {
-            let high_speed_swap = self.kv_cache.lock().config().cache_blocks_per_seq.is_some();
-            crate::layers::qwen4_prefill_moe::attn16::admit_surface(
-                self.vision_prompt_present(tokens),
-                seq.seq_len,
-                chunk_start,
-                chunk_len,
-                total,
-                high_speed_swap,
-            )?;
-        }
+        let high_speed_swap = self.kv_cache.lock().config().cache_blocks_per_seq.is_some();
+        let _attn16_suppressed = crate::layers::qwen4_prefill_moe::attn16::admit_or_suppress(
+            self.vision_prompt_present(tokens),
+            seq.seq_len,
+            chunk_start,
+            chunk_len,
+            total,
+            high_speed_swap,
+        )?;
         crate::layers::qwen4_prefill_moe::admit_request(&self.config, total, 0)?;
         if crate::layers::qwen4_prefill_moe::attn16::selected()? {
             let kv_cache = self.kv_cache.lock();
@@ -189,6 +187,20 @@ impl TransformerModel {
                 }
             };
         }
+
+        // PLE level 2: start this chunk's O_DIRECT row reads now, so they
+        // overlap embedding, metadata setup and layer 0. Used only if the chunk
+        // ends up processing exactly [chunk_start, chunk_start + chunk_len).
+        let ple_prefetch = match &self.qwen4_ple {
+            Some(ple)
+                if crate::layers::qwen4_ple::prefill_stream_level() >= 2
+                    && std::env::var("ATLAS_QWEN4_PLE_PREFILL_BATCH").ok().as_deref() == Some("1") =>
+            {
+                let current = &tokens[chunk_start..chunk_start + chunk_len];
+                Some((chunk_start, chunk_len, ple.begin_prefill_read(current, &tokens[..chunk_start])))
+            }
+            _ => None,
+        };
 
         // ── Phase 1+1b: embed chunk + vision pad overlay ──
         self.prefill_b_embed_chunk(tokens, chunk_start, chunk_len, stream)?;
@@ -294,6 +306,7 @@ impl TransformerModel {
             use_mrope,
             needs_paged,
             stream,
+            ple_prefetch,
         )?;
         phase_mark!("layers");
 

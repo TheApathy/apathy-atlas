@@ -12,6 +12,10 @@ use crate::layer::AttnMetadataDev;
 use crate::layers::ops;
 use crate::weight_map::DenseWeight;
 
+/// Largest row count one exact QSA tile call accepts: a 32-row attention tile,
+/// or a whole 2048-row prefill chunk (`ATLAS_QWEN4_PREFILL_ATTN_FULLROW`).
+const TILE_MAX_ROWS: usize = 2048;
+
 impl Qwen4QsaIndexer {
     pub(crate) fn validate_exact_group4(&self) -> Result<()> {
         ensure!(
@@ -160,8 +164,8 @@ impl Qwen4QsaIndexer {
     ) -> Result<()> {
         self.validate_exact_group4()?;
         ensure!(
-            tile_start.is_multiple_of(COMPRESS_RATIO) && rows.is_multiple_of(COMPRESS_RATIO) && rows > 0 && rows <= 32,
-            "exact QSA tile requires aligned complete groups (<= 32 rows)"
+            tile_start.is_multiple_of(COMPRESS_RATIO) && rows.is_multiple_of(COMPRESS_RATIO) && rows > 0 && rows <= TILE_MAX_ROWS,
+            "exact QSA tile requires aligned complete groups (<= {TILE_MAX_ROWS} rows)"
         );
         ensure!(meta.num_seqs == 1, "exact QSA tile requires C1");
         let cache = self.cache(gpu, kv_cache)?;
@@ -182,9 +186,9 @@ impl Qwen4QsaIndexer {
             let mut g = SCRATCH.lock().unwrap();
             if g.is_none() {
                 *g = Some((
-                    gpu.alloc(32 * INDEX_DIM as usize * 2)?,
-                    gpu.alloc(8 * INDEX_DIM as usize * 2)?,
-                    gpu.alloc(8 * std::mem::size_of::<u32>())?,
+                    gpu.alloc(TILE_MAX_ROWS * INDEX_DIM as usize * 2)?,
+                    gpu.alloc(TILE_MAX_ROWS / COMPRESS_RATIO * INDEX_DIM as usize * 2)?,
+                    gpu.alloc(TILE_MAX_ROWS / COMPRESS_RATIO * std::mem::size_of::<u32>())?,
                 ));
             }
             g.unwrap()
