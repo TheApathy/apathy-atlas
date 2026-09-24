@@ -21,6 +21,7 @@ mod decode_logits_step;
 mod decode_step;
 mod emit_step;
 mod exact_greedy_admission;
+mod glm53_policy_driver;
 mod helpers;
 // Run-scoped levers the dashboard toggles. Minimal port: the loop watchdog only.
 pub mod levers;
@@ -33,8 +34,6 @@ mod phase_continue_prefills;
 mod phase_promote_prefills;
 mod phase_start_prefills;
 mod prefill_a_step;
-#[cfg(test)]
-mod vision_request_reset_tests;
 mod prefill_b_step;
 mod proposal_lifecycle;
 mod repetition;
@@ -56,6 +55,8 @@ mod verify_dflash_step;
 mod verify_k2_step;
 mod verify_k3_step;
 mod verify_k4_step;
+#[cfg(test)]
+mod vision_request_reset_tests;
 
 pub use cfg_jump_forward::{
     build_delim_table, build_forced_ids, cfg_jf_enabled, set_delim_table, set_forced_ids,
@@ -458,6 +459,18 @@ pub fn run(
         reflection_suppress_ids: &reflection_suppress_ids,
         adaptive_sampling,
     };
+    // GLM-5.3 speculation runs its own policy-before-commit verifier; every
+    // other model takes `step_mtp` unchanged.
+    let glm_policy = model.requires_verify_policy();
+    let glm_settings = glm53_policy_driver::DecodeSettings {
+        think_end_token,
+        think_start_token,
+        code_fence_token,
+        tool_call_start_token,
+        tool_call_end_token,
+        reflection_suppress_ids: &reflection_suppress_ids,
+        adaptive_sampling,
+    };
     let mut snapshot_steps: u64 = 0;
     loop {
         // ── Drain pending → start prefill (chunked or full) ──
@@ -771,7 +784,17 @@ pub fn run(
                             // untouched. `step_mtp`'s post-think policy gate routes
                             // both native short drafts and DFlash γ blocks through
                             // the row-by-row sampler oracle.
-                            step_mtp(&*model, &mut active, nd, &think_ctx, &mut cache_on_finish);
+                            if glm_policy {
+                                glm53_policy_driver::step(&*model, &mut active, nd, &glm_settings);
+                            } else {
+                                step_mtp(
+                                    &*model,
+                                    &mut active,
+                                    nd,
+                                    &think_ctx,
+                                    &mut cache_on_finish,
+                                );
+                            }
                         } else {
                             match arm.kind {
                                 ArmKind::Serial => {
@@ -800,13 +823,22 @@ pub fn run(
                                         arm_drafts
                                     };
                                     last_spec_num_drafts = nd;
-                                    step_mtp(
-                                        &*model,
-                                        &mut active,
-                                        nd,
-                                        &think_ctx,
-                                        &mut cache_on_finish,
-                                    );
+                                    if glm_policy {
+                                        glm53_policy_driver::step(
+                                            &*model,
+                                            &mut active,
+                                            nd,
+                                            &glm_settings,
+                                        );
+                                    } else {
+                                        step_mtp(
+                                            &*model,
+                                            &mut active,
+                                            nd,
+                                            &think_ctx,
+                                            &mut cache_on_finish,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -824,13 +856,22 @@ pub fn run(
                         }
                         last_step_was_entry_pin = pinned_spec_width.is_some();
                     } else {
-                        step_mtp(
-                            &*model,
-                            &mut active,
-                            num_drafts,
-                            &think_ctx,
-                            &mut cache_on_finish,
-                        );
+                        if glm_policy {
+                            glm53_policy_driver::step(
+                                &*model,
+                                &mut active,
+                                num_drafts,
+                                &glm_settings,
+                            );
+                        } else {
+                            step_mtp(
+                                &*model,
+                                &mut active,
+                                num_drafts,
+                                &think_ctx,
+                                &mut cache_on_finish,
+                            );
+                        }
                     }
                 } else {
                     // Fall through to the ordinary decode path below.
