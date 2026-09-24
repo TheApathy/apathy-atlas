@@ -70,3 +70,6 @@ atlas:
     # bit-identical to the per-(row, head) references, ~4.5x faster at 8K.
     ATLAS_GLM53_DSA_SELECTED_ROWS: "1"
     ATLAS_GLM53_DSA_SCORE_ROWS: "1"
+    # KDA recurrence with q/k/decay/beta/value staged through shared memory;
+    # bit-identical to rr_c8, ~-2% prefill at 2048 and 8192.
+    ATLAS_GLM53_KDA_RR_PREFETCH: "3"
