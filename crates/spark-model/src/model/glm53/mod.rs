@@ -46,6 +46,7 @@ mod phase_timing;
 mod phase_timing_wrappers;
 mod prefill_capture_ingest;
 mod prefix_commit;
+pub(crate) mod speculative_admission;
 mod prefill_capture_owner;
 mod prefill_capture_plan;
 mod prefill_exl3;

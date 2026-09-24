@@ -28,6 +28,21 @@ pub(super) const DSA_ORDINALS: usize = 11;
 pub(super) const KDA_ROW_BYTES: usize = 4 * 1024 * 1024;
 /// Rows 0..=6 of an 8-row pass get a snapshot; the last row lands in staged.
 pub(super) const KDA_SNAPSHOT_ROWS: usize = 7;
+
+/// `ATLAS_GLM53_PREFIX_COMMIT_ROWS=<1..=7>` (default 7): KDA snapshot rows to
+/// allocate, i.e. the widest verify minus one. 7 rows cost 952 MiB; a
+/// `--glm-dflash-max-drafts 3` server needs 3 (408 MiB). A wider verify is refused.
+pub(super) fn kda_snapshot_rows_from(value: Option<&str>) -> Result<usize> {
+    let Some(value) = value else {
+        return Ok(KDA_SNAPSHOT_ROWS);
+    };
+    let rows: usize = value
+        .parse()
+        .ok()
+        .filter(|rows| (1..=KDA_SNAPSHOT_ROWS).contains(rows))
+        .with_context(|| format!("ATLAS_GLM53_PREFIX_COMMIT_ROWS must be 1..=7, got {value:?}"))?;
+    Ok(rows)
+}
 pub(super) const DSA_SNAPSHOT_ROWS: usize = 8;
 /// One row's DSA carry (latent rows, published pools, tail) packed 256-aligned.
 pub(super) const DSA_ROW_SLOT_BYTES: usize = 12_288;
@@ -50,41 +65,54 @@ pub(super) fn prefix_commit_enabled() -> bool {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PrefixCommitBuffers {
+    kda_rows: usize,
     kda: DevicePtr,
     dsa: DevicePtr,
     conv: DevicePtr,
 }
 
 impl PrefixCommitBuffers {
-    pub(super) const KDA_BYTES: usize = KDA_ORDINALS * KDA_SNAPSHOT_ROWS * KDA_ROW_BYTES;
+    pub(super) const fn kda_bytes(kda_rows: usize) -> usize {
+        KDA_ORDINALS * kda_rows * KDA_ROW_BYTES
+    }
     pub(super) const DSA_BYTES: usize = DSA_ORDINALS * DSA_SNAPSHOT_ROWS * DSA_ROW_SLOT_BYTES;
     /// Each KDA layer's q/k/v conv inputs for the verify rows. The verify
     /// scratch is shared by all 34 layers, so the per-layer inputs a prefix
     /// re-stage of the conv shift register needs must be kept here.
     pub(super) const CONV_BYTES: usize =
         KDA_ORDINALS * 3 * CONV_INPUT_ROWS * CONV_INPUT_ROW_BYTES;
-    pub(super) const BYTES: usize = Self::KDA_BYTES + Self::DSA_BYTES + Self::CONV_BYTES;
+    pub(super) const fn bytes(kda_rows: usize) -> usize {
+        Self::kda_bytes(kda_rows) + Self::DSA_BYTES + Self::CONV_BYTES
+    }
 
-    pub(super) fn bind(base: DevicePtr) -> Result<Self> {
+    pub(super) fn bind(base: DevicePtr, kda_rows: usize) -> Result<Self> {
+        ensure!(
+            (1..=KDA_SNAPSHOT_ROWS).contains(&kda_rows),
+            "prefix commit KDA snapshot rows must be 1..=7"
+        );
         ensure!(base != DevicePtr::NULL, "prefix commit buffers are null");
         ensure!(
             base.0 % ALIGNMENT as u64 == 0,
             "prefix commit buffers must be 256-byte aligned"
         );
+        let kda_bytes = Self::kda_bytes(kda_rows);
         Ok(Self {
+            kda_rows,
             kda: base,
-            dsa: DevicePtr(base.0 + Self::KDA_BYTES as u64),
-            conv: DevicePtr(base.0 + (Self::KDA_BYTES + Self::DSA_BYTES) as u64),
+            dsa: DevicePtr(base.0 + kda_bytes as u64),
+            conv: DevicePtr(base.0 + (kda_bytes + Self::DSA_BYTES) as u64),
         })
     }
 
     pub(super) fn kda_row(&self, ordinal: usize, row: usize) -> Result<GgmlIqBuffer> {
         ensure!(
-            ordinal < KDA_ORDINALS && row < KDA_SNAPSHOT_ROWS,
-            "prefix commit KDA snapshot ordinal {ordinal}/row {row} out of range"
+            ordinal < KDA_ORDINALS && row < self.kda_rows,
+            "prefix commit KDA snapshot ordinal {ordinal}/row {row} out of range \
+             (ATLAS_GLM53_PREFIX_COMMIT_ROWS={}; it must cover --glm-dflash-max-drafts)",
+            self.kda_rows
         );
         Ok(GgmlIqBuffer {
-            ptr: DevicePtr(self.kda.0 + ((ordinal * KDA_SNAPSHOT_ROWS + row) * KDA_ROW_BYTES) as u64),
+            ptr: DevicePtr(self.kda.0 + ((ordinal * self.kda_rows + row) * KDA_ROW_BYTES) as u64),
             bytes: KDA_ROW_BYTES,
         })
     }
@@ -225,9 +253,17 @@ mod tests {
 
     #[test]
     fn layout_is_disjoint_and_bounded() {
-        assert_eq!(PrefixCommitBuffers::KDA_BYTES, 34 * 7 * 4 * 1024 * 1024);
-        let buffers = PrefixCommitBuffers::bind(DevicePtr(0x1000)).unwrap();
-        assert!(PrefixCommitBuffers::bind(DevicePtr(0x1010)).is_err());
+        assert_eq!(PrefixCommitBuffers::kda_bytes(7), 34 * 7 * 4 * 1024 * 1024);
+        let buffers = PrefixCommitBuffers::bind(DevicePtr(0x1000), 7).unwrap();
+        assert!(PrefixCommitBuffers::bind(DevicePtr(0x1010), 7).is_err());
+        assert!(PrefixCommitBuffers::bind(DevicePtr(0x1000), 0).is_err());
+        assert!(PrefixCommitBuffers::bind(DevicePtr(0x1000), 8).is_err());
+        let narrow = PrefixCommitBuffers::bind(DevicePtr(0x1000), 3).unwrap();
+        assert!(narrow.kda_row(0, 2).is_ok() && narrow.kda_row(0, 3).is_err());
+        assert_eq!(kda_snapshot_rows_from(None).unwrap(), 7);
+        assert_eq!(kda_snapshot_rows_from(Some("3")).unwrap(), 3);
+        assert!(kda_snapshot_rows_from(Some("0")).is_err());
+        assert!(kda_snapshot_rows_from(Some("8")).is_err());
         let mut seen = Vec::new();
         for ordinal in 0..KDA_ORDINALS {
             for row in 0..KDA_SNAPSHOT_ROWS {
@@ -255,7 +291,7 @@ mod tests {
         }
         assert_eq!(
             seen.last().unwrap().1 - 0x1000,
-            PrefixCommitBuffers::BYTES as u64
+            PrefixCommitBuffers::bytes(7) as u64
         );
         assert!(buffers.kda_row(34, 0).is_err());
         assert!(buffers.kda_row(0, 7).is_err());
