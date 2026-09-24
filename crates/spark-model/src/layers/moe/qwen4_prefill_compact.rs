@@ -186,7 +186,20 @@ pub(super) fn validate_handles(kernels: Option<Kernels>) -> Result<()> {
     Ok(())
 }
 
+/// The native Qwen4 MTP head is a one-layer copy of the trunk config
+/// (`weight_loader::qwen4_mtp_config`). It only ever decodes one token at a
+/// time (drafting and prompt replay), never enters compact prefill, and so
+/// must not be held to the trunk's canonical 48-layer shape.
+pub(crate) fn is_qwen4_mtp_head(config: &ModelConfig) -> bool {
+    config.is_qwen4_exp() && config.weight_prefix == "mtp" && config.num_hidden_layers == 1
+}
+
 pub(super) fn load(gpu: &dyn GpuBackend, config: &ModelConfig) -> Result<Option<Kernels>> {
+    // No compact kernels for the MTP head. Its MoE reaching compact prefill
+    // anyway would fail closed in `validate_handles` (selected, no bundle).
+    if is_qwen4_mtp_head(config) {
+        return Ok(None);
+    }
     admit_request(config, 2, 0)?;
     if !selected()? {
         return Ok(None);
@@ -300,4 +313,48 @@ pub(crate) fn validate_context(ctx: &ForwardContext, rows: usize) -> Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod mtp_head_tests {
+    use super::is_qwen4_mtp_head;
+    use atlas_core::config::{LayerType, ModelConfig};
+
+    fn flash_next_trunk() -> ModelConfig {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "qwen4_exp".into();
+        config.hidden_size = 2_560;
+        config.num_hidden_layers = 48;
+        config.layer_types = (0..48)
+            .map(|i| {
+                if i % 4 == 3 {
+                    LayerType::FullAttention
+                } else {
+                    LayerType::LinearAttention
+                }
+            })
+            .collect();
+        config
+    }
+
+    #[test]
+    fn mtp_head_config_is_recognised() {
+        let trunk = flash_next_trunk();
+        let head = crate::weight_loader::qwen4_mtp_config(&trunk);
+        assert!(is_qwen4_mtp_head(&head));
+    }
+
+    #[test]
+    fn trunk_and_foreign_configs_are_not_mtp_heads() {
+        let trunk = flash_next_trunk();
+        assert!(!is_qwen4_mtp_head(&trunk));
+        // A one-layer trunk that is not the MTP prefix keeps the canonical check.
+        let mut one_layer = trunk.clone();
+        one_layer.num_hidden_layers = 1;
+        assert!(!is_qwen4_mtp_head(&one_layer));
+        // An "mtp" prefix on a non-Qwen4 model is not exempt either.
+        let mut other = crate::weight_loader::qwen4_mtp_config(&trunk);
+        other.model_type = "qwen3_next".into();
+        assert!(!is_qwen4_mtp_head(&other));
+    }
 }

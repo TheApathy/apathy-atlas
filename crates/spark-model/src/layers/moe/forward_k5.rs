@@ -24,6 +24,14 @@ impl MoeLayer {
             ctx.comm.is_none_or(|comm| comm.world_size() == 1),
             "Qwen4 exact NVFP4 MoE does not support expert parallelism"
         );
+        // Under ATLAS_UNIFIED_MOE_LAYOUT the untransposed expert weights are
+        // freed and the gate/up/down pointer tables below go stale; only the
+        // `_t` kernels may run. This path has no `_t` variant.
+        anyhow::ensure!(
+            !self.use_t_layout_for_decode(),
+            "Qwen4 exact K5/K9 MoE (ATLAS_QWEN4_K5_NATIVE_MOE) reads the untransposed expert \
+             layout, which ATLAS_UNIFIED_MOE_LAYOUT frees"
+        );
         let nvfp4 = self
             .gate_nvfp4
             .as_ref()
