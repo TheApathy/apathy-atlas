@@ -19,8 +19,10 @@ metadata:
 defaults:
   port: 8888
   host: 0.0.0.0
-  max_model_len: 2048
-  max_prefill_tokens: 2048
+  # GLM takes a prompt in one prefill call (no scheduler chunking), so the
+  # prefill budget must cover the whole context.
+  max_model_len: 16384
+  max_prefill_tokens: 16384
   max_batch_size: 1
   max_num_seqs: 1
   oom_guard_mb: 4096
@@ -41,7 +43,10 @@ atlas:
     ATLAS_GLM53_EXL3_ROUTE_PRIVATE_PREFILL: "1"
     ATLAS_GLM53_FFN_GRAPHS: "1"
     ATLAS_GLM53_LAYER_MAJOR_PREFILL: "1"
-    ATLAS_GLM53_LAYER_MAJOR_PREFILL_ROWS: "2048"
+    # 4096-row layer-major chunks: the MoE expert stream and trellis decode are
+    # paid once per 4096 prompt rows; GEMMs run in 2048-row slices, so logits
+    # are byte-identical to 2048-row chunks.
+    ATLAS_GLM53_LAYER_MAJOR_PREFILL_ROWS: "4096"
     # Needs the DFlash2 capture, which is not installed target-only: with it on,
     # every image request fails "layer-major capture requires installed DFlash2".
     ATLAS_GLM53_LAYER_MAJOR_VISION_PREFILL: "0"
@@ -61,3 +66,7 @@ atlas:
     ATLAS_GLM53_KDA_CONV_FUSED: "1"
     ATLAS_GLM53_DSA_DENSE_FAST: "1"
     ATLAS_GLM53_HC_POST_PROMPT: "1"
+    # Row-shared DSA sparse-path kernels (every prompt row past 2048):
+    # bit-identical to the per-(row, head) references, ~4.5x faster at 8K.
+    ATLAS_GLM53_DSA_SELECTED_ROWS: "1"
+    ATLAS_GLM53_DSA_SCORE_ROWS: "1"
