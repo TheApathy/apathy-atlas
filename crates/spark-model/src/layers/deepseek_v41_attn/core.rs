@@ -900,9 +900,19 @@ impl Dsv41SparseCore {
         // q_i = rope_c(bf16(qr @ dequant(wq_b)^T)); wts = bf16(x @ weights_proj^T) * 1/64
         self.prof.begin(ops)?;
         let qrow = INDEX_HEADS * INDEX_HEAD_DIM * 2;
-        if let Some(f) = &self.fp8 {
+        // Prefill passes: dequant + ONE pinned cuBLASLt GEMM. The fused v7 kernel runs this shape
+        // (N = 4096, K = 1280) at only 0.60-0.73x of that path (fp8gemm3/gate_m2816.log, M = 512..3968);
+        // byte-identical either way (one m16n8k16 chain per output), keyed on the pass kind, never on
+        // M. Decode/Verify keep the fused launch (graph-captured, tiny M). ATLAS_DSV41_INDEX_Q_V7=1: v7
+        // on prefill too (A/B only).
+        let prefill_cublas = is_prefill(st) && std::env::var("ATLAS_DSV41_INDEX_Q_V7").as_deref() != Ok("1");
+        if let Some(f) = self.fp8.as_ref().filter(|_| !prefill_cublas) {
             // The FP8 weight read directly, one launch, row-invariant at every M.
             f.linear(gpu, a.qr, Q_LORA, &w.wq_b, s.qi, INDEX_HEADS * INDEX_HEAD_DIM, t, stream)?;
+        } else if self.fp8.is_some() {
+            ops.dequant(&w.wq_b, s.deq)?;
+            self.prof.mark(ops, "index.dequant_wq_b")?;
+            ops.linear_bf16_policy(a.qr, Q_LORA, s.deq, s.qi, INDEX_HEADS * INDEX_HEAD_DIM, t, INDEX_HEADS * INDEX_HEAD_DIM, Q_LORA)?;
         } else {
             ops.dequant(&w.wq_b, s.deq)?;
             self.prof.mark(ops, "index.dequant_wq_b")?;
