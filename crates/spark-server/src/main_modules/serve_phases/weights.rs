@@ -370,6 +370,8 @@ pub(crate) fn load_dflash_drafter(
 > {
     use spark_runtime::weights::WeightLoader;
     if !args.dflash {
+        // No drafter, no verify to mirror: decode TC parity stays off.
+        spark_model::layers::configure_decode_tc_parity(None);
         return Ok(None);
     }
     let drafter_id = args
@@ -423,6 +425,14 @@ pub(crate) fn load_dflash_drafter(
         drafter_store.len(),
         drafter_store.total_bytes()
     );
+    // Decode TC parity may only mirror a verify that runs the tensor-core
+    // routes: record the configured verify width (γ + 1) at every model load,
+    // before the first decode, so the gate fails closed when it cannot hold.
+    spark_model::layers::configure_decode_tc_parity(Some(
+        spark_model::layers::dflash_head::effective_verify_rows(
+            drafter_config.resolve_draft_count(args.dflash_gamma)?,
+        ),
+    ));
     Ok(Some((drafter_store, drafter_config)))
 }
 

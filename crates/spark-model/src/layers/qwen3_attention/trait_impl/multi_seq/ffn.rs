@@ -123,7 +123,7 @@ impl Qwen3AttentionLayer {
             // fast kernel on truncated-γ verifies, costing the prose
             // path 15-20 tok/s.
             let try_kgamma = !force_serial_ffn
-                && n > 3
+                && n >= crate::layers::TC_VERIFY_MIN_ROWS
                 && (crate::layers::ffn_kgamma_m16_enabled()
                     || self.ffn.exact_kgamma_applicable(n as u32));
             let used_kgamma = if try_kgamma {
