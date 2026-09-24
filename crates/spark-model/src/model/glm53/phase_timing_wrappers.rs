@@ -25,6 +25,10 @@ impl LogitsIo for TimedLogits<'_, '_> {
         self.timing
             .measure(Phase::Readback, || self.inner.copy_logits(destination))
     }
+
+    fn device_logits(&self) -> Option<spark_runtime::gpu::DevicePtr> {
+        self.inner.device_logits()
+    }
 }
 
 pub(crate) struct TimedPolicy<'a, 'clock> {
@@ -47,6 +51,17 @@ impl VerifyPolicy for TimedPolicy<'_, '_> {
     fn pick(&mut self, row: usize, logits: &[u8]) -> Result<u32> {
         self.timing
             .measure(Phase::PolicyPick, || self.inner.pick(row, logits))
+    }
+
+    fn pick_resident(
+        &mut self,
+        row: usize,
+        logits: &[u8],
+        device_row: Option<spark_runtime::gpu::DevicePtr>,
+    ) -> Result<u32> {
+        self.timing.measure(Phase::PolicyPick, || {
+            self.inner.pick_resident(row, logits, device_row)
+        })
     }
 
     fn advance(&mut self, token: u32) -> Result<PolicyAdvance> {

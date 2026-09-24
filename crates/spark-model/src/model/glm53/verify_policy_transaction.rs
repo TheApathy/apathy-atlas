@@ -82,12 +82,20 @@ pub trait LogitsIo {
     /// The GPU adapter must validate its source extent, not use the legacy
     /// single-row `copy_logits` implementation with a larger destination.
     fn copy_logits(&mut self, destination: &mut [u8]) -> Result<usize>;
+
+    /// Device base of the staged `[rows, vocab]` BF16 logits the copy read,
+    /// when they stay resident through selection. Lets a policy sample a row
+    /// through the ordinary decode sampler on the device logits themselves.
+    fn device_logits(&self) -> Option<spark_runtime::gpu::DevicePtr> {
+        None
+    }
 }
 
 pub struct StagedLogits {
     bytes: Vec<u8>,
     row_bytes: usize,
     rows: usize,
+    device: Option<spark_runtime::gpu::DevicePtr>,
 }
 
 impl StagedLogits {
@@ -109,7 +117,20 @@ impl StagedLogits {
             bytes,
             row_bytes: request.row_bytes,
             rows: request.inputs().len(),
+            device: io.device_logits(),
         })
+    }
+
+    /// Device address of row `index`, when the source keeps it resident.
+    pub fn row_device(&self, index: usize) -> Result<Option<spark_runtime::gpu::DevicePtr>> {
+        ensure!(
+            index < self.rows,
+            "GLM policy logits row is outside the captured extent"
+        );
+        let offset = index
+            .checked_mul(self.row_bytes)
+            .context("GLM policy device row offset overflow")?;
+        Ok(self.device.map(|base| base.offset(offset)))
     }
 
     pub fn row(&self, index: usize) -> Result<&[u8]> {
@@ -146,6 +167,17 @@ pub trait VerifyPolicy {
     /// Caller bias, sampling settings, masks and penalties belong in the
     /// adapter, not a second sampler in this model helper.
     fn pick(&mut self, row: usize, logits: &[u8]) -> Result<u32>;
+
+    /// `pick` with the row's device address when the logits source keeps it
+    /// resident. The default ignores it.
+    fn pick_resident(
+        &mut self,
+        row: usize,
+        logits: &[u8],
+        _device_row: Option<spark_runtime::gpu::DevicePtr>,
+    ) -> Result<u32> {
+        self.pick(row, logits)
+    }
 
     /// Advance only the reversible policy view, never real emission. Return
     /// Terminal when this pick ends generation. OrdinaryReplay requests a real
@@ -195,7 +227,7 @@ fn select(
         terminal: false,
     };
     for row in 0..request.inputs().len() {
-        let token = policy.pick(row, logits.row(row)?)?;
+        let token = policy.pick_resident(row, logits.row(row)?, logits.row_device(row)?)?;
         ensure!(
             (token as usize) < request.vocab,
             "GLM policy picked a token outside vocabulary"
@@ -431,5 +463,45 @@ impl PublishedVerify {
 
     pub fn terminal(&self) -> bool {
         self.terminal
+    }
+}
+
+#[cfg(test)]
+mod resident_logits_tests {
+    use super::*;
+    use spark_runtime::gpu::DevicePtr;
+
+    struct Source {
+        device: Option<DevicePtr>,
+    }
+
+    impl LogitsIo for Source {
+        fn copy_logits(&mut self, destination: &mut [u8]) -> Result<usize> {
+            destination.fill(0);
+            Ok(destination.len())
+        }
+
+        fn device_logits(&self) -> Option<DevicePtr> {
+            self.device
+        }
+    }
+
+    #[test]
+    fn resident_rows_are_addressed_by_row_stride() {
+        let request = VerifyRequest::new(10, 64, 4, &[1, 2, 3]).unwrap();
+        let mut source = Source {
+            device: Some(DevicePtr(0x1000)),
+        };
+        let logits = StagedLogits::read(&request, &mut source).unwrap();
+        assert_eq!(logits.row_device(0).unwrap(), Some(DevicePtr(0x1000)));
+        assert_eq!(logits.row_device(2).unwrap(), Some(DevicePtr(0x1000 + 2 * 4 * 2)));
+        assert!(logits.row_device(3).is_err());
+    }
+
+    #[test]
+    fn a_host_only_source_offers_no_device_rows() {
+        let request = VerifyRequest::new(0, 64, 4, &[1, 2]).unwrap();
+        let logits = StagedLogits::read(&request, &mut Source { device: None }).unwrap();
+        assert_eq!(logits.row_device(1).unwrap(), None);
     }
 }

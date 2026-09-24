@@ -19,6 +19,10 @@ impl LogitsIo for PolicyLogits<'_> {
             .copy_policy_logits(self.logits, self.bytes, destination, self.stream)?;
         Ok(self.bytes)
     }
+
+    fn device_logits(&self) -> Option<DevicePtr> {
+        Some(self.logits)
+    }
 }
 
 pub(super) struct PolicyTarget<'a> {
