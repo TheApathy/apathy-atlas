@@ -145,6 +145,30 @@ fn metrics_from(value: &serde_json::Value) -> Glm53GateMetrics {
     }
 }
 
+/// serde_json's default float parser is not correctly rounded (it can land one
+/// ULP off the literal), so floats are compared to 1e-12 relative. Counts and
+/// the presence of each optional metric must match exactly.
+fn assert_same_metrics(record: Glm53GateMetrics, constant: Glm53GateMetrics) {
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * a.abs().max(b.abs());
+    let close_opt = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => close(a, b),
+        _ => false,
+    };
+    assert!(
+        record.prompts == constant.prompts
+            && record.positions == constant.positions
+            && close(
+                record.argmax_agreement_excl_ties,
+                constant.argmax_agreement_excl_ties
+            )
+            && close(record.mean_kl, constant.mean_kl)
+            && close_opt(record.top1_delta_abs, constant.top1_delta_abs)
+            && close_opt(record.nll_delta_rel, constant.nll_delta_rel),
+        "evidence.json {record:?} != constant {constant:?}"
+    );
+}
+
 /// The admission constant and the committed gate record must be the same
 /// claim: neither can be edited without the other.
 #[test]
@@ -158,6 +182,8 @@ fn recorded_evidence_matches_the_committed_gate_record() {
         ),
         Some(evidence) => {
             assert_eq!(status, "pass");
+            // A one-ULP parse difference must not hide a real edit: a changed
+            // digit anywhere in these values is far outside 1e-12.
             assert_eq!(
                 record["build_commit"].as_str().unwrap(),
                 evidence.build_commit
@@ -171,9 +197,9 @@ fn recorded_evidence_matches_the_committed_gate_record() {
                 record["prompts_sha256"].as_str().unwrap(),
                 evidence.prompts_sha256
             );
-            assert_eq!(metrics_from(&record["prefill"]), evidence.prefill);
-            assert_eq!(metrics_from(&record["decode"]), evidence.decode);
-            assert_eq!(metrics_from(&record["control"]), evidence.control);
+            assert_same_metrics(metrics_from(&record["prefill"]), evidence.prefill);
+            assert_same_metrics(metrics_from(&record["decode"]), evidence.decode);
+            assert_same_metrics(metrics_from(&record["control"]), evidence.control);
             Glm53TargetOnlyAdmission::current().validate().unwrap();
         }
     }
