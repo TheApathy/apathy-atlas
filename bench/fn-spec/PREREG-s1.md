@@ -171,3 +171,14 @@ C1 ALL C2 ALLZ C3 GATE C4 ALLF. Predictions carried over from s8/s9:
 - ALL think_code == plain 166af6bb (tie fix); ALLF think_code == "times" divergence (control). 85%/90%.
 - ALL code_py >= 60 tok/s (1.45x). 50%.  ALLZ vs ALL +2-4%, identical outputs. 60%.
 - GATE chat >= 0.97x. 50%.
+
+## s10 outcome (vg7)
+- ALL: lost to the FN load hang (layer 42, log silent 13.5 min; reported to infra-audit).
+- ALLZ (= ALL + GDN lazy): code_py 51.90 (1.32x vs C2/C3, 1.36x vs C1/C2), code_rs 47.82
+  (1.22-1.26x), chat 35.93 (0.92-0.95x), think 39.71 (1.01-1.05x). Outputs: code_py/chat/think 5/5
+  == plain; code_rs 4/5 + one 9cd942 (the same flip plain C4 shows). Pre-registered 1.45x: MISS.
+  Tie fix: think == plain 166af6bb 5/5 (pre-registered 85%: HIT).
+- LOGITS_FNV: ALLZ verify rows bit-identical to plain decode rows at every output index on clean
+  trials (319/319, 255/255, 122/122); divergences only after a base-race hit (same as plain).
+- GATE: 1.25x / 1.16x / 0.87x / 0.90x, worse than ALLZ everywhere (pre-registered chat >= 0.97x: MISS).
+- ALLF (first-wins control): pending on the lock at report time.
