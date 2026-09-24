@@ -182,3 +182,4 @@ C1 ALL C2 ALLZ C3 GATE C4 ALLF. Predictions carried over from s8/s9:
   trials (319/319, 255/255, 122/122); divergences only after a base-race hit (same as plain).
 - GATE: 1.25x / 1.16x / 0.87x / 0.90x, worse than ALLZ everywhere (pre-registered chat >= 0.97x: MISS).
 - ALLF (first-wins control): pending on the lock at report time.
+- ALLF (first-wins control) ran 00:52Z: think_code == fd692dc8 (the 'times' divergence) 5/5 -> the control FAILS as required; the tie fix is the cause of think exactness (pre-registered 90%: HIT).
