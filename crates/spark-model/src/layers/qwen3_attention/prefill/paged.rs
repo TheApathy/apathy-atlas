@@ -515,6 +515,20 @@ impl Qwen3AttentionLayer {
             }
         }
 
+        super::core_dump::dump_attention_core(
+            ctx,
+            self.attn_layer_idx,
+            "paged",
+            seq_len_start,
+            num_tokens,
+            q_contiguous,
+            k_contiguous,
+            v_contiguous,
+            attn_out,
+            q_dim,
+            kv_dim,
+            stream,
+        )?;
         // ── 9. Sigmoid gate × attn_out (gated only) — single batched kernel ──
         if self.gated {
             // Gate data is in qg_out at offset q_dim (after deinterleave_qg_split),
