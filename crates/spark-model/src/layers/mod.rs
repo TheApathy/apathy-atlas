@@ -1365,6 +1365,13 @@ pub fn gdn_prefill_gatecache_v2_enabled() -> bool {
 }
 
 
+/// `ATLAS_PREFILL_FFN_CUBLASLT_FP8=1`: the prefill FFN runs on cuBLASLt FP8
+/// (e4m3 weights and activations, pinned algorithm) ahead of FlashInfer.
+pub fn prefill_ffn_cublaslt_fp8_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_FFN_CUBLASLT_FP8").ok().as_deref() == Some("1"))
+}
+
 /// `ATLAS_SSM_BA_PREFILL_ROWS=1`: the SSM b/a gate projection in prefill runs
 /// `dense_gemm_ba_gates_prefill_rows8`, an exact multi-token shadow of the
 /// per-(token, 4 outputs) parent that stages activation rows once and keeps

@@ -9,6 +9,7 @@
 const CUDA_BACKEND: &str = include_str!("../src/cuda_backend.rs");
 const GPU_IMPL: &str = include_str!("../src/cuda_backend/gpu_impl.rs");
 const MICROFIXTURE: &str = include_str!("../examples/cuda_blocking_copy_microfixture.rs");
+const BOUNDED_COPY: &str = include_str!("../src/cuda_backend/bounded_copy.rs");
 
 fn method_body<'a>(source: &'a str, name: &str, next_name: &str) -> &'a str {
     let marker = format!("    fn {name}(");
@@ -46,7 +47,13 @@ fn blocking_and_coalesced_cuda_d2h_are_pageable_safe() {
     ] {
         assert!(CUDA_BACKEND.contains(declaration), "missing {declaration}");
     }
-    assert!(!CUDA_BACKEND.contains("fn cuMemcpyDtoHAsync_v2("));
+    // The async D2H entry point exists only for ATLAS_BOUNDED_HOST_COPY, which
+    // copies through page-locked staging (cuMemAllocHost_v2), never into the
+    // caller's pageable slice; the generic methods never call it directly.
+    assert!(!GPU_IMPL.contains("cuMemcpyDtoHAsync_v2("));
+    assert!(BOUNDED_COPY.contains("cuMemAllocHost_v2("));
+    assert!(BOUNDED_COPY.contains("cuMemcpyDtoHAsync_v2(stage.cast()"));
+    assert!(BOUNDED_COPY.contains("cuMemcpyHtoDAsync_v2(dst + off as u64, stage.cast()"));
 
     let d2h_on_stream = method_body(GPU_IMPL, "copy_d2h_on_stream", "copy_d2h_pair_on_stream");
     assert!(d2h_on_stream.contains("cuMemcpyDtoH_v2("));

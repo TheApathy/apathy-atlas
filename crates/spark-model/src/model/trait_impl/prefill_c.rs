@@ -61,10 +61,23 @@ impl TransformerModel {
                  (arena_cap={arena_cap})",
                 total_len.div_ceil(chunk_size),
             );
+            // Diagnostic (default off): ATLAS_PREFILL_CHUNK_SCHEDULE=<first>:<rest>
+            // prefills the first `first` tokens as one chunk, then the rest in
+            // chunks of `rest` (1 = the prefill-as-decode path), so decode-path
+            // scoring can follow a prefill built by a chosen route.
+            let schedule = std::env::var("ATLAS_PREFILL_CHUNK_SCHEDULE").ok().and_then(|v| {
+                let (a, b) = v.split_once(':')?;
+                Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+            });
             let mut offset = 0;
             while offset < total_len {
                 let remaining = total_len - offset;
-                let chunk_len = remaining.min(chunk_size);
+                let this_chunk = match schedule {
+                    Some((first, _)) if offset == 0 => first.clamp(1, chunk_size),
+                    Some((_, rest)) => rest.clamp(1, chunk_size),
+                    None => chunk_size,
+                };
+                let chunk_len = remaining.min(this_chunk);
                 let is_last = offset + chunk_len >= total_len;
                 let logits = self.prefill_chunk(tokens, seq, offset, chunk_len, is_last, stream)?;
                 offset += chunk_len;

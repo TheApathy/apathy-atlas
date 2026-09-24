@@ -50,6 +50,8 @@ const PREF_REDUCTION_SCHEME_MASK: u32 = 3;
 pub enum GemmDtype {
     Bf16,
     F32,
+    /// FP8 e4m3 operands (inputs only; the output stays BF16/F32).
+    E4m3,
 }
 
 impl GemmDtype {
@@ -57,6 +59,7 @@ impl GemmDtype {
         match self {
             GemmDtype::Bf16 => CUDA_R_16BF,
             GemmDtype::F32 => CUDA_R_32F,
+            GemmDtype::E4m3 => CUDA_R_8F_E4M3,
         }
     }
 }

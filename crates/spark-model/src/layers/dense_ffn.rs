@@ -1045,6 +1045,12 @@ pub struct DenseFfnLayer {
     /// (272, 56)=15232 CTAs — 4x fewer CTAs but 4x more work per CTA,
     /// and ~2x less weight DRAM traffic.
     w4a16_gemm_t_m128: KernelHandle,
+    /// `ATLAS_PREFILL_FFN_CUBLASLT_FP8` kernels (0 when absent) and its
+    /// lazily materialized e4m3 weights / activation scratch.
+    fp8_cast_k: KernelHandle,
+    fp8_dequant_k: KernelHandle,
+    fp8_weights: std::sync::Mutex<Option<[DevicePtr; 3]>>,
+    fp8_act_scratch: std::sync::Mutex<Option<(DevicePtr, usize)>>,
     /// `w4a16_gemm_t_m32_n64` — DFlash K=17 verify specialization:
     /// single B read (one 32-row M-tile) × 272 CTAs (N_TILE=64).
     /// Loaded via `try_kernel`; 0 falls back to m128/m16.
@@ -1387,6 +1393,10 @@ impl DenseFfnLayer {
             // GEMM for prefill. Handle 0 disables the
             // `ATLAS_PREFILL_FFN_FAST` fast path silently.
             w4a16_gemm_t_m128: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
+            fp8_cast_k: super::try_kernel(gpu, "w4a16_v2", "cast_bf16_to_e4m3"),
+            fp8_dequant_k: super::try_kernel(gpu, "w4a16_v2", "dequant_nvfp4_to_e4m3"),
+            fp8_weights: std::sync::Mutex::new(None),
+            fp8_act_scratch: std::sync::Mutex::new(None),
             w4a16_gemm_t_m32_n64: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_n64"),
             // Optional fused gate+up+silu kernel. Handle 0 keeps the split
             // gate/up path (ATLAS_FFN_FUSED_GATEUP).
@@ -4018,6 +4028,10 @@ impl DenseFfnLayer {
         }
 
         #[cfg(all(feature = "cuda", target_os = "linux"))]
+        if self.try_forward_prefill_cublaslt_fp8(input, m, h, inter, gate_out, up_out, ctx, stream)? {
+            return Ok(());
+        }
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
         if self.try_forward_flashinfer_prefill(input, m, h, inter, gate_out, up_out, ctx, stream)? {
             return Ok(());
         }
@@ -4873,6 +4887,10 @@ impl DenseFfnLayer {
         self.forward_prefill(input, num_tokens, ctx, stream)
     }
 }
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[path = "dense_ffn/prefill_fp8.rs"]
+mod prefill_fp8;
 
 #[cfg(test)]
 #[path = "dense_ffn/exact_route_tests.rs"]
