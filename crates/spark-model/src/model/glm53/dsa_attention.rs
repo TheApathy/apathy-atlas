@@ -1856,6 +1856,64 @@ impl Glm53DsaAttentionKernels {
                 sequence_length,
                 stream,
             )?;
+        } else if let Some(prefix) = dense_prefix_rows(rows, geometry.position)? {
+            // A chunk wider than the default prompt chunk that starts the
+            // sequence: attend its first `prefix` rows exactly as a default
+            // first chunk would (dense causal over their own prefix) and only
+            // the remainder through the sparse selector, so the result matches
+            // default-chunk prefill row for row.
+            let slice = |buffer: GgmlIqBuffer, row_bytes: usize, first: u32, count: u32| {
+                GgmlIqBuffer {
+                    ptr: buffer.ptr.offset(first as usize * row_bytes),
+                    bytes: count as usize * row_bytes,
+                }
+            };
+            let q_row = HEADS as usize * LATENT as usize * 2;
+            let index_row = SELECTED as usize * 4;
+            let part = |first: u32, count: u32| -> Result<_> {
+                Ok((
+                    Glm53DsaSelectedAttentionPlan::new(
+                        1,
+                        count,
+                        geometry.capacity,
+                        HEADS,
+                        LATENT,
+                        SELECTED,
+                        Glm53DsaSelectedStorage::Bf16,
+                    )?,
+                    Glm53DsaSelectedAttentionBuffers {
+                        absorbed_query_bf16: slice(buffers.absorbed_q_bf16, q_row, first, count),
+                        latent_cache_bf16: cache.latent_cache_bf16,
+                        selected_indices_i32: slice(
+                            buffers.selected_indices_i32,
+                            index_row,
+                            first,
+                            count,
+                        ),
+                        sequence_lengths_u32: sequence_lengths,
+                        query_positions_u32: slice(query_positions, 4, first, count),
+                        query_validity_u8: slice(query_validity, 1, first, count),
+                        output_weighted_latent_bf16: slice(
+                            buffers.weighted_latent_bf16,
+                            q_row,
+                            first,
+                            count,
+                        ),
+                    },
+                ))
+            };
+            let (dense_plan, dense_buffers) = part(0, prefix)?;
+            self.selected.launch_dense_causal(
+                gpu,
+                dense_plan,
+                dense_buffers,
+                0,
+                prefix,
+                stream,
+            )?;
+            let (sparse_plan, sparse_buffers) = part(prefix, rows - prefix)?;
+            self.selected
+                .launch(gpu, sparse_plan, sparse_buffers, stream)?;
         } else {
             self.selected
                 .launch(gpu, selected_plan, selected_buffers, stream)?;
@@ -2317,6 +2375,15 @@ impl Glm53DsaLayerGeometry {
     pub fn usable_pools(self) -> u32 {
         (self.position + 1) / KPOOL
     }
+}
+
+
+/// Rows of a sequence-opening chunk wider than the default prompt chunk that
+/// a default-chunk prefill would have attended densely: its whole first chunk.
+fn dense_prefix_rows(rows: u32, position: u32) -> Result<Option<u32>> {
+    let default_rows = u32::try_from(crate::layers::ops::GLM53_EXL3_DEFAULT_WIDE_ROWS)?;
+    Ok((glm53_layer_major_prefill_active() && position == 0 && rows > default_rows)
+        .then_some(default_rows))
 }
 
 #[cfg(test)]
