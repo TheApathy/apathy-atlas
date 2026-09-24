@@ -248,7 +248,7 @@ mod tests {
         // the assertion that replaces the old source-text check.
         let refusal = format!(
             "{:#}",
-            target_model::Glm53Model::admit(target_model::Glm53AdmissionScope::Speculative)
+            target_model::Glm53Model::admit(target_model::Glm53AdmissionScope::GgufTargetOnly)
                 .unwrap_err()
         );
         assert!(

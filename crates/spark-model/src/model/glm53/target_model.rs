@@ -176,8 +176,25 @@ impl Glm53Model {
     /// without allocating an arena first.
     pub fn admit(scope: Glm53AdmissionScope) -> Result<()> {
         let gate = match scope {
-            Glm53AdmissionScope::GgufTargetOnly | Glm53AdmissionScope::Speculative => {
-                Glm53KernelAdmission::current().validate()
+            Glm53AdmissionScope::GgufTargetOnly => Glm53KernelAdmission::current().validate(),
+            // Speculation is admitted on its own evidence (bit-identity with
+            // the admitted EXL3 target walk), so it also needs the target open.
+            Glm53AdmissionScope::Speculative => {
+                if super::speculative_admission::speculative_control_active() {
+                    Err(anyhow!(
+                        "a GLM-5.3 speculation negative control is set; it deliberately \
+                         corrupts the commit and is never admitted"
+                    ))
+                } else if negative_control_active()? {
+                    Err(anyhow!(
+                        "{GLM53_NEGATIVE_CONTROL_ENV} deliberately corrupts the commit and is \
+                         never admitted"
+                    ))
+                } else {
+                    Glm53TargetOnlyAdmission::current().validate().and_then(|()| {
+                        super::speculative_admission::GLM53_SPECULATIVE_EVIDENCE.validate()
+                    })
+                }
             }
             Glm53AdmissionScope::Exl3TargetOnly => {
                 if negative_control_active()? {

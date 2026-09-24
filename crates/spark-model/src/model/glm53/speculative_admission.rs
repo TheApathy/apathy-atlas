@@ -64,6 +64,19 @@ pub(crate) const GLM53_SPECULATIVE_EVIDENCE: Glm53SpeculativeEvidence = Glm53Spe
     chunked_prefill_covered: false,
 };
 
+/// The speculation gate controls (`bench/glm53-spec`) that deliberately break
+/// the accept path. Admission refuses while either is set.
+pub(crate) const SPECULATIVE_CONTROL_ENVS: [&str; 2] = [
+    "ATLAS_GLM53_PREFIX_COMMIT_CONTROL_LEGACY_RESTAGE",
+    "ATLAS_GLM53_SPEC_CONTROL_COMMIT_EXTRA_ROW",
+];
+
+pub(crate) fn speculative_control_active() -> bool {
+    SPECULATIVE_CONTROL_ENVS
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|value| value == "1"))
+}
+
 impl Glm53SpeculativeEvidence {
     /// Admit greedy speculation only when every identity and state check held,
     /// with enough coverage, and every negative control failed as it must.

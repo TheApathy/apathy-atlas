@@ -10,10 +10,7 @@ fn admission_refuses_by_default_and_names_both_gates() {
     if Glm53Model::bringup_escape_set() {
         panic!("{GLM53_BRINGUP_ENV} is set in the test environment; unset it");
     }
-    for scope in [
-        Glm53AdmissionScope::GgufTargetOnly,
-        Glm53AdmissionScope::Speculative,
-    ] {
+    for scope in [Glm53AdmissionScope::GgufTargetOnly] {
         let refusal = format!("{:#}", Glm53Model::admit(scope).unwrap_err());
         assert!(refusal.contains("admission is closed"), "{refusal}");
         assert!(refusal.contains(GLM53_BRINGUP_ENV), "{refusal}");
@@ -33,7 +30,27 @@ fn exl3_target_only_admission_follows_the_recorded_evidence() {
         Glm53Model::admit(Glm53AdmissionScope::Exl3TargetOnly).is_ok(),
         evidence_ok
     );
-    assert!(Glm53Model::admit(Glm53AdmissionScope::Speculative).is_err());
+    // Speculation needs the target admitted AND its own bit-identity evidence.
+    let speculative_ok = evidence_ok
+        && crate::model::glm53::speculative_admission::GLM53_SPECULATIVE_EVIDENCE
+            .validate()
+            .is_ok();
+    assert_eq!(
+        Glm53Model::admit(Glm53AdmissionScope::Speculative).is_ok(),
+        speculative_ok
+    );
+}
+
+/// A speculation negative control is never admitted, whatever the evidence says.
+#[test]
+fn speculative_admission_refuses_its_negative_controls() {
+    for name in crate::model::glm53::speculative_admission::SPECULATIVE_CONTROL_ENVS {
+        assert!(
+            std::env::var(name).is_err(),
+            "{name} is set in the test environment; unset it"
+        );
+    }
+    assert!(!crate::model::glm53::speculative_admission::speculative_control_active());
 }
 
 /// Runtime allocation must be accounted, not discovered at `alloc` time.
